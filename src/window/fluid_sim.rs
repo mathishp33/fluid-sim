@@ -9,11 +9,11 @@ pub struct Fluid {
 }
 
 impl Fluid {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize, start_density: f64) -> Self {
         Fluid {
             width,
             height,
-            density: Array2::zeros((width, height)),
+            density: Array2::from_elem((width, height), start_density),
             velocity_x: Array2::zeros((width, height)),
             velocity_y: Array2::zeros((width, height)),
         }
