@@ -52,9 +52,18 @@ impl Fluid {
         let mut new_velocity_y = self.velocity_y.clone();
         for x in 0..self.width {
             for y in 0..self.height {
+                if self.velocity_x[(x, y)] == 0.0 && self.velocity_y[(x, y)] == 0.0 {
+                    continue;
+                }
+                if self.density[(x, y)] <= 0.0 {
+                    new_density[(x, y)] = 0.0;
+                    new_velocity_x[(x, y)] = 0.0;
+                    new_velocity_y[(x, y)] = 0.0;
+                    continue;
+                }
                 let x1 = x as f64 + self.velocity_x[(x, y)].round();
                 let y1 = y as f64 + self.velocity_y[(x, y)].round();
-                if x1 < 0.0 || y1 < 0.0 || x1 >= self.width as f64 - 1.0 || y1 >= self.height as f64 - 1.0 {
+                if x1 <= 0.0 || y1 <= 0.0 || x1 >= self.width as f64 - 1.0 || y1 >= self.height as f64 - 1.0 {
                     continue;
                 }
                 let f = (x1 - self.velocity_x[(x, y)], y1 - self.velocity_y[(x, y)]);
@@ -66,7 +75,12 @@ impl Fluid {
                 let z1 = self.lerp(self.density[(i.0 as usize, i.1 as usize)], self.density[(i.0 as usize + 1, i.1 as usize)], j.0);
                 let z2 = self.lerp(self.density[(i.0 as usize, i.1 as usize + 1)], self.density[(i.0 as usize + 1, i.1 as usize + 1)], j.0);
 
-                new_density[(x1 as usize, y1 as usize)] = self.lerp(z1, z2, j.1);
+                let mut density_to_give = self.lerp(z1, z2, j.1);
+                if density_to_give > self.density[(x, y)] {
+                    density_to_give = self.density[(x, y)];
+                }
+                new_density[(x1 as usize, y1 as usize)] += density_to_give;
+                new_density[(x, y)] -= density_to_give; //enlever si on veux un truc + beau
                 new_velocity_x[(x, y)] = 0.0;
                 new_velocity_y[(x, y)] = 0.0;
                 new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * k;
