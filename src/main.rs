@@ -2,8 +2,8 @@ use eframe::egui::{self, Color32, ComboBox};
 
 mod window;
 
-fn launch_simulation() {
-    let mut window = window::FluidWindow::new(800, 600, 120, 10, 5, 0.1);
+fn launch_simulation(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64) {
+    let mut window = window::FluidWindow::new(width, height, fps, particle_radius, precision, start_density);
     window.run();
 }
 
@@ -91,7 +91,7 @@ impl eframe::App for MyApp {
             ui.checkbox(&mut self.settings.inverse_density_color, "Inverse Color Density");
 
             if ui.button("Launch Simulation").clicked() {
-                launch_simulation();
+                launch_simulation(self.settings.width, self.settings.height, self.settings.max_fps, self.settings.particle_radius, self.settings.precision, self.settings.start_density);
             }
         });
     }
