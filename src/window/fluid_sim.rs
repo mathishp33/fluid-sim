@@ -6,16 +6,20 @@ pub struct Fluid {
     pub density: Array2<f64>,
     pub velocity_x: Array2<f64>,
     pub velocity_y: Array2<f64>,
+    pub diffusion_rate: f64,
+    pub friction_rate: f64,
 }
 
 impl Fluid {
-    pub fn new(width: usize, height: usize, start_density: f64) -> Self {
+    pub fn new(width: usize, height: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64) -> Self {
         Fluid {
             width,
             height,
             density: Array2::from_elem((width, height), start_density),
             velocity_x: Array2::zeros((width, height)),
             velocity_y: Array2::zeros((width, height)),
+            diffusion_rate,
+            friction_rate,
         }
 
     }
@@ -25,11 +29,10 @@ impl Fluid {
     }
 
     pub fn diffusion(&mut self) {
-        let k = 0.1; // diffusion rate
         let mut new_density = self.density.clone();
         for x in 1..self.width - 1 {
             for y in 1..self.height - 1 {
-                new_density[(x, y)] += k * (
+                new_density[(x, y)] += self.diffusion_rate * (
                     self.density[(x + 1, y)] +
                     self.density[(x - 1, y)] +
                     self.density[(x, y + 1)] +
@@ -46,7 +49,6 @@ impl Fluid {
     }
 
     pub fn advection(&mut self) {
-        let k = 0.5; //friction rate
         let mut new_density = self.density.clone();
         let mut new_velocity_x = self.velocity_x.clone();
         let mut new_velocity_y = self.velocity_y.clone();
@@ -76,15 +78,15 @@ impl Fluid {
                 let z2 = self.lerp(self.density[(i.0 as usize, i.1 as usize + 1)], self.density[(i.0 as usize + 1, i.1 as usize + 1)], j.0);
 
                 let mut density_to_give = self.lerp(z1, z2, j.1);
-                if density_to_give > self.density[(x, y)] {
-                    density_to_give = self.density[(x, y)];
+                if density_to_give > new_density[(x, y)] {
+                    density_to_give = new_density[(x, y)];
                 }
                 new_density[(x1 as usize, y1 as usize)] += density_to_give;
                 new_density[(x, y)] -= density_to_give; //enlever si on veux un truc + beau
-                new_velocity_x[(x, y)] = 0.0;
-                new_velocity_y[(x, y)] = 0.0;
-                new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * k;
-                new_velocity_y[(x1 as usize, y1 as usize)] = self.velocity_y[(x, y)] * k;
+                new_velocity_x[(x, y)] = self.velocity_x[(x, y)] * self.friction_rate;
+                new_velocity_y[(x, y)] = self.velocity_y[(x, y)] * self.friction_rate;
+                new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * self.friction_rate;
+                new_velocity_y[(x1 as usize, y1 as usize)] = self.velocity_y[(x, y)] * self.friction_rate;
             }
         }
         self.density = new_density;

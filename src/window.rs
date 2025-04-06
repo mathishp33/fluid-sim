@@ -13,10 +13,12 @@ pub struct FluidWindow {
     pub precision : usize,
     pub window: Window,
     pub start_density: f64,
+    pub diffusion_rate: f64,
+    pub friction_rate: f64,
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64) -> Self {
+    pub fn new(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64) -> Self {
         FluidWindow {
             width,
             height,
@@ -27,7 +29,7 @@ impl FluidWindow {
             window: Window::new(
                 "Fluid Simulation", 
                 width,
-                height, 
+                height,
                 WindowOptions {
                     resize: false,
                     ..WindowOptions::default()
@@ -36,11 +38,13 @@ impl FluidWindow {
                     panic!("Unable to create window: {}", e);
                 }),
             start_density,
+            diffusion_rate,
+            friction_rate,
         }
     }
 
     pub fn run(&mut self) {
-        let mut fluid = fluid_sim::Fluid::new((self.width / self.precision) as usize, (self.height / self.precision) as usize, self.start_density);
+        let mut fluid = fluid_sim::Fluid::new((self.width / self.precision) as usize, (self.height / self.precision) as usize, self.start_density, self.diffusion_rate, self.friction_rate);
     
         let mut mouse_pos0 = (0, 0);
     
