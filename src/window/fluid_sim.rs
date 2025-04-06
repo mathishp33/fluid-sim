@@ -67,6 +67,8 @@ impl Fluid {
                 let z2 = self.lerp(self.density[(i.0 as usize, i.1 as usize + 1)], self.density[(i.0 as usize + 1, i.1 as usize + 1)], j.0);
 
                 new_density[(x1 as usize, y1 as usize)] = self.lerp(z1, z2, j.1);
+                new_velocity_x[(x, y)] = 0.0;
+                new_velocity_y[(x, y)] = 0.0;
                 new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * k;
                 new_velocity_y[(x1 as usize, y1 as usize)] = self.velocity_y[(x, y)] * k;
             }
