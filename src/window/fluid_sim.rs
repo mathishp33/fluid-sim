@@ -82,7 +82,7 @@ impl Fluid {
                     density_to_give = new_density[(x, y)];
                 }
                 new_density[(x1 as usize, y1 as usize)] += density_to_give;
-                new_density[(x, y)] -= density_to_give; //enlever si on veux un truc + beau
+                new_density[(x, y)] -= density_to_give;
                 new_velocity_x[(x, y)] = self.velocity_x[(x, y)] * self.friction_rate;
                 new_velocity_y[(x, y)] = self.velocity_y[(x, y)] * self.friction_rate;
                 new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * self.friction_rate;

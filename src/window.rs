@@ -46,7 +46,8 @@ impl FluidWindow {
     }
 
     pub fn run(&mut self) {
-        let mut fluid = fluid_sim::Fluid::new((self.width / self.precision) as usize, (self.height / self.precision) as usize, self.start_density, self.diffusion_rate, self.friction_rate);
+        let mut fluid = fluid_sim::Fluid::new((self.width / self.precision) as usize, (self.height / self.precision) as usize,
+         self.start_density, self.diffusion_rate, self.friction_rate);
     
         let mut mouse_pos0 = (0, 0);
     

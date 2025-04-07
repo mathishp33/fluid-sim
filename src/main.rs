@@ -14,7 +14,6 @@ struct SimulationSettings {
     particle_radius: usize,
     precision: usize,
     start_density: f64,
-    create_density_on_advection: bool,
     max_density_color: Color32,
     diffusion_rate: f64,
     friction_rate: f64,
@@ -29,7 +28,6 @@ impl Default for SimulationSettings {
             particle_radius: 10,
             precision: 5,
             start_density: 0.2,
-            create_density_on_advection: false,
             max_density_color: Color32::WHITE,
             diffusion_rate: 0.1,
             friction_rate: 0.5,
@@ -87,8 +85,6 @@ impl eframe::App for MyApp {
                 });
 
             ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
-
-            ui.checkbox(&mut self.settings.create_density_on_advection, "Create Density on Advection");
 
             ui.label("Max Density Color");
             ui.color_edit_button_srgba(&mut self.settings.max_density_color);
