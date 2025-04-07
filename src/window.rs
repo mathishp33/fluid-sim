@@ -15,10 +15,11 @@ pub struct FluidWindow {
     pub start_density: f64,
     pub diffusion_rate: f64,
     pub friction_rate: f64,
+    pub max_color: u32,
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64) -> Self {
+    pub fn new(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64, max_color: u32) -> Self {
         FluidWindow {
             width,
             height,
@@ -40,6 +41,7 @@ impl FluidWindow {
             start_density,
             diffusion_rate,
             friction_rate,
+            max_color,
         }
     }
 
@@ -102,8 +104,17 @@ impl FluidWindow {
     
                 for y in 0..fluid.height {
                     for x in 0..fluid.width {
-                        let color = (fluid.get_density(x, y) * 255.0f64) as i32;
-                        let u32_color = ((color as u32) << 16) | ((color as u32) << 8) | (color as u32);
+                        let density = fluid.get_density(x, y);
+
+                        let r: u8 = (density * ((self.max_color >> 0) & 0xFF) as f64) as u8;
+                        let g: u8 = (density * ((self.max_color >> 8) & 0xFF) as f64) as u8;
+                        let b: u8 = (density * ((self.max_color >> 16) & 0xFF) as f64) as u8;
+
+                        let u32_color = 
+                            ((b as u32) << 16) |
+                            ((g as u32) << 8)  |
+                            (r as u32);
+                
                         for i in 0..self.precision {
                             for j in 0..self.precision {
                                 let buffer_index = ((y * self.precision + j) * self.width + (x * self.precision + i)) as usize;

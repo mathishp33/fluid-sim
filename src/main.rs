@@ -2,8 +2,8 @@ use eframe::egui::{self, Color32, ComboBox};
 
 mod window;
 
-fn launch_simulation(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64) {
-    let mut window = window::FluidWindow::new(width, height, fps, particle_radius, precision, start_density, diffusion_rate, friction_rate);
+fn launch_simulation(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64, max_color: u32) {
+    let mut window = window::FluidWindow::new(width, height, fps, particle_radius, precision, start_density, diffusion_rate, friction_rate, max_color);
     window.run();
 }
 
@@ -16,7 +16,6 @@ struct SimulationSettings {
     start_density: f64,
     create_density_on_advection: bool,
     max_density_color: Color32,
-    inverse_density_color: bool,
     diffusion_rate: f64,
     friction_rate: f64,
 }
@@ -32,7 +31,6 @@ impl Default for SimulationSettings {
             start_density: 0.2,
             create_density_on_advection: false,
             max_density_color: Color32::WHITE,
-            inverse_density_color: false,
             diffusion_rate: 0.1,
             friction_rate: 0.5,
         }
@@ -95,10 +93,11 @@ impl eframe::App for MyApp {
             ui.label("Max Density Color");
             ui.color_edit_button_srgba(&mut self.settings.max_density_color);
 
-            ui.checkbox(&mut self.settings.inverse_density_color, "Inverse Color Density");
-
             if ui.button("Launch Simulation").clicked() {
-                launch_simulation(self.settings.width, self.settings.height, self.settings.max_fps, self.settings.particle_radius, self.settings.precision, self.settings.start_density, self.settings.diffusion_rate, self.settings.friction_rate);
+                let color = self.settings.max_density_color;
+                let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
+                launch_simulation(self.settings.width, self.settings.height, self.settings.max_fps, self.settings.particle_radius, self.settings.precision, self.settings.start_density, self.settings.diffusion_rate, self.settings.friction_rate, max_color);
+            
             }
         });
     }
