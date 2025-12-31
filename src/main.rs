@@ -2,8 +2,11 @@ use eframe::egui::{self, Color32, ComboBox};
 
 mod window;
 
-fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32) {
-    let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate, max_color);
+fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, 
+    max_color: u32, randomize: bool, random_smoothing: usize) {
+
+    let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate,
+         max_color, randomize, random_smoothing);
     window.run();
 }
 
@@ -15,6 +18,8 @@ struct SimulationSettings {
     start_density: f64,
     max_density_color: Color32,
     diffusion_rate: f64,
+    randomize: bool,
+    random_smoothing: usize,
 }
 
 impl Default for SimulationSettings {
@@ -23,10 +28,12 @@ impl Default for SimulationSettings {
             width: 800,
             height: 600,
             particle_radius: 10,
-            precision: 5,
+            precision: 10,
             start_density: 0.2,
             max_density_color: Color32::WHITE,
             diffusion_rate: 0.1,
+            randomize: false,
+            random_smoothing: 100,
         }
     }
 }
@@ -72,6 +79,8 @@ impl eframe::App for MyApp {
                 });
 
             ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
+            ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
+            ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
 
             ui.label("Max Density Color");
             ui.color_edit_button_srgba(&mut self.settings.max_density_color);
@@ -79,8 +88,8 @@ impl eframe::App for MyApp {
             if ui.button("Launch Simulation").clicked() {
                 let color = self.settings.max_density_color;
                 let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
-                launch_simulation(self.settings.width, self.settings.height, self.settings.particle_radius, self.settings.precision, self.settings.start_density, self.settings.diffusion_rate, max_color);
-            
+                launch_simulation(self.settings.width, self.settings.height, self.settings.particle_radius, self.settings.precision, 
+                    self.settings.start_density, self.settings.diffusion_rate, max_color, self.settings.randomize, self.settings.random_smoothing);
             }
         });
     }

@@ -12,10 +12,12 @@ pub struct FluidWindow {
     pub start_density: f64,
     pub diffusion_rate: f64,
     pub max_color: u32,
+    pub randomize: bool,
+    pub random_smoothing: usize,
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32) -> Self {
+    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32, randomize: bool, random_smoothing: usize) -> Self {
         FluidWindow {
             width,
             height,
@@ -35,6 +37,8 @@ impl FluidWindow {
             start_density,
             diffusion_rate,
             max_color,
+            randomize,
+            random_smoothing,
         }
     }
 
@@ -45,6 +49,10 @@ impl FluidWindow {
             self.start_density,
             self.diffusion_rate,
         );
+
+        if self.randomize {
+            fluid.randomize_density_smoothed(self.random_smoothing);
+        }
 
         let mut last_mouse = (0usize, 0usize);
         let mut last_time = std::time::Instant::now();
@@ -92,7 +100,7 @@ impl FluidWindow {
                         let y = y as usize;
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
-                            fluid.density[(x, y)] += 1.0 * dt;
+                            fluid.density[(x, y)] += 2.0 * dt;
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Right) {

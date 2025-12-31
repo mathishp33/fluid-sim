@@ -1,4 +1,5 @@
 use ndarray::Array2;
+use rand::Rng;
 
 pub struct Fluid {
     pub width: usize,
@@ -22,6 +23,22 @@ impl Fluid {
             diffusion_rate,
             pressure: Array2::zeros((width, height)),
             divergence: Array2::zeros((width, height)),
+        }
+    }
+
+    pub fn randomize_density_smoothed(&mut self, seed_count: usize) {
+        let mut rng = rand::thread_rng();
+
+        self.density.fill(0.0);
+
+        for _ in 0..seed_count {
+            let x = rng.gen_range(1..self.width - 1);
+            let y = rng.gen_range(1..self.height - 1);
+            self.density[(x, y)] = rng.gen_range(0.5..1.0);
+        }
+
+        for _ in 0..20 {
+            self.diffuse_density(0.1, 1);
         }
     }
 
