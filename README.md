@@ -1,5 +1,5 @@
 # Fluid Simulation
 
-A 100% rust fluid simulation, note that the simulated fluid is compressible.
+A 100% rust fluid simulation, note that the simulated fluid is incompressible.
 
-Use Left click to add density and hold left click to move the fluid
+Use feft click to add density and hold right click to move the fluid.
