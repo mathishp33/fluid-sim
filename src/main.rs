@@ -2,21 +2,19 @@ use eframe::egui::{self, Color32, ComboBox};
 
 mod window;
 
-fn launch_simulation(width: usize, height: usize, fps: i32, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64, max_color: u32) {
-    let mut window = window::FluidWindow::new(width, height, fps, particle_radius, precision, start_density, diffusion_rate, friction_rate, max_color);
+fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32) {
+    let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate, max_color);
     window.run();
 }
 
 struct SimulationSettings {
     width: usize,
     height: usize,
-    max_fps: i32,
     particle_radius: usize,
     precision: usize,
     start_density: f64,
     max_density_color: Color32,
     diffusion_rate: f64,
-    friction_rate: f64,
 }
 
 impl Default for SimulationSettings {
@@ -24,13 +22,11 @@ impl Default for SimulationSettings {
         Self {
             width: 800,
             height: 600,
-            max_fps: 60,
             particle_radius: 10,
             precision: 5,
             start_density: 0.2,
             max_density_color: Color32::WHITE,
             diffusion_rate: 0.1,
-            friction_rate: 0.5,
         }
     }
 }
@@ -64,15 +60,6 @@ impl eframe::App for MyApp {
             ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
             ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=0.20).text("Diffusion Rate"));
-            ui.add(egui::Slider::new(&mut self.settings.friction_rate, 0.0..=1.0).text("Restitution"));
-
-            ComboBox::from_label("Max FPS")
-                .selected_text(format!("{}", self.settings.max_fps))
-                .show_ui(ui, |ui| {
-                    for fps in [30, 60, 120, 144, 180, 240] {
-                        ui.selectable_value(&mut self.settings.max_fps, fps, format!("{fps}"));
-                    }
-                });
 
             ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=50).text("Mouse Radius (pixels)"));
 
@@ -92,7 +79,7 @@ impl eframe::App for MyApp {
             if ui.button("Launch Simulation").clicked() {
                 let color = self.settings.max_density_color;
                 let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
-                launch_simulation(self.settings.width, self.settings.height, self.settings.max_fps, self.settings.particle_radius, self.settings.precision, self.settings.start_density, self.settings.diffusion_rate, self.settings.friction_rate, max_color);
+                launch_simulation(self.settings.width, self.settings.height, self.settings.particle_radius, self.settings.precision, self.settings.start_density, self.settings.diffusion_rate, max_color);
             
             }
         });

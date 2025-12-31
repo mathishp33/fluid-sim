@@ -7,11 +7,12 @@ pub struct Fluid {
     pub velocity_x: Array2<f64>,
     pub velocity_y: Array2<f64>,
     pub diffusion_rate: f64,
-    pub friction_rate: f64,
+    pub pressure: Array2<f64>,
+    pub divergence: Array2<f64>,
 }
 
 impl Fluid {
-    pub fn new(width: usize, height: usize, start_density: f64, diffusion_rate: f64, friction_rate: f64) -> Self {
+    pub fn new(width: usize, height: usize, start_density: f64, diffusion_rate: f64) -> Self {
         Fluid {
             width,
             height,
@@ -19,78 +20,162 @@ impl Fluid {
             velocity_x: Array2::zeros((width, height)),
             velocity_y: Array2::zeros((width, height)),
             diffusion_rate,
-            friction_rate,
+            pressure: Array2::zeros((width, height)),
+            divergence: Array2::zeros((width, height)),
         }
-
     }
 
-    pub fn get_density(&mut self, x: usize, y: usize) -> f64 {
-        return self.density[(x, y)];
+    pub fn get_density(&self, x: usize, y: usize) -> f64 {
+        self.density[(x, y)]
     }
 
-    pub fn diffusion(&mut self) {
+    pub fn diffuse_density(&mut self, dt: f64, iterations: usize) {
+        let a = self.diffusion_rate * dt;
+
+        for _ in 0..iterations {
+            for x in 1..self.width - 1 {
+                for y in 1..self.height - 1 {
+                    self.density[(x, y)] = (
+                        self.density[(x, y)] +
+                        a * (
+                            self.density[(x + 1, y)] +
+                            self.density[(x - 1, y)] +
+                            self.density[(x, y + 1)] +
+                            self.density[(x, y - 1)]
+                        )
+                    ) / (1.0 + 4.0 * a);
+                }
+            }
+        }
+    }
+
+    fn lerp(a: f64, b: f64, t: f64) -> f64 {
+        a + t * (b - a)
+    }
+
+    fn sample_field(field: &Array2<f64>, x: f64, y: f64) -> f64 {
+        let w = field.shape()[0] as isize;
+        let h = field.shape()[1] as isize;
+
+        let x0 = x.floor().clamp(0.0, (w - 1) as f64) as isize;
+        let y0 = y.floor().clamp(0.0, (h - 1) as f64) as isize;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+
+        let sx = x - x0 as f64;
+        let sy = y - y0 as f64;
+
+        let v00 = field[(x0 as usize, y0 as usize)];
+        let v10 = field[(x1 as usize, y0 as usize)];
+        let v01 = field[(x0 as usize, y1 as usize)];
+        let v11 = field[(x1 as usize, y1 as usize)];
+
+        let a = Self::lerp(v00, v10, sx);
+        let b = Self::lerp(v01, v11, sx);
+        Self::lerp(a, b, sy)
+    }
+
+    pub fn advect_density(&mut self, dt: f64) {
         let mut new_density = self.density.clone();
+
         for x in 1..self.width - 1 {
             for y in 1..self.height - 1 {
-                new_density[(x, y)] += self.diffusion_rate * (
-                    self.density[(x + 1, y)] +
-                    self.density[(x - 1, y)] +
-                    self.density[(x, y + 1)] +
-                    self.density[(x, y - 1)] -
-                    4.0 * self.density[(x, y)]
+                let vx = self.velocity_x[(x, y)];
+                let vy = self.velocity_y[(x, y)];
+
+                let px = x as f64 - vx * dt;
+                let py = y as f64 - vy * dt;
+
+                new_density[(x, y)] = Self::sample_field(&self.density, px, py);
+            }
+        }
+
+        self.density = new_density;
+    }
+
+    pub fn advect_velocity(&mut self, dt: f64) {
+        let mut new_vx = self.velocity_x.clone();
+        let mut new_vy = self.velocity_y.clone();
+
+        for x in 1..self.width - 1 {
+            for y in 1..self.height - 1 {
+                let vx = self.velocity_x[(x, y)];
+                let vy = self.velocity_y[(x, y)];
+
+                let px = x as f64 - vx * dt;
+                let py = y as f64 - vy * dt;
+
+                new_vx[(x, y)] = Self::sample_field(&self.velocity_x, px, py);
+                new_vy[(x, y)] = Self::sample_field(&self.velocity_y, px, py);
+            }
+        }
+
+        self.velocity_x = new_vx;
+        self.velocity_y = new_vy;
+    }
+
+    /// Calculate velocity divergence at each grid cell
+    fn calculate_divergence(&mut self) {
+        for x in 1..self.width - 1 {
+            for y in 1..self.height - 1 {
+                let divergence = 0.5 * (
+                    self.velocity_x[(x + 1, y)] - self.velocity_x[(x - 1, y)] +
+                    self.velocity_y[(x, y + 1)] - self.velocity_y[(x, y - 1)]
                 );
+                self.divergence[(x, y)] = -divergence;
             }
         }
-        self.density = new_density;
     }
 
-    pub fn lerp(&mut self, a: f64, b: f64, k: f64) -> f64 {
-        a + k * (b - a)
-    }
+    fn solve_pressure(&mut self, iterations: usize) {
+        self.pressure = Array2::zeros((self.width, self.height));
+        
+        for _ in 0..iterations {
+            for x in 1..self.width - 1 {
+                for y in 1..self.height - 1 {
+                    let neighbors = self.pressure[(x + 1, y)] +
+                                   self.pressure[(x - 1, y)] +
+                                   self.pressure[(x, y + 1)] +
+                                   self.pressure[(x, y - 1)];
+                    self.pressure[(x, y)] = (neighbors + self.divergence[(x, y)]) / 4.0;
+                }
+            }
 
-    pub fn advection(&mut self) {
-        let mut new_density = self.density.clone();
-        let mut new_velocity_x = self.velocity_x.clone();
-        let mut new_velocity_y = self.velocity_y.clone();
-        for x in 0..self.width {
             for y in 0..self.height {
-                if self.velocity_x[(x, y)] == 0.0 && self.velocity_y[(x, y)] == 0.0 {
-                    continue;
-                }
-                if self.density[(x, y)] <= 0.0 {
-                    new_density[(x, y)] = 0.0;
-                    new_velocity_x[(x, y)] = 0.0;
-                    new_velocity_y[(x, y)] = 0.0;
-                    continue;
-                }
-                let x1 = x as f64 + self.velocity_x[(x, y)].round();
-                let y1 = y as f64 + self.velocity_y[(x, y)].round();
-                if x1 <= 0.0 || y1 <= 0.0 || x1 >= self.width as f64 - 1.0 || y1 >= self.height as f64 - 1.0 {
-                    continue;
-                }
-                let f = (x1 - self.velocity_x[(x, y)], y1 - self.velocity_y[(x, y)]);
-                let i = (f.0.floor(), f.1.floor());
-                let j = (f.0.fract(), f.1.fract());
-                if i.0 < 0.0 || i.1 < 0.0 || i.0 >= self.width as f64 - 1.0 || i.1 >= self.height as f64 - 1.0 {
-                    continue;
-                }
-                let z1 = self.lerp(self.density[(i.0 as usize, i.1 as usize)], self.density[(i.0 as usize + 1, i.1 as usize)], j.0);
-                let z2 = self.lerp(self.density[(i.0 as usize, i.1 as usize + 1)], self.density[(i.0 as usize + 1, i.1 as usize + 1)], j.0);
-
-                let mut density_to_give = self.lerp(z1, z2, j.1);
-                if density_to_give > new_density[(x, y)] {
-                    density_to_give = new_density[(x, y)];
-                }
-                new_density[(x1 as usize, y1 as usize)] += density_to_give;
-                new_density[(x, y)] -= density_to_give;
-                new_velocity_x[(x, y)] = self.velocity_x[(x, y)] * self.friction_rate;
-                new_velocity_y[(x, y)] = self.velocity_y[(x, y)] * self.friction_rate;
-                new_velocity_x[(x1 as usize, y1 as usize)] = self.velocity_x[(x, y)] * self.friction_rate;
-                new_velocity_y[(x1 as usize, y1 as usize)] = self.velocity_y[(x, y)] * self.friction_rate;
+                self.pressure[(0, y)] = 0.0;
+                self.pressure[(self.width - 1, y)] = 0.0;
+            }
+            for x in 0..self.width {
+                self.pressure[(x, 0)] = 0.0;
+                self.pressure[(x, self.height - 1)] = 0.0;
             }
         }
-        self.density = new_density;
-        self.velocity_x = new_velocity_x;
-        self.velocity_y = new_velocity_y;
+    }
+
+    fn correct_velocity(&mut self) {
+        for x in 1..self.width - 1 {
+            for y in 1..self.height - 1 {
+                let pressure_gradient_x = 0.5 * (self.pressure[(x + 1, y)] - self.pressure[(x - 1, y)]);
+                let pressure_gradient_y = 0.5 * (self.pressure[(x, y + 1)] - self.pressure[(x, y - 1)]);
+                
+                self.velocity_x[(x, y)] -= pressure_gradient_x;
+                self.velocity_y[(x, y)] -= pressure_gradient_y;
+            }
+        }
+    }
+
+    pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {
+        self.calculate_divergence();
+        self.solve_pressure(pressure_iterations);
+        self.correct_velocity();
+    }
+
+
+    pub fn step(&mut self, dt: f64) {
+        self.advect_velocity(dt);
+        self.enforce_incompressibility(20);
+
+        self.diffuse_density(dt, 10);
+        self.advect_density(dt);
     }
 }
