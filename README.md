@@ -14,6 +14,3 @@ All sort of parameters can be adjusted such as:
 * Random density (it overrides Default density)
 * Random smoothing (works only with Random density)
 * Max density color
-
-
-![A normal screenshot.](/assets/images/screenshot_0.png)
