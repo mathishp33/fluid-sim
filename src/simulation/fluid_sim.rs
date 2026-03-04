@@ -1,6 +1,6 @@
 use rand::Rng;
 
-pub struct Fluid {
+pub struct FluidSim {
     pub width: usize,
     pub height: usize,
     pub density: Vec<f64>,
@@ -15,7 +15,7 @@ pub struct Fluid {
     velocity_y_temp: Vec<f64>,
 }
 
-impl Fluid {
+impl FluidSim {
     #[inline]
     fn idx(&self, x: usize, y: usize) -> usize {
         x + y * self.width
@@ -23,7 +23,7 @@ impl Fluid {
 
     pub fn new(width: usize, height: usize, start_density: f64, diffusion_rate: f64) -> Self {
         let size = width * height;
-        Fluid {
+        FluidSim {
             width,
             height,
             density: vec![start_density; size],

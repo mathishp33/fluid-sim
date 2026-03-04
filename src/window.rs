@@ -1,6 +1,6 @@
 use minifb::{Window, WindowOptions};
 
-mod fluid_sim;
+use crate::simulation::fluid_sim;
 
 
 pub struct FluidWindow {
@@ -16,11 +16,12 @@ pub struct FluidWindow {
     pub random_smoothing: usize,
     pub pressure_iters: usize,
     pub diffusion_iters: usize,
-    buffer: Vec<u32>,  // Reusable buffer
+    buffer: Vec<u32>,
     fps: f64,
     frame_count: usize,
     last_fps_update: std::time::Instant,
     paused: bool,
+    step_frame: usize,
 }
 
 impl FluidWindow {
@@ -49,16 +50,17 @@ impl FluidWindow {
             random_smoothing,
             pressure_iters,
             diffusion_iters,
-            buffer: vec![0u32; width * height],  // Allocate once
+            buffer: vec![0u32; width * height],
             fps: 0.0,
             frame_count: 0,
             last_fps_update: std::time::Instant::now(),
             paused: false,
+            step_frame: 0,
         }
     }
 
     pub fn run(&mut self) {
-        let mut fluid = fluid_sim::Fluid::new(
+        let mut fluid = fluid_sim::FluidSim::new(
             (self.width / self.precision) as usize,
             (self.height / self.precision) as usize,
             self.start_density,
@@ -79,6 +81,29 @@ impl FluidWindow {
 
             if dt <= 0.0 {
                 continue;
+            }
+
+            self.frame_count += 1;
+            let elapsed = now.duration_since(self.last_fps_update).as_secs_f64();
+            if elapsed >= 0.5 {
+                self.fps = self.frame_count as f64 / elapsed;
+                self.frame_count = 0;
+                self.last_fps_update = now;
+                let title = format!("Fluid Simulation - FPS: {:.1} ({})", self.fps, if self.paused { "PAUSED" } else { "RUNNING" });
+                self.window.set_title(&title);
+            }
+
+            if self.window.is_key_pressed(minifb::Key::Space, minifb::KeyRepeat::No) {
+                self.paused = !self.paused;
+            }
+
+            if self.paused {
+                if self.window.is_key_pressed(minifb::Key::Right, minifb::KeyRepeat::No) {
+                    self.step_frame = 1;
+                }
+                if self.window.is_key_pressed(minifb::Key::Up, minifb::KeyRepeat::No) {
+                    self.step_frame = 10;
+                }
             }
 
             let (mx, my) = self
@@ -114,7 +139,7 @@ impl FluidWindow {
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
                             let idx = x + y * fluid.width;
-                            fluid.density[idx] += 2.0 * dt;
+                            fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Right) {
@@ -128,9 +153,12 @@ impl FluidWindow {
 
             last_mouse = (mx, my);
 
-            fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); // clamp dt for stability
+            if !self.paused || self.step_frame > 0 {
+                fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); // clamp dt for stability
+                self.step_frame = self.step_frame.saturating_sub(1);
+            }
 
-            // Clear buffer
+
             self.buffer.fill(0);
 
             for y in 0..fluid.height {

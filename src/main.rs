@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, ComboBox};
 
 mod window;
+mod simulation;
 
 fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, 
     max_color: u32, randomize: bool, random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) {
