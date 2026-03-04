@@ -17,6 +17,10 @@ pub struct FluidWindow {
     pub pressure_iters: usize,
     pub diffusion_iters: usize,
     buffer: Vec<u32>,  // Reusable buffer
+    fps: f64,
+    frame_count: usize,
+    last_fps_update: std::time::Instant,
+    paused: bool,
 }
 
 impl FluidWindow {
@@ -46,6 +50,10 @@ impl FluidWindow {
             pressure_iters,
             diffusion_iters,
             buffer: vec![0u32; width * height],  // Allocate once
+            fps: 0.0,
+            frame_count: 0,
+            last_fps_update: std::time::Instant::now(),
+            paused: false,
         }
     }
 
@@ -105,12 +113,14 @@ impl FluidWindow {
                         let y = y as usize;
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
-                            fluid.density[(x, y)] += 2.0 * dt;
+                            let idx = x + y * fluid.width;
+                            fluid.density[idx] += 2.0 * dt;
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Right) {
-                            fluid.velocity_x[(x, y)] += fx * 0.05;
-                            fluid.velocity_y[(x, y)] += fy * 0.05;
+                            let idx = x + y * fluid.width;
+                            fluid.velocity_x[idx] += fx * 0.05;
+                            fluid.velocity_y[idx] += fy * 0.05;
                         }
                     }
                 }
