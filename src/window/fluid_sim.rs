@@ -10,6 +10,10 @@ pub struct Fluid {
     pub diffusion_rate: f64,
     pub pressure: Array2<f64>,
     pub divergence: Array2<f64>,
+    // swap buffers to avoid allocations
+    density_temp: Array2<f64>,
+    velocity_x_temp: Array2<f64>,
+    velocity_y_temp: Array2<f64>,
 }
 
 impl Fluid {
@@ -23,6 +27,9 @@ impl Fluid {
             diffusion_rate,
             pressure: Array2::zeros((width, height)),
             divergence: Array2::zeros((width, height)),
+            density_temp: Array2::zeros((width, height)),
+            velocity_x_temp: Array2::zeros((width, height)),
+            velocity_y_temp: Array2::zeros((width, height)),
         }
     }
 
@@ -46,15 +53,16 @@ impl Fluid {
         self.density[(x, y)]
     }
 
-    pub fn diffuse_density(&mut self, dt: f64, iterations: usize) {
+    pub fn diffuse_density(&mut self, dt: f64, diffusion_iters: usize) {
         let a = self.diffusion_rate * dt;
 
-        for _ in 0..iterations {
+        for _ in 0..diffusion_iters {
+            // Apply diffusion using swap buffer - split interior and boundary
+            // Interior cells use diffusion formula
             for x in 1..self.width - 1 {
                 for y in 1..self.height - 1 {
-                    self.density[(x, y)] = (
-                        self.density[(x, y)] +
-                        a * (
+                    self.density_temp[(x, y)] = (
+                        self.density[(x, y)] + a * (
                             self.density[(x + 1, y)] +
                             self.density[(x - 1, y)] +
                             self.density[(x, y + 1)] +
@@ -63,6 +71,18 @@ impl Fluid {
                     ) / (1.0 + 4.0 * a);
                 }
             }
+            
+            // Copy boundaries (Neumann boundary condition)
+            for y in 0..self.height {
+                self.density_temp[(0, y)] = self.density[(0, y)];
+                self.density_temp[(self.width - 1, y)] = self.density[(self.width - 1, y)];
+            }
+            for x in 0..self.width {
+                self.density_temp[(x, 0)] = self.density[(x, 0)];
+                self.density_temp[(x, self.height - 1)] = self.density[(x, self.height - 1)];
+            }
+            
+            std::mem::swap(&mut self.density, &mut self.density_temp);
         }
     }
 
@@ -93,8 +113,10 @@ impl Fluid {
     }
 
     pub fn advect_density(&mut self, dt: f64) {
-        let mut new_density = self.density.clone();
-
+        // Copy current density to temp buffer
+        self.density_temp.assign(&self.density);
+        
+        // Advect interior cells
         for x in 1..self.width - 1 {
             for y in 1..self.height - 1 {
                 let vx = self.velocity_x[(x, y)];
@@ -103,17 +125,25 @@ impl Fluid {
                 let px = x as f64 - vx * dt;
                 let py = y as f64 - vy * dt;
 
-                new_density[(x, y)] = Self::sample_field(&self.density, px, py);
+                self.density_temp[(x, y)] = Self::sample_field(&self.density, px, py);
             }
         }
 
-        self.density = new_density;
+        std::mem::swap(&mut self.density, &mut self.density_temp);
+        
+        // Clear boundaries
+        self.density.slice_mut(ndarray::s![0, ..]).fill(0.0);
+        self.density.slice_mut(ndarray::s![self.width - 1, ..]).fill(0.0);
+        self.density.slice_mut(ndarray::s![.., 0]).fill(0.0);
+        self.density.slice_mut(ndarray::s![.., self.height - 1]).fill(0.0);
     }
 
     pub fn advect_velocity(&mut self, dt: f64) {
-        let mut new_vx = self.velocity_x.clone();
-        let mut new_vy = self.velocity_y.clone();
-
+        // Copy current velocity to temp buffers
+        self.velocity_x_temp.assign(&self.velocity_x);
+        self.velocity_y_temp.assign(&self.velocity_y);
+        
+        // Advect interior cells
         for x in 1..self.width - 1 {
             for y in 1..self.height - 1 {
                 let vx = self.velocity_x[(x, y)];
@@ -122,16 +152,26 @@ impl Fluid {
                 let px = x as f64 - vx * dt;
                 let py = y as f64 - vy * dt;
 
-                new_vx[(x, y)] = Self::sample_field(&self.velocity_x, px, py);
-                new_vy[(x, y)] = Self::sample_field(&self.velocity_y, px, py);
+                self.velocity_x_temp[(x, y)] = Self::sample_field(&self.velocity_x, px, py);
+                self.velocity_y_temp[(x, y)] = Self::sample_field(&self.velocity_y, px, py);
             }
         }
 
-        self.velocity_x = new_vx;
-        self.velocity_y = new_vy;
+        std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
+        std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
+        
+        // Clear boundaries
+        self.velocity_x.slice_mut(ndarray::s![0, ..]).fill(0.0);
+        self.velocity_x.slice_mut(ndarray::s![self.width - 1, ..]).fill(0.0);
+        self.velocity_x.slice_mut(ndarray::s![.., 0]).fill(0.0);
+        self.velocity_x.slice_mut(ndarray::s![.., self.height - 1]).fill(0.0);
+        
+        self.velocity_y.slice_mut(ndarray::s![0, ..]).fill(0.0);
+        self.velocity_y.slice_mut(ndarray::s![self.width - 1, ..]).fill(0.0);
+        self.velocity_y.slice_mut(ndarray::s![.., 0]).fill(0.0);
+        self.velocity_y.slice_mut(ndarray::s![.., self.height - 1]).fill(0.0);
     }
 
-    /// Calculate velocity divergence at each grid cell
     fn calculate_divergence(&mut self) {
         for x in 1..self.width - 1 {
             for y in 1..self.height - 1 {
@@ -145,9 +185,10 @@ impl Fluid {
     }
 
     fn solve_pressure(&mut self, iterations: usize) {
-        self.pressure = Array2::zeros((self.width, self.height));
+        self.pressure.fill(0.0);
         
         for _ in 0..iterations {
+            // Interior cells
             for x in 1..self.width - 1 {
                 for y in 1..self.height - 1 {
                     let neighbors = self.pressure[(x + 1, y)] +
@@ -158,14 +199,11 @@ impl Fluid {
                 }
             }
 
-            for y in 0..self.height {
-                self.pressure[(0, y)] = 0.0;
-                self.pressure[(self.width - 1, y)] = 0.0;
-            }
-            for x in 0..self.width {
-                self.pressure[(x, 0)] = 0.0;
-                self.pressure[(x, self.height - 1)] = 0.0;
-            }
+            // Clear boundaries
+            self.pressure.slice_mut(ndarray::s![0, ..]).fill(0.0);
+            self.pressure.slice_mut(ndarray::s![self.width - 1, ..]).fill(0.0);
+            self.pressure.slice_mut(ndarray::s![.., 0]).fill(0.0);
+            self.pressure.slice_mut(ndarray::s![.., self.height - 1]).fill(0.0);
         }
     }
 
@@ -188,11 +226,11 @@ impl Fluid {
     }
 
 
-    pub fn step(&mut self, dt: f64) {
+    pub fn step(&mut self, dt: f64, pressure_iterations: usize, diffusion_iterations: usize) {
         self.advect_velocity(dt);
-        self.enforce_incompressibility(20);
+        self.enforce_incompressibility(pressure_iterations);
 
-        self.diffuse_density(dt, 10);
+        self.diffuse_density(dt, diffusion_iterations);
         self.advect_density(dt);
     }
 }

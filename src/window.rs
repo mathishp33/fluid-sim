@@ -14,10 +14,14 @@ pub struct FluidWindow {
     pub max_color: u32,
     pub randomize: bool,
     pub random_smoothing: usize,
+    pub pressure_iters: usize,
+    pub diffusion_iters: usize,
+    buffer: Vec<u32>,  // Reusable buffer
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32, randomize: bool, random_smoothing: usize) -> Self {
+    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32, randomize: bool, 
+        random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) -> Self {
         FluidWindow {
             width,
             height,
@@ -39,6 +43,9 @@ impl FluidWindow {
             max_color,
             randomize,
             random_smoothing,
+            pressure_iters,
+            diffusion_iters,
+            buffer: vec![0u32; width * height],  // Allocate once
         }
     }
 
@@ -65,8 +72,6 @@ impl FluidWindow {
             if dt <= 0.0 {
                 continue;
             }
-
-            let mut buffer = vec![0u32; self.width * self.height];
 
             let (mx, my) = self
                 .window
@@ -113,10 +118,13 @@ impl FluidWindow {
 
             last_mouse = (mx, my);
 
-            fluid.step(dt.min(0.05)); // clamp dt for stability
+            fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); // clamp dt for stability
 
+            // Clear buffer
+            self.buffer.fill(0);
 
             for y in 0..fluid.height {
+                let base_y = y * self.precision * self.width;
                 for x in 0..fluid.width {
                     let d = fluid.get_density(x, y).clamp(0.0, 1.0);
 
@@ -129,18 +137,18 @@ impl FluidWindow {
                         ((g as u32) << 8) |
                         (r as u32);
 
+                    let base_x = x * self.precision;
                     for py in 0..self.precision {
+                        let row_offset = base_y + py * self.width;
                         for px in 0..self.precision {
-                            let i = (y * self.precision + py) * self.width
-                                + (x * self.precision + px);
-                            buffer[i] = color;
+                            self.buffer[row_offset + base_x + px] = color;
                         }
                     }
                 }
             }
 
             self.window
-                .update_with_buffer(&buffer, self.width, self.height)
+                .update_with_buffer(&self.buffer, self.width, self.height)
                 .unwrap();
         }
     }
