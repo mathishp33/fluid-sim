@@ -14,6 +14,7 @@ pub struct FluidSim {
     density_temp: Vec<f64>,
     velocity_x_temp: Vec<f64>,
     velocity_y_temp: Vec<f64>,
+    pressure_temp: Vec<f64>,
 }
 
 impl FluidSim {
@@ -36,6 +37,7 @@ impl FluidSim {
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
             velocity_y_temp: vec![0.0; size],
+            pressure_temp: vec![0.0; size],
         }
     }
 
@@ -265,35 +267,43 @@ impl FluidSim {
 
     fn solve_pressure(&mut self, iterations: usize) {
         self.pressure.fill(0.0);
-        
-        for _ in 0..iterations {
-            for y in 1..self.height - 1 {
-                for x in 1..self.width - 1 {
-                    let idx = self.idx(x, y);
-                    let idx_right = self.idx(x + 1, y);
-                    let idx_left = self.idx(x - 1, y);
-                    let idx_up = self.idx(x, y + 1);
-                    let idx_down = self.idx(x, y - 1);
-                    
-                    let neighbors = self.pressure[idx_right] + self.pressure[idx_left] +
-                                   self.pressure[idx_up] + self.pressure[idx_down];
-                    self.pressure[idx] = (neighbors + self.divergence[idx]) / 4.0;
-                }
-            }
 
-            // Clear boundaries
-            for y in 0..self.height {
-                let idx_left = self.idx(0, y);
-                let idx_right = self.idx(self.width - 1, y);
-                self.pressure[idx_left] = 0.0;
-                self.pressure[idx_right] = 0.0;
-            }
-            for x in 0..self.width {
-                let idx_top = self.idx(x, 0);
-                let idx_bottom = self.idx(x, self.height - 1);
-                self.pressure[idx_top] = 0.0;
-                self.pressure[idx_bottom] = 0.0;
-            }
+        let width = self.width;
+        let height = self.height;
+
+        for _ in 0..iterations {
+            let pressure = &self.pressure;
+            let divergence = &self.divergence;
+
+            self.pressure_temp
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    if y == 0 || y == height - 1 {
+                        return;
+                    }
+
+                    for x in 1..width - 1 {
+                        let idx = x + y * width;
+                        let neighbors = pressure[idx + 1] + pressure[idx - 1] + pressure[idx + width] + pressure[idx - width];
+                        row[x] = (neighbors + divergence[idx]) * 0.25;
+                    }
+                });
+
+            self.pressure_temp
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    if y == 0 || y == height - 1 {
+                        row.fill(0.0);
+                    }
+                    else {
+                        row[0] = 0.0;
+                        row[width - 1] = 0.0;
+                    }
+                });
+
+            std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
         }
     }
 
