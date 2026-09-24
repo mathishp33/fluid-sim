@@ -1,4 +1,3 @@
-1. ajouter un système de vélocité aux bornes pour créer un flux avec vitesse initiale
 4. optimiser pour avoir des belles perfs (ORDRE IMPORTANT):
  - profiler step() (diffusion, advection, divergence, pressure, correction) et rendu aussi
  - optimiser le solveur de pression
