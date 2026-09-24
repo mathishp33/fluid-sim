@@ -1,7 +1,7 @@
 use minifb::{Window, WindowOptions};
 
 use crate::simulation::fluid_sim;
-
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, PartialEq)]
 enum DisplayMode {
@@ -57,12 +57,12 @@ fn signed_color(value: f32, max_abs: f32) -> u32 {
     ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
 }
 
-fn max_abs(field: &[f32]) -> f32 {
-    field
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0, f32::max)
-}
+// fn max_abs(field: &[f32]) -> f32 {
+//     field
+//         .iter()
+//         .map(|v| v.abs())
+//         .fold(0.0, f32::max)
+// }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
     let h = (h % 360.0 + 360.0) % 360.0;
@@ -281,55 +281,57 @@ impl FluidWindow {
                 .zip(fluid.velocity_y.iter())
                 .map(|(&vx, &vy)| (vx * vx + vy * vy).sqrt())
                 .fold(0.0, f32::max);
-            self.buffer.fill(0);
 
-            for y in 0..fluid.height {
-                let base_y = y * self.precision * self.width;
-                for x in 0..fluid.width {
-                    let color = self.render_color(&fluid, x, y, pressure_max, divergence_max, velocity_max);
+            let precision = self.precision;
+            let max_color = self.max_color;
+            let display_mode = self.display_mode;
 
-                    let base_x = x * self.precision;
-                    for py in 0..self.precision {
-                        let row_offset = base_y + py * self.width;
-                        for px in 0..self.precision {
-                            self.buffer[row_offset + base_x + px] = color;
+            self.buffer
+                .par_chunks_mut(self.width * precision)
+                .enumerate()
+                .for_each(|(y, screen_rows)| {
+                    for x in 0..fluid.width {
+                        let idx = x + y * fluid.width;
+
+                        let color = match display_mode {
+                            DisplayMode::Density => {
+                                let d = fluid.density[idx].clamp(0.0, 1.0);
+
+                                let r = (d * ((max_color >> 0) & 0xFF) as f32) as u8;
+                                let g = (d * ((max_color >> 8) & 0xFF) as f32) as u8;
+                                let b = (d * ((max_color >> 16) & 0xFF) as f32) as u8;
+
+                                ((b as u32) << 16) |
+                                    ((g as u32) << 8) |
+                                    r as u32
+                            }
+
+                            DisplayMode::Pressure => {
+                                signed_color(fluid.pressure[idx], pressure_max)
+                            }
+
+                            DisplayMode::Divergence => {
+                                signed_color(fluid.divergence[idx], divergence_max)
+                            }
+
+                            DisplayMode::Velocity => {
+                                velocity_color(fluid.velocity_x[idx], fluid.velocity_y[idx], velocity_max)
+                            }
+                        };
+
+                        let base_x = x * precision;
+
+                        for row in screen_rows.chunks_exact_mut(self.width) {
+                            for px in 0..precision {
+                                row[base_x + px] = color;
+                            }
                         }
                     }
-                }
-            }
+                });
 
             self.window
                 .update_with_buffer(&self.buffer, self.width, self.height)
                 .unwrap();
-        }
-    }
-
-    fn render_color(&self, fluid: &fluid_sim::FluidSim, x: usize, y: usize, pressure_max: f32, divergence_max: f32,
-                    velocity_max: f32) -> u32 {
-        let idx = x + y * fluid.width;
-
-        match self.display_mode {
-            DisplayMode::Density => {
-                let d = fluid.density[idx].clamp(0.0, 1.0);
-
-                let r = (d * ((self.max_color >> 0) & 0xFF) as f32) as u8;
-                let g = (d * ((self.max_color >> 8) & 0xFF) as f32) as u8;
-                let b = (d * ((self.max_color >> 16) & 0xFF) as f32) as u8;
-
-                ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
-            }
-
-            DisplayMode::Pressure => {
-                signed_color(fluid.pressure[idx], pressure_max)
-            }
-
-            DisplayMode::Divergence => {
-                signed_color(fluid.divergence[idx], divergence_max)
-            }
-
-            DisplayMode::Velocity => {
-                velocity_color(fluid.velocity_x[idx], fluid.velocity_y[idx], velocity_max)
-            }
         }
     }
 }

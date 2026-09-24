@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, ComboBox};
+use serde::{Deserialize, Serialize};
 
 mod window;
 mod simulation;
@@ -11,13 +12,14 @@ fn launch_simulation(width: usize, height: usize, particle_radius: usize, precis
     window.run();
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 struct SimulationSettings {
     width: usize,
     height: usize,
     particle_radius: usize,
     precision: usize,
     start_density: f32,
-    max_density_color: Color32,
+    max_density_color: [u8; 4],
     diffusion_rate: f32,
     randomize: bool,
     random_smoothing: usize,
@@ -33,7 +35,7 @@ impl Default for SimulationSettings {
             particle_radius: 10,
             precision: 10,
             start_density: 0.2,
-            max_density_color: Color32::WHITE,
+            max_density_color: [255, 255, 255, 255],
             diffusion_rate: 0.1,
             randomize: false,
             random_smoothing: 100,
@@ -94,7 +96,14 @@ impl eframe::App for MyApp {
             //ui.color_edit_button_srgba(&mut self.settings.max_density_color);
 
             if ui.button("Launch Simulation").clicked() {
-                let color = self.settings.max_density_color;
+                save_settings(&self.settings);
+
+                let color = Color32::from_rgba_unmultiplied(
+                    self.settings.max_density_color[0],
+                    self.settings.max_density_color[1],
+                    self.settings.max_density_color[2],
+                    self.settings.max_density_color[3],
+                );
                 let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
                 launch_simulation(self.settings.width, self.settings.height, self.settings.particle_radius, self.settings.precision, 
                     self.settings.start_density, self.settings.diffusion_rate, max_color, self.settings.randomize, self.settings.random_smoothing, 
@@ -105,6 +114,40 @@ impl eframe::App for MyApp {
     }
 }
 
+fn load_settings() -> SimulationSettings {
+    let path = "config.json";
+
+    match std::fs::read_to_string(path) {
+        Ok(data) => {
+            serde_json::from_str(&data).unwrap_or_else(|e| {
+                eprintln!("Unable to read config.json : {e}");
+                SimulationSettings::default()
+            })
+        }
+
+        Err(_) => {
+            println!("nNo config found, using default values ...");
+            SimulationSettings::default()
+        }
+    }
+}
+
+fn save_settings(settings: &SimulationSettings) {
+    let path = "config.json";
+
+    match serde_json::to_string_pretty(settings) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                eprintln!("unable to save config.json : {e}");
+            }
+        }
+
+        Err(e) => {
+            eprintln!("impossible to serialize config : {e}");
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     println!("Rayon threads: {}", rayon::current_num_threads());
 
@@ -112,6 +155,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Fluid Simulation Config",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::default()))),
+        Box::new(|_cc| {
+            Ok(Box::new(MyApp {
+                settings: load_settings(),
+                dark_theme_set: false,
+            }))
+        }),
     )
 }
