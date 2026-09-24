@@ -19,10 +19,10 @@ All sort of parameters can be adjusted such as:
 
 ## Controls
 
-| control | usage |
-|---------|-------|
-| hold left click | adds density |
-| hold right click | move fluid |
-| space | pause/resume sim |
-| right arrow | skip 1 frame |
-| up arrow | skip 10 frames |
+| control          | usage            |
+|------------------|------------------|
+| hold left click  | adds density     |
+| hold right click | move fluid       |
+| space            | pause/resume sim |
+| right arrow      | skip 1 frame     |
+| up arrow         | skip 10 frames   |

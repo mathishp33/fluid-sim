@@ -1,4 +1,5 @@
 use rand::Rng;
+use rayon::prelude::*;
 
 pub struct FluidSim {
     pub width: usize,
@@ -65,24 +66,23 @@ impl FluidSim {
         for _ in 0..diffusion_iters {
             // Apply diffusion using swap buffer - split interior and boundary
             // Interior cells use diffusion formula
-            for x in 1..self.width - 1 {
-                for y in 1..self.height - 1 {
-                    let idx = self.idx(x, y);
-                    let idx_right = self.idx(x + 1, y);
-                    let idx_left = self.idx(x - 1, y);
-                    let idx_up = self.idx(x, y + 1);
-                    let idx_down = self.idx(x, y - 1);
-                    
-                    self.density_temp[idx] = (
-                        self.density[idx] + a * (
-                            self.density[idx_right] +
-                            self.density[idx_left] +
-                            self.density[idx_up] +
-                            self.density[idx_down]
-                        )
-                    ) / (1.0 + 4.0 * a);
-                }
-            }
+            let width = self.width;
+
+            self.density_temp
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    if y == 0 || y == self.height - 1 {
+                        return;
+                    }
+
+                    for x in 1..width - 1 {
+                        let idx = x + y * width;
+
+                        row[x] = (self.density[idx] + a * (self.density[idx + 1] + self.density[idx - 1] +
+                                    self.density[idx + width] + self.density[idx - width])) / (1.0 + 4.0 * a);
+                    }
+                });
             
             // Copy boundaries (Neumann boundary condition)
             for y in 0..self.height {
@@ -136,20 +136,33 @@ impl FluidSim {
     pub fn advect_density(&mut self, dt: f64) {
         // Copy current density to temp buffer
         self.density_temp.copy_from_slice(&self.density);
-        
-        // Advect interior cells
-        for x in 1..self.width - 1 {
-            for y in 1..self.height - 1 {
-                let idx = self.idx(x, y);
-                let vx = self.velocity_x[idx];
-                let vy = self.velocity_y[idx];
 
-                let px = x as f64 - vx * dt;
-                let py = y as f64 - vy * dt;
+        let width = self.width;
+        let height = self.height;
 
-                self.density_temp[idx] = Self::sample_field(&self.density, self.width, self.height, px, py);
-            }
-        }
+        let density = &self.density;
+        let velocity_x = &self.velocity_x;
+        let velocity_y = &self.velocity_y;
+
+        self.density_temp
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                if y == 0 || y == height - 1 {
+                    return;
+                }
+
+                for x in 1..width - 1 {
+                    let idx = x + y * width;
+
+                    let vx = velocity_x[idx];
+                    let vy = velocity_y[idx];
+                    let px = x as f64 - vx * dt;
+                    let py = y as f64 - vy * dt;
+
+                    row[x] = Self::sample_field(density, width, height, px, py);
+                }
+            });
 
         std::mem::swap(&mut self.density, &mut self.density_temp);
         
@@ -172,20 +185,35 @@ impl FluidSim {
         // Copy current velocity to temp buffers
         self.velocity_x_temp.copy_from_slice(&self.velocity_x);
         self.velocity_y_temp.copy_from_slice(&self.velocity_y);
-        
-        for x in 1..self.width - 1 {
-            for y in 1..self.height - 1 {
-                let idx = self.idx(x, y);
-                let vx = self.velocity_x[idx];
-                let vy = self.velocity_y[idx];
 
-                let px = x as f64 - vx * dt;
-                let py = y as f64 - vy * dt;
+        let width = self.width;
+        let height = self.height;
 
-                self.velocity_x_temp[idx] = Self::sample_field(&self.velocity_x, self.width, self.height, px, py);
-                self.velocity_y_temp[idx] = Self::sample_field(&self.velocity_y, self.width, self.height, px, py);
-            }
-        }
+        let velocity_x = &self.velocity_x;
+        let velocity_y = &self.velocity_y;
+
+        self.velocity_x_temp
+            .par_chunks_mut(width)
+            .zip(self.velocity_y_temp.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, (row_x, row_y))| {
+                if y == 0 || y == height - 1 {
+                    return;
+                }
+
+                for x in 1..width - 1 {
+                    let idx = x + y * width;
+
+                    let vx = velocity_x[idx];
+                    let vy = velocity_y[idx];
+                    let px = x as f64 - vx * dt;
+                    let py = y as f64 - vy * dt;
+
+                    row_x[x] = Self::sample_field(velocity_x, width, height, px, py);
+
+                    row_y[x] = Self::sample_field(velocity_y, width, height, px, py);
+                }
+            });
 
         std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
         std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
@@ -209,39 +237,46 @@ impl FluidSim {
     }
 
     fn calculate_divergence(&mut self) {
-        for x in 1..self.width - 1 {
-            for y in 1..self.height - 1 {
-                let idx = self.idx(x, y);
-                let idx_right = self.idx(x + 1, y);
-                let idx_left = self.idx(x - 1, y);
-                let idx_up = self.idx(x, y + 1);
-                let idx_down = self.idx(x, y - 1);
-                
-                let divergence = 0.5 * (
-                    self.velocity_x[idx_right] - self.velocity_x[idx_left] +
-                    self.velocity_y[idx_up] - self.velocity_y[idx_down]
-                );
-                self.divergence[idx] = -divergence;
-            }
-        }
+        let width = self.width;
+        let height = self.height;
+
+        let velocity_x = &self.velocity_x;
+        let velocity_y = &self.velocity_y;
+
+        self.divergence
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                if y == 0 || y == height - 1 {
+                    return;
+                }
+
+                for x in 1..width - 1 {
+                    let idx = x + y * width;
+
+                    let divergence = 0.5 * (
+                        velocity_x[idx + 1] - velocity_x[idx - 1] + velocity_y[idx + width] - velocity_y[idx - width]
+                    );
+
+                    row[x] = -divergence;
+                }
+            });
     }
 
     fn solve_pressure(&mut self, iterations: usize) {
         self.pressure.fill(0.0);
         
         for _ in 0..iterations {
-            for x in 1..self.width - 1 {
-                for y in 1..self.height - 1 {
+            for y in 1..self.height - 1 {
+                for x in 1..self.width - 1 {
                     let idx = self.idx(x, y);
                     let idx_right = self.idx(x + 1, y);
                     let idx_left = self.idx(x - 1, y);
                     let idx_up = self.idx(x, y + 1);
                     let idx_down = self.idx(x, y - 1);
                     
-                    let neighbors = self.pressure[idx_right] +
-                                   self.pressure[idx_left] +
-                                   self.pressure[idx_up] +
-                                   self.pressure[idx_down];
+                    let neighbors = self.pressure[idx_right] + self.pressure[idx_left] +
+                                   self.pressure[idx_up] + self.pressure[idx_down];
                     self.pressure[idx] = (neighbors + self.divergence[idx]) / 4.0;
                 }
             }
@@ -263,21 +298,30 @@ impl FluidSim {
     }
 
     fn correct_velocity(&mut self) {
-        for x in 1..self.width - 1 {
-            for y in 1..self.height - 1 {
-                let idx = self.idx(x, y);
-                let idx_right = self.idx(x + 1, y);
-                let idx_left = self.idx(x - 1, y);
-                let idx_up = self.idx(x, y + 1);
-                let idx_down = self.idx(x, y - 1);
-                
-                let pressure_gradient_x = 0.5 * (self.pressure[idx_right] - self.pressure[idx_left]);
-                let pressure_gradient_y = 0.5 * (self.pressure[idx_up] - self.pressure[idx_down]);
-                
-                self.velocity_x[idx] -= pressure_gradient_x;
-                self.velocity_y[idx] -= pressure_gradient_y;
-            }
-        }
+        let width = self.width;
+        let height = self.height;
+
+        let pressure = &self.pressure;
+
+        self.velocity_x
+            .par_chunks_mut(width)
+            .zip(self.velocity_y.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, (row_x, row_y))| {
+                if y == 0 || y == height - 1 {
+                    return;
+                }
+
+                for x in 1..width - 1 {
+                    let idx = x + y * width;
+
+                    let pressure_gradient_x = 0.5 * (pressure[idx + 1] - pressure[idx - 1]);
+                    let pressure_gradient_y = 0.5 * (pressure[idx + width] - pressure[idx - width]);
+
+                    row_x[x] -= pressure_gradient_x;
+                    row_y[x] -= pressure_gradient_y;
+                }
+            });
     }
 
     pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {

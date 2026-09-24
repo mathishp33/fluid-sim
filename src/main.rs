@@ -73,15 +73,15 @@ impl eframe::App for MyApp {
 
             ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
 
-            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=10).text("Pressure Iterations"));
-            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=10).text("Diffusion Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=30).text("Pressure Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=30).text("Diffusion Iterations"));
 
-            ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=50).text("Mouse Radius (pixels)"));
+            ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
 
             ComboBox::from_label("Precision (pixels)")
                 .selected_text(format!("{}", self.settings.precision))
                 .show_ui(ui, |ui| {
-                    for level in [1, 2, 5, 10] {
+                    for level in [1, 2, 5, 10, 20] {
                         ui.selectable_value(&mut self.settings.precision, level, format!("{level}"));
                     }
                 });
