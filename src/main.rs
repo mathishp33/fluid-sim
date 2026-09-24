@@ -1,14 +1,20 @@
 use eframe::egui::{self, Color32, ComboBox};
 use serde::{Deserialize, Serialize};
+use simulation::fluid_sim::Boundary;
 
 mod window;
 mod simulation;
 
-fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f32, diffusion_rate: f32,
-    max_color: u32, randomize: bool, random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) {
+fn launch_simulation(width: usize, height: usize,
+    particle_radius: usize, precision: usize,
+    start_density: f32, diffusion_rate: f32,
+    max_color: u32, randomize: bool, random_smoothing: usize,
+    pressure_iters: usize, diffusion_iters: usize,
+    left_boundary: Boundary, right_boundary: Boundary,
+    top_boundary: Boundary, bottom_boundary: Boundary) {
 
     let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate,
-         max_color, randomize, random_smoothing, pressure_iters, diffusion_iters);
+         max_color, randomize, random_smoothing, pressure_iters, diffusion_iters, left_boundary, right_boundary, top_boundary, bottom_boundary);
     window.run();
 }
 
@@ -25,6 +31,10 @@ struct SimulationSettings {
     random_smoothing: usize,
     pressure_iters: usize,
     diffusion_iters: usize,
+    left_boundary: Boundary,
+    right_boundary: Boundary,
+    top_boundary: Boundary,
+    bottom_boundary: Boundary,
 }
 
 impl Default for SimulationSettings {
@@ -41,6 +51,10 @@ impl Default for SimulationSettings {
             random_smoothing: 100,
             pressure_iters: 3,
             diffusion_iters: 3,
+            left_boundary: Boundary::wall(),
+            right_boundary: Boundary::wall(),
+            top_boundary: Boundary::wall(),
+            bottom_boundary: Boundary::wall(),
         }
     }
 }
@@ -92,6 +106,11 @@ impl eframe::App for MyApp {
             ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
             ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
 
+            boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
+            boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
+            boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
+            boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
+
             //ui.label("Max Density Color");
             //ui.color_edit_button_srgba(&mut self.settings.max_density_color);
 
@@ -105,13 +124,41 @@ impl eframe::App for MyApp {
                     self.settings.max_density_color[3],
                 );
                 let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
-                launch_simulation(self.settings.width, self.settings.height, self.settings.particle_radius, self.settings.precision, 
-                    self.settings.start_density, self.settings.diffusion_rate, max_color, self.settings.randomize, self.settings.random_smoothing, 
-                    self.settings.pressure_iters, self.settings.diffusion_iters
+                launch_simulation(
+                    self.settings.width, self.settings.height,
+                    self.settings.particle_radius, self.settings.precision,
+                    self.settings.start_density, self.settings.diffusion_rate,
+                    max_color, self.settings.randomize, self.settings.random_smoothing,
+                    self.settings.pressure_iters, self.settings.diffusion_iters,
+                    self.settings.left_boundary, self.settings.right_boundary,
+                    self.settings.top_boundary, self.settings.bottom_boundary,
                 );
             }
         });
     }
+}
+fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
+    ui.collapsing(name, |ui| {
+        ComboBox::from_label("Type")
+            .selected_text(format!("{:?}", boundary.boundary_type))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid_sim::BoundaryType::Wall, "Wall");
+                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid_sim::BoundaryType::Inlet, "Inlet");
+                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid_sim::BoundaryType::Outlet, "Outlet");
+            });
+
+        match boundary.boundary_type {
+            simulation::fluid_sim::BoundaryType::Inlet => {
+                ui.add(egui::Slider::new(&mut boundary.velocity_x, -20.0..=20.0).text("Velocity X"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_y, -20.0..=20.0).text("Velocity Y"));
+                ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
+            }
+
+            simulation::fluid_sim::BoundaryType::Wall => {}
+
+            simulation::fluid_sim::BoundaryType::Outlet => {}
+        }
+    });
 }
 
 fn load_settings() -> SimulationSettings {

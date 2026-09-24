@@ -2,6 +2,8 @@ use minifb::{Window, WindowOptions};
 
 use crate::simulation::fluid_sim;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use fluid_sim::Boundary;
 
 #[derive(Clone, Copy, PartialEq)]
 enum DisplayMode {
@@ -57,12 +59,6 @@ fn signed_color(value: f32, max_abs: f32) -> u32 {
     ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
 }
 
-// fn max_abs(field: &[f32]) -> f32 {
-//     field
-//         .iter()
-//         .map(|v| v.abs())
-//         .fold(0.0, f32::max)
-// }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
     let h = (h % 360.0 + 360.0) % 360.0;
@@ -117,6 +113,10 @@ pub struct FluidWindow {
     pub random_smoothing: usize,
     pub pressure_iters: usize,
     pub diffusion_iters: usize,
+    pub left_boundary: Boundary,
+    pub right_boundary: Boundary,
+    pub top_boundary: Boundary,
+    pub bottom_boundary: Boundary,
     buffer: Vec<u32>,
     fps: f32,
     frame_count: usize,
@@ -127,8 +127,14 @@ pub struct FluidWindow {
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f32, diffusion_rate: f32, max_color: u32, randomize: bool,
-        random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) -> Self {
+    pub fn new(width: usize, height: usize,
+               particle_radius: usize, precision: usize,
+               start_density: f32, diffusion_rate: f32,
+               max_color: u32, randomize: bool, random_smoothing: usize,
+               pressure_iters: usize, diffusion_iters: usize,
+               left_boundary: fluid_sim::Boundary, right_boundary: fluid_sim::Boundary,
+               top_boundary: fluid_sim::Boundary, bottom_boundary: fluid_sim::Boundary,
+    ) -> Self {
         FluidWindow {
             width,
             height,
@@ -152,6 +158,10 @@ impl FluidWindow {
             random_smoothing,
             pressure_iters,
             diffusion_iters,
+            left_boundary,
+            right_boundary,
+            top_boundary,
+            bottom_boundary,
             buffer: vec![0u32; width * height],
             fps: 0.0,
             frame_count: 0,
@@ -169,6 +179,10 @@ impl FluidWindow {
             self.start_density,
             self.diffusion_rate,
         );
+        fluid.left_boundary = self.left_boundary;
+        fluid.right_boundary = self.right_boundary;
+        fluid.top_boundary = self.top_boundary;
+        fluid.bottom_boundary = self.bottom_boundary;
 
         if self.randomize {
             fluid.randomize_density_smoothed(self.random_smoothing);
