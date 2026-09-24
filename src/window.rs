@@ -3,29 +3,131 @@ use minifb::{Window, WindowOptions};
 use crate::simulation::fluid_sim;
 
 
+#[derive(Clone, Copy, PartialEq)]
+enum DisplayMode {
+    Density,
+    Pressure,
+    Divergence,
+    Velocity,
+}
+
+impl DisplayMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Density => Self::Pressure,
+            Self::Pressure => Self::Divergence,
+            Self::Divergence => Self::Velocity,
+            Self::Velocity => Self::Density,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Density => "DENSITY",
+            Self::Pressure => "PRESSURE",
+            Self::Divergence => "DIVERGENCE",
+            Self::Velocity => "VELOCITY",
+        }
+    }
+}
+
+fn signed_color(value: f32, max_abs: f32) -> u32 {
+    if max_abs <= 1e-12 {
+        return 0;
+    }
+
+    let v = (value / max_abs).clamp(-1.0, 1.0);
+
+    let r;
+    let g;
+    let b;
+
+    if v < 0.0 {
+        let t = -v;
+        r = 0;
+        g = (t * 255.0) as u8;
+        b = (t * 255.0) as u8;
+    } else {
+        let t = v;
+        r = (t * 255.0) as u8;
+        g = 0;
+        b = 0;
+    }
+
+    ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
+}
+
+fn max_abs(field: &[f32]) -> f32 {
+    field
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0, f32::max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
+    let h = (h % 360.0 + 360.0) % 360.0;
+
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+
+    let (r, g, b) = match h {
+        h if h < 60.0 => (c, x, 0.0),
+        h if h < 120.0 => (x, c, 0.0),
+        h if h < 180.0 => (0.0, c, x),
+        h if h < 240.0 => (0.0, x, c),
+        h if h < 300.0 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    let r = ((r + m) * 255.0) as u32;
+    let g = ((g + m) * 255.0) as u32;
+    let b = ((b + m) * 255.0) as u32;
+
+    (b << 16) | (g << 8) | r
+}
+
+fn velocity_color(vx: f32, vy: f32, max_speed: f32) -> u32 {
+    let speed = (vx * vx + vy * vy).sqrt();
+
+    if speed < 1e-12 || max_speed <= 1e-12 {
+        return 0;
+    }
+
+    // direction vecteur -> angle -> "teine"
+    let angle = vy.atan2(vx);
+    let hue = angle.to_degrees() + 180.0;
+
+    // norme vitesse -> luminosité
+    let brightness = (speed / max_speed).clamp(0.0, 1.0);
+
+    hsv_to_rgb(hue, 1.0, brightness)
+}
+
 pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
     pub particle_radius: usize,
     pub precision : usize,
     pub window: Window,
-    pub start_density: f64,
-    pub diffusion_rate: f64,
+    pub start_density: f32,
+    pub diffusion_rate: f32,
     pub max_color: u32,
     pub randomize: bool,
     pub random_smoothing: usize,
     pub pressure_iters: usize,
     pub diffusion_iters: usize,
     buffer: Vec<u32>,
-    fps: f64,
+    fps: f32,
     frame_count: usize,
     last_fps_update: std::time::Instant,
     paused: bool,
     step_frame: usize,
+    display_mode: DisplayMode,
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, max_color: u32, randomize: bool, 
+    pub fn new(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f32, diffusion_rate: f32, max_color: u32, randomize: bool,
         random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) -> Self {
         FluidWindow {
             width,
@@ -56,6 +158,7 @@ impl FluidWindow {
             last_fps_update: std::time::Instant::now(),
             paused: false,
             step_frame: 0,
+            display_mode: DisplayMode::Density,
         }
     }
 
@@ -76,7 +179,7 @@ impl FluidWindow {
 
         while self.window.is_open() && !self.window.is_key_down(minifb::Key::Escape) {
             let now = std::time::Instant::now();
-            let dt = (now - last_time).as_secs_f64();
+            let dt = (now - last_time).as_secs_f32();
             last_time = now;
 
             if dt <= 0.0 {
@@ -84,12 +187,13 @@ impl FluidWindow {
             }
 
             self.frame_count += 1;
-            let elapsed = now.duration_since(self.last_fps_update).as_secs_f64();
+            let elapsed = now.duration_since(self.last_fps_update).as_secs_f32();
             if elapsed >= 0.5 {
-                self.fps = self.frame_count as f64 / elapsed;
+                self.fps = self.frame_count as f32 / elapsed;
                 self.frame_count = 0;
                 self.last_fps_update = now;
-                let title = format!("Fluid Simulation - FPS: {:.1} ({})", self.fps, if self.paused { "PAUSED" } else { "RUNNING" });
+                let title = format!("Fluid Simulation - \
+                FPS: {:.1} ({}) | {}", self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name());
                 self.window.set_title(&title);
             }
 
@@ -106,6 +210,10 @@ impl FluidWindow {
                 }
             }
 
+            if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
+                self.display_mode = self.display_mode.next();
+            }
+
             let (mx, my) = self
                 .window
                 .get_mouse_pos(minifb::MouseMode::Clamp)
@@ -114,8 +222,8 @@ impl FluidWindow {
             let mx = mx as usize;
             let my = my as usize;
 
-            let fx = (mx as f64 - last_mouse.0 as f64) / dt;
-            let fy = (my as f64 - last_mouse.1 as f64) / dt;
+            let fx = (mx as f32 - last_mouse.0 as f32) / dt;
+            let fy = (my as f32 - last_mouse.1 as f32) / dt;
 
             let gx = mx / self.precision;
             let gy = my / self.precision;
@@ -158,22 +266,27 @@ impl FluidWindow {
                 self.step_frame = self.step_frame.saturating_sub(1);
             }
 
+            let pressure_max = fluid.pressure
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0, f32::max);
 
+            let divergence_max = fluid.divergence
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0, f32::max);
+
+            let velocity_max = fluid.velocity_x
+                .iter()
+                .zip(fluid.velocity_y.iter())
+                .map(|(&vx, &vy)| (vx * vx + vy * vy).sqrt())
+                .fold(0.0, f32::max);
             self.buffer.fill(0);
 
             for y in 0..fluid.height {
                 let base_y = y * self.precision * self.width;
                 for x in 0..fluid.width {
-                    let d = fluid.get_density(x, y).clamp(0.0, 1.0);
-
-                    let r = (d * ((self.max_color >> 0) & 0xFF) as f64) as u8;
-                    let g = (d * ((self.max_color >> 8) & 0xFF) as f64) as u8;
-                    let b = (d * ((self.max_color >> 16) & 0xFF) as f64) as u8;
-
-                    let color =
-                        ((b as u32) << 16) |
-                        ((g as u32) << 8) |
-                        (r as u32);
+                    let color = self.render_color(&fluid, x, y, pressure_max, divergence_max, velocity_max);
 
                     let base_x = x * self.precision;
                     for py in 0..self.precision {
@@ -190,5 +303,35 @@ impl FluidWindow {
                 .unwrap();
         }
     }
+
+    fn render_color(&self, fluid: &fluid_sim::FluidSim, x: usize, y: usize, pressure_max: f32, divergence_max: f32,
+                    velocity_max: f32) -> u32 {
+        let idx = x + y * fluid.width;
+
+        match self.display_mode {
+            DisplayMode::Density => {
+                let d = fluid.density[idx].clamp(0.0, 1.0);
+
+                let r = (d * ((self.max_color >> 0) & 0xFF) as f32) as u8;
+                let g = (d * ((self.max_color >> 8) & 0xFF) as f32) as u8;
+                let b = (d * ((self.max_color >> 16) & 0xFF) as f32) as u8;
+
+                ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
+            }
+
+            DisplayMode::Pressure => {
+                signed_color(fluid.pressure[idx], pressure_max)
+            }
+
+            DisplayMode::Divergence => {
+                signed_color(fluid.divergence[idx], divergence_max)
+            }
+
+            DisplayMode::Velocity => {
+                velocity_color(fluid.velocity_x[idx], fluid.velocity_y[idx], velocity_max)
+            }
+        }
+    }
 }
 
+// c'est cool nan ? OwO

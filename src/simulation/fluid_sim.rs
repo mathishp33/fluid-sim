@@ -4,17 +4,17 @@ use rayon::prelude::*;
 pub struct FluidSim {
     pub width: usize,
     pub height: usize,
-    pub density: Vec<f64>,
-    pub velocity_x: Vec<f64>,
-    pub velocity_y: Vec<f64>,
-    pub diffusion_rate: f64,
-    pub pressure: Vec<f64>,
-    pub divergence: Vec<f64>,
+    pub density: Vec<f32>,
+    pub velocity_x: Vec<f32>,
+    pub velocity_y: Vec<f32>,
+    pub diffusion_rate: f32,
+    pub pressure: Vec<f32>,
+    pub divergence: Vec<f32>,
 
-    density_temp: Vec<f64>,
-    velocity_x_temp: Vec<f64>,
-    velocity_y_temp: Vec<f64>,
-    pressure_temp: Vec<f64>,
+    density_temp: Vec<f32>,
+    velocity_x_temp: Vec<f32>,
+    velocity_y_temp: Vec<f32>,
+    pressure_temp: Vec<f32>,
 }
 
 impl FluidSim {
@@ -23,7 +23,7 @@ impl FluidSim {
         x + y * self.width
     }
 
-    pub fn new(width: usize, height: usize, start_density: f64, diffusion_rate: f64) -> Self {
+    pub fn new(width: usize, height: usize, start_density: f32, diffusion_rate: f32) -> Self {
         let size = width * height;
         FluidSim {
             width,
@@ -58,11 +58,11 @@ impl FluidSim {
         }
     }
 
-    pub fn get_density(&self, x: usize, y: usize) -> f64 {
+    pub fn get_density(&self, x: usize, y: usize) -> f32 {
         self.density[self.idx(x, y)]
     }
 
-    pub fn diffuse_density(&mut self, dt: f64, diffusion_iters: usize) {
+    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) {
         let a = self.diffusion_rate * dt;
 
         for _ in 0..diffusion_iters {
@@ -104,21 +104,21 @@ impl FluidSim {
         }
     }
 
-    fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
         a + t * (b - a)
     }
 
-    fn sample_field(field: &Vec<f64>, width: usize, height: usize, x: f64, y: f64) -> f64 {
+    fn sample_field(field: &Vec<f32>, width: usize, height: usize, x: f32, y: f32) -> f32 {
         let w = width as isize;
         let h = height as isize;
 
-        let x0 = x.floor().clamp(0.0, (w - 1) as f64) as isize;
-        let y0 = y.floor().clamp(0.0, (h - 1) as f64) as isize;
+        let x0 = x.floor().clamp(0.0, (w - 1) as f32) as isize;
+        let y0 = y.floor().clamp(0.0, (h - 1) as f32) as isize;
         let x1 = (x0 + 1).min(w - 1);
         let y1 = (y0 + 1).min(h - 1);
 
-        let sx = x - x0 as f64;
-        let sy = y - y0 as f64;
+        let sx = x - x0 as f32;
+        let sy = y - y0 as f32;
 
         let idx_00 = (x0 as usize) + (y0 as usize) * width;
         let idx_10 = (x1 as usize) + (y0 as usize) * width;
@@ -135,7 +135,7 @@ impl FluidSim {
         Self::lerp(a, b, sy)
     }
 
-    pub fn advect_density(&mut self, dt: f64) {
+    pub fn advect_density(&mut self, dt: f32) {
         // Copy current density to temp buffer
         self.density_temp.copy_from_slice(&self.density);
 
@@ -159,8 +159,8 @@ impl FluidSim {
 
                     let vx = velocity_x[idx];
                     let vy = velocity_y[idx];
-                    let px = x as f64 - vx * dt;
-                    let py = y as f64 - vy * dt;
+                    let px = x as f32 - vx * dt;
+                    let py = y as f32 - vy * dt;
 
                     row[x] = Self::sample_field(density, width, height, px, py);
                 }
@@ -183,7 +183,7 @@ impl FluidSim {
         }
     }
 
-    pub fn advect_velocity(&mut self, dt: f64) {
+    pub fn advect_velocity(&mut self, dt: f32) {
         // Copy current velocity to temp buffers
         self.velocity_x_temp.copy_from_slice(&self.velocity_x);
         self.velocity_y_temp.copy_from_slice(&self.velocity_y);
@@ -208,8 +208,8 @@ impl FluidSim {
 
                     let vx = velocity_x[idx];
                     let vy = velocity_y[idx];
-                    let px = x as f64 - vx * dt;
-                    let py = y as f64 - vy * dt;
+                    let px = x as f32 - vx * dt;
+                    let py = y as f32 - vy * dt;
 
                     row_x[x] = Self::sample_field(velocity_x, width, height, px, py);
 
@@ -341,7 +341,7 @@ impl FluidSim {
     }
 
 
-    pub fn step(&mut self, dt: f64, pressure_iterations: usize, diffusion_iterations: usize) {
+    pub fn step(&mut self, dt: f32, pressure_iterations: usize, diffusion_iterations: usize) {
         self.advect_velocity(dt);
         self.enforce_incompressibility(pressure_iterations);
 

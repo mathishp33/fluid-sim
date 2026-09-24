@@ -26,3 +26,4 @@ All sort of parameters can be adjusted such as:
 | space            | pause/resume sim |
 | right arrow      | skip 1 frame     |
 | up arrow         | skip 10 frames   |
+| V                | changes view     |

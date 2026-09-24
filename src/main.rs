@@ -3,7 +3,7 @@ use eframe::egui::{self, Color32, ComboBox};
 mod window;
 mod simulation;
 
-fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f64, diffusion_rate: f64, 
+fn launch_simulation(width: usize, height: usize, particle_radius: usize, precision: usize, start_density: f32, diffusion_rate: f32,
     max_color: u32, randomize: bool, random_smoothing: usize, pressure_iters: usize, diffusion_iters: usize) {
 
     let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate,
@@ -16,9 +16,9 @@ struct SimulationSettings {
     height: usize,
     particle_radius: usize,
     precision: usize,
-    start_density: f64,
+    start_density: f32,
     max_density_color: Color32,
-    diffusion_rate: f64,
+    diffusion_rate: f32,
     randomize: bool,
     random_smoothing: usize,
     pressure_iters: usize,
@@ -90,8 +90,8 @@ impl eframe::App for MyApp {
             ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
             ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
 
-            ui.label("Max Density Color");
-            ui.color_edit_button_srgba(&mut self.settings.max_density_color);
+            //ui.label("Max Density Color");
+            //ui.color_edit_button_srgba(&mut self.settings.max_density_color);
 
             if ui.button("Launch Simulation").clicked() {
                 let color = self.settings.max_density_color;
@@ -106,6 +106,8 @@ impl eframe::App for MyApp {
 }
 
 fn main() -> eframe::Result<()> {
+    println!("Rayon threads: {}", rayon::current_num_threads());
+
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Fluid Simulation Config",
