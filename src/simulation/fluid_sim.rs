@@ -81,7 +81,7 @@ impl FluidSim {
         }
     }
 
-    pub fn randomize_density_smoothed(&mut self, seed_count: usize) {
+    pub fn randomize_density_smoothed(&mut self, seed_count: usize) { //O(n)
         let mut rng = rand::thread_rng();
 
         self.density.fill(0.0);
@@ -102,7 +102,7 @@ impl FluidSim {
         self.density[self.idx(x, y)]
     }
 
-    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) {
+    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) { //O(n + m)
         let a = self.diffusion_rate * dt;
 
         for _ in 0..diffusion_iters {
@@ -424,7 +424,7 @@ impl FluidSim {
             match self.left_boundary.boundary_type {
                 BoundaryType::Wall => {
                     self.velocity_x[idx] = 0.0;
-                    self.velocity_y[idx] = 0.0;
+                    //self.velocity_y[idx] = 0.0;
                 }
 
                 BoundaryType::Inlet => {
@@ -447,7 +447,7 @@ impl FluidSim {
             match self.right_boundary.boundary_type {
                 BoundaryType::Wall => {
                     self.velocity_x[idx] = 0.0;
-                    self.velocity_y[idx] = 0.0;
+                    //self.velocity_y[idx] = 0.0;
                 }
 
                 BoundaryType::Inlet => {
@@ -469,7 +469,7 @@ impl FluidSim {
 
             match self.top_boundary.boundary_type {
                 BoundaryType::Wall => {
-                    self.velocity_x[idx] = 0.0;
+                    //self.velocity_x[idx] = 0.0;
                     self.velocity_y[idx] = 0.0;
                 }
 
@@ -492,7 +492,7 @@ impl FluidSim {
 
             match self.bottom_boundary.boundary_type {
                 BoundaryType::Wall => {
-                    self.velocity_x[idx] = 0.0;
+                    //self.velocity_x[idx] = 0.0;
                     self.velocity_y[idx] = 0.0;
                 }
 
@@ -538,10 +538,10 @@ impl FluidSim {
     }
 
     fn solve_pressure(&mut self, iterations: usize) {
-        self.pressure.fill(0.0);
-
         let width = self.width;
         let height = self.height;
+
+        self.apply_pressure_boundaries();
 
         for _ in 0..iterations {
             let pressure = &self.pressure;

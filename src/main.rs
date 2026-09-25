@@ -89,8 +89,8 @@ impl eframe::App for MyApp {
 
             ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
 
-            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=30).text("Pressure Iterations"));
-            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=30).text("Diffusion Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
 
             ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
 
@@ -111,8 +111,11 @@ impl eframe::App for MyApp {
             boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
             boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
 
-            //ui.label("Max Density Color");
-            //ui.color_edit_button_srgba(&mut self.settings.max_density_color);
+            let c = self.settings.max_density_color;
+            let mut local_color = Color32::from_rgb(c[0], c[1], c[2]);
+            ui.label("Max Density Color");
+            ui.color_edit_button_srgba(&mut local_color);
+            self.settings.max_density_color = local_color.to_array();
 
             if ui.button("Launch Simulation").clicked() {
                 save_settings(&self.settings);
@@ -149,8 +152,8 @@ fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
 
         match boundary.boundary_type {
             simulation::fluid_sim::BoundaryType::Inlet => {
-                ui.add(egui::Slider::new(&mut boundary.velocity_x, -20.0..=20.0).text("Velocity X"));
-                ui.add(egui::Slider::new(&mut boundary.velocity_y, -20.0..=20.0).text("Velocity Y"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_x, -50.0..=50.0).text("Velocity X"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_y, -50.0..=50.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
             }
 
