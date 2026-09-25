@@ -38,6 +38,7 @@ pub struct FluidSim {
     pub diffusion_rate: f32,
     pub pressure: Vec<f32>,
     pub divergence: Vec<f32>,
+    pub solids: Vec<bool>,
 
     density_temp: Vec<f32>,
     velocity_x_temp: Vec<f32>,
@@ -66,9 +67,10 @@ impl FluidSim {
             velocity_x: vec![0.0; size],
             velocity_y: vec![0.0; size],
             diffusion_rate,
-
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
+            solids: vec![false; size],
+
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
             velocity_y_temp: vec![0.0; size],
@@ -79,6 +81,78 @@ impl FluidSim {
             top_boundary: Boundary::wall(),
             bottom_boundary: Boundary::wall(),
         }
+    }
+
+    pub fn set_solid(&mut self, x: usize, y: usize, solid: bool) {
+        if x == 0 || x >= self.width - 1 || y == 0 || y >= self.height - 1 {
+            return;
+        }
+        let idx = self.idx(x, y);
+
+        if self.solids[idx] == solid {
+            return;
+        }
+
+        self.solids[idx] = solid;
+
+        if solid {
+            self.density[idx] = 0.0;
+            self.velocity_x[idx] = 0.0;
+            self.velocity_y[idx] = 0.0;
+            self.pressure[idx] = 0.0;
+            self.divergence[idx] = 0.0;
+
+            self.density_temp[idx] = 0.0;
+            self.velocity_x_temp[idx] = 0.0;
+            self.velocity_y_temp[idx] = 0.0;
+            self.pressure_temp[idx] = 0.0;
+
+            return;
+        }
+
+        let neighbors = [
+            self.idx(x - 1, y),
+            self.idx(x + 1, y),
+            self.idx(x, y - 1),
+            self.idx(x, y + 1),
+        ];
+
+        let mut density_sum = 0.0;
+        let mut velocity_x_sum = 0.0;
+        let mut velocity_y_sum = 0.0;
+        let mut pressure_sum = 0.0;
+        let mut count = 0.0;
+
+        for neighbor in neighbors {
+            if self.solids[neighbor] {
+                continue;
+            }
+
+            density_sum += self.density[neighbor];
+            velocity_x_sum += self.velocity_x[neighbor];
+            velocity_y_sum += self.velocity_y[neighbor];
+            pressure_sum += self.pressure[neighbor];
+            count += 1.0;
+        }
+
+        if count > 0.0 {
+            self.density[idx] = density_sum / count;
+            self.velocity_x[idx] = velocity_x_sum / count;
+            self.velocity_y[idx] = velocity_y_sum / count;
+            self.pressure[idx] = pressure_sum / count;
+        } else {
+            self.density[idx] = 0.0;
+            self.velocity_x[idx] = 0.0;
+            self.velocity_y[idx] = 0.0;
+            self.pressure[idx] = 0.0;
+        }
+
+        self.divergence[idx] = 0.0;
+
+        self.density_temp[idx] = self.density[idx];
+        self.velocity_x_temp[idx] = self.velocity_x[idx];
+        self.velocity_y_temp[idx] = self.velocity_y[idx];
+        self.pressure_temp[idx] = self.pressure[idx];
     }
 
     pub fn randomize_density_smoothed(&mut self, seed_count: usize) { //O(n)
@@ -100,7 +174,7 @@ impl FluidSim {
 
     pub fn get_density(&self, x: usize, y: usize) -> f32 {
         self.density[self.idx(x, y)]
-    }
+    } //O(1)
 
     pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) { //O(n + m)
         let a = self.diffusion_rate * dt;
@@ -120,9 +194,18 @@ impl FluidSim {
 
                     for x in 1..width - 1 {
                         let idx = x + y * width;
+                        if self.solids[idx] {
+                            row[x] = 0.0;
+                            continue;
+                        }
 
-                        row[x] = (self.density[idx] + a * (self.density[idx + 1] + self.density[idx - 1] +
-                                    self.density[idx + width] + self.density[idx - width])) / (1.0 + 4.0 * a);
+                        let center = self.density[idx];
+                        let right = if self.solids[idx + 1] { center } else { self.density[idx + 1] };
+                        let left = if self.solids[idx - 1] { center } else { self.density[idx - 1] };
+                        let down = if self.solids[idx + width] { center } else { self.density[idx + width] };
+                        let up = if self.solids[idx - width] { center } else { self.density[idx - width] };
+
+                        row[x] = (center + a * (right + left + down + up)) / (1.0 + 4.0 * a);
                     }
                 });
             
@@ -146,9 +229,9 @@ impl FluidSim {
 
     fn lerp(a: f32, b: f32, t: f32) -> f32 {
         a + t * (b - a)
-    }
+    } //O(1)
 
-    fn sample_field(field: &Vec<f32>, width: usize, height: usize, x: f32, y: f32) -> f32 {
+    fn sample_field(field: &Vec<f32>, width: usize, height: usize, x: f32, y: f32) -> f32 { //O(1)
         let w = width as isize;
         let h = height as isize;
 
@@ -173,6 +256,54 @@ impl FluidSim {
         let a = Self::lerp(v00, v10, sx);
         let b = Self::lerp(v01, v11, sx);
         Self::lerp(a, b, sy)
+    }
+
+    fn sample_field_solid_aware(field: &[f32], solids: &[bool], width: usize, height: usize, x: f32, y: f32, fallback: f32) -> f32 {
+        let w = width as isize;
+        let h = height as isize;
+
+        let x0 = x.floor().clamp(0.0, (w - 1) as f32) as usize;
+        let y0 = y.floor().clamp(0.0, (h - 1) as f32) as usize;
+        let x1 = (x0 + 1).min(width - 1);
+        let y1 = (y0 + 1).min(height - 1);
+
+        let sx = x - x0 as f32;
+        let sy = y - y0 as f32;
+
+        let idx_00 = x0 + y0 * width;
+        let idx_10 = x1 + y0 * width;
+        let idx_01 = x0 + y1 * width;
+        let idx_11 = x1 + y1 * width;
+
+        let w00 = (1.0 - sx) * (1.0 - sy);
+        let w10 = sx * (1.0 - sy);
+        let w01 = (1.0 - sx) * sy;
+        let w11 = sx * sy;
+
+        let mut value = 0.0;
+        let mut weight = 0.0;
+
+        if !solids[idx_00] {
+            value += field[idx_00] * w00;
+            weight += w00;
+        }
+        if !solids[idx_10] {
+            value += field[idx_10] * w10;
+            weight += w10;
+        }
+        if !solids[idx_01] {
+            value += field[idx_01] * w01;
+            weight += w01;
+        }
+        if !solids[idx_11] {
+            value += field[idx_11] * w11;
+            weight += w11;
+        }
+        if weight <= 1e-6 {
+            fallback
+        } else {
+            value / weight
+        }
     }
 
     fn sample_density(&self, x: f32, y: f32) -> f32 {
@@ -208,10 +339,8 @@ impl FluidSim {
             return match self.bottom_boundary.boundary_type {
                 BoundaryType::Outlet => 0.0,
                 BoundaryType::Inlet => self.bottom_boundary.density,
-                BoundaryType::Wall =>
-                    self.density[self.idx(x.clamp(0.0, (self.width - 1) as f32) as usize,
-                                          self.height - 1,
-                )],
+                BoundaryType::Wall => self.density[self.idx(x.clamp(0.0, (self.width - 1) as f32) as usize,
+                                                            self.height - 1, )],
             };
         }
 
@@ -227,9 +356,8 @@ impl FluidSim {
         let density = &self.density;
         let velocity_x = &self.velocity_x;
         let velocity_y = &self.velocity_y;
+        let solids = &self.solids;
 
-        // Copie des conditions aux limites pour éviter d'emprunter `self`
-        // dans la closure Rayon.
         let left_boundary = self.left_boundary;
         let right_boundary = self.right_boundary;
         let top_boundary = self.top_boundary;
@@ -245,6 +373,10 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
+                    if solids[idx] {
+                        row[x] = 0.0;
+                        continue;
+                    }
 
                     let vx = velocity_x[idx];
                     let vy = velocity_y[idx];
@@ -302,7 +434,7 @@ impl FluidSim {
                         }
                     }
                     else {
-                        Self::sample_field(density, width, height, px, py)
+                        Self::sample_field_solid_aware(density, solids, width, height, px, py, density[idx])
                     };
 
                     row[x] = value;
@@ -387,6 +519,7 @@ impl FluidSim {
 
         let velocity_x = &self.velocity_x;
         let velocity_y = &self.velocity_y;
+        let solids = &self.solids;
 
         self.velocity_x_temp
             .par_chunks_mut(width)
@@ -399,21 +532,55 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
+                    if solids[idx] {
+                        row_x[x] = 0.0;
+                        row_y[x] = 0.0;
+                        continue;
+                    }
 
                     let vx = velocity_x[idx];
                     let vy = velocity_y[idx];
                     let px = x as f32 - vx * dt;
                     let py = y as f32 - vy * dt;
 
-                    row_x[x] = Self::sample_field(velocity_x, width, height, px, py);
-
-                    row_y[x] = Self::sample_field(velocity_y, width, height, px, py);
+                    row_x[x] = Self::sample_field_solid_aware(velocity_x, solids, width, height, px, py, velocity_x[idx]);
+                    row_y[x] = Self::sample_field_solid_aware(velocity_y, solids, width, height, px, py, velocity_y[idx]);
                 }
             });
 
         std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
         std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
 
+    }
+
+    fn apply_solid_velocity_boundaries(&mut self) {
+        let width = self.width;
+        let height = self.height;
+
+        for y in 1..height - 1 {
+            for x in 1..width - 1 {
+                let idx = self.idx(x, y);
+
+                if self.solids[idx] {
+                    self.velocity_x[idx] = 0.0;
+                    self.velocity_y[idx] = 0.0;
+                    continue;
+                }
+
+                let solid_left = self.solids[self.idx(x - 1, y)];
+                let solid_right = self.solids[self.idx(x + 1, y)];
+                let solid_top = self.solids[self.idx(x, y - 1)];
+                let solid_bottom = self.solids[self.idx(x, y + 1)];
+
+                if solid_left || solid_right {
+                    self.velocity_x[idx] = 0.0;
+                }
+
+                if solid_top || solid_bottom {
+                    self.velocity_y[idx] = 0.0;
+                }
+            }
+        }
     }
 
     fn apply_velocity_boundaries(&mut self) {
@@ -527,11 +694,17 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
+                    if self.solids[idx] {
+                        row[x] = 0.0;
+                        continue;
+                    }
 
-                    let divergence = 0.5 * (
-                        velocity_x[idx + 1] - velocity_x[idx - 1] + velocity_y[idx + width] - velocity_y[idx - width]
-                    );
+                    let vx_right = if self.solids[idx + 1] { 0.0 } else { velocity_x[idx + 1] };
+                    let vx_left = if self.solids[idx - 1] { 0.0 } else { velocity_x[idx - 1] };
+                    let vy_down = if self.solids[idx + width] { 0.0 } else { velocity_y[idx + width] };
+                    let vy_up = if self.solids[idx - width] { 0.0 } else { velocity_y[idx - width] };
 
+                    let divergence = 0.5 * (vx_right - vx_left + vy_down - vy_up);
                     row[x] = -divergence;
                 }
             });
@@ -557,8 +730,25 @@ impl FluidSim {
 
                     for x in 1..width - 1 {
                         let idx = x + y * width;
-                        let neighbors = pressure[idx + 1] + pressure[idx - 1] + pressure[idx + width] + pressure[idx - width];
-                        row[x] = (neighbors + divergence[idx]) * 0.25;
+                        if self.solids[idx] {
+                            row[x] = 0.0;
+                            continue;
+                        }
+
+                        let mut sum = divergence[idx];
+                        let mut count = 0usize;
+
+                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width, ];
+
+                        for neighbor in neighbors {
+                            if self.solids[neighbor] {
+                                continue;
+                            }
+                            sum += pressure[neighbor];
+                            count += 1;
+                        }
+
+                        row[x] = if count > 0 { sum / count as f32 } else { pressure[idx] };
                     }
                 });
 
@@ -573,43 +763,52 @@ impl FluidSim {
 
         for y in 1..height - 1 {
             let l0 = self.idx(0, y);
-            self.pressure[l0] =
-                match self.left_boundary.boundary_type {
-                    BoundaryType::Outlet => 0.0,
-                    BoundaryType::Wall | BoundaryType::Inlet => {
-                        self.pressure[self.idx(1, y)]
-                    }
-                };
+
+            if self.solids[l0] {
+                self.pressure[l0] = 0.0;
+            } else {
+                self.pressure[l0] =
+                    match self.left_boundary.boundary_type {
+                        BoundaryType::Outlet => 0.0,
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(1, y)] }
+                    };
+            }
 
             let l1 = self.idx(width - 1, y);
-            self.pressure[l1] =
-                match self.right_boundary.boundary_type {
-                    BoundaryType::Outlet => 0.0,
-                    BoundaryType::Wall | BoundaryType::Inlet => {
-                        self.pressure[self.idx(width - 2, y)]
-                    }
-                };
+            if self.solids[l1] {
+                self.pressure[l1] = 0.0;
+            } else {
+                self.pressure[l1] =
+                    match self.right_boundary.boundary_type {
+                        BoundaryType::Outlet => 0.0,
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(width - 2, y)] }
+                    };
+            }
         }
 
 
         for x in 1..width - 1 {
             let l2 = self.idx(x, 0);
-            self.pressure[l2] =
-                match self.top_boundary.boundary_type {
-                    BoundaryType::Outlet => 0.0,
-                    BoundaryType::Wall | BoundaryType::Inlet => {
-                        self.pressure[self.idx(x, 1)]
-                    }
-                };
+            if self.solids[l2] {
+                self.pressure[l2] = 0.0;
+            } else {
+                self.pressure[l2] =
+                    match self.top_boundary.boundary_type {
+                        BoundaryType::Outlet => 0.0,
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, 1)] }
+                    };
+            }
 
             let l3 = self.idx(x, height - 1);
-            self.pressure[l3] =
-                match self.bottom_boundary.boundary_type {
-                    BoundaryType::Outlet => 0.0,
-                    BoundaryType::Wall | BoundaryType::Inlet => {
-                        self.pressure[self.idx(x, height - 2)]
-                    }
-                };
+            if self.solids[l3] {
+                self.pressure[l3] = 0.0;
+            } else {
+                self.pressure[l3] =
+                    match self.bottom_boundary.boundary_type {
+                        BoundaryType::Outlet => 0.0,
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, height - 2)] }
+                    };
+            }
         }
     }
 
@@ -630,9 +829,19 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
+                    if self.solids[idx] {
+                        row_x[x] = 0.0;
+                        row_y[x] = 0.0;
+                        continue;
+                    }
 
-                    let pressure_gradient_x = 0.5 * (pressure[idx + 1] - pressure[idx - 1]);
-                    let pressure_gradient_y = 0.5 * (pressure[idx + width] - pressure[idx - width]);
+                    let pressure_right = if self.solids[idx + 1] { pressure[idx] } else { pressure[idx + 1] };
+                    let pressure_left = if self.solids[idx - 1] { pressure[idx] } else { pressure[idx - 1] };
+                    let pressure_down = if self.solids[idx + width] { pressure[idx] } else { pressure[idx + width] };
+                    let pressure_up = if self.solids[idx - width] { pressure[idx] } else { pressure[idx - width] };
+
+                    let pressure_gradient_x = 0.5 * (pressure_right - pressure_left);
+                    let pressure_gradient_y = 0.5 * (pressure_down - pressure_up);
 
                     row_x[x] -= pressure_gradient_x;
                     row_y[x] -= pressure_gradient_y;
@@ -648,14 +857,18 @@ impl FluidSim {
 
 
     pub fn step(&mut self, dt: f32, pressure_iterations: usize, diffusion_iterations: usize) {
-        self.advect_velocity(dt);
-        self.apply_velocity_boundaries();
+        self.advect_velocity(dt); //advection vitesse (v)
+        self.apply_velocity_boundaries(); //attention aux bordures (v)
 
-        self.enforce_incompressibility(pressure_iterations);
-        self.apply_velocity_boundaries();
+        self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
-        self.diffuse_density(dt, diffusion_iterations);
-        self.advect_density(dt);
-        self.apply_density_boundaries();
+        self.enforce_incompressibility(pressure_iterations); //divergence et pression -> vitesse
+        self.apply_velocity_boundaries(); //attention aux bordures (v)
+
+        self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
+
+        self.diffuse_density(dt, diffusion_iterations); //diffuser la densité (d)
+        self.advect_density(dt); //advection de la densité (d)
+        self.apply_density_boundaries(); //attention aux bordures (d)
     }
 }

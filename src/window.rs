@@ -124,11 +124,11 @@ pub struct FluidWindow {
     paused: bool,
     step_frame: usize,
     display_mode: DisplayMode,
+    matter_mode: bool, //false: fluid, true: solid
 }
 
 impl FluidWindow {
-    pub fn new(width: usize, height: usize,
-               particle_radius: usize, precision: usize,
+    pub fn new(width: usize, height: usize, precision: usize,
                start_density: f32, diffusion_rate: f32,
                max_color: u32, randomize: bool, random_smoothing: usize,
                pressure_iters: usize, diffusion_iters: usize,
@@ -138,7 +138,7 @@ impl FluidWindow {
         FluidWindow {
             width,
             height,
-            particle_radius,
+            particle_radius: 20,
             precision,
             window: Window::new(
                 "Fluid Simulation", 
@@ -169,6 +169,7 @@ impl FluidWindow {
             paused: false,
             step_frame: 0,
             display_mode: DisplayMode::Density,
+            matter_mode: false,
         }
     }
 
@@ -206,8 +207,10 @@ impl FluidWindow {
                 self.fps = self.frame_count as f32 / elapsed;
                 self.frame_count = 0;
                 self.last_fps_update = now;
-                let title = format!("Fluid Simulation - \
-                FPS: {:.1} ({}) | {}", self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name());
+                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {} ",
+                                    self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
+                                    self.matter_mode, self.particle_radius
+                );
                 self.window.set_title(&title);
             }
 
@@ -226,6 +229,16 @@ impl FluidWindow {
 
             if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
                 self.display_mode = self.display_mode.next();
+            }
+
+            if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
+                self.matter_mode = !self.matter_mode;
+            }
+
+            if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
+                let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
+                let idx = radius.iter().position(|&r| r == self.particle_radius);
+                self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
             }
 
             let (mx, my) = self
@@ -260,14 +273,27 @@ impl FluidWindow {
                         let y = y as usize;
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
-                            let idx = x + y * fluid.width;
-                            fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
+                            if self.matter_mode {
+                                fluid.set_solid(x, y, true);
+                            } else {
+                                let idx = x + y * fluid.width;
+                                fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
+                            }
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Right) {
                             let idx = x + y * fluid.width;
                             fluid.velocity_x[idx] += fx * 0.05;
                             fluid.velocity_y[idx] += fy * 0.05;
+                        }
+
+                        if self.window.get_mouse_down(minifb::MouseButton::Middle) {
+                            if self.matter_mode {
+                                fluid.set_solid(x, y, false);
+                            } else {
+                                let idx = x + y * fluid.width;
+                                fluid.density[idx] = (fluid.density[idx] - 2.0 * dt).max(0.0);
+                            }
                         }
                     }
                 }
@@ -307,29 +333,31 @@ impl FluidWindow {
                     for x in 0..fluid.width {
                         let idx = x + y * fluid.width;
 
-                        let color = match display_mode {
-                            DisplayMode::Density => {
-                                let d = fluid.density[idx].clamp(0.0, 1.0);
+                        let color = if fluid.solids[idx] {
+                            0x000000
+                        } else {
+                            match display_mode {
+                                DisplayMode::Density => {
+                                    let d = fluid.density[idx].clamp(0.0, 1.0);
 
-                                let r = (d * ((max_color >> 0) & 0xFF) as f32) as u8;
-                                let g = (d * ((max_color >> 8) & 0xFF) as f32) as u8;
-                                let b = (d * ((max_color >> 16) & 0xFF) as f32) as u8;
+                                    let r = (d * ((max_color >> 0) & 0xFF) as f32) as u8;
+                                    let g = (d * ((max_color >> 8) & 0xFF) as f32) as u8;
+                                    let b = (d * ((max_color >> 16) & 0xFF) as f32) as u8;
 
-                                ((b as u32) << 16) |
-                                    ((g as u32) << 8) |
-                                    r as u32
-                            }
+                                    ((b as u32) << 16) | ((g as u32) << 8) | r as u32
+                                }
 
-                            DisplayMode::Pressure => {
-                                signed_color(fluid.pressure[idx], pressure_max)
-                            }
+                                DisplayMode::Pressure => {
+                                    signed_color(fluid.pressure[idx], pressure_max)
+                                }
 
-                            DisplayMode::Divergence => {
-                                signed_color(fluid.divergence[idx], divergence_max)
-                            }
+                                DisplayMode::Divergence => {
+                                    signed_color(fluid.divergence[idx], divergence_max)
+                                }
 
-                            DisplayMode::Velocity => {
-                                velocity_color(fluid.velocity_x[idx], fluid.velocity_y[idx], velocity_max)
+                                DisplayMode::Velocity => {
+                                    velocity_color(fluid.velocity_x[idx], fluid.velocity_y[idx], velocity_max)
+                                }
                             }
                         };
 

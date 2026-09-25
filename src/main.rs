@@ -6,14 +6,14 @@ mod window;
 mod simulation;
 
 fn launch_simulation(width: usize, height: usize,
-    particle_radius: usize, precision: usize,
+    precision: usize,
     start_density: f32, diffusion_rate: f32,
     max_color: u32, randomize: bool, random_smoothing: usize,
     pressure_iters: usize, diffusion_iters: usize,
     left_boundary: Boundary, right_boundary: Boundary,
     top_boundary: Boundary, bottom_boundary: Boundary) {
 
-    let mut window = window::FluidWindow::new(width, height, particle_radius, precision, start_density, diffusion_rate,
+    let mut window = window::FluidWindow::new(width, height, precision, start_density, diffusion_rate,
          max_color, randomize, random_smoothing, pressure_iters, diffusion_iters, left_boundary, right_boundary, top_boundary, bottom_boundary);
     window.run();
 }
@@ -22,7 +22,6 @@ fn launch_simulation(width: usize, height: usize,
 struct SimulationSettings {
     width: usize,
     height: usize,
-    particle_radius: usize,
     precision: usize,
     start_density: f32,
     max_density_color: [u8; 4],
@@ -42,7 +41,6 @@ impl Default for SimulationSettings {
         Self {
             width: 800,
             height: 600,
-            particle_radius: 10,
             precision: 10,
             start_density: 0.2,
             max_density_color: [255, 255, 255, 255],
@@ -92,7 +90,7 @@ impl eframe::App for MyApp {
             ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
             ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
 
-            ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
+            //ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
 
             ComboBox::from_label("Precision (pixels)")
                 .selected_text(format!("{}", self.settings.precision))
@@ -128,8 +126,7 @@ impl eframe::App for MyApp {
                 );
                 let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
                 launch_simulation(
-                    self.settings.width, self.settings.height,
-                    self.settings.particle_radius, self.settings.precision,
+                    self.settings.width, self.settings.height, self.settings.precision,
                     self.settings.start_density, self.settings.diffusion_rate,
                     max_color, self.settings.randomize, self.settings.random_smoothing,
                     self.settings.pressure_iters, self.settings.diffusion_iters,
