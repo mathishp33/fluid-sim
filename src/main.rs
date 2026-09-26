@@ -152,6 +152,7 @@ fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
                 ui.add(egui::Slider::new(&mut boundary.velocity_x, -50.0..=50.0).text("Velocity X"));
                 ui.add(egui::Slider::new(&mut boundary.velocity_y, -50.0..=50.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
+                ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
             }
 
             simulation::fluid_sim::BoundaryType::Wall => {}

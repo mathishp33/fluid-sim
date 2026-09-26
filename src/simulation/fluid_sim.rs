@@ -15,6 +15,7 @@ pub struct Boundary {
     pub velocity_x: f32,
     pub velocity_y: f32,
     pub density: f32,
+    pub offset: usize,
 }
 
 impl Boundary {
@@ -24,6 +25,7 @@ impl Boundary {
             velocity_x: 0.0,
             velocity_y: 0.0,
             density: 0.0,
+            offset: 1,
         }
     }
 }
@@ -155,6 +157,25 @@ impl FluidSim {
         self.pressure_temp[idx] = self.pressure[idx];
     }
 
+    #[inline]
+    fn offset_factor(x: usize, size: usize, offset: usize) -> f32 {
+        if offset == 0 {
+            return 1.0;
+        }
+
+        if size <= 2 || offset >= size {
+            return 0.0;
+        }
+
+        let distance_from_edge = x.min(size - 1 - x);
+
+        (distance_from_edge as f32 / offset as f32).clamp(0.0, 1.0)
+    }
+
+    pub fn offset_velocity(x: usize, size: usize, velocity: f32, offset: usize) -> f32 {
+        velocity * Self::offset_factor(x, size, offset)
+    }
+
     pub fn randomize_density_smoothed(&mut self, seed_count: usize) { //O(n)
         let mut rng = rand::thread_rng();
 
@@ -208,7 +229,7 @@ impl FluidSim {
                         row[x] = (center + a * (right + left + down + up)) / (1.0 + 4.0 * a);
                     }
                 });
-            
+
             // Copy boundaries (Neumann boundary condition)
             for y in 0..self.height {
                 let idx_left = self.idx(0, y);
@@ -222,7 +243,7 @@ impl FluidSim {
                 self.density_temp[idx_top] = self.density[idx_top];
                 self.density_temp[idx_bottom] = self.density[idx_bottom];
             }
-            
+
             std::mem::swap(&mut self.density, &mut self.density_temp);
         }
     }
@@ -319,8 +340,7 @@ impl FluidSim {
             return match self.right_boundary.boundary_type {
                 BoundaryType::Outlet => 0.0,
                 BoundaryType::Inlet => self.right_boundary.density,
-                BoundaryType::Wall => self.density[self.idx(self.width - 1,
-                    y.clamp(0.0, (self.height - 1) as f32) as usize,
+                BoundaryType::Wall => self.density[self.idx(self.width - 1, y.clamp(0.0, (self.height - 1) as f32) as usize,
                 )],
             };
         }
@@ -595,8 +615,9 @@ impl FluidSim {
                 }
 
                 BoundaryType::Inlet => {
-                    self.velocity_x[idx] = self.left_boundary.velocity_x;
-                    self.velocity_y[idx] = self.left_boundary.velocity_y;
+                    let factor = Self::offset_factor(y, self.height, self.left_boundary.offset);
+                    self.velocity_x[idx] = self.left_boundary.velocity_x * factor;
+                    self.velocity_y[idx] = self.left_boundary.velocity_y * factor;
                 }
 
                 BoundaryType::Outlet => {
@@ -618,8 +639,9 @@ impl FluidSim {
                 }
 
                 BoundaryType::Inlet => {
-                    self.velocity_x[idx] = self.right_boundary.velocity_x;
-                    self.velocity_y[idx] = self.right_boundary.velocity_y;
+                    let factor = Self::offset_factor(y, self.height, self.right_boundary.offset);
+                    self.velocity_x[idx] = self.right_boundary.velocity_x * factor;
+                    self.velocity_y[idx] = self.right_boundary.velocity_y * factor;
                 }
 
                 BoundaryType::Outlet => {
@@ -641,8 +663,9 @@ impl FluidSim {
                 }
 
                 BoundaryType::Inlet => {
-                    self.velocity_x[idx] = self.top_boundary.velocity_x;
-                    self.velocity_y[idx] = self.top_boundary.velocity_y;
+                    let factor = Self::offset_factor(x, self.width, self.top_boundary.offset);
+                    self.velocity_x[idx] = self.top_boundary.velocity_x * factor;
+                    self.velocity_y[idx] = self.top_boundary.velocity_y * factor;
                 }
 
                 BoundaryType::Outlet => {
@@ -664,8 +687,9 @@ impl FluidSim {
                 }
 
                 BoundaryType::Inlet => {
-                    self.velocity_x[idx] = self.bottom_boundary.velocity_x;
-                    self.velocity_y[idx] = self.bottom_boundary.velocity_y;
+                    let factor = Self::offset_factor(x, self.width, self.bottom_boundary.offset, );
+                    self.velocity_x[idx] = self.bottom_boundary.velocity_x * factor;
+                    self.velocity_y[idx] = self.bottom_boundary.velocity_y * factor;
                 }
 
                 BoundaryType::Outlet => {
@@ -680,6 +704,8 @@ impl FluidSim {
     fn calculate_divergence(&mut self) {
         let width = self.width;
         let height = self.height;
+
+        //self.divergence.fill(0.0);
 
         let velocity_x = &self.velocity_x;
         let velocity_y = &self.velocity_y;

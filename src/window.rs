@@ -1,3 +1,4 @@
+use std::fmt::format;
 use minifb::{Window, WindowOptions};
 
 use crate::simulation::fluid_sim;
@@ -141,7 +142,7 @@ impl FluidWindow {
             particle_radius: 20,
             precision,
             window: Window::new(
-                "Fluid Simulation", 
+                "Fluid Simulation",
                 width,
                 height,
                 WindowOptions {
@@ -241,6 +242,13 @@ impl FluidWindow {
                 self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
             }
 
+            if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
+                fluid.pressure.fill(0.0);
+                fluid.divergence.fill(0.0);
+                fluid.velocity_y.fill(0.0);
+                fluid.velocity_x.fill(0.0);
+            }
+
             let (mx, my) = self
                 .window
                 .get_mouse_pos(minifb::MouseMode::Clamp)
@@ -264,8 +272,8 @@ impl FluidWindow {
                         let y = gy as isize + dy;
 
                         if x <= 0 || y <= 0 ||
-                        x >= fluid.width as isize - 1 ||
-                        y >= fluid.height as isize - 1 {
+                            x >= fluid.width as isize - 1 ||
+                            y >= fluid.height as isize - 1 {
                             continue;
                         }
 
@@ -294,6 +302,14 @@ impl FluidWindow {
                                 let idx = x + y * fluid.width;
                                 fluid.density[idx] = (fluid.density[idx] - 2.0 * dt).max(0.0);
                             }
+                        }
+
+                        if self.window.is_key_pressed(minifb::Key::D, minifb::KeyRepeat::No) {
+                            let idx = x + y * fluid.width;
+                            let text = format!("x: {}, y: {}, vx: {:.2}, vy: {:.2}, de: {}, di: {:.2}, p: {:.2}, s: {}", x, y,
+                                               fluid.velocity_x[idx], fluid.velocity_y[idx], fluid.density[idx],
+                                               fluid.divergence[idx], fluid.pressure[idx], fluid.solids[idx]);
+                            print!("{} \n ------------------------------------------------------- \n", text);
                         }
                     }
                 }
