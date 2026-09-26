@@ -280,51 +280,37 @@ impl FluidSim {
     }
 
     fn sample_field_solid_aware(field: &[f32], solids: &[bool], width: usize, height: usize, x: f32, y: f32, fallback: f32) -> f32 {
-        let w = width as isize;
-        let h = height as isize;
+        let x = x.clamp(0.0, (width - 1) as f32);
+        let y = y.clamp(0.0, (height - 1) as f32);
 
-        let x0 = x.floor().clamp(0.0, (w - 1) as f32) as usize;
-        let y0 = y.floor().clamp(0.0, (h - 1) as f32) as usize;
+        let x0 = x.floor() as usize;
+        let y0 = y.floor() as usize;
+
         let x1 = (x0 + 1).min(width - 1);
         let y1 = (y0 + 1).min(height - 1);
 
         let sx = x - x0 as f32;
         let sy = y - y0 as f32;
 
-        let idx_00 = x0 + y0 * width;
-        let idx_10 = x1 + y0 * width;
-        let idx_01 = x0 + y1 * width;
-        let idx_11 = x1 + y1 * width;
+        let idx00 = x0 + y0 * width;
+        let idx10 = x1 + y0 * width;
+        let idx01 = x0 + y1 * width;
+        let idx11 = x1 + y1 * width;
 
         let w00 = (1.0 - sx) * (1.0 - sy);
         let w10 = sx * (1.0 - sy);
         let w01 = (1.0 - sx) * sy;
         let w11 = sx * sy;
 
-        let mut value = 0.0;
-        let mut weight = 0.0;
+        let v00 = if solids[idx00] { fallback } else { field[idx00] };
+        let v10 = if solids[idx10] { fallback } else { field[idx10] };
+        let v01 = if solids[idx01] { fallback } else { field[idx01] };
+        let v11 = if solids[idx11] { fallback } else { field[idx11] };
 
-        if !solids[idx_00] {
-            value += field[idx_00] * w00;
-            weight += w00;
-        }
-        if !solids[idx_10] {
-            value += field[idx_10] * w10;
-            weight += w10;
-        }
-        if !solids[idx_01] {
-            value += field[idx_01] * w01;
-            weight += w01;
-        }
-        if !solids[idx_11] {
-            value += field[idx_11] * w11;
-            weight += w11;
-        }
-        if weight <= 1e-6 {
-            fallback
-        } else {
-            value / weight
-        }
+        v00 * w00
+            + v10 * w10
+            + v01 * w01
+            + v11 * w11
     }
 
     fn sample_density(&self, x: f32, y: f32) -> f32 {
@@ -530,7 +516,6 @@ impl FluidSim {
     }
 
     pub fn advect_velocity(&mut self, dt: f32) {
-        // Copy current velocity to temp buffers
         self.velocity_x_temp.copy_from_slice(&self.velocity_x);
         self.velocity_y_temp.copy_from_slice(&self.velocity_y);
 
@@ -552,6 +537,7 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
+
                     if solids[idx] {
                         row_x[x] = 0.0;
                         row_y[x] = 0.0;
@@ -560,17 +546,25 @@ impl FluidSim {
 
                     let vx = velocity_x[idx];
                     let vy = velocity_y[idx];
-                    let px = x as f32 - vx * dt;
-                    let py = y as f32 - vy * dt;
 
-                    row_x[x] = Self::sample_field_solid_aware(velocity_x, solids, width, height, px, py, velocity_x[idx]);
-                    row_y[x] = Self::sample_field_solid_aware(velocity_y, solids, width, height, px, py, velocity_y[idx]);
+                    let px = (x as f32 - vx * dt).clamp(0.0, (width - 1) as f32);
+
+                    let py = (y as f32 - vy * dt).clamp(0.0, (height - 1) as f32);
+
+                    row_x[x] = Self::sample_field_solid_aware(velocity_x, solids, width, height, px, py, vx);
+                    row_y[x] = Self::sample_field_solid_aware(velocity_y, solids, width, height, px, py, vy);
                 }
             });
 
-        std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
-        std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
+        std::mem::swap(
+            &mut self.velocity_x,
+            &mut self.velocity_x_temp,
+        );
 
+        std::mem::swap(
+            &mut self.velocity_y,
+            &mut self.velocity_y_temp,
+        );
     }
 
     fn apply_solid_velocity_boundaries(&mut self) {
@@ -704,8 +698,6 @@ impl FluidSim {
     fn calculate_divergence(&mut self) {
         let width = self.width;
         let height = self.height;
-
-        //self.divergence.fill(0.0);
 
         let velocity_x = &self.velocity_x;
         let velocity_y = &self.velocity_y;
@@ -889,7 +881,7 @@ impl FluidSim {
         self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
         self.enforce_incompressibility(pressure_iterations); //divergence et pression -> vitesse
-        self.apply_velocity_boundaries(); //attention aux bordures (v)
+        //self.apply_velocity_boundaries(); //attention aux bordures (v)
 
         self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
