@@ -228,25 +228,27 @@ impl FluidWindow {
                 }
             }
 
-            if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
-                self.display_mode = self.display_mode.next();
-            }
+            if self.window.is_key_pressed(minifb::Key::LeftCtrl, minifb::KeyRepeat::Yes) {
+                if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
+                    self.display_mode = self.display_mode.next();
+                }
 
-            if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
-                self.matter_mode = !self.matter_mode;
-            }
+                if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
+                    self.matter_mode = !self.matter_mode;
+                }
 
-            if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
-                let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
-                let idx = radius.iter().position(|&r| r == self.particle_radius);
-                self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
-            }
+                if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
+                    let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
+                    let idx = radius.iter().position(|&r| r == self.particle_radius);
+                    self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
+                }
 
-            if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
-                fluid.pressure.fill(0.0);
-                fluid.divergence.fill(0.0);
-                fluid.velocity_y.fill(0.0);
-                fluid.velocity_x.fill(0.0);
+                if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
+                    fluid.pressure.fill(0.0);
+                    fluid.divergence.fill(0.0);
+                    fluid.velocity_y.fill(0.0);
+                    fluid.velocity_x.fill(0.0);
+                }
             }
 
             let (mx, my) = self
