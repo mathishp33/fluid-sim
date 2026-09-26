@@ -754,19 +754,17 @@ impl FluidSim {
                         }
 
                         let mut sum = divergence[idx];
-                        let mut count = 0usize;
-
-                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width, ];
+                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
 
                         for neighbor in neighbors {
                             if self.solids[neighbor] {
-                                continue;
+                                sum += pressure[idx]; //dp/dn = 0
+                            } else {
+                                sum += pressure[neighbor];
                             }
-                            sum += pressure[neighbor];
-                            count += 1;
                         }
 
-                        row[x] = if count > 0 { sum / count as f32 } else { pressure[idx] };
+                        row[x] = sum * 0.25;
                     }
                 });
 
