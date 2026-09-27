@@ -101,6 +101,27 @@ fn velocity_color(vx: f32, vy: f32, max_speed: f32) -> u32 {
     hsv_to_rgb(hue, 1.0, brightness)
 }
 
+pub struct Perf {
+    render: u32,
+    sim: u32,
+    fps: f32,
+    frame_count: usize,
+    last_fps_update: std::time::Instant,
+}
+
+impl Perf {
+    pub fn new() -> Self {
+        Perf {
+            render: 0u32,
+            sim: 0u32,
+            fps: 0.0,
+            frame_count: 0usize,
+            last_fps_update: std::time::Instant::now(),
+        }
+
+    }
+}
+
 pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
@@ -119,9 +140,7 @@ pub struct FluidWindow {
     pub top_boundary: Boundary,
     pub bottom_boundary: Boundary,
     buffer: Vec<u32>,
-    fps: f32,
-    frame_count: usize,
-    last_fps_update: std::time::Instant,
+    perf: Perf,
     paused: bool,
     step_frame: usize,
     display_mode: DisplayMode,
@@ -164,9 +183,7 @@ impl FluidWindow {
             top_boundary,
             bottom_boundary,
             buffer: vec![0u32; width * height],
-            fps: 0.0,
-            frame_count: 0,
-            last_fps_update: std::time::Instant::now(),
+            perf: Perf::new(),
             paused: false,
             step_frame: 0,
             display_mode: DisplayMode::Density,
@@ -202,15 +219,16 @@ impl FluidWindow {
                 continue;
             }
 
-            self.frame_count += 1;
-            let elapsed = now.duration_since(self.last_fps_update).as_secs_f32();
+            self.perf.frame_count += 1;
+            let elapsed = now.duration_since(self.perf.last_fps_update).as_secs_f32();
             if elapsed >= 0.5 {
-                self.fps = self.frame_count as f32 / elapsed;
-                self.frame_count = 0;
-                self.last_fps_update = now;
-                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {} ",
-                                    self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
-                                    self.matter_mode, self.particle_radius
+                self.perf.fps = self.perf.frame_count as f32 / elapsed;
+                self.perf.frame_count = 0;
+                self.perf.last_fps_update = now;
+                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {} | \
+                render: {}ms | sim: {}ms",
+                    self.perf.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
+                    self.matter_mode, self.particle_radius, self.perf.render, self.perf.sim
                 );
                 self.window.set_title(&title);
             }
@@ -319,10 +337,15 @@ impl FluidWindow {
 
             last_mouse = (mx, my);
 
+            let t0_s = std::time::Instant::now();
             if !self.paused || self.step_frame > 0 {
                 fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); // clamp dt for stability
                 self.step_frame = self.step_frame.saturating_sub(1);
             }
+            self.perf.sim = (std::time::Instant::now() - t0_s).as_millis() as u32;
+
+            // Render
+            let t0_r = std::time::Instant::now();
 
             let pressure_max = fluid.pressure
                 .iter()
@@ -389,9 +412,9 @@ impl FluidWindow {
                     }
                 });
 
-            self.window
-                .update_with_buffer(&self.buffer, self.width, self.height)
-                .unwrap();
+            self.window.update_with_buffer(&self.buffer, self.width, self.height).unwrap();
+
+            self.perf.render = (std::time::Instant::now() - t0_r).as_millis() as u32;
         }
     }
 }
