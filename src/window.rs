@@ -126,7 +126,10 @@ pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
     pub particle_radius: usize,
-    pub precision : usize,
+    pub precision: usize,
+    pub gravity_x: f32,
+    pub gravity_y: f32,
+    pub friction: f32,
     pub window: Window,
     pub start_density: f32,
     pub diffusion_rate: f32,
@@ -150,6 +153,7 @@ pub struct FluidWindow {
 impl FluidWindow {
     pub fn new(width: usize, height: usize, precision: usize,
                start_density: f32, diffusion_rate: f32,
+               gravity_x: f32, gravity_y: f32, friction: f32,
                max_color: u32, randomize: bool, random_smoothing: usize,
                pressure_iters: usize, diffusion_iters: usize,
                left_boundary: fluid_sim::Boundary, right_boundary: fluid_sim::Boundary,
@@ -160,6 +164,9 @@ impl FluidWindow {
             height,
             particle_radius: 20,
             precision,
+            gravity_x,
+            gravity_y,
+            friction,
             window: Window::new(
                 "Fluid Simulation",
                 width,
@@ -197,6 +204,8 @@ impl FluidWindow {
             (self.height / self.precision) as usize,
             self.start_density,
             self.diffusion_rate,
+            self.gravity_x, self.gravity_y,
+            self.friction
         );
         fluid.left_boundary = self.left_boundary;
         fluid.right_boundary = self.right_boundary;
@@ -225,10 +234,10 @@ impl FluidWindow {
                 self.perf.fps = self.perf.frame_count as f32 / elapsed;
                 self.perf.frame_count = 0;
                 self.perf.last_fps_update = now;
-                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {} | \
+                let title = format!("Fluid Sim - FPS: {:.0} ({}) | D_MODE: {} | MODE: {} | RADIUS: {} | \
                 render: {}ms | sim: {}ms",
                     self.perf.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
-                    self.matter_mode, self.particle_radius, self.perf.render, self.perf.sim
+                    if self.matter_mode { "SOLID" } else { "FLUID" }, self.particle_radius, self.perf.render, self.perf.sim,
                 );
                 self.window.set_title(&title);
             }
@@ -246,7 +255,7 @@ impl FluidWindow {
                 }
             }
 
-            if self.window.is_key_pressed(minifb::Key::LeftCtrl, minifb::KeyRepeat::Yes) {
+            if !self.window.is_key_down(minifb::Key::LeftCtrl) {
                 if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
                     self.display_mode = self.display_mode.next();
                 }

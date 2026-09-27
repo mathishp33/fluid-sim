@@ -1,1 +1,19 @@
-4. optimiser la simulation de fluide (solveur de pression ou autre ?)
+ - Optimiser la simulation de fluide (Red/Black Gauss-Siedel ?, SOR ?, Conjugate Gradient ?, PCG ?, Multi-grid ?)
+ - PROBLEME AVEC RED/BLACK GAUSS SIEDEL ?
+ - Forces externes (gravité, archimède, frottements/pas frottements)
+ - Forces sur les solides Solid(position, accéleration, masse, angle, vitesse angulaire, inertie, statique/dynamique, forme)
+ - Viscosité de vitesse
+ - Différents fluides FluidMaterial(density, viscosity, diffusion, temperature, color)
+ - Température
+ - Flottabilité
+ - Plusieurs fluides (changer le système de "density")
+ - Surface libre (liquide, air, interface) -> séparation liquide | air
+ - Tension de surface
+ - Système de particules ?
+ - FLIP/PIC ?
+ - Indicateur vorticité
+ - Écoulement compressible
+ - Meilleures conditions aux limites (Periodic, Open, PressureOutlet, VelocityOutlet)
+ - Sources / puits Sink(), Emitter(), Accelerator(), Deccelerator()
+ - Adaptation automatique du dt (condition CFL)
+ - Conservation & Diagnostics (div_max, tot_mass, Ec, CFL, pressure_residuals)
