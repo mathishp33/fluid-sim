@@ -51,6 +51,9 @@ pub struct FluidSim {
     pub right_boundary: Boundary,
     pub top_boundary: Boundary,
     pub bottom_boundary: Boundary,
+
+    density_rhs: Vec<f32>,
+    open: Vec<bool>,
 }
 
 impl FluidSim {
@@ -82,6 +85,9 @@ impl FluidSim {
             right_boundary: Boundary::wall(),
             top_boundary: Boundary::wall(),
             bottom_boundary: Boundary::wall(),
+
+            density_rhs: vec![0.0; size],
+            open: vec![false; size],
         }
     }
 
@@ -197,53 +203,41 @@ impl FluidSim {
         self.density[self.idx(x, y)]
     } //O(1)
 
-    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) { //O(n + m)
-        let a = self.diffusion_rate * dt;
+    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[bool], width: usize, height: usize, a: f32, iters: usize, ) {
+        rhs.copy_from_slice(field);
+        temp.copy_from_slice(field);
 
-        for _ in 0..diffusion_iters {
-            let width = self.width;
-
-            self.density_temp
-                .par_chunks_mut(width)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    if y == 0 || y == self.height - 1 {
+        for _ in 0..iters {
+            {
+                let cur: &Vec<f32> = field;
+                let rhs: &Vec<f32> = rhs;
+                temp.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+                    if y == 0 || y == height - 1 {
                         return;
                     }
-
                     for x in 1..width - 1 {
                         let idx = x + y * width;
-                        if self.solids[idx] {
+                        if solids[idx] {
                             row[x] = 0.0;
                             continue;
                         }
-
-                        let center = self.density[idx];
-                        let right = if self.solids[idx + 1] { center } else { self.density[idx + 1] };
-                        let left = if self.solids[idx - 1] { center } else { self.density[idx - 1] };
-                        let down = if self.solids[idx + width] { center } else { self.density[idx + width] };
-                        let up = if self.solids[idx - width] { center } else { self.density[idx - width] };
-
-                        row[x] = (center + a * (right + left + down + up)) / (1.0 + 4.0 * a);
+                        let c = cur[idx];
+                        let r = if solids[idx + 1] { c } else { cur[idx + 1] };
+                        let l = if solids[idx - 1] { c } else { cur[idx - 1] };
+                        let d = if solids[idx + width] { c } else { cur[idx + width] };
+                        let u = if solids[idx - width] { c } else { cur[idx - width] };
+                        row[x] = (rhs[idx] + a * (r + l + d + u)) / (1.0 + 4.0 * a);
                     }
                 });
-
-            // Copy boundaries (Neumann boundary condition)
-            for y in 0..self.height {
-                let idx_left = self.idx(0, y);
-                let idx_right = self.idx(self.width - 1, y);
-                self.density_temp[idx_left] = self.density[idx_left];
-                self.density_temp[idx_right] = self.density[idx_right];
             }
-            for x in 0..self.width {
-                let idx_top = self.idx(x, 0);
-                let idx_bottom = self.idx(x, self.height - 1);
-                self.density_temp[idx_top] = self.density[idx_top];
-                self.density_temp[idx_bottom] = self.density[idx_bottom];
-            }
-
-            std::mem::swap(&mut self.density, &mut self.density_temp);
+            std::mem::swap(field, temp);
         }
+    }
+
+    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) {
+        let a = self.diffusion_rate * dt;
+        Self::diffuse_field(&mut self.density, &mut self.density_temp, &mut self.density_rhs,
+                            &self.solids, self.width, self.height, a, diffusion_iters);
     }
 
     fn lerp(a: f32, b: f32, t: f32) -> f32 {
