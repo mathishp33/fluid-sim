@@ -125,7 +125,7 @@ pub struct FluidWindow {
     paused: bool,
     step_frame: usize,
     display_mode: DisplayMode,
-    matter_mode: bool, //false: fluid, true: solid
+    //matter_mode: bool, //false: fluid, true: solid
 }
 
 impl FluidWindow {
@@ -170,7 +170,7 @@ impl FluidWindow {
             paused: false,
             step_frame: 0,
             display_mode: DisplayMode::Density,
-            matter_mode: false,
+            //matter_mode: false,
         }
     }
 
@@ -208,9 +208,9 @@ impl FluidWindow {
                 self.fps = self.frame_count as f32 / elapsed;
                 self.frame_count = 0;
                 self.last_fps_update = now;
-                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {} ",
+                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_RADIUS: {} ",
                                     self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
-                                    self.matter_mode, self.particle_radius
+                                    self.particle_radius
                 );
                 self.window.set_title(&title);
             }
@@ -230,10 +230,6 @@ impl FluidWindow {
 
             if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
                 self.display_mode = self.display_mode.next();
-            }
-
-            if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
-                self.matter_mode = !self.matter_mode;
             }
 
             if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
@@ -281,7 +277,7 @@ impl FluidWindow {
                         let y = y as usize;
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
-                            if self.matter_mode {
+                            if self.window.is_key_down(minifb::Key::LeftCtrl) {
                                 fluid.set_solid(x, y, true);
                             } else {
                                 let idx = x + y * fluid.width;
@@ -296,7 +292,7 @@ impl FluidWindow {
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Middle) {
-                            if self.matter_mode {
+                            if self.window.is_key_down(minifb::Key::LeftCtrl) {
                                 fluid.set_solid(x, y, false);
                             } else {
                                 let idx = x + y * fluid.width;

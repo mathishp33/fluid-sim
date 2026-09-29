@@ -101,8 +101,8 @@ impl eframe::App for MyApp {
                 });
 
             ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
-            ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
-            ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
+            //ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
+            //ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
 
             boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
             boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
@@ -149,8 +149,8 @@ fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
 
         match boundary.boundary_type {
             simulation::fluid_sim::BoundaryType::Inlet => {
-                ui.add(egui::Slider::new(&mut boundary.velocity_x, -50.0..=50.0).text("Velocity X"));
-                ui.add(egui::Slider::new(&mut boundary.velocity_y, -50.0..=50.0).text("Velocity Y"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_x, -200.0..=200.0).text("Velocity X"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
                 ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
             }
