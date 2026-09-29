@@ -101,35 +101,11 @@ fn velocity_color(vx: f32, vy: f32, max_speed: f32) -> u32 {
     hsv_to_rgb(hue, 1.0, brightness)
 }
 
-pub struct Perf {
-    render: u32,
-    sim: u32,
-    fps: f32,
-    frame_count: usize,
-    last_fps_update: std::time::Instant,
-}
-
-impl Perf {
-    pub fn new() -> Self {
-        Perf {
-            render: 0u32,
-            sim: 0u32,
-            fps: 0.0,
-            frame_count: 0usize,
-            last_fps_update: std::time::Instant::now(),
-        }
-
-    }
-}
-
 pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
     pub particle_radius: usize,
-    pub precision: usize,
-    pub gravity_x: f32,
-    pub gravity_y: f32,
-    pub friction: f32,
+    pub precision : usize,
     pub window: Window,
     pub start_density: f32,
     pub diffusion_rate: f32,
@@ -143,17 +119,18 @@ pub struct FluidWindow {
     pub top_boundary: Boundary,
     pub bottom_boundary: Boundary,
     buffer: Vec<u32>,
-    perf: Perf,
+    fps: f32,
+    frame_count: usize,
+    last_fps_update: std::time::Instant,
     paused: bool,
     step_frame: usize,
     display_mode: DisplayMode,
-    matter_mode: bool, //false: fluid, true: solid
+    //matter_mode: bool, //false: fluid, true: solid
 }
 
 impl FluidWindow {
     pub fn new(width: usize, height: usize, precision: usize,
                start_density: f32, diffusion_rate: f32,
-               gravity_x: f32, gravity_y: f32, friction: f32,
                max_color: u32, randomize: bool, random_smoothing: usize,
                pressure_iters: usize, diffusion_iters: usize,
                left_boundary: fluid_sim::Boundary, right_boundary: fluid_sim::Boundary,
@@ -164,9 +141,6 @@ impl FluidWindow {
             height,
             particle_radius: 20,
             precision,
-            gravity_x,
-            gravity_y,
-            friction,
             window: Window::new(
                 "Fluid Simulation",
                 width,
@@ -190,11 +164,13 @@ impl FluidWindow {
             top_boundary,
             bottom_boundary,
             buffer: vec![0u32; width * height],
-            perf: Perf::new(),
+            fps: 0.0,
+            frame_count: 0,
+            last_fps_update: std::time::Instant::now(),
             paused: false,
             step_frame: 0,
             display_mode: DisplayMode::Density,
-            matter_mode: false,
+            //matter_mode: false,
         }
     }
 
@@ -204,8 +180,6 @@ impl FluidWindow {
             (self.height / self.precision) as usize,
             self.start_density,
             self.diffusion_rate,
-            self.gravity_x, self.gravity_y,
-            self.friction
         );
         fluid.left_boundary = self.left_boundary;
         fluid.right_boundary = self.right_boundary;
@@ -228,16 +202,15 @@ impl FluidWindow {
                 continue;
             }
 
-            self.perf.frame_count += 1;
-            let elapsed = now.duration_since(self.perf.last_fps_update).as_secs_f32();
+            self.frame_count += 1;
+            let elapsed = now.duration_since(self.last_fps_update).as_secs_f32();
             if elapsed >= 0.5 {
-                self.perf.fps = self.perf.frame_count as f32 / elapsed;
-                self.perf.frame_count = 0;
-                self.perf.last_fps_update = now;
-                let title = format!("Fluid Sim - FPS: {:.0} ({}) | D_MODE: {} | MODE: {} | RADIUS: {} | \
-                render: {}ms | sim: {}ms",
-                    self.perf.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
-                    if self.matter_mode { "SOLID" } else { "FLUID" }, self.particle_radius, self.perf.render, self.perf.sim,
+                self.fps = self.frame_count as f32 / elapsed;
+                self.frame_count = 0;
+                self.last_fps_update = now;
+                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_RADIUS: {} ",
+                                    self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
+                                    self.particle_radius
                 );
                 self.window.set_title(&title);
             }
@@ -255,27 +228,21 @@ impl FluidWindow {
                 }
             }
 
-            if !self.window.is_key_down(minifb::Key::LeftCtrl) {
-                if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
-                    self.display_mode = self.display_mode.next();
-                }
+            if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
+                self.display_mode = self.display_mode.next();
+            }
 
-                if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
-                    self.matter_mode = !self.matter_mode;
-                }
+            if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
+                let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
+                let idx = radius.iter().position(|&r| r == self.particle_radius);
+                self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
+            }
 
-                if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
-                    let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
-                    let idx = radius.iter().position(|&r| r == self.particle_radius);
-                    self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
-                }
-
-                if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
-                    fluid.pressure.fill(0.0);
-                    fluid.divergence.fill(0.0);
-                    fluid.velocity_y.fill(0.0);
-                    fluid.velocity_x.fill(0.0);
-                }
+            if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
+                fluid.pressure.fill(0.0);
+                fluid.divergence.fill(0.0);
+                fluid.velocity_y.fill(0.0);
+                fluid.velocity_x.fill(0.0);
             }
 
             let (mx, my) = self
@@ -310,7 +277,7 @@ impl FluidWindow {
                         let y = y as usize;
 
                         if self.window.get_mouse_down(minifb::MouseButton::Left) {
-                            if self.matter_mode {
+                            if self.window.is_key_down(minifb::Key::LeftCtrl) {
                                 fluid.set_solid(x, y, true);
                             } else {
                                 let idx = x + y * fluid.width;
@@ -325,7 +292,7 @@ impl FluidWindow {
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Middle) {
-                            if self.matter_mode {
+                            if self.window.is_key_down(minifb::Key::LeftCtrl) {
                                 fluid.set_solid(x, y, false);
                             } else {
                                 let idx = x + y * fluid.width;
@@ -346,15 +313,10 @@ impl FluidWindow {
 
             last_mouse = (mx, my);
 
-            let t0_s = std::time::Instant::now();
             if !self.paused || self.step_frame > 0 {
                 fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); // clamp dt for stability
                 self.step_frame = self.step_frame.saturating_sub(1);
             }
-            self.perf.sim = (std::time::Instant::now() - t0_s).as_millis() as u32;
-
-            // Render
-            let t0_r = std::time::Instant::now();
 
             let pressure_max = fluid.pressure
                 .iter()
@@ -421,9 +383,9 @@ impl FluidWindow {
                     }
                 });
 
-            self.window.update_with_buffer(&self.buffer, self.width, self.height).unwrap();
-
-            self.perf.render = (std::time::Instant::now() - t0_r).as_millis() as u32;
+            self.window
+                .update_with_buffer(&self.buffer, self.width, self.height)
+                .unwrap();
         }
     }
 }

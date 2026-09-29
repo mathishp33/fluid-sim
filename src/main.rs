@@ -7,14 +7,13 @@ mod simulation;
 
 fn launch_simulation(width: usize, height: usize,
     precision: usize,
-    gravity_x: f32, gravity_y: f32, friction: f32,
     start_density: f32, diffusion_rate: f32,
     max_color: u32, randomize: bool, random_smoothing: usize,
     pressure_iters: usize, diffusion_iters: usize,
     left_boundary: Boundary, right_boundary: Boundary,
     top_boundary: Boundary, bottom_boundary: Boundary) {
 
-    let mut window = window::FluidWindow::new(width, height, precision, start_density, diffusion_rate, gravity_x, gravity_y, friction,
+    let mut window = window::FluidWindow::new(width, height, precision, start_density, diffusion_rate,
          max_color, randomize, random_smoothing, pressure_iters, diffusion_iters, left_boundary, right_boundary, top_boundary, bottom_boundary);
     window.run();
 }
@@ -24,9 +23,6 @@ struct SimulationSettings {
     width: usize,
     height: usize,
     precision: usize,
-    pub gravity_x: f32,
-    pub gravity_y: f32,
-    pub friction: f32,
     start_density: f32,
     max_density_color: [u8; 4],
     diffusion_rate: f32,
@@ -46,9 +42,6 @@ impl Default for SimulationSettings {
             width: 800,
             height: 600,
             precision: 10,
-            gravity_x: 0.0,
-            gravity_y: 0.0,
-            friction: 0.0,
             start_density: 0.2,
             max_density_color: [255, 255, 255, 255],
             diffusion_rate: 0.1,
@@ -87,67 +80,60 @@ impl eframe::App for MyApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.heading("Fluid Simulation Settings");
+            ui.heading("Fluid Simulation Settings");
 
-                ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
-                ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
+            ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
+            ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
-                ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
+            ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
 
-                ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=500).text("Pressure Iterations"));
-                ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=100).text("Diffusion Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
+            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
 
-                //ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
+            //ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
 
-                ComboBox::from_label("Precision (pixels)")
-                    .selected_text(format!("{}", self.settings.precision))
-                    .show_ui(ui, |ui| {
-                        for level in [1, 2, 5, 10, 20] {
-                            ui.selectable_value(&mut self.settings.precision, level, format!("{level}"));
-                        }
-                    });
+            ComboBox::from_label("Precision (pixels)")
+                .selected_text(format!("{}", self.settings.precision))
+                .show_ui(ui, |ui| {
+                    for level in [1, 2, 5, 10, 20] {
+                        ui.selectable_value(&mut self.settings.precision, level, format!("{level}"));
+                    }
+                });
 
-                ui.add(egui::Slider::new(&mut self.settings.gravity_x, -50.0..=50.0).text("Gravity X"));
-                ui.add(egui::Slider::new(&mut self.settings.gravity_y, -50.0..=50.0).text("Gravity Y"));
-                ui.add(egui::Slider::new(&mut self.settings.friction, 0.0..=2.0).text("Fluid Friction"));
+            ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
+            //ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
+            //ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
 
-                ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
-                ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
-                ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
+            boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
+            boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
+            boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
+            boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
 
-                boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
-                boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
-                boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
-                boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
+            let c = self.settings.max_density_color;
+            let mut local_color = Color32::from_rgb(c[0], c[1], c[2]);
+            ui.label("Max Density Color");
+            ui.color_edit_button_srgba(&mut local_color);
+            self.settings.max_density_color = local_color.to_array();
 
-                let c = self.settings.max_density_color;
-                let mut local_color = Color32::from_rgb(c[0], c[1], c[2]);
-                ui.label("Max Density Color");
-                ui.color_edit_button_srgba(&mut local_color);
-                self.settings.max_density_color = local_color.to_array();
+            if ui.button("Launch Simulation").clicked() {
+                save_settings(&self.settings);
 
-                if ui.button("Launch Simulation").clicked() {
-                    save_settings(&self.settings);
-
-                    let color = Color32::from_rgba_unmultiplied(
-                        self.settings.max_density_color[0],
-                        self.settings.max_density_color[1],
-                        self.settings.max_density_color[2],
-                        self.settings.max_density_color[3],
-                    );
-                    let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
-                    launch_simulation(
-                        self.settings.width, self.settings.height, self.settings.precision,
-                        self.settings.gravity_x, self.settings.gravity_y, self.settings.friction,
-                        self.settings.start_density, self.settings.diffusion_rate,
-                        max_color, self.settings.randomize, self.settings.random_smoothing,
-                        self.settings.pressure_iters, self.settings.diffusion_iters,
-                        self.settings.left_boundary, self.settings.right_boundary,
-                        self.settings.top_boundary, self.settings.bottom_boundary,
-                    );
-                }
-            });
+                let color = Color32::from_rgba_unmultiplied(
+                    self.settings.max_density_color[0],
+                    self.settings.max_density_color[1],
+                    self.settings.max_density_color[2],
+                    self.settings.max_density_color[3],
+                );
+                let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
+                launch_simulation(
+                    self.settings.width, self.settings.height, self.settings.precision,
+                    self.settings.start_density, self.settings.diffusion_rate,
+                    max_color, self.settings.randomize, self.settings.random_smoothing,
+                    self.settings.pressure_iters, self.settings.diffusion_iters,
+                    self.settings.left_boundary, self.settings.right_boundary,
+                    self.settings.top_boundary, self.settings.bottom_boundary,
+                );
+            }
         });
     }
 }
@@ -163,8 +149,8 @@ fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
 
         match boundary.boundary_type {
             simulation::fluid_sim::BoundaryType::Inlet => {
-                ui.add(egui::Slider::new(&mut boundary.velocity_x, -100.0..=100.0).text("Velocity X"));
-                ui.add(egui::Slider::new(&mut boundary.velocity_y, -100.0..=100.0).text("Velocity Y"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_x, -200.0..=200.0).text("Velocity X"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
                 ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
             }
@@ -213,13 +199,7 @@ fn save_settings(settings: &SimulationSettings) {
 fn main() -> eframe::Result<()> {
     println!("Rayon threads: {}", rayon::current_num_threads());
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 600.0])
-            .with_min_inner_size([400.0, 400.0])
-            .with_resizable(true),
-        ..Default::default()
-    };
+    let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Fluid Simulation Config",
         options,

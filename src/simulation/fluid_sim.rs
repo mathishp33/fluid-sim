@@ -217,8 +217,6 @@ impl FluidSim {
         let a = self.diffusion_rate * dt;
 
         for _ in 0..diffusion_iters {
-            // Apply diffusion using swap buffer - split interior and boundary
-            // Interior cells use diffusion formula
             let width = self.width;
 
             self.density_temp
@@ -329,46 +327,6 @@ impl FluidSim {
             + v11 * w11
     }
 
-    fn sample_density(&self, x: f32, y: f32) -> f32 {
-        if x < 0.0 {
-            return match self.left_boundary.boundary_type {
-                BoundaryType::Outlet => 0.0,
-                BoundaryType::Inlet => self.left_boundary.density,
-                BoundaryType::Wall => self.density[self.idx(0, y.clamp(0.0, (self.height - 1) as f32) as usize)],
-            };
-        }
-
-        if x >= self.width as f32 {
-            return match self.right_boundary.boundary_type {
-                BoundaryType::Outlet => 0.0,
-                BoundaryType::Inlet => self.right_boundary.density,
-                BoundaryType::Wall => self.density[self.idx(self.width - 1, y.clamp(0.0, (self.height - 1) as f32) as usize,
-                )],
-            };
-        }
-
-        if y < 0.0 {
-            return match self.top_boundary.boundary_type {
-                BoundaryType::Outlet => 0.0,
-                BoundaryType::Inlet => self.top_boundary.density,
-                BoundaryType::Wall => self.density[self.idx(
-                    x.clamp(0.0, (self.width - 1) as f32) as usize, 0,
-                )],
-            };
-        }
-
-        if y >= self.height as f32 {
-            return match self.bottom_boundary.boundary_type {
-                BoundaryType::Outlet => 0.0,
-                BoundaryType::Inlet => self.bottom_boundary.density,
-                BoundaryType::Wall => self.density[self.idx(x.clamp(0.0, (self.width - 1) as f32) as usize,
-                                                            self.height - 1, )],
-            };
-        }
-
-        Self::sample_field(&self.density, self.width, self.height, x, y)
-    }
-
     pub fn advect_density(&mut self, dt: f32) {
         self.density_temp.copy_from_slice(&self.density);
 
@@ -409,50 +367,26 @@ impl FluidSim {
                     let value = if px < 0.0 {
                         match left_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-
-                            BoundaryType::Inlet => {
-                                left_boundary.density
-                            }
-
-                            BoundaryType::Wall => {
-                                density[1 + y * width]
-                            }
+                            BoundaryType::Inlet => { left_boundary.density }
+                            BoundaryType::Wall => { density[1 + y * width] }
                         }
                     } else if px >= width as f32 {
                         match right_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-
-                            BoundaryType::Inlet => {
-                                right_boundary.density
-                            }
-
-                            BoundaryType::Wall => {
-                                density[(width - 2) + y * width]
-                            }
+                            BoundaryType::Inlet => { right_boundary.density }
+                            BoundaryType::Wall => { density[(width - 2) + y * width] }
                         }
                     } else if py < 0.0 {
                         match top_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-
-                            BoundaryType::Inlet => {
-                                top_boundary.density
-                            }
-
-                            BoundaryType::Wall => {
-                                density[x + width]
-                            }
+                            BoundaryType::Inlet => { top_boundary.density }
+                            BoundaryType::Wall => { density[x + width] }
                         }
                     } else if py >= height as f32 {
                         match bottom_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-
-                            BoundaryType::Inlet => {
-                                bottom_boundary.density
-                            }
-
-                            BoundaryType::Wall => {
-                                density[x + (height - 2) * width]
-                            }
+                            BoundaryType::Inlet => { bottom_boundary.density }
+                            BoundaryType::Wall => { density[x + (height - 2) * width] }
                         }
                     }
                     else {
@@ -475,13 +409,8 @@ impl FluidSim {
             let idx = self.idx(0, y);
 
             match self.left_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => {
-                    self.density[idx] = self.density[self.idx(1, y)];
-                }
-
-                BoundaryType::Inlet => {
-                    self.density[idx] = self.left_boundary.density;
-                }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(1, y)]; }
+                BoundaryType::Inlet => { self.density[idx] = self.left_boundary.density; }
             }
         }
 
@@ -490,13 +419,8 @@ impl FluidSim {
             let idx = self.idx(self.width - 1, y);
 
             match self.right_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => {
-                    self.density[idx] = self.density[self.idx(self.width - 2, y)];
-                }
-
-                BoundaryType::Inlet => {
-                    self.density[idx] = self.right_boundary.density;
-                }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(self.width - 2, y)]; }
+                BoundaryType::Inlet => { self.density[idx] = self.right_boundary.density; }
             }
         }
 
@@ -505,13 +429,8 @@ impl FluidSim {
             let idx = self.idx(x, 0);
 
             match self.top_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => {
-                    self.density[idx] = self.density[self.idx(x, 1)];
-                }
-
-                BoundaryType::Inlet => {
-                    self.density[idx] = self.top_boundary.density;
-                }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(x, 1)]; }
+                BoundaryType::Inlet => { self.density[idx] = self.top_boundary.density; }
             }
         }
 
@@ -520,13 +439,8 @@ impl FluidSim {
             let idx = self.idx(x, self.height - 1);
 
             match self.bottom_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => {
-                    self.density[idx] = self.density[self.idx(x, self.height - 2)];
-                }
-
-                BoundaryType::Inlet => {
-                    self.density[idx] = self.bottom_boundary.density;
-                }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(x, self.height - 2)]; }
+                BoundaryType::Inlet => { self.density[idx] = self.bottom_boundary.density; }
             }
         }
     }
@@ -602,11 +516,11 @@ impl FluidSim {
                 let solid_top = self.solids[self.idx(x, y - 1)];
                 let solid_bottom = self.solids[self.idx(x, y + 1)];
 
-                if solid_left || solid_right {
+                if (solid_left && self.velocity_x[idx] < 0.0) || (solid_right && self.velocity_x[idx] > 0.0) {
                     self.velocity_x[idx] = 0.0;
                 }
 
-                if solid_top || solid_bottom {
+                if (solid_top && self.velocity_y[idx] < 0.0) || (solid_bottom && self.velocity_y[idx] > 0.0) {
                     self.velocity_y[idx] = 0.0;
                 }
             }
