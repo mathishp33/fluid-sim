@@ -1,6 +1,7 @@
 use std::fmt::format;
 use minifb::{Window, WindowOptions};
-
+use std::fs;
+use rfd::FileDialog;
 use crate::simulation::fluid_sim;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,28 @@ impl DisplayMode {
             Self::Pressure => "PRESSURE",
             Self::Divergence => "DIVERGENCE",
             Self::Velocity => "VELOCITY",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MouseMode {
+    Rectangle,
+    Circle,
+}
+
+impl MouseMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Rectangle => Self::Circle,
+            Self::Circle => Self::Rectangle,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rectangle => "RECTANGLE",
+            Self::Circle => "CIRCLE",
         }
     }
 }
@@ -101,6 +124,35 @@ fn velocity_color(vx: f32, vy: f32, max_speed: f32) -> u32 {
     hsv_to_rgb(hue, 1.0, brightness)
 }
 
+pub fn save_vec(data: &Vec<bool>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = FileDialog::new()
+        .add_filter("Fluid Sim File", &["fsf"])
+        .set_file_name("simulation.fsf")
+        .save_file();
+
+    if let Some(path) = path {
+        let encoded = bincode::serialize(data)?;
+        fs::write(path, encoded)?;
+    }
+
+    Ok(())
+}
+
+pub fn load_vec() -> Result<Option<Vec<bool>>, Box<dyn std::error::Error>> {
+    let path = FileDialog::new()
+        .add_filter("Fluid Sim File", &["fsf"])
+        .pick_file();
+
+    if let Some(path) = path {
+        let bytes = fs::read(path)?;
+        let decoded: Vec<bool> = bincode::deserialize(&bytes)?;
+
+        return Ok(Some(decoded));
+    }
+
+    Ok(None)
+}
+
 pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
@@ -125,6 +177,8 @@ pub struct FluidWindow {
     paused: bool,
     step_frame: usize,
     display_mode: DisplayMode,
+    mouse_mode: MouseMode,
+    inverse_solid_color: bool,
     //matter_mode: bool, //false: fluid, true: solid
 }
 
@@ -170,6 +224,8 @@ impl FluidWindow {
             paused: false,
             step_frame: 0,
             display_mode: DisplayMode::Density,
+            mouse_mode: MouseMode::Rectangle,
+            inverse_solid_color: true,
             //matter_mode: false,
         }
     }
@@ -208,9 +264,13 @@ impl FluidWindow {
                 self.fps = self.frame_count as f32 / elapsed;
                 self.frame_count = 0;
                 self.last_fps_update = now;
-                let title = format!("Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_RADIUS: {} ",
-                                    self.fps, if self.paused { "PAUSED" } else { "RUNNING" }, self.display_mode.name(),
-                                    self.particle_radius
+                let title = format!(
+                    "Fluid Simulation - FPS: {:.1} ({}) | D_MODE: {} | M_MODE: {} | M_RADIUS: {}",
+                    self.fps,
+                    if self.paused { "PAUSED" } else { "RUNNING" },
+                    self.display_mode.name(),
+                    self.mouse_mode.name(),
+                    self.particle_radius
                 );
                 self.window.set_title(&title);
             }
@@ -228,14 +288,49 @@ impl FluidWindow {
                 }
             }
 
+            if self.window.is_key_pressed(minifb::Key::S, minifb::KeyRepeat::No) {
+                if let Err(e) = save_vec(&fluid.solids) {
+                    eprintln!("Save error: {}", e);
+                }
+            }
+
+            if self.window.is_key_pressed(minifb::Key::I, minifb::KeyRepeat::No) {
+                self.inverse_solid_color = !self.inverse_solid_color;
+            }
+
+            // Charger
+            if self.window.is_key_pressed(minifb::Key::L, minifb::KeyRepeat::No) {
+                match load_vec() {
+                    Ok(Some(data)) => {
+                        if data.len() == fluid.solids.len() {
+                            fluid.solids = data;
+                        } else {
+                            eprintln!("Invalid vector size");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("Load error: {}", e),
+                }
+            }
+
             if self.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
                 self.display_mode = self.display_mode.next();
             }
 
-            if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::No) {
-                let radius: [usize; 7] = [1, 2, 5, 10, 20, 50, 100];
-                let idx = radius.iter().position(|&r| r == self.particle_radius);
-                self.particle_radius = if idx.unwrap() + 1usize == radius.len() { radius[0] } else {radius[idx.unwrap() + 1usize] };
+            if self.window.is_key_pressed(minifb::Key::M, minifb::KeyRepeat::No) {
+                self.mouse_mode = self.mouse_mode.next();
+            }
+
+            if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::Yes) {
+                let radius: [usize; 38] = [1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+                    160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310, 320, 330, 340, 350];
+                let idx = radius.iter().position(|&r| r == self.particle_radius).unwrap();
+                if self.window.is_key_down(minifb::Key::LeftShift) {
+                    self.particle_radius = if idx == 0usize { radius[radius.len() - 1] } else {radius[idx - 1usize] };
+                }
+                else {
+                    self.particle_radius = if idx + 1usize == radius.len() { radius[0] } else {radius[idx + 1usize] };
+                }
             }
 
             if self.window.is_key_pressed(minifb::Key::R, minifb::KeyRepeat::No) {
@@ -260,13 +355,26 @@ impl FluidWindow {
             let gy = my / self.precision;
 
             if gx > 1 && gx < fluid.width - 1 && gy > 1 && gy < fluid.height - 1 {
-                let r = self.particle_radius / self.precision.max(1);
+                let r = (self.particle_radius / self.precision.max(1)).max(1);
+                let r_squared = (r * r) as isize;
 
                 for dx in -(r as isize)..=(r as isize) {
                     for dy in -(r as isize)..=(r as isize) {
+
+                        let inside = match self.mouse_mode {
+                            MouseMode::Rectangle => true,
+
+                            MouseMode::Circle => {
+                                dx * dx + dy * dy <= r_squared
+                            }
+                        };
+
+                        if !inside {
+                            continue;
+                        }
+
                         let x = gx as isize + dx;
                         let y = gy as isize + dy;
-
                         if x <= 0 || y <= 0 ||
                             x >= fluid.width as isize - 1 ||
                             y >= fluid.height as isize - 1 {
@@ -281,7 +389,9 @@ impl FluidWindow {
                                 fluid.set_solid(x, y, true);
                             } else {
                                 let idx = x + y * fluid.width;
-                                fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
+                                if !fluid.solids[idx] {
+                                    fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
+                                }
                             }
                         }
 
@@ -337,6 +447,7 @@ impl FluidWindow {
             let precision = self.precision;
             let max_color = self.max_color;
             let display_mode = self.display_mode;
+            let solid_color = if self.inverse_solid_color { 0xffffff } else { 0x000000 };
 
             self.buffer
                 .par_chunks_mut(self.width * precision)
@@ -346,7 +457,23 @@ impl FluidWindow {
                         let idx = x + y * fluid.width;
 
                         let color = if fluid.solids[idx] {
-                            0x000000
+                            match display_mode {
+                                DisplayMode::Density => {
+                                    0x000000
+                                }
+                                DisplayMode::Pressure => {
+                                    solid_color
+                                }
+
+                                DisplayMode::Divergence => {
+                                    solid_color
+                                }
+
+                                DisplayMode::Velocity => {
+                                    solid_color
+                                }
+                            }
+
                         } else {
                             match display_mode {
                                 DisplayMode::Density => {
