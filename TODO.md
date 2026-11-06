@@ -1,42 +1,35 @@
 
 
 ## Prioritaire
-1. Teleporter() kind of broken, destination size is not customizable.
-
+1. remplacer solver Poisson par solver Red-Black Gauss-Siedel
+2. paralléliser certains calculs couteux (incompressibilité en priorité) sur le GPU
+3. rélger le bug: taille de souris pas assez petite
+4. régler le bug: quand on ajoute à la souris de la densité sur des solides, la densité se duplique
+5. rajouter des "classes" de solides, Door(), Sink(), Emitter(), Accelerator(), Source()
 
 ## Moins prioritaire
-1. backtrace RK2 ou MacCormack
+1. changer minifb pour un système plus performant (Vulkan ? OpenGL ?) → on doit garder le cross platform
 
 ## Pas prioritaire
 1. faire une option 3D
 
-## Ancien / Autre (Quand même à faire)
+## Ancien / Autre
 
-1. Adaptation automatique du dt (condition CFL)
-2. Conservation & Diagnostics (CFL, pressure_residuals)
-3. Optimiser la simulation de fluide (Red/Black Gauss-Siedel ?, SOR ?, Conjugate Gradient ?, PCG ?, Multi-grid ?)
-4. Viscosité de vitesse
-5. Température
-6. Différents fluides FluidMaterial(density, viscosity, diffusion, temperature, color)
-7. Meilleures conditions aux limites (Periodic, Open, PressureOutlet, VelocityOutlet)
-8. Plusieurs fluides (changer le système de "density")
-9. Forces externes (gravité, archimède, frottements/pas frottements)
-10. Forces sur les solides mobiles Solid(position, accéleration, masse, angle, vitesse angulaire, inertie, statique/dynamique, forme)
-
-
+Optimiser la simulation de fluide (Red/Black Gauss-Siedel ?, SOR ?, Conjugate Gradient ?, PCG ?, Multi-grid ?)
+Forces externes (gravité, archimède, frottements/pas frottements)
+Forces sur les solides Solid(position, accéleration, masse, angle, vitesse angulaire, inertie, statique/dynamique, forme)
+Viscosité de vitesse
+Différents fluides FluidMaterial(density, viscosity, diffusion, temperature, color)
+Température
 Flottabilité
+Plusieurs fluides (changer le système de "density")
 Surface libre (liquide, air, interface) -> séparation liquide | air
 Tension de surface
+Système de particules ?
 FLIP/PIC ?
 Indicateur vorticité
 Écoulement compressible
-
-
-# Fait (Fonctionnalités)
- - solveur Red-Black Gauss-Siedel
- - SOR
- - Sous-pas adaptifs CFL
- - Advection semi-Lagrangienne
- - grille MAC
- - solides immobiles
- - cellules spéciales
+Meilleures conditions aux limites (Periodic, Open, PressureOutlet, VelocityOutlet)
+Sources / puits Sink(), Emitter(), Accelerator(), Deccelerator()
+Adaptation automatique du dt (condition CFL)
+Conservation & Diagnostics (div_max, tot_mass, Ec, CFL, pressure_residuals)

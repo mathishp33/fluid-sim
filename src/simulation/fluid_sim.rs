@@ -42,9 +42,6 @@ pub struct FluidSim {
     pub divergence: Vec<f32>,
     pub solids: Vec<bool>,
     pub sor_omega: f32,
-    pub gravity_x: f32,
-    pub gravity_y: f32,
-    pub friction: f32,
 
     density_temp: Vec<f32>,
     velocity_x_temp: Vec<f32>,
@@ -66,10 +63,8 @@ impl FluidSim {
         x + y * self.width
     }
 
-    pub fn new(width: usize, height: usize, start_density: f32, diffusion_rate: f32, gravity_x: f32, gravity_y: f32, friction: f32) -> Self {
+    pub fn new(width: usize, height: usize, start_density: f32, diffusion_rate: f32) -> Self {
         let size = width * height;
-        let n = width.min(height).max(2) as f32;
-        let sor_omega = 2.0 / (1.0 + (std::f32::consts::PI / n).sin());
         FluidSim {
             width,
             height,
@@ -81,10 +76,10 @@ impl FluidSim {
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
             solids: vec![false; size],
-            sor_omega,
-            gravity_x,
-            gravity_y,
-            friction,
+            sor_omega: {
+                let n = width.min(height) as f32;
+                2.0 / (1.0 + (std::f32::consts::PI / n).sin())
+            },
 
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
@@ -188,14 +183,8 @@ impl FluidSim {
         (distance_from_edge as f32 / offset as f32).clamp(0.0, 1.0)
     }
 
-    pub fn pressure_residual(&self) -> f32 {
-        // résidu = |div(v) - (pression appliquée)|
-        self.divergence
-            .iter()
-            .zip(self.solids.iter())
-            .filter(|(_, &s)| !s)
-            .map(|(d, _)| d.abs())
-            .fold(0.0, f32::max)
+    pub fn offset_velocity(x: usize, size: usize, velocity: f32, offset: usize) -> f32 {
+        velocity * Self::offset_factor(x, size, offset)
     }
 
     pub fn randomize_density_smoothed(&mut self, seed_count: usize) { //O(n)
@@ -712,66 +701,52 @@ impl FluidSim {
         let width = self.width;
         let height = self.height;
 
-        // gauche
         for y in 1..height - 1 {
-            let boundary = self.idx(0, y);
-            let inside = self.idx(1, y);
+            let l0 = self.idx(0, y);
 
-            if self.solids[boundary] {
-                self.pressure[boundary] = 0.0;
+            if self.solids[l0] {
+                self.pressure[l0] = 0.0;
             } else {
-                self.pressure[boundary] =
+                self.pressure[l0] =
                     match self.left_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[inside] }
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(1, y)] }
                     };
             }
-        }
 
-        // droite
-        for y in 1..height - 1 {
-            let boundary = self.idx(width - 1, y);
-            let inside = self.idx(width - 2, y);
-
-            if self.solids[boundary] {
-                self.pressure[boundary] = 0.0;
+            let l1 = self.idx(width - 1, y);
+            if self.solids[l1] {
+                self.pressure[l1] = 0.0;
             } else {
-                self.pressure[boundary] =
+                self.pressure[l1] =
                     match self.right_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[inside] }
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(width - 2, y)] }
                     };
             }
         }
 
-        // haut
-        for x in 1..width - 1 {
-            let boundary = self.idx(x, 0);
-            let inside = self.idx(x, 1);
 
-            if self.solids[boundary] {
-                self.pressure[boundary] = 0.0;
+        for x in 1..width - 1 {
+            let l2 = self.idx(x, 0);
+            if self.solids[l2] {
+                self.pressure[l2] = 0.0;
             } else {
-                self.pressure[boundary] =
+                self.pressure[l2] =
                     match self.top_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[inside] }
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, 1)] }
                     };
             }
-        }
 
-        // bas
-        for x in 1..width - 1 {
-            let boundary = self.idx(x, height - 1);
-            let inside = self.idx(x, height - 2);
-
-            if self.solids[boundary] {
-                self.pressure[boundary] = 0.0;
+            let l3 = self.idx(x, height - 1);
+            if self.solids[l3] {
+                self.pressure[l3] = 0.0;
             } else {
-                self.pressure[boundary] =
+                self.pressure[l3] =
                     match self.bottom_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[inside] }
+                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, height - 2)] }
                     };
             }
         }
@@ -814,43 +789,14 @@ impl FluidSim {
             });
     }
 
-    fn apply_external_forces(&mut self, dt: f32) {
-        let width = self.width;
-        let height = self.height;
-        let gravity_x = self.gravity_x;
-        let gravity_y = self.gravity_y;
-        let damping = (1.0 - self.friction * dt).max(0.0);
-        let solids = &self.solids;
-
-        self.velocity_x
-            .par_chunks_mut(width)
-            .zip(self.velocity_y.par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(y, (row_x, row_y))| {
-                if y == 0 || y == height - 1 {
-                    return;
-                }
-
-                for x in 1..width - 1 {
-                    let idx = x + y * width;
-                    if solids[idx] {
-                        continue;
-                    }
-
-                    row_x[x] = (row_x[x] + gravity_x * dt) * damping;
-                    row_y[x] = (row_y[x] + gravity_y * dt) * damping;
-                }
-            });
-    }
-
     pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {
         self.calculate_divergence();
         self.solve_pressure(pressure_iterations);
         self.correct_velocity();
     }
 
+
     pub fn step(&mut self, dt: f32, pressure_iterations: usize, diffusion_iterations: usize) {
-        self.apply_external_forces(dt);
         self.advect_velocity(dt); //advection vitesse (v)
         self.apply_velocity_boundaries(); //attention aux bordures (v)
 
