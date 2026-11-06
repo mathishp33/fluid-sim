@@ -1,8 +1,8 @@
 use eframe::egui::{self, Color32, ComboBox};
 use serde::{Deserialize, Serialize};
 use simulation::fluid_sim::Boundary;
-mod gpu;
 
+mod gpu;
 mod window;
 mod simulation;
 

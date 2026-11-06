@@ -20,3 +20,6 @@ pollster = "0.3"
 
 [[src]]
 name = "gpu"
+
+[[simulation]]
+name = "simulation/fluid_sim"

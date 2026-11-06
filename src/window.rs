@@ -1,10 +1,8 @@
-use std::fmt::format;
 use minifb::{Window, WindowOptions};
 use std::fs;
 use rfd::FileDialog;
 use crate::simulation::fluid_sim;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use fluid_sim::Boundary;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -156,7 +154,7 @@ pub fn load_vec() -> Result<Option<Vec<bool>>, Box<dyn std::error::Error>> {
 pub struct FluidWindow {
     pub width: usize,
     pub height: usize,
-    pub particle_radius: usize,
+    pub mouse_radius: usize,
     pub precision : usize,
     pub window: Window,
     pub start_density: f32,
@@ -193,7 +191,7 @@ impl FluidWindow {
         FluidWindow {
             width,
             height,
-            particle_radius: 20,
+            mouse_radius: 20,
             precision,
             window: Window::new(
                 "Fluid Simulation",
@@ -270,7 +268,7 @@ impl FluidWindow {
                     if self.paused { "PAUSED" } else { "RUNNING" },
                     self.display_mode.name(),
                     self.mouse_mode.name(),
-                    self.particle_radius
+                    self.mouse_radius
                 );
                 self.window.set_title(&title);
             }
@@ -324,12 +322,12 @@ impl FluidWindow {
             if self.window.is_key_pressed(minifb::Key::C, minifb::KeyRepeat::Yes) {
                 let radius: [usize; 38] = [1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
                     160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310, 320, 330, 340, 350];
-                let idx = radius.iter().position(|&r| r == self.particle_radius).unwrap();
+                let idx = radius.iter().position(|&r| r == self.mouse_radius).unwrap();
                 if self.window.is_key_down(minifb::Key::LeftShift) {
-                    self.particle_radius = if idx == 0usize { radius[radius.len() - 1] } else {radius[idx - 1usize] };
+                    self.mouse_radius = if idx == 0usize { radius[radius.len() - 1] } else {radius[idx - 1usize] };
                 }
                 else {
-                    self.particle_radius = if idx + 1usize == radius.len() { radius[0] } else {radius[idx + 1usize] };
+                    self.mouse_radius = if idx + 1usize == radius.len() { radius[0] } else {radius[idx + 1usize] };
                 }
             }
 
@@ -355,17 +353,27 @@ impl FluidWindow {
             let gy = my / self.precision;
 
             if gx > 1 && gx < fluid.width - 1 && gy > 1 && gy < fluid.height - 1 {
-                let r = (self.particle_radius / self.precision.max(1)).max(1);
-                let r_squared = (r * r) as isize;
+                let r = (self.mouse_radius as f32 / self.precision as f32).ceil() as isize;
 
-                for dx in -(r as isize)..=(r as isize) {
-                    for dy in -(r as isize)..=(r as isize) {
+                for dx in -r..=r {
+                    for dy in -r..=r {
+                        let x = gx as isize + dx;
+                        let y = gy as isize + dy;
+
+                        if x <= 0 || y <= 0 || x >= fluid.width as isize - 1 || y >= fluid.height as isize - 1 {
+                            continue;
+                        }
+
+                        // Distance réelle en pixels écran
+                        let dist_x = dx as f32 * self.precision as f32;
+                        let dist_y = dy as f32 * self.precision as f32;
 
                         let inside = match self.mouse_mode {
-                            MouseMode::Rectangle => true,
-
+                            MouseMode::Rectangle => {
+                                dist_x.abs() <= self.mouse_radius as f32 && dist_y.abs() <= self.mouse_radius as f32
+                            }
                             MouseMode::Circle => {
-                                dx * dx + dy * dy <= r_squared
+                                dist_x * dist_x + dist_y * dist_y <= (self.mouse_radius * self.mouse_radius) as f32
                             }
                         };
 
@@ -375,9 +383,7 @@ impl FluidWindow {
 
                         let x = gx as isize + dx;
                         let y = gy as isize + dy;
-                        if x <= 0 || y <= 0 ||
-                            x >= fluid.width as isize - 1 ||
-                            y >= fluid.height as isize - 1 {
+                        if x <= 0 || y <= 0 || x >= fluid.width as isize - 1 || y >= fluid.height as isize - 1 {
                             continue;
                         }
 
@@ -397,8 +403,8 @@ impl FluidWindow {
 
                         if self.window.get_mouse_down(minifb::MouseButton::Right) {
                             let idx = x + y * fluid.width;
-                            fluid.velocity_x[idx] += fx * 0.05;
-                            fluid.velocity_y[idx] += fy * 0.05;
+                            fluid.velocity_x[idx] += fx * 0.07;
+                            fluid.velocity_y[idx] += fy * 0.07;
                         }
 
                         if self.window.get_mouse_down(minifb::MouseButton::Middle) {
