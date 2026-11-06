@@ -1,6 +1,13 @@
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use crate::gpu::GpuContext;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ComputeMethod {
+    CPU,
+    GPU,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BoundaryType {
@@ -41,7 +48,7 @@ pub struct FluidSim {
     pub pressure: Vec<f32>,
     pub divergence: Vec<f32>,
     pub solids: Vec<bool>,
-    pub sor_omega: f32,
+    //pub sor_omega: f32,
 
     density_temp: Vec<f32>,
     velocity_x_temp: Vec<f32>,
@@ -54,7 +61,8 @@ pub struct FluidSim {
     pub bottom_boundary: Boundary,
 
     density_rhs: Vec<f32>,
-    open: Vec<bool>,
+    compute_method: ComputeMethod,
+    gpu_context: GpuContext,
 }
 
 impl FluidSim {
@@ -76,10 +84,10 @@ impl FluidSim {
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
             solids: vec![false; size],
-            sor_omega: {
-                let n = width.min(height) as f32;
-                2.0 / (1.0 + (std::f32::consts::PI / n).sin())
-            },
+            // sor_omega: {
+            //     let n = width.min(height) as f32;
+            //     2.0 / (1.0 + (std::f32::consts::PI / n).sin())
+            // },
 
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
@@ -92,7 +100,8 @@ impl FluidSim {
             bottom_boundary: Boundary::wall(),
 
             density_rhs: vec![0.0; size],
-            open: vec![false; size],
+            compute_method: ComputeMethod::GPU,
+            gpu_context: GpuContext::new(width, height),
         }
     }
 
@@ -644,56 +653,47 @@ impl FluidSim {
     fn solve_pressure(&mut self, iterations: usize) {
         let width = self.width;
         let height = self.height;
-        let omega = self.sor_omega;
 
         self.apply_pressure_boundaries();
 
         for _ in 0..iterations {
-            for color in 0..2 {
-                let pressure = &self.pressure;
-                let divergence = &self.divergence;
-                let solids = &self.solids;
+            let pressure = &self.pressure;
+            let divergence = &self.divergence;
+            let solids = &self.solids;
 
-                self.pressure_temp
-                    .par_chunks_mut(width)
-                    .enumerate()
-                    .for_each(|(y, row)| {
-                        if y == 0 || y == height - 1 {
-                            return;
+            self.pressure_temp
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    if y == 0 || y == height - 1 {
+                        return;
+                    }
+
+                    for x in 1..width - 1 {
+                        let idx = x + y * width;
+
+                        if solids[idx] {
+                            row[x] = 0.0;
+                            continue;
                         }
 
-                        for x in 1..width - 1 {
-                            let idx = x + y * width;
+                        let mut sum = divergence[idx];
+                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
 
-                            if solids[idx] {
-                                row[x] = 0.0;
-                                continue;
+                        for neighbor in neighbors {
+                            if solids[neighbor] {
+                                sum += pressure[idx]; // dp/dn = 0
+                            } else {
+                                sum += pressure[neighbor];
                             }
-
-                            if (x + y) % 2 != color {
-                                row[x] = pressure[idx];
-                                continue;
-                            }
-
-                            let mut sum = divergence[idx];
-                            let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
-
-                            for neighbor in neighbors {
-                                if solids[neighbor] {
-                                    sum += pressure[idx]; // dp/dn = 0
-                                } else {
-                                    sum += pressure[neighbor];
-                                }
-                            }
-
-                            let gs_value = sum * 0.25;
-                            row[x] = pressure[idx] + omega * (gs_value - pressure[idx]);
                         }
-                    });
 
-                std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
-                self.apply_pressure_boundaries();
-            }
+                        row[x] = sum * 0.25;
+                    }
+                });
+
+            std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
+            self.apply_pressure_boundaries();
         }
     }
 
@@ -790,9 +790,27 @@ impl FluidSim {
     }
 
     pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {
-        self.calculate_divergence();
-        self.solve_pressure(pressure_iterations);
-        self.correct_velocity();
+        if self.compute_method == ComputeMethod::CPU {
+            self.calculate_divergence();
+            self.solve_pressure(pressure_iterations);
+            self.correct_velocity();
+        } else if self.compute_method == ComputeMethod::GPU {
+            self.gpu_context.upload_solids(&self.solids);
+            self.gpu_context.upload_f32(&self.gpu_context.velocity_x_buf, &self.velocity_x);
+            self.gpu_context.upload_f32(&self.gpu_context.velocity_y_buf, &self.velocity_y);
+            self.gpu_context.upload_f32(&self.gpu_context.pressure_buf, &self.pressure);
+
+            self.gpu_context.enforce_incompressibility(
+                pressure_iterations,
+                self.left_boundary.boundary_type,
+                self.right_boundary.boundary_type,
+                self.top_boundary.boundary_type,
+                self.bottom_boundary.boundary_type,
+                &mut self.velocity_x,
+                &mut self.velocity_y,
+                &mut self.pressure,
+            );
+        }
     }
 
 
