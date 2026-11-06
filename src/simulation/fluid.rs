@@ -1,7 +1,7 @@
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::gpu::GpuContext;
+use crate::simulation::gpu::gpu::GpuContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeMethod {
@@ -194,23 +194,6 @@ impl FluidSim {
 
     pub fn offset_velocity(x: usize, size: usize, velocity: f32, offset: usize) -> f32 {
         velocity * Self::offset_factor(x, size, offset)
-    }
-
-    pub fn randomize_density_smoothed(&mut self, seed_count: usize) { //O(n)
-        let mut rng = rand::thread_rng();
-
-        self.density.fill(0.0);
-
-        for _ in 0..seed_count {
-            let x = rng.gen_range(1..self.width - 1);
-            let y = rng.gen_range(1..self.height - 1);
-            let idx = self.idx(x, y);
-            self.density[idx] = rng.gen_range(0.5..1.0);
-        }
-
-        for _ in 0..20 {
-            self.diffuse_density(0.1, 1);
-        }
     }
 
     pub fn get_density(&self, x: usize, y: usize) -> f32 {
