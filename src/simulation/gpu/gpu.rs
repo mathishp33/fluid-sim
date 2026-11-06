@@ -1,4 +1,4 @@
-use crate::simulation::fluid_sim::BoundaryType;
+use crate::simulation::fluid::BoundaryType;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

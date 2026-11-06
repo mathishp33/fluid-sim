@@ -1,9 +1,9 @@
 use minifb::{Window, WindowOptions};
 use std::fs;
 use rfd::FileDialog;
-use crate::simulation::fluid_sim;
+use crate::simulation::fluid;
 use rayon::prelude::*;
-use fluid_sim::Boundary;
+use fluid::Boundary;
 
 #[derive(Clone, Copy, PartialEq)]
 enum DisplayMode {
@@ -160,8 +160,6 @@ pub struct FluidWindow {
     pub start_density: f32,
     pub diffusion_rate: f32,
     pub max_color: u32,
-    pub randomize: bool,
-    pub random_smoothing: usize,
     pub pressure_iters: usize,
     pub diffusion_iters: usize,
     pub left_boundary: Boundary,
@@ -183,10 +181,10 @@ pub struct FluidWindow {
 impl FluidWindow {
     pub fn new(width: usize, height: usize, precision: usize,
                start_density: f32, diffusion_rate: f32,
-               max_color: u32, randomize: bool, random_smoothing: usize,
+               max_color: u32,
                pressure_iters: usize, diffusion_iters: usize,
-               left_boundary: fluid_sim::Boundary, right_boundary: fluid_sim::Boundary,
-               top_boundary: fluid_sim::Boundary, bottom_boundary: fluid_sim::Boundary,
+               left_boundary: fluid::Boundary, right_boundary: fluid::Boundary,
+               top_boundary: fluid::Boundary, bottom_boundary: fluid::Boundary,
     ) -> Self {
         FluidWindow {
             width,
@@ -207,8 +205,6 @@ impl FluidWindow {
             start_density,
             diffusion_rate,
             max_color,
-            randomize,
-            random_smoothing,
             pressure_iters,
             diffusion_iters,
             left_boundary,
@@ -229,7 +225,7 @@ impl FluidWindow {
     }
 
     pub fn run(&mut self) {
-        let mut fluid = fluid_sim::FluidSim::new(
+        let mut fluid = fluid::FluidSim::new(
             (self.width / self.precision) as usize,
             (self.height / self.precision) as usize,
             self.start_density,
@@ -239,10 +235,6 @@ impl FluidWindow {
         fluid.right_boundary = self.right_boundary;
         fluid.top_boundary = self.top_boundary;
         fluid.bottom_boundary = self.bottom_boundary;
-
-        if self.randomize {
-            fluid.randomize_density_smoothed(self.random_smoothing);
-        }
 
         let mut last_mouse = (0usize, 0usize);
         let mut last_time = std::time::Instant::now();
