@@ -1,11 +1,10 @@
 
 
 ## Prioritaire
-1. remplacer solver Poisson par solver Red-Black Gauss-Siedel
-2. paralléliser certains calculs couteux (incompressibilité en priorité) sur le GPU
-3. rélger le bug: taille de souris pas assez petite
-4. régler le bug: quand on ajoute à la souris de la densité sur des solides, la densité se duplique
-5. rajouter des "classes" de solides, Door(), Sink(), Emitter(), Accelerator(), Source()
+1. rélger le bug: taille de souris pas assez petite
+2. régler le bug: quand on ajoute à la souris de la densité sur des solides, la densité se duplique
+3. rajouter des "classes" de solides, Door(), Sink(), Emitter(), Accelerator(), Source()
+4. remplacer solver Poisson par solver Red-Black Gauss-Siedel
 
 ## Moins prioritaire
 1. changer minifb pour un système plus performant (Vulkan ? OpenGL ?) → on doit garder le cross platform
