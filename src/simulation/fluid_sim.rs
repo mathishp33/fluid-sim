@@ -41,6 +41,7 @@ pub struct FluidSim {
     pub pressure: Vec<f32>,
     pub divergence: Vec<f32>,
     pub solids: Vec<bool>,
+    pub sor_omega: f32,
 
     density_temp: Vec<f32>,
     velocity_x_temp: Vec<f32>,
@@ -75,6 +76,10 @@ impl FluidSim {
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
             solids: vec![false; size],
+            sor_omega: {
+                let n = width.min(height) as f32;
+                2.0 / (1.0 + (std::f32::consts::PI / n).sin())
+            },
 
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
@@ -639,45 +644,56 @@ impl FluidSim {
     fn solve_pressure(&mut self, iterations: usize) {
         let width = self.width;
         let height = self.height;
+        let omega = self.sor_omega;
 
         self.apply_pressure_boundaries();
 
         for _ in 0..iterations {
-            let pressure = &self.pressure;
-            let divergence = &self.divergence;
+            for color in 0..2 {
+                let pressure = &self.pressure;
+                let divergence = &self.divergence;
+                let solids = &self.solids;
 
-            self.pressure_temp
-                .par_chunks_mut(width)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    if y == 0 || y == height - 1 {
-                        return;
-                    }
-
-                    for x in 1..width - 1 {
-                        let idx = x + y * width;
-                        if self.solids[idx] {
-                            row[x] = 0.0;
-                            continue;
+                self.pressure_temp
+                    .par_chunks_mut(width)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        if y == 0 || y == height - 1 {
+                            return;
                         }
 
-                        let mut sum = divergence[idx];
-                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
+                        for x in 1..width - 1 {
+                            let idx = x + y * width;
 
-                        for neighbor in neighbors {
-                            if self.solids[neighbor] {
-                                sum += pressure[idx]; //dp/dn = 0
-                            } else {
-                                sum += pressure[neighbor];
+                            if solids[idx] {
+                                row[x] = 0.0;
+                                continue;
                             }
+
+                            if (x + y) % 2 != color {
+                                row[x] = pressure[idx];
+                                continue;
+                            }
+
+                            let mut sum = divergence[idx];
+                            let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
+
+                            for neighbor in neighbors {
+                                if solids[neighbor] {
+                                    sum += pressure[idx]; // dp/dn = 0
+                                } else {
+                                    sum += pressure[neighbor];
+                                }
+                            }
+
+                            let gs_value = sum * 0.25;
+                            row[x] = pressure[idx] + omega * (gs_value - pressure[idx]);
                         }
+                    });
 
-                        row[x] = sum * 0.25;
-                    }
-                });
-
-            std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
-            self.apply_pressure_boundaries();
+                std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
+                self.apply_pressure_boundaries();
+            }
         }
     }
 
