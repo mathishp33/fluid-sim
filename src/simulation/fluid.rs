@@ -1,3 +1,4 @@
+use std::cmp::PartialEq;
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,16 @@ impl Boundary {
     }
 }
 
+
+#[derive(Clone, Copy)]
+pub enum CellEffect {
+    Sink { rate: f32, sub_div: bool },
+    Source { density: f32 },
+    Emitter { vx: f32, vy: f32, density: f32 },
+    Accelerator { ax: f32, ay: f32 },
+    Teleporter { dest_idx: usize },
+}
+
 pub struct FluidSim {
     pub width: usize,
     pub height: usize,
@@ -48,6 +59,7 @@ pub struct FluidSim {
     pub pressure: Vec<f32>,
     pub divergence: Vec<f32>,
     pub solids: Vec<bool>,
+    pub special_cells: Vec<(usize, CellEffect)>,
     //pub sor_omega: f32,
 
     density_temp: Vec<f32>,
@@ -84,6 +96,7 @@ impl FluidSim {
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
             solids: vec![false; size],
+            special_cells: vec![],
             // sor_omega: {
             //     let n = width.min(height) as f32;
             //     2.0 / (1.0 + (std::f32::consts::PI / n).sin())
@@ -103,6 +116,10 @@ impl FluidSim {
             compute_method: ComputeMethod::GPU,
             gpu_context: GpuContext::new(width, height),
         }
+    }
+
+    pub fn set_special(&mut self, x: usize, y: usize, effect: CellEffect) {
+
     }
 
     pub fn set_solid(&mut self, x: usize, y: usize, solid: bool) {
@@ -192,15 +209,7 @@ impl FluidSim {
         (distance_from_edge as f32 / offset as f32).clamp(0.0, 1.0)
     }
 
-    pub fn offset_velocity(x: usize, size: usize, velocity: f32, offset: usize) -> f32 {
-        velocity * Self::offset_factor(x, size, offset)
-    }
-
-    pub fn get_density(&self, x: usize, y: usize) -> f32 {
-        self.density[self.idx(x, y)]
-    } //O(1)
-
-    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[bool], width: usize, height: usize, a: f32, iters: usize, ) {
+    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[bool], width: usize, height: usize, a: f32, iters: usize) {
         rhs.copy_from_slice(field);
         temp.copy_from_slice(field);
 
@@ -600,6 +609,39 @@ impl FluidSim {
         }
     }
 
+    fn apply_special_cells(&mut self, dt: f32) {
+        for special_cell in self.special_cells.iter() {
+            let (idx, sc) = special_cell;
+            if self.solids[*idx] {
+                continue;
+            }
+            match sc {
+                CellEffect::Accelerator {ax, ay} => {
+                    self.velocity_x[*idx] += ax * dt;
+                    self.velocity_y[*idx] += ay * dt;
+                }
+                CellEffect::Emitter {vx, vy, density} => {
+                    self.velocity_x[*idx] = *vx;
+                    self.velocity_y[*idx] = *vy;
+                    self.density[*idx] = *density;
+                }
+                CellEffect::Source {density} => {
+                    self.density[*idx] = *density;
+                }
+                CellEffect::Teleporter {dest_idx} => {
+                    self.density[*dest_idx] = self.density[*idx];
+                    self.density[*idx] = 0.0;
+                }
+                CellEffect::Sink {rate, sub_div} => {
+                    if *sub_div {
+                        self.divergence[*idx] = - rate * dt;
+                    }
+                    self.density[*idx] = (self.density[*idx] - rate * dt).min(0.0);
+                }
+            }
+        }
+    }
+
     fn calculate_divergence(&mut self) {
         let width = self.width;
         let height = self.height;
@@ -805,6 +847,8 @@ impl FluidSim {
 
         self.enforce_incompressibility(pressure_iterations); //divergence et pression -> vitesse
         self.apply_velocity_boundaries(); //attention aux bordures (v)
+
+        self.apply_special_cells(dt); //conditions des cellules speciales
 
         self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
