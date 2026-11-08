@@ -8,8 +8,8 @@ use rfd::FileDialog;
 
 use crate::simulation::fluid::FluidSim;
 use crate::window::starting_window::SimulationSettings;
+use crate::window::starting_window::boundary_ui;
 
-/// Ce que l'écran de simulation demande à l'application racine.
 pub enum WindowAction {
     None,
     BackToSettings,
@@ -81,10 +81,6 @@ fn cycle_radius(current: usize, reverse: bool) -> usize {
         RADII.iter().copied().find(|&r| r > current).unwrap_or(RADII[0])
     }
 }
-
-// ---------------------------------------------------------------------------
-// Couleurs (inchangées : elles produisent du 0x00RRGGBB comme avec minifb)
-// ---------------------------------------------------------------------------
 
 fn signed_color(value: f32, max_abs: f32) -> u32 {
     if max_abs <= 1e-12 {
@@ -186,11 +182,7 @@ pub fn load_vec() -> Result<Option<Vec<bool>>, Box<dyn std::error::Error>> {
     Ok(None)
 }
 
-// ---------------------------------------------------------------------------
-// Entrées
-// ---------------------------------------------------------------------------
 
-/// Touche pressée cette frame, sans compter l'auto-répétition (≈ KeyRepeat::No).
 fn pressed_once(input: &egui::InputState, key: egui::Key) -> bool {
     input.events.iter().any(|e| {
         matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key)
@@ -211,11 +203,9 @@ struct Stats {
     divergence_max: f32,
     velocity_max: f32,
     total_density: f32,
+    kinetic_energy: f32,
 }
 
-// ---------------------------------------------------------------------------
-// Écran de simulation
-// ---------------------------------------------------------------------------
 
 pub struct FluidWindow {
     fluid: FluidSim,
@@ -294,7 +284,6 @@ impl FluidWindow {
         }
     }
 
-    /// Appelé à chaque frame egui. Dessine toute l'interface et fait avancer la simulation.
     pub fn ui(&mut self, ctx: &egui::Context) -> WindowAction {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().max(1e-4);
@@ -305,7 +294,6 @@ impl FluidWindow {
 
         self.handle_shortcuts(ctx, &mut action);
 
-        // Les panneaux latéraux/haut/bas doivent être ajoutés AVANT le CentralPanel.
         self.top_bar(ctx, &mut action);
         self.status_bar(ctx);
         self.controls_panel(ctx);
@@ -313,7 +301,6 @@ impl FluidWindow {
         self.canvas(ctx, dt);
         self.help_window(ctx);
 
-        // Simulation temps réel : on redemande une frame en continu.
         ctx.request_repaint();
         action
     }
@@ -327,10 +314,6 @@ impl FluidWindow {
             self.last_fps_update = now;
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Raccourcis clavier
-    // -----------------------------------------------------------------------
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, action: &mut WindowAction) {
         if ctx.wants_keyboard_input() {
@@ -380,10 +363,6 @@ impl FluidWindow {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Actions
-    // -----------------------------------------------------------------------
-
     fn reset_flow(&mut self) {
         self.fluid.pressure.fill(0.0);
         self.fluid.divergence.fill(0.0);
@@ -416,15 +395,12 @@ impl FluidWindow {
         self.after_blocking_dialog();
     }
 
-    /// Les dialogues rfd bloquent la boucle : on évite un énorme dt et un "saut" de souris après.
+
     fn after_blocking_dialog(&mut self) {
         self.last_frame = Instant::now();
         self.last_mouse = None;
     }
 
-    // -----------------------------------------------------------------------
-    // Panneaux egui (c'est ici que tu peux personnaliser l'interface)
-    // -----------------------------------------------------------------------
 
     fn top_bar(&mut self, ctx: &egui::Context, action: &mut WindowAction) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -496,13 +472,23 @@ impl FluidWindow {
             ui.add(egui::Slider::new(&mut self.mouse_radius, 1..=350).text("Radius (C)"));
 
             ui.separator();
-            ui.label("Solver (live)");
+            ui.checkbox(&mut self.inverse_solid_color, "White solids (I)");
+
+            ui.separator();
+            ui.heading("Live Settings");
+            ui.separator();
+            ui.label("Solver");
             ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
             ui.add(egui::Slider::new(&mut self.diffusion_iters, 0..=50).text("Diffusion iters"));
             ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
-
             ui.separator();
-            ui.checkbox(&mut self.inverse_solid_color, "White solids (I)");
+            ui.label("Boundaries");
+            boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary);
+            boundary_ui(ui, "Right Boundary", &mut self.fluid.right_boundary);
+            boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary);
+            boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary);
+
+
         });
     }
 
@@ -528,6 +514,7 @@ impl FluidWindow {
                 row("Max |divergence|", format!("{:.3}", self.stats.divergence_max));
                 row("Max speed", format!("{:.3}", self.stats.velocity_max));
                 row("Total density", format!("{:.2}", self.stats.total_density));
+                row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
             });
 
             ui.separator();
@@ -586,10 +573,6 @@ impl FluidWindow {
             });
     }
 
-    // -----------------------------------------------------------------------
-    // Zone centrale : simulation + rendu
-    // -----------------------------------------------------------------------
-
     fn canvas(&mut self, ctx: &egui::Context, dt: f32) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
@@ -598,7 +581,6 @@ impl FluidWindow {
                 return;
             }
 
-            // Image affichée en conservant le ratio de la grille, centrée.
             let gw = self.fluid.width as f32;
             let gh = self.fluid.height as f32;
             let scale = (outer.width() / gw).min(outer.height() / gh);
@@ -645,7 +627,6 @@ impl FluidWindow {
             return;
         };
 
-        // Position normalisée dans l'image [0, 1)
         let u = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 0.9999);
         let v = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 0.9999);
 
@@ -655,7 +636,6 @@ impl FluidWindow {
         let gy = (v * gh) as usize;
         self.hovered_cell = Some((gx, gy));
 
-        // Position en "pixels de simulation" (indépendante de la taille de la fenêtre)
         let mx = u * gw * self.precision as f32;
         let my = v * gh * self.precision as f32;
 
@@ -694,7 +674,6 @@ impl FluidWindow {
                     continue;
                 }
 
-                // Distance réelle en pixels de simulation
                 let dist_x = dx as f32 * precision;
                 let dist_y = dy as f32 * precision;
 
@@ -736,10 +715,17 @@ impl FluidWindow {
 
     fn simulate(&mut self, dt: f32) {
         if !self.paused || self.step_frame > 0 {
-            // dt borné pour la stabilité
-            self.fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters);
+            self.fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); //todo!(baisser 0.05)
             self.step_frame = self.step_frame.saturating_sub(1);
         }
+    }
+
+    fn calculate_kinetic_energy(&mut self) -> f32 {
+        let mut sum: f32 = 0.0;
+        for i in 0..=self.fluid.velocity_x.len() {
+           sum += (self.fluid.velocity_x[i] * self.fluid.velocity_x[i] + self.fluid.velocity_y[i] * self.fluid.velocity_y[i]) * self.fluid.density[i];
+        }
+        0.5 * sum
     }
 
     fn update_stats(&mut self) {
@@ -754,11 +740,18 @@ impl FluidWindow {
                 .map(|(&vx, &vy)| (vx * vx + vy * vy).sqrt())
                 .reduce(|| 0.0, f32::max),
             total_density: f.density.par_iter().sum::<f32>(),
+            kinetic_energy: 0.5 * f
+                .velocity_x
+                .par_iter()
+                .zip(f.velocity_y.par_iter())
+                .zip(f.density.par_iter())
+                .map(|((&vx, &vy), &d)| {
+                    d * (vx * vx + vy * vy)
+                })
+                .sum::<f32>(),
         };
     }
 
-    /// Colorise la grille (1 pixel par cellule) puis envoie le résultat au GPU (wgpu) comme texture.
-    /// Le agrandissement (precision) est fait par le GPU avec un filtre "nearest".
     fn update_texture(&mut self, ctx: &egui::Context) {
         let w = self.fluid.width;
         let h = self.fluid.height;

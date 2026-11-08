@@ -103,7 +103,7 @@ impl StartingGui {
     }
 }
 
-fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
+pub fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
     ui.collapsing(name, |ui| {
         ComboBox::from_label("Type")
             .selected_text(format!("{:?}", boundary.boundary_type))
