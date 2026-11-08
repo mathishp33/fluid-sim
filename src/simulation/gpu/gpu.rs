@@ -1,4 +1,5 @@
 use crate::simulation::fluid::BoundaryType;
+use crate::simulation::fluid::CellType;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -195,8 +196,8 @@ impl GpuContext {
         self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
-    pub fn upload_solids(&self, data: &[bool]) {
-        let as_u32: Vec<u32> = data.iter().map(|&b| b as u32).collect();
+    pub fn upload_solids(&self, data: &[CellType]) {
+        let as_u32: Vec<u32> = data.iter().map(|&t| (t == CellType::Wall) as u32).collect();
         self.queue.write_buffer(&self.solids_buf, 0, bytemuck::cast_slice(&as_u32));
     }
 

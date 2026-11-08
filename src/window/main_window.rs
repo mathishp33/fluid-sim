@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use rfd::FileDialog;
 
 use crate::simulation::fluid::FluidSim;
+use crate::simulation::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
 
@@ -148,11 +149,7 @@ fn velocity_color(vx: f32, vy: f32, max_speed: f32) -> u32 {
     hsv_to_rgb(hue, 1.0, brightness)
 }
 
-// ---------------------------------------------------------------------------
-// Sauvegarde / chargement des solides
-// ---------------------------------------------------------------------------
-
-pub fn save_vec(data: &[bool]) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+pub fn save_vec(data: &[CellType]) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     let path = FileDialog::new()
         .add_filter("Fluid Sim File", &["fsf"])
         .set_file_name("simulation.fsf")
@@ -167,14 +164,14 @@ pub fn save_vec(data: &[bool]) -> Result<Option<PathBuf>, Box<dyn std::error::Er
     Ok(None)
 }
 
-pub fn load_vec() -> Result<Option<Vec<bool>>, Box<dyn std::error::Error>> {
+pub fn load_vec() -> Result<Option<Vec<CellType>>, Box<dyn std::error::Error>> {
     let path = FileDialog::new()
         .add_filter("Fluid Sim File", &["fsf"])
         .pick_file();
 
     if let Some(path) = path {
         let bytes = fs::read(path)?;
-        let decoded: Vec<bool> = bincode::deserialize(&bytes)?;
+        let decoded: Vec<CellType> = bincode::deserialize(&bytes)?;
 
         return Ok(Some(decoded));
     }
@@ -535,7 +532,7 @@ impl FluidWindow {
                         row("Density", format!("{:.3}", self.fluid.density[idx]));
                         row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
                         row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
-                        row("Solid", format!("{}", self.fluid.solids[idx]));
+                        row("Solid", format!("{}", self.fluid.solids[idx].to_string()));
                     });
                 }
                 None => {
@@ -691,8 +688,8 @@ impl FluidWindow {
 
                 if input.left {
                     if input.ctrl {
-                        fluid.set_solid(x, y, true);
-                    } else if !fluid.solids[idx] {
+                        fluid.set_cell(x, y, CellType::Wall, None);
+                    } else if fluid.solids[idx] == CellType::Fluid {
                         fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
                     }
                 }
@@ -704,7 +701,7 @@ impl FluidWindow {
 
                 if input.middle {
                     if input.ctrl {
-                        fluid.set_solid(x, y, false);
+                        fluid.set_cell(x, y, CellType::Fluid, None);
                     } else {
                         fluid.density[idx] = (fluid.density[idx] - 2.0 * dt).max(0.0);
                     }
@@ -776,7 +773,7 @@ impl FluidWindow {
                 for (x, px) in row.chunks_exact_mut(4).enumerate() {
                     let idx = x + y * w;
 
-                    let color: u32 = if solids[idx] {
+                    let color: u32 = if solids[idx] == CellType::Wall {
                         match mode {
                             DisplayMode::Density => 0x000000,
                             _ => solid_color,

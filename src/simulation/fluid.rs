@@ -38,14 +38,65 @@ impl Boundary {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellType {
+    Fluid = 0,
+    Wall = 1,
+    Sink = 2,
+    Emitter = 3,
+    Accelerator = 4,
+    Teleporter = 5,
+}
 
-#[derive(Clone, Copy)]
+impl CellType {
+    #[inline]
+    pub fn is_special(self) -> bool {
+        self as u8 >= 2
+    }
+
+    pub fn to_string(self) -> String {
+        match self {
+            CellType::Fluid => {
+                "Fluid".parse().unwrap()
+            }
+            CellType::Wall => {
+                "Wall".parse().unwrap()
+            }
+            CellType::Sink => {
+                "Sink".parse().unwrap()
+            }
+            CellType::Emitter => {
+                "Emitter".parse().unwrap()
+            }
+            CellType::Accelerator => {
+                "Accelerator".parse().unwrap()
+            }
+            CellType::Teleporter => {
+                "Teleporter".parse().unwrap()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CellEffect {
-    Sink { rate: f32, sub_div: bool },
-    Source { density: f32 },
+    Sink { rate: f32 },
     Emitter { vx: f32, vy: f32, density: f32 },
     Accelerator { ax: f32, ay: f32 },
     Teleporter { dest_idx: usize },
+}
+
+impl CellEffect {
+    pub fn default_for(kind: CellType) -> Option<(Self)> {
+        match kind {
+            CellType::Sink => Some(Self::Sink { rate: 5.0 }),
+            CellType::Emitter => Some(Self::Emitter { vx: 0.0, vy: 0.0, density: 1.0 }),
+            CellType::Accelerator => Some(Self::Accelerator { ax: 50.0, ay: 0.0 }),
+            CellType::Teleporter => None, // dest_idx dépend de la cellule, voir set_cell
+            _ => None,
+        }
+    }
 }
 
 pub struct FluidSim {
@@ -58,7 +109,7 @@ pub struct FluidSim {
     pub diffusion_rate: f32,
     pub pressure: Vec<f32>,
     pub divergence: Vec<f32>,
-    pub solids: Vec<bool>,
+    pub solids: Vec<CellType>,
     pub special_cells: Vec<(usize, CellEffect)>,
     //pub sor_omega: f32,
 
@@ -95,8 +146,8 @@ impl FluidSim {
             diffusion_rate,
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
-            solids: vec![false; size],
-            special_cells: vec![],
+            solids: vec![CellType::Fluid; size],
+            special_cells: Vec::new(),
             // sor_omega: {
             //     let n = width.min(height) as f32;
             //     2.0 / (1.0 + (std::f32::consts::PI / n).sin())
@@ -118,23 +169,33 @@ impl FluidSim {
         }
     }
 
-    pub fn set_special(&mut self, x: usize, y: usize, effect: CellEffect) {
-
-    }
-
-    pub fn set_solid(&mut self, x: usize, y: usize, solid: bool) {
+    pub fn set_cell(&mut self, x: usize, y: usize, kind: CellType, effect: Option<CellEffect>) {
         if x == 0 || x >= self.width - 1 || y == 0 || y >= self.height - 1 {
             return;
         }
         let idx = self.idx(x, y);
+        let old = self.solids[idx];
 
-        if self.solids[idx] == solid {
+        if old == kind && !kind.is_special() {
             return;
         }
 
-        self.solids[idx] = solid;
+        if old.is_special() {
+            if let Some(p) = self.special_cells.iter().position(|(i, _)| *i == idx) {
+                self.special_cells.swap_remove(p);
+            }
+        }
 
-        if solid {
+        self.solids[idx] = kind;
+
+        if kind.is_special() {
+            let eff = effect
+                .or_else(|| CellEffect::default_for(kind))
+                .unwrap_or(CellEffect::Teleporter { dest_idx: idx }); // téléporteur sans destination = no-op
+            self.special_cells.push((idx, eff));
+        }
+
+        if kind == CellType::Wall {
             self.density[idx] = 0.0;
             self.velocity_x[idx] = 0.0;
             self.velocity_y[idx] = 0.0;
@@ -145,7 +206,10 @@ impl FluidSim {
             self.velocity_x_temp[idx] = 0.0;
             self.velocity_y_temp[idx] = 0.0;
             self.pressure_temp[idx] = 0.0;
+            return;
+        }
 
+        if old != CellType::Wall {
             return;
         }
 
@@ -163,10 +227,9 @@ impl FluidSim {
         let mut count = 0.0;
 
         for neighbor in neighbors {
-            if self.solids[neighbor] {
+            if self.solids[neighbor] == CellType::Wall {
                 continue;
             }
-
             density_sum += self.density[neighbor];
             velocity_x_sum += self.velocity_x[neighbor];
             velocity_y_sum += self.velocity_y[neighbor];
@@ -187,7 +250,6 @@ impl FluidSim {
         }
 
         self.divergence[idx] = 0.0;
-
         self.density_temp[idx] = self.density[idx];
         self.velocity_x_temp[idx] = self.velocity_x[idx];
         self.velocity_y_temp[idx] = self.velocity_y[idx];
@@ -209,7 +271,7 @@ impl FluidSim {
         (distance_from_edge as f32 / offset as f32).clamp(0.0, 1.0)
     }
 
-    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[bool], width: usize, height: usize, a: f32, iters: usize) {
+    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[CellType], width: usize, height: usize, a: f32, iters: usize) {
         rhs.copy_from_slice(field);
         temp.copy_from_slice(field);
 
@@ -223,15 +285,15 @@ impl FluidSim {
                     }
                     for x in 1..width - 1 {
                         let idx = x + y * width;
-                        if solids[idx] {
+                        if solids[idx] == CellType::Wall {
                             row[x] = 0.0;
                             continue;
                         }
                         let c = cur[idx];
-                        let r = if solids[idx + 1] { c } else { cur[idx + 1] };
-                        let l = if solids[idx - 1] { c } else { cur[idx - 1] };
-                        let d = if solids[idx + width] { c } else { cur[idx + width] };
-                        let u = if solids[idx - width] { c } else { cur[idx - width] };
+                        let r = if solids[idx + 1] == CellType::Wall { c } else { cur[idx + 1] };
+                        let l = if solids[idx - 1] == CellType::Wall { c } else { cur[idx - 1] };
+                        let d = if solids[idx + width] == CellType::Wall { c } else { cur[idx + width] };
+                        let u = if solids[idx - width] == CellType::Wall { c } else { cur[idx - width] };
                         row[x] = (rhs[idx] + a * (r + l + d + u)) / (1.0 + 4.0 * a);
                     }
                 });
@@ -277,7 +339,7 @@ impl FluidSim {
         Self::lerp(a, b, sy)
     }
 
-    fn sample_field_solid_aware(field: &[f32], solids: &[bool], width: usize, height: usize, x: f32, y: f32, fallback: f32) -> f32 {
+    fn sample_field_solid_aware(field: &[f32], solids: &[CellType], width: usize, height: usize, x: f32, y: f32, fallback: f32) -> f32 {
         let x = x.clamp(0.0, (width - 1) as f32);
         let y = y.clamp(0.0, (height - 1) as f32);
 
@@ -300,10 +362,10 @@ impl FluidSim {
         let w01 = (1.0 - sx) * sy;
         let w11 = sx * sy;
 
-        let v00 = if solids[idx00] { fallback } else { field[idx00] };
-        let v10 = if solids[idx10] { fallback } else { field[idx10] };
-        let v01 = if solids[idx01] { fallback } else { field[idx01] };
-        let v11 = if solids[idx11] { fallback } else { field[idx11] };
+        let v00 = if solids[idx00] == CellType::Wall { fallback } else { field[idx00] };
+        let v10 = if solids[idx10] == CellType::Wall { fallback } else { field[idx10] };
+        let v01 = if solids[idx01] == CellType::Wall { fallback } else { field[idx01] };
+        let v11 = if solids[idx11] == CellType::Wall { fallback } else { field[idx11] };
 
         v00 * w00
             + v10 * w10
@@ -337,7 +399,7 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
-                    if solids[idx] {
+                    if solids[idx] == CellType::Wall {
                         row[x] = 0.0;
                         continue;
                     }
@@ -452,7 +514,7 @@ impl FluidSim {
                 for x in 1..width - 1 {
                     let idx = x + y * width;
 
-                    if solids[idx] {
+                    if solids[idx] == CellType::Wall {
                         row_x[x] = 0.0;
                         row_y[x] = 0.0;
                         continue;
@@ -489,16 +551,16 @@ impl FluidSim {
             for x in 1..width - 1 {
                 let idx = self.idx(x, y);
 
-                if self.solids[idx] {
+                if self.solids[idx] == CellType::Wall {
                     self.velocity_x[idx] = 0.0;
                     self.velocity_y[idx] = 0.0;
                     continue;
                 }
 
-                let solid_left = self.solids[self.idx(x - 1, y)];
-                let solid_right = self.solids[self.idx(x + 1, y)];
-                let solid_top = self.solids[self.idx(x, y - 1)];
-                let solid_bottom = self.solids[self.idx(x, y + 1)];
+                let solid_left = self.solids[self.idx(x - 1, y)] == CellType::Wall;
+                let solid_right = self.solids[self.idx(x + 1, y)] == CellType::Wall;
+                let solid_top = self.solids[self.idx(x, y - 1)] == CellType::Wall;
+                let solid_bottom = self.solids[self.idx(x, y + 1)] == CellType::Wall;
 
                 if (solid_left && self.velocity_x[idx] < 0.0) || (solid_right && self.velocity_x[idx] > 0.0) {
                     self.velocity_x[idx] = 0.0;
@@ -609,35 +671,44 @@ impl FluidSim {
         }
     }
 
-    fn apply_special_cells(&mut self, dt: f32) {
-        for special_cell in self.special_cells.iter() {
-            let (idx, sc) = special_cell;
-            if self.solids[*idx] {
-                continue;
-            }
-            match sc {
-                CellEffect::Accelerator {ax, ay} => {
-                    self.velocity_x[*idx] += ax * dt;
-                    self.velocity_y[*idx] += ay * dt;
+    fn apply_special_velocity(&mut self, dt: f32) {
+        for &(idx, effect) in self.special_cells.iter() {
+            match effect {
+                CellEffect::Emitter { vx, vy, .. } => {
+                    self.velocity_x[idx] = vx;
+                    self.velocity_y[idx] = vy;
                 }
-                CellEffect::Emitter {vx, vy, density} => {
-                    self.velocity_x[*idx] = *vx;
-                    self.velocity_y[*idx] = *vy;
-                    self.density[*idx] = *density;
+                CellEffect::Accelerator { ax, ay } => {
+                    self.velocity_x[idx] += ax * dt;
+                    self.velocity_y[idx] += ay * dt;
                 }
-                CellEffect::Source {density} => {
-                    self.density[*idx] = *density;
-                }
-                CellEffect::Teleporter {dest_idx} => {
-                    self.density[*dest_idx] = self.density[*idx];
-                    self.density[*idx] = 0.0;
-                }
-                CellEffect::Sink {rate, sub_div} => {
-                    if *sub_div {
-                        self.divergence[*idx] = - rate * dt;
+                CellEffect::Teleporter { dest_idx } => {
+                    if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
+                        self.velocity_x[dest_idx] = self.velocity_x[idx];
+                        self.velocity_y[dest_idx] = self.velocity_y[idx];
                     }
-                    self.density[*idx] = (self.density[*idx] - rate * dt).min(0.0);
                 }
+                CellEffect::Sink { .. } => {}
+            }
+        }
+    }
+
+    fn apply_special_density(&mut self, dt: f32) {
+        for &(idx, effect) in self.special_cells.iter() {
+            match effect {
+                CellEffect::Emitter { density, .. } => {
+                    self.density[idx] = density;
+                }
+                CellEffect::Sink { rate } => {
+                    self.density[idx] *= (1.0 - rate * dt).max(0.0);
+                }
+                CellEffect::Teleporter { dest_idx } => {
+                    if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
+                        self.density[dest_idx] = (self.density[dest_idx] + self.density[idx]).min(1.0);
+                        self.density[idx] = 0.0;
+                    }
+                }
+                CellEffect::Accelerator { .. } => {}
             }
         }
     }
@@ -659,15 +730,15 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
-                    if self.solids[idx] {
+                    if self.solids[idx] == CellType::Wall {
                         row[x] = 0.0;
                         continue;
                     }
 
-                    let vx_right = if self.solids[idx + 1] { 0.0 } else { velocity_x[idx + 1] };
-                    let vx_left = if self.solids[idx - 1] { 0.0 } else { velocity_x[idx - 1] };
-                    let vy_down = if self.solids[idx + width] { 0.0 } else { velocity_y[idx + width] };
-                    let vy_up = if self.solids[idx - width] { 0.0 } else { velocity_y[idx - width] };
+                    let vx_right = if self.solids[idx + 1] == CellType::Wall { 0.0 } else { velocity_x[idx + 1] };
+                    let vx_left = if self.solids[idx - 1] == CellType::Wall { 0.0 } else { velocity_x[idx - 1] };
+                    let vy_down = if self.solids[idx + width] == CellType::Wall { 0.0 } else { velocity_y[idx + width] };
+                    let vy_up = if self.solids[idx - width] == CellType::Wall { 0.0 } else { velocity_y[idx - width] };
 
                     let divergence = 0.5 * (vx_right - vx_left + vy_down - vy_up);
                     row[x] = -divergence;
@@ -697,7 +768,7 @@ impl FluidSim {
                     for x in 1..width - 1 {
                         let idx = x + y * width;
 
-                        if solids[idx] {
+                        if solids[idx] == CellType::Wall {
                             row[x] = 0.0;
                             continue;
                         }
@@ -706,7 +777,7 @@ impl FluidSim {
                         let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
 
                         for neighbor in neighbors {
-                            if solids[neighbor] {
+                            if solids[neighbor] == CellType::Wall {
                                 sum += pressure[idx]; // dp/dn = 0
                             } else {
                                 sum += pressure[neighbor];
@@ -729,22 +800,20 @@ impl FluidSim {
         for y in 1..height - 1 {
             let l0 = self.idx(0, y);
 
-            if self.solids[l0] {
+            if self.solids[l0] == CellType::Wall {
                 self.pressure[l0] = 0.0;
             } else {
-                self.pressure[l0] =
-                    match self.left_boundary.boundary_type {
+                self.pressure[l0] = match self.left_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
                         BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(1, y)] }
                     };
             }
 
             let l1 = self.idx(width - 1, y);
-            if self.solids[l1] {
+            if self.solids[l1] == CellType::Wall {
                 self.pressure[l1] = 0.0;
             } else {
-                self.pressure[l1] =
-                    match self.right_boundary.boundary_type {
+                self.pressure[l1] = match self.right_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
                         BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(width - 2, y)] }
                     };
@@ -754,22 +823,20 @@ impl FluidSim {
 
         for x in 1..width - 1 {
             let l2 = self.idx(x, 0);
-            if self.solids[l2] {
+            if self.solids[l2] == CellType::Wall {
                 self.pressure[l2] = 0.0;
             } else {
-                self.pressure[l2] =
-                    match self.top_boundary.boundary_type {
+                self.pressure[l2] = match self.top_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
                         BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, 1)] }
                     };
             }
 
             let l3 = self.idx(x, height - 1);
-            if self.solids[l3] {
+            if self.solids[l3] == CellType::Wall {
                 self.pressure[l3] = 0.0;
             } else {
-                self.pressure[l3] =
-                    match self.bottom_boundary.boundary_type {
+                self.pressure[l3] = match self.bottom_boundary.boundary_type {
                         BoundaryType::Outlet => 0.0,
                         BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, height - 2)] }
                     };
@@ -794,16 +861,16 @@ impl FluidSim {
 
                 for x in 1..width - 1 {
                     let idx = x + y * width;
-                    if self.solids[idx] {
+                    if self.solids[idx] == CellType::Wall {
                         row_x[x] = 0.0;
                         row_y[x] = 0.0;
                         continue;
                     }
 
-                    let pressure_right = if self.solids[idx + 1] { pressure[idx] } else { pressure[idx + 1] };
-                    let pressure_left = if self.solids[idx - 1] { pressure[idx] } else { pressure[idx - 1] };
-                    let pressure_down = if self.solids[idx + width] { pressure[idx] } else { pressure[idx + width] };
-                    let pressure_up = if self.solids[idx - width] { pressure[idx] } else { pressure[idx - width] };
+                    let pressure_right = if self.solids[idx + 1] == CellType::Wall { pressure[idx] } else { pressure[idx + 1] };
+                    let pressure_left = if self.solids[idx - 1] == CellType::Wall { pressure[idx] } else { pressure[idx - 1] };
+                    let pressure_down = if self.solids[idx + width] == CellType::Wall { pressure[idx] } else { pressure[idx + width] };
+                    let pressure_up = if self.solids[idx - width] == CellType::Wall { pressure[idx] } else { pressure[idx - width] };
 
                     let pressure_gradient_x = 0.5 * (pressure_right - pressure_left);
                     let pressure_gradient_y = 0.5 * (pressure_down - pressure_up);
@@ -845,15 +912,16 @@ impl FluidSim {
 
         self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
+        self.apply_special_velocity(dt);
+
         self.enforce_incompressibility(pressure_iterations); //divergence et pression -> vitesse
         self.apply_velocity_boundaries(); //attention aux bordures (v)
-
-        self.apply_special_cells(dt); //conditions des cellules speciales
 
         self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
 
         self.diffuse_density(dt, diffusion_iterations); //diffuser la densité (d)
         self.advect_density(dt); //advection de la densité (d)
+        self.apply_special_density(dt);
         self.apply_density_boundaries(); //attention aux bordures (d)
     }
 }
