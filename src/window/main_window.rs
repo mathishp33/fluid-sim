@@ -717,14 +717,6 @@ impl FluidWindow {
         }
     }
 
-    fn calculate_kinetic_energy(&mut self) -> f32 {
-        let mut sum: f32 = 0.0;
-        for i in 0..=self.fluid.velocity_x.len() {
-           sum += (self.fluid.velocity_x[i] * self.fluid.velocity_x[i] + self.fluid.velocity_y[i] * self.fluid.velocity_y[i]) * self.fluid.density[i];
-        }
-        0.5 * sum
-    }
-
     fn update_stats(&mut self) {
         let f = &self.fluid;
         self.stats = Stats {
