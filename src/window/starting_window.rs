@@ -1,38 +1,22 @@
-use eframe::epaint::Color32;
 use egui::ComboBox;
 use serde::{Deserialize, Serialize};
-use crate::simulation;
-use crate::simulation::fluid::Boundary;
-use crate::window::main_window;
 
-fn launch_simulation(width: usize, height: usize, 
-                     precision: usize, 
-                     start_density: f32, 
-                     diffusion_rate: f32,
-                     max_color: u32,
-                     pressure_iters: usize, diffusion_iters: usize,
-                     left_boundary: Boundary, right_boundary: Boundary,
-                     top_boundary: Boundary, bottom_boundary: Boundary) {
-
-    let mut window = main_window::FluidWindow::new(width, height, precision, start_density, diffusion_rate,
-                                                   max_color, pressure_iters, diffusion_iters, left_boundary, right_boundary, top_boundary, bottom_boundary);
-    window.run();
-}
+use crate::simulation::fluid::{Boundary, BoundaryType};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SimulationSettings {
-    width: usize,
-    height: usize,
-    precision: usize,
-    start_density: f32,
-    max_density_color: [u8; 4],
-    diffusion_rate: f32,
-    pressure_iters: usize,
-    diffusion_iters: usize,
-    left_boundary: Boundary,
-    right_boundary: Boundary,
-    top_boundary: Boundary,
-    bottom_boundary: Boundary,
+    pub width: usize,
+    pub height: usize,
+    pub precision: usize,
+    pub start_density: f32,
+    pub max_density_color: [u8; 4],
+    pub diffusion_rate: f32,
+    pub pressure_iters: usize,
+    pub diffusion_iters: usize,
+    pub left_boundary: Boundary,
+    pub right_boundary: Boundary,
+    pub top_boundary: Boundary,
+    pub bottom_boundary: Boundary,
 }
 
 impl Default for SimulationSettings {
@@ -54,107 +38,90 @@ impl Default for SimulationSettings {
     }
 }
 
+impl SimulationSettings {
+    pub fn max_color(&self) -> u32 {
+        let c = self.max_density_color;
+        ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
+    }
+}
+
 pub struct StartingGui {
     pub settings: SimulationSettings,
-    pub dark_theme_set: bool,
 }
 
-impl Default for StartingGui {
-    fn default() -> Self {
-        Self {
-            settings: SimulationSettings::default(),
-            dark_theme_set: false,
-        }
+impl StartingGui {
+    pub fn new(settings: SimulationSettings) -> Self {
+        Self { settings }
     }
-}
 
-impl eframe::App for StartingGui {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
-        if !self.dark_theme_set {
-            ctx.set_visuals(egui::Visuals::dark());
-            self.dark_theme_set = true;
-        }
+    pub fn ui(&mut self, ctx: &egui::Context) -> Option<SimulationSettings> {
+        let mut launch = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Fluid Simulation Settings");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Fluid Simulation Settings");
+                ui.add_space(8.0);
 
-            ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
-            ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
+                ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
+                ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
-            ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
+                ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
 
-            ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
-            ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
+                ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
+                ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
 
-            //ui.add(egui::Slider::new(&mut self.settings.particle_radius, 1..=100).text("Mouse Radius (pixels)"));
+                ComboBox::from_label("Precision (pixels)")
+                    .selected_text(format!("{}", self.settings.precision))
+                    .show_ui(ui, |ui| {
+                        for level in [1, 2, 5, 10, 20] {
+                            ui.selectable_value(&mut self.settings.precision, level, format!("{level}"));
+                        }
+                    });
 
-            ComboBox::from_label("Precision (pixels)")
-                .selected_text(format!("{}", self.settings.precision))
-                .show_ui(ui, |ui| {
-                    for level in [1, 2, 5, 10, 20] {
-                        ui.selectable_value(&mut self.settings.precision, level, format!("{level}"));
-                    }
-                });
+                ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
 
-            ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
-            //ui.checkbox(&mut self.settings.randomize, "Randomize Initial Density (it overrides Default Density)");
-            //ui.add(egui::Slider::new(&mut self.settings.random_smoothing, 1..=10000).text("Random Smoothing"));
+                boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
+                boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
+                boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
+                boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
 
-            boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
-            boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
-            boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary);
-            boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary);
+                ui.label("Max Density Color");
+                let c = self.settings.max_density_color;
+                let mut rgb = [c[0], c[1], c[2]];
+                ui.color_edit_button_srgb(&mut rgb);
+                self.settings.max_density_color = [rgb[0], rgb[1], rgb[2], 255];
 
-            let c = self.settings.max_density_color;
-            let mut local_color = Color32::from_rgb(c[0], c[1], c[2]);
-            ui.label("Max Density Color");
-            ui.color_edit_button_srgba(&mut local_color);
-            self.settings.max_density_color = local_color.to_array();
-
-            if ui.button("Launch Simulation").clicked() {
-                save_settings(&self.settings);
-
-                let color = Color32::from_rgba_unmultiplied(
-                    self.settings.max_density_color[0],
-                    self.settings.max_density_color[1],
-                    self.settings.max_density_color[2],
-                    self.settings.max_density_color[3],
-                );
-                let max_color = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | ((color.b() as u32) << 0);
-                launch_simulation(
-                    self.settings.width, self.settings.height, self.settings.precision,
-                    self.settings.start_density, self.settings.diffusion_rate,
-                    max_color,
-                    self.settings.pressure_iters, self.settings.diffusion_iters,
-                    self.settings.left_boundary, self.settings.right_boundary,
-                    self.settings.top_boundary, self.settings.bottom_boundary,
-                );
-            }
+                ui.add_space(8.0);
+                if ui.button("Launch Simulation").clicked() {
+                    save_settings(&self.settings);
+                    launch = Some(self.settings.clone());
+                }
+            });
         });
+
+        launch
     }
 }
+
 fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
     ui.collapsing(name, |ui| {
         ComboBox::from_label("Type")
             .selected_text(format!("{:?}", boundary.boundary_type))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid::BoundaryType::Wall, "Wall");
-                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid::BoundaryType::Inlet, "Inlet");
-                ui.selectable_value(&mut boundary.boundary_type, simulation::fluid::BoundaryType::Outlet, "Outlet");
+                ui.selectable_value(&mut boundary.boundary_type, BoundaryType::Wall, "Wall");
+                ui.selectable_value(&mut boundary.boundary_type, BoundaryType::Inlet, "Inlet");
+                ui.selectable_value(&mut boundary.boundary_type, BoundaryType::Outlet, "Outlet");
             });
 
         match boundary.boundary_type {
-            simulation::fluid::BoundaryType::Inlet => {
+            BoundaryType::Inlet => {
                 ui.add(egui::Slider::new(&mut boundary.velocity_x, -200.0..=200.0).text("Velocity X"));
                 ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
                 ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
             }
-
-            simulation::fluid::BoundaryType::Wall => {}
-
-            simulation::fluid::BoundaryType::Outlet => {}
+            BoundaryType::Wall => {}
+            BoundaryType::Outlet => {}
         }
     });
 }
@@ -163,15 +130,13 @@ pub fn load_settings() -> SimulationSettings {
     let path = "config.json";
 
     match std::fs::read_to_string(path) {
-        Ok(data) => {
-            serde_json::from_str(&data).unwrap_or_else(|e| {
-                eprintln!("Unable to read config.json : {e}");
-                SimulationSettings::default()
-            })
-        }
+        Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+            eprintln!("Unable to read config.json : {e}");
+            SimulationSettings::default()
+        }),
 
         Err(_) => {
-            println!("nNo config found, using default values ...");
+            println!("No config found, using default values ...");
             SimulationSettings::default()
         }
     }

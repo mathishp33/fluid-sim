@@ -1,22 +1,26 @@
-use crate::window::starting_window::StartingGui;
-use crate::window::starting_window::load_settings;
-
-mod window;
 mod simulation;
-
+mod window;
 
 fn main() -> eframe::Result<()> {
     println!("Rayon threads: {}", rayon::current_num_threads());
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        // Rendu egui via wgpu (feature "wgpu" d'eframe requise)
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([800.0, 500.0]),
+        //décommente pour débloquer les FPS (pas de vsync)
+        // wgpu_options: egui_wgpu::WgpuConfiguration {
+        //     present_mode: egui_wgpu::wgpu::PresentMode::AutoNoVsync,
+        //     ..Default::default()
+        // },
+        ..Default::default()
+    };
+
     eframe::run_native(
-        "Fluid Simulation Config",
+        "Fluid Simulation",
         options,
-        Box::new(|_cc| {
-            Ok(Box::new(StartingGui {
-                settings: load_settings(),
-                dark_theme_set: false,
-            }))
-        }),
+        Box::new(|_cc| Ok(Box::new(window::app::App::new()))),
     )
 }
