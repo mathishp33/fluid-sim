@@ -225,6 +225,7 @@ pub struct FluidWindow {
     display_mode: DisplayMode,
     mouse_mode: MouseMode,
     inverse_solid_color: bool,
+    selected_cell_type: CellType,
 
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
@@ -272,6 +273,7 @@ impl FluidWindow {
             display_mode: DisplayMode::Density,
             mouse_mode: MouseMode::Rectangle,
             inverse_solid_color: true,
+            selected_cell_type: CellType::Wall,
 
             last_mouse: None,
             hovered_cell: None,
@@ -485,6 +487,28 @@ impl FluidWindow {
             boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary);
             boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary);
 
+            ui.separator();
+            ui.heading("Cell Effects");
+            for cell_type in CellType::ALL_EXCEPT_ONE {
+                ui.selectable_value(&mut self.selected_cell_type, cell_type, cell_type.to_string());
+            }
+            // match self.selected_cell_type { /todo
+            //     CellType::Wall => {
+            //
+            //     }
+            //     CellType::Sink {
+            //         ui.add(egui::Slider::new());
+            //     }
+            //     CellType::Accelerator {
+            //
+            //     }
+            //     CellType::Accelerator {
+            //
+            //     }
+            //     _ => {
+            //
+            //     }
+            // }
 
         });
     }
