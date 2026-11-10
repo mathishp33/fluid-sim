@@ -50,6 +50,8 @@ pub enum CellType {
 }
 
 impl CellType {
+
+    pub const ALL_EXCEPT_ONE: [Self; 4] = [Self::Wall, Self::Sink, Self::Emitter, Self::Accelerator];
     #[inline]
     pub fn is_special(self) -> bool {
         self as u8 >= 2
@@ -141,8 +143,8 @@ impl FluidSim {
             height,
 
             density: vec![start_density; size],
-            velocity_x: vec![0.0; size],
-            velocity_y: vec![0.0; size],
+            velocity_x: vec![0.0; size], //face droite
+            velocity_y: vec![0.0; size], //face basse
             diffusion_rate,
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
@@ -345,32 +347,32 @@ impl FluidSim {
 
         let x0 = x.floor() as usize;
         let y0 = y.floor() as usize;
-
         let x1 = (x0 + 1).min(width - 1);
         let y1 = (y0 + 1).min(height - 1);
 
         let sx = x - x0 as f32;
         let sy = y - y0 as f32;
 
-        let idx00 = x0 + y0 * width;
-        let idx10 = x1 + y0 * width;
-        let idx01 = x0 + y1 * width;
-        let idx11 = x1 + y1 * width;
+        let taps = [(x0 + y0 * width, (1.0 - sx) * (1.0 - sy)), (x1 + y0 * width, sx * (1.0 - sy)),
+            (x0 + y1 * width, (1.0 - sx) * sy), (x1 + y1 * width, sx * sy)];
 
-        let w00 = (1.0 - sx) * (1.0 - sy);
-        let w10 = sx * (1.0 - sy);
-        let w01 = (1.0 - sx) * sy;
-        let w11 = sx * sy;
+        let mut sum = 0.0;
+        let mut weight = 0.0;
+        for (idx, w) in taps {
+            if solids[idx] != CellType::Wall {
+                sum += field[idx] * w;
+                weight += w;
+            }
+        }
 
-        let v00 = if solids[idx00] == CellType::Wall { fallback } else { field[idx00] };
-        let v10 = if solids[idx10] == CellType::Wall { fallback } else { field[idx10] };
-        let v01 = if solids[idx01] == CellType::Wall { fallback } else { field[idx01] };
-        let v11 = if solids[idx11] == CellType::Wall { fallback } else { field[idx11] };
+        if weight > 1e-6 { sum / weight } else { fallback }
+    }
 
-        v00 * w00
-            + v10 * w10
-            + v01 * w01
-            + v11 * w11
+    fn interior_mass(&self) -> f32 {
+        let w = self.width;
+        (1..self.height - 1)
+            .map(|y| self.density[1 + y * w..w - 1 + y * w].iter().sum::<f32>())
+            .sum()
     }
 
     pub fn advect_density(&mut self, dt: f32) {
@@ -404,49 +406,40 @@ impl FluidSim {
                         continue;
                     }
 
-                    let vx = velocity_x[idx];
-                    let vy = velocity_y[idx];
+                    let px = x as f32 - velocity_x[idx] * dt;
+                    let py = y as f32 - velocity_y[idx] * dt;
 
-                    let px = x as f32 - vx * dt;
-                    let py = y as f32 - vy * dt;
-
-                    let value = if px < 0.0 {
+                    row[x] = if px < 0.0 {
                         match left_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => { left_boundary.density }
-                            BoundaryType::Wall => { density[1 + y * width] }
+                            BoundaryType::Inlet => left_boundary.density,
+                            BoundaryType::Wall => density[1 + y * width],
                         }
                     } else if px >= width as f32 {
                         match right_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => { right_boundary.density }
-                            BoundaryType::Wall => { density[(width - 2) + y * width] }
+                            BoundaryType::Inlet => right_boundary.density,
+                            BoundaryType::Wall => density[(width - 2) + y * width],
                         }
                     } else if py < 0.0 {
                         match top_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => { top_boundary.density }
-                            BoundaryType::Wall => { density[x + width] }
+                            BoundaryType::Inlet => top_boundary.density,
+                            BoundaryType::Wall => density[x + width],
                         }
                     } else if py >= height as f32 {
                         match bottom_boundary.boundary_type {
                             BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => { bottom_boundary.density }
-                            BoundaryType::Wall => { density[x + (height - 2) * width] }
+                            BoundaryType::Inlet => bottom_boundary.density,
+                            BoundaryType::Wall => density[x + (height - 2) * width],
                         }
-                    }
-                    else {
-                        Self::sample_field_solid_aware(density, solids, width, height, px, py, density[idx])
+                    } else {
+                        Self::sample_field_solid_aware(density, solids, width, height, px, py, 0.0)
                     };
-
-                    row[x] = value;
                 }
             });
 
-        std::mem::swap(
-            &mut self.density,
-            &mut self.density_temp,
-        );
+        std::mem::swap(&mut self.density, &mut self.density_temp);
     }
 
     fn apply_density_boundaries(&mut self) {
@@ -704,7 +697,7 @@ impl FluidSim {
                 }
                 CellEffect::Teleporter { dest_idx } => {
                     if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
-                        self.density[dest_idx] = (self.density[dest_idx] + self.density[idx]).min(1.0);
+                        self.density[dest_idx] = (self.density[dest_idx] + self.density[idx]).min(1.0); //todo attention au surplus
                         self.density[idx] = 0.0;
                     }
                 }
