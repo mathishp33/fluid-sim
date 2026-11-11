@@ -1,22 +1,13 @@
 
 
 ## Prioritaire
-1. diagnostique des résidus de pressions, CFL, divergence RMS et moyenne, ... 
-``` rust
-    pub pressure_residual: f32,
-    pub divergence_rms: f32,
-    pub velocity_rms: f32,
-    pub cfl: f32,
-```
-2. encodeur de conditions initiales (ex: je veux créer une condition initiale particulière de vitesses
+1. encodeur de conditions initiales (ex: je veux créer une condition initiale particulière de vitesses
  donc j'entre une formule f(x,y)=... dans une fenetre spéciale puis j'importe ces CI. cette fenetre sera 
  accessible depuis la barre haute de main_window.rs )
-3. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
-4. PCG (Ax = b)
-5. viscosité de vitesse
-6. force externes
-7. thermodynamique (température)
-9. Teleporter() kind of broken, destination size is not customizable.
+2. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
+3. PCG (Ax = b) ? pas sur
+4. force externes
+5. Teleporter() kind of broken, destination size is not customizable.
 
 
 ## Moins prioritaire
@@ -54,4 +45,6 @@ Indicateur vorticité
  - grille MAC
  - solides immobiles
  - cellules spéciales
- - diagnostiques de divergence, pression, énérgie, masse
+ - diagnostiques de divergence, pression, énérgie, masse, CFL, ...
+ - température fluide & solide
+ - viscosité (faible)

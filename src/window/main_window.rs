@@ -6,10 +6,12 @@ use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOpti
 use rayon::prelude::*;
 use rfd::FileDialog;
 
-use crate::simulation::fluid::{CellEffect, FluidSim};
+use crate::simulation::fluid::{BoundaryType, CellEffect, FluidSim};
 use crate::simulation::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
+
+const MAX_DT: f32 = 0.05;
 
 pub enum WindowAction {
     None,
@@ -215,6 +217,10 @@ struct Stats {
     velocity_max: f32,
     total_density: f64,
     kinetic_energy: f32,
+    pub pressure_residual: f32,
+    pub divergence_rms: f32,
+    pub velocity_rms: f32,
+    pub cfl: f32,
 }
 
 
@@ -613,6 +619,10 @@ impl FluidWindow {
                     row("Max speed", format!("{:.3}", self.stats.velocity_max));
                     row("Total density", format!("{:.4}", self.stats.total_density));
                     row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
+                    row("Pressure residual", format!("{:.4e}", self.stats.pressure_residual));
+                    row("Divergence RMS", format!("{:.4e}", self.stats.divergence_rms));
+                    row("Velocity RMS", format!("{:.3}", self.stats.velocity_rms));
+                    row("CFL (max|v|·dt)", format!("{:.3}", self.stats.cfl));
                 });
 
                 ui.separator();
@@ -689,7 +699,9 @@ impl FluidWindow {
 
             self.handle_mouse(ctx, &response, rect, dt);
             self.simulate(dt);
-            self.update_stats();
+            if !self.paused || self.step_frame > 0  {
+                self.update_stats(dt.min(MAX_DT));
+            }
             self.update_texture(ctx);
 
             ui.painter().rect_filled(outer, 0.0, Color32::BLACK);
@@ -851,29 +863,72 @@ impl FluidWindow {
 
     fn simulate(&mut self, dt: f32) {
         if !self.paused || self.step_frame > 0 {
-            self.fluid.step(dt.min(0.05), self.pressure_iters); //todo!(baisser 0.05)
+            self.fluid.step(dt.min(MAX_DT), self.pressure_iters);
             self.step_frame = self.step_frame.saturating_sub(1);
         }
     }
 
-    fn update_stats(&mut self) {
+    fn update_stats(&mut self, dt: f32) {
         let f = &self.fluid;
         let (w, h) = (f.width, f.height);
+        let s = &f.solids;
 
-        let (speed_max, kinetic) = (0..h)
+        let lo = f.left_boundary.boundary_type == BoundaryType::Outlet;
+        let ro = f.right_boundary.boundary_type == BoundaryType::Outlet;
+        let to = f.top_boundary.boundary_type == BoundaryType::Outlet;
+        let bo = f.bottom_boundary.boundary_type == BoundaryType::Outlet;
+        let wall = |i: usize| s[i] == CellType::Wall;
+
+        let open_u = |x: usize, y: usize| -> bool {
+            if y == 0 || y >= h - 1 || x >= w - 1 { return false; }
+            let i = x + y * w;
+            if x == 0 { lo && !wall(i + 1) }
+            else if x == w - 2 { ro && !wall(i) }
+            else { !wall(i) && !wall(i + 1) }
+        };
+        let open_v = |x: usize, y: usize| -> bool {
+            if y >= h - 1 || x == 0 || x >= w - 1 { return false; }
+            let i = x + y * w;
+            if y == 0 { to && !wall(i + w) }
+            else if y == h - 2 { bo && !wall(i) }
+            else { !wall(i) && !wall(i + w) }
+        };
+
+        // (max s^2, Ec, sum(div^2), sum(|v|^2), nbr cell actives, max(residu))
+        let (speed2_max, kinetic, div2_sum, v2_sum, count, residual) = (0..h)
             .into_par_iter()
             .map(|y| {
-                let mut m = 0.0f32;
-                let mut e = 0.0f32;
+                let (mut m, mut e) = (0.0f32, 0.0f32);
+                let (mut d2, mut v2, mut n_cells, mut res) = (0.0f64, 0.0f64, 0u64, 0.0f32);
                 for x in 0..w {
+                    let i = x + y * w;
                     let (vx, vy) = FluidSim::cell_velocity_from(&f.velocity_x, &f.velocity_y, w, h, x, y);
                     let s2 = vx * vx + vy * vy;
                     m = m.max(s2);
-                    e += f.density[x + y * w] * s2;
+                    e += f.density[i] * s2;
+
+                    let interior = x >= 1 && x < w - 1 && y >= 1 && y < h - 1;
+                    if !interior || s[i] == CellType::Wall || s[i] == CellType::Sink {
+                        continue;
+                    }
+                    let dv = f.divergence[i];
+                    d2 += (dv * dv) as f64;
+                    v2 += s2 as f64;
+                    n_cells += 1;
+
+                    let n = open_u(x, y) as u8 + open_u(x - 1, y) as u8
+                        + open_v(x, y) as u8 + open_v(x, y - 1) as u8;
+                    if n > 0 {
+                        res = res.max(dv.abs());
+                    }
                 }
-                (m.sqrt(), 0.5 * e)
+                (m, 0.5 * e, d2, v2, n_cells, res)
             })
-            .reduce(|| (0.0, 0.0), |a, b| (a.0.max(b.0), a.1 + b.1));
+            .reduce(|| (0.0, 0.0, 0.0, 0.0, 0, 0.0),
+                    |a, b| (a.0.max(b.0), a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4, a.5.max(b.5)));
+
+        let speed_max = speed2_max.sqrt();
+        let n = count.max(1) as f64;
 
         self.stats = Stats {
             pressure_max: f.pressure.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max),
@@ -881,6 +936,10 @@ impl FluidWindow {
             velocity_max: speed_max,
             total_density: f.total_mass(),
             kinetic_energy: kinetic,
+            pressure_residual: residual,
+            divergence_rms: (div2_sum / n).sqrt() as f32,
+            velocity_rms: (v2_sum / n).sqrt() as f32,
+            cfl: speed_max * dt,
         };
     }
 

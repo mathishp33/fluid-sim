@@ -540,7 +540,7 @@ impl FluidSim {
                     let mut x = if ((1 + y) & 1) == color { 1 } else { 2 };
                     while x < w - 1 {
                         let i = x + y * w;
-                        if s[i] != CellType::Wall && s[i] != CellType::Wall {
+                        if s[i] != CellType::Wall && s[i] != CellType::Sink {
                             let a = ou[i] as f32;
                             let b = ou[i - 1] as f32;
                             let c = ov[i] as f32;
