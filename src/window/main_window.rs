@@ -6,7 +6,7 @@ use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOpti
 use rayon::prelude::*;
 use rfd::FileDialog;
 
-use crate::simulation::fluid::FluidSim;
+use crate::simulation::fluid::{CellEffect, FluidSim};
 use crate::simulation::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
@@ -225,6 +225,7 @@ pub struct FluidWindow {
     mouse_mode: MouseMode,
     inverse_solid_color: bool,
     selected_cell_type: CellType,
+    current_cell_effect: Option<CellEffect>,
 
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
@@ -272,6 +273,7 @@ impl FluidWindow {
             mouse_mode: MouseMode::Rectangle,
             inverse_solid_color: true,
             selected_cell_type: CellType::Wall,
+            current_cell_effect: None,
 
             last_mouse: None,
             hovered_cell: None,
@@ -490,24 +492,28 @@ impl FluidWindow {
             for cell_type in CellType::ALL_EXCEPT_ONE {
                 ui.selectable_value(&mut self.selected_cell_type, cell_type, cell_type.to_string());
             }
-            // match self.selected_cell_type { /todo
-            //     CellType::Wall => {
-            //
-            //     }
-            //     CellType::Sink {
-            //         ui.add(egui::Slider::new());
-            //     }
-            //     CellType::Accelerator {
-            //
-            //     }
-            //     CellType::Accelerator {
-            //
-            //     }
-            //     _ => {
-            //
-            //     }
-            // }
-
+            self.current_cell_effect = CellEffect::default_for(self.selected_cell_type);
+            ui.collapsing(self.selected_cell_type.to_string(), |ui| {
+                if (self.current_cell_effect != None) {
+                    match self.current_cell_effect.unwrap() {
+                        CellEffect::Sink { mut rate } => {
+                            ui.add(egui::Slider::new(&mut rate, 0.0..=10.0).text("Density Rate"));
+                        }
+                        CellEffect::Emitter { mut density, mut vx, mut vy } => {
+                            ui.add(egui::Slider::new(&mut density, 0.0..=1.0).text("Density"));
+                            ui.add(egui::Slider::new(&mut vx, -200.0..=200.0).text("X velocity"));
+                            ui.add(egui::Slider::new(&mut vy, -200.0..=200.0).text("Y velocity"));
+                        }
+                        CellEffect::Accelerator { mut ax, mut ay } => {
+                            ui.add(egui::Slider::new(&mut ax, -50.0..=50.0).text("X acceleration"));
+                            ui.add(egui::Slider::new(&mut ay, -50.0..=50.0).text("Y acceleration"));
+                        }
+                        CellEffect::Teleporter { .. } => {
+                            //todo
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -711,7 +717,12 @@ impl FluidWindow {
 
                 if input.left {
                     if input.ctrl {
-                        fluid.set_cell(x, y, CellType::Wall, None);
+                        if self.selected_cell_type == CellType::Wall {
+                            fluid.set_cell(x, y, CellType::Wall, None);
+                        }
+                        else {
+                            fluid.set_cell(x, y, self.selected_cell_type, Option::from(self.current_cell_effect));
+                        }
                     } else if fluid.solids[idx] == CellType::Fluid {
                         fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
                     }
