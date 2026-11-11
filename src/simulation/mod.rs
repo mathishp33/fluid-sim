@@ -1,1 +1,3 @@
-pub mod fluid_sim;
+pub mod fluid;
+pub mod gpu;
+pub mod cpu;
