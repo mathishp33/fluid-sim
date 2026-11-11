@@ -12,7 +12,6 @@ pub struct SimulationSettings {
     pub max_density_color: [u8; 4],
     pub diffusion_rate: f32,
     pub pressure_iters: usize,
-    pub diffusion_iters: usize,
     pub left_boundary: Boundary,
     pub right_boundary: Boundary,
     pub top_boundary: Boundary,
@@ -28,8 +27,7 @@ impl Default for SimulationSettings {
             start_density: 0.2,
             max_density_color: [255, 255, 255, 255],
             diffusion_rate: 0.1,
-            pressure_iters: 3,
-            diffusion_iters: 3,
+            pressure_iters: 30,
             left_boundary: Boundary::wall(),
             right_boundary: Boundary::wall(),
             top_boundary: Boundary::wall(),
@@ -68,7 +66,6 @@ impl StartingGui {
                 ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
 
                 ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
-                ui.add(egui::Slider::new(&mut self.settings.diffusion_iters, 0..=50).text("Diffusion Iterations"));
 
                 ComboBox::from_label("Precision (pixels)")
                     .selected_text(format!("{}", self.settings.precision))
