@@ -39,3 +39,4 @@ Indicateur vorticité
  - Advection semi-Lagrangienne
  - grille MAC
  - solides immobiles
+ - cellules spéciales
