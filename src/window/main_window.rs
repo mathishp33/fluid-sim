@@ -199,7 +199,7 @@ struct Stats {
     pressure_max: f32,
     divergence_max: f32,
     velocity_max: f32,
-    total_density: f32,
+    total_density: f64,
     kinetic_energy: f32,
 }
 
@@ -212,7 +212,6 @@ pub struct FluidWindow {
     precision: usize,
     mouse_radius: usize,
     pressure_iters: usize,
-    diffusion_iters: usize,
     max_color: u32,
 
     fps: f32,
@@ -260,7 +259,6 @@ impl FluidWindow {
             precision,
             mouse_radius: 20,
             pressure_iters: settings.pressure_iters,
-            diffusion_iters: settings.diffusion_iters,
             max_color: settings.max_color(),
 
             fps: 0.0,
@@ -478,7 +476,7 @@ impl FluidWindow {
             ui.separator();
             ui.label("Solver");
             ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
-            ui.add(egui::Slider::new(&mut self.diffusion_iters, 0..=50).text("Diffusion iters"));
+            ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
             ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
             ui.separator();
             ui.label("Boundaries");
@@ -534,7 +532,7 @@ impl FluidWindow {
                 row("Max |pressure|", format!("{:.3}", self.stats.pressure_max));
                 row("Max |divergence|", format!("{:.3}", self.stats.divergence_max));
                 row("Max speed", format!("{:.3}", self.stats.velocity_max));
-                row("Total density", format!("{:.2}", self.stats.total_density));
+                row("Total density", format!("{:.4}", self.stats.total_density));
                 row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
             });
 
@@ -551,8 +549,9 @@ impl FluidWindow {
                             ui.end_row();
                         };
                         row("Position", format!("{x}, {y}"));
-                        row("Velocity X", format!("{:.3}", self.fluid.velocity_x[idx]));
-                        row("Velocity Y", format!("{:.3}", self.fluid.velocity_y[idx]));
+                        let (cvx, cvy) = self.fluid.cell_velocity(x, y);
+                        row("Velocity X", format!("{:.3}", cvx));
+                        row("Velocity Y", format!("{:.3}", cvy));
                         row("Density", format!("{:.3}", self.fluid.density[idx]));
                         row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
                         row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
@@ -736,32 +735,36 @@ impl FluidWindow {
 
     fn simulate(&mut self, dt: f32) {
         if !self.paused || self.step_frame > 0 {
-            self.fluid.step(dt.min(0.05), self.pressure_iters, self.diffusion_iters); //todo!(baisser 0.05)
+            self.fluid.step(dt.min(0.05), self.pressure_iters); //todo!(baisser 0.05)
             self.step_frame = self.step_frame.saturating_sub(1);
         }
     }
 
     fn update_stats(&mut self) {
         let f = &self.fluid;
+        let (w, h) = (f.width, f.height);
+
+        let (speed_max, kinetic) = (0..h)
+            .into_par_iter()
+            .map(|y| {
+                let mut m = 0.0f32;
+                let mut e = 0.0f32;
+                for x in 0..w {
+                    let (vx, vy) = FluidSim::cell_velocity_from(&f.velocity_x, &f.velocity_y, w, h, x, y);
+                    let s2 = vx * vx + vy * vy;
+                    m = m.max(s2);
+                    e += f.density[x + y * w] * s2;
+                }
+                (m.sqrt(), 0.5 * e)
+            })
+            .reduce(|| (0.0, 0.0), |a, b| (a.0.max(b.0), a.1 + b.1));
+
         self.stats = Stats {
             pressure_max: f.pressure.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max),
             divergence_max: f.divergence.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max),
-            velocity_max: f
-                .velocity_x
-                .par_iter()
-                .zip(f.velocity_y.par_iter())
-                .map(|(&vx, &vy)| (vx * vx + vy * vy).sqrt())
-                .reduce(|| 0.0, f32::max),
-            total_density: f.density.par_iter().sum::<f32>(),
-            kinetic_energy: 0.5 * f
-                .velocity_x
-                .par_iter()
-                .zip(f.velocity_y.par_iter())
-                .zip(f.density.par_iter())
-                .map(|((&vx, &vy), &d)| {
-                    d * (vx * vx + vy * vy)
-                })
-                .sum::<f32>(),
+            velocity_max: speed_max,
+            total_density: f.total_mass(),
+            kinetic_energy: kinetic,
         };
     }
 
@@ -780,6 +783,7 @@ impl FluidWindow {
         let divergence = &self.fluid.divergence[..];
         let velocity_x = &self.fluid.velocity_x[..];
         let velocity_y = &self.fluid.velocity_y[..];
+        let grid_h = h;
         let solids = &self.fluid.solids[..];
 
         self.rgba
@@ -806,7 +810,8 @@ impl FluidWindow {
                             DisplayMode::Pressure => signed_color(pressure[idx], pressure_max),
                             DisplayMode::Divergence => signed_color(divergence[idx], divergence_max),
                             DisplayMode::Velocity => {
-                                velocity_color(velocity_x[idx], velocity_y[idx], velocity_max)
+                                let (vx, vy) = FluidSim::cell_velocity_from(velocity_x, velocity_y, w, grid_h, x, y);
+                                velocity_color(vx, vy, velocity_max)
                             }
                         }
                     };

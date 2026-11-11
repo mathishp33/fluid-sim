@@ -1,8 +1,12 @@
 use std::cmp::PartialEq;
-use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use crate::simulation::gpu::gpu::GpuContext;
+
+/// Nombre de Courant visé pour l'advection/diffusion de la densité (< 1 : la densité reste positive).
+const CFL: f32 = 0.9;
+/// Nombre maximal de sous-pas de densité par step().
+const MAX_SUBSTEPS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeMethod {
@@ -92,15 +96,82 @@ pub enum CellEffect {
 impl CellEffect {
     pub fn default_for(kind: CellType) -> Option<(Self)> {
         match kind {
-            CellType::Sink => Some(Self::Sink { rate: 5.0 }),
-            CellType::Emitter => Some(Self::Emitter { vx: 0.0, vy: 0.0, density: 1.0 }),
-            CellType::Accelerator => Some(Self::Accelerator { ax: 50.0, ay: 0.0 }),
+            CellType::Sink => Some(Self::Sink {
+                rate: 5.0
+            }),
+            CellType::Emitter => Some(Self::Emitter {
+                vx: 0.0, vy: 0.0, density: 1.0
+            }),
+            CellType::Accelerator => Some(Self::Accelerator {
+                ax: 50.0, ay: 0.0
+            }),
             CellType::Teleporter => None, // dest_idx dépend de la cellule, voir set_cell
             _ => None,
         }
     }
 }
 
+//Pour le Rad-Black Gauss-Siedel
+#[derive(Clone, Copy)]
+struct SharedMut(*mut f32);
+unsafe impl Send for SharedMut {}
+unsafe impl Sync for SharedMut {}
+impl SharedMut {
+    #[inline]
+    fn ptr(self) -> *mut f32 {
+        self.0
+    }
+}
+
+/// Flux de densité (advection + diffusion) à travers les faces de la grille MAC.
+struct DensityKernel<'a> {
+    w: usize,
+    h: usize,
+    u: &'a [f32],
+    v: &'a [f32],
+    open_u: &'a [u8],
+    open_v: &'a [u8],
+    d: f32,
+}
+
+impl DensityKernel<'_> {
+    #[inline]
+    fn fx(&self, rho: &[f32], x: usize, y: usize) -> f32 {
+        let i = x + y * self.w;
+        let uf = self.u[i];
+        let adv = uf * if uf > 0.0 {
+            rho[i]
+        } else {
+            rho[i + 1]
+        };
+        let dif = if x >= 1 && x + 2 < self.w && self.open_u[i] != 0 {
+            -self.d * (rho[i + 1] - rho[i])
+        } else {
+            0.0
+        };
+        adv + dif
+    }
+
+    #[inline]
+    fn fy(&self, rho: &[f32], x: usize, y: usize) -> f32 {
+        let i = x + y * self.w;
+        let vf = self.v[i];
+        let adv = vf * if vf > 0.0 {
+            rho[i]
+        } else {
+            rho[i + self.w]
+        };
+        let dif = if y >= 1 && y + 2 < self.h && self.open_v[i] != 0 {
+            -self.d * (rho[i + self.w] - rho[i])
+        } else {
+            0.0
+        };
+        adv + dif
+    }
+}
+
+
+// les cellules en bordure (x = 0, x = w-1, y = 0, y = h-1) sont des cellules fantômes.
 pub struct FluidSim {
     pub width: usize,
     pub height: usize,
@@ -113,21 +184,27 @@ pub struct FluidSim {
     pub divergence: Vec<f32>,
     pub solids: Vec<CellType>,
     pub special_cells: Vec<(usize, CellEffect)>,
-    //pub sor_omega: f32,
+    // Facteur de sur-relaxation du Red-Black Gauss-Seidel (1.0 = Gauss-Seidel pur).
+    // Avec peu d'itérations par frame, rester vers 1.0-1.5 ; 2/(1+sin(pi/n)) ne vaut que
+    // si le solveur a le temps de converger.
+    pub sor_omega: f32,
 
     density_temp: Vec<f32>,
     velocity_x_temp: Vec<f32>,
     velocity_y_temp: Vec<f32>,
-    pressure_temp: Vec<f32>,
+
+    // 1 si la face droite (resp. basse) de la cellule i laisse passer le fluide
+    // (aucune des deux cellules n'est solide, ou face de bord vers un Outlet).
+    open_u: Vec<u8>,
+    open_v: Vec<u8>,
 
     pub left_boundary: Boundary,
     pub right_boundary: Boundary,
     pub top_boundary: Boundary,
     pub bottom_boundary: Boundary,
 
-    density_rhs: Vec<f32>,
     compute_method: ComputeMethod,
-    gpu_context: GpuContext,
+    gpu_context: Option<GpuContext>,
 }
 
 impl FluidSim {
@@ -138,37 +215,55 @@ impl FluidSim {
 
     pub fn new(width: usize, height: usize, start_density: f32, diffusion_rate: f32) -> Self {
         let size = width * height;
+
+        let gpu_context = GpuContext::try_new(width, height);
+        let compute_method = if gpu_context.is_some() {
+            ComputeMethod::GPU
+        } else {
+            eprintln!("No GPU found: falling back to CPU pressure solver");
+            ComputeMethod::CPU
+        };
+
         FluidSim {
             width,
             height,
 
             density: vec![start_density; size],
-            velocity_x: vec![0.0; size], //face droite
-            velocity_y: vec![0.0; size], //face basse
+            velocity_x: vec![0.0; size],
+            velocity_y: vec![0.0; size],
             diffusion_rate,
             pressure: vec![0.0; size],
             divergence: vec![0.0; size],
             solids: vec![CellType::Fluid; size],
             special_cells: Vec::new(),
-            // sor_omega: {
-            //     let n = width.min(height) as f32;
-            //     2.0 / (1.0 + (std::f32::consts::PI / n).sin())
-            // },
+            sor_omega: 1.5,
 
             density_temp: vec![0.0; size],
             velocity_x_temp: vec![0.0; size],
             velocity_y_temp: vec![0.0; size],
-            pressure_temp: vec![0.0; size],
+
+            open_u: vec![0; size],
+            open_v: vec![0; size],
 
             left_boundary: Boundary::wall(),
             right_boundary: Boundary::wall(),
             top_boundary: Boundary::wall(),
             bottom_boundary: Boundary::wall(),
 
-            density_rhs: vec![0.0; size],
-            compute_method: ComputeMethod::GPU,
-            gpu_context: GpuContext::new(width, height),
+            compute_method,
+            gpu_context,
         }
+    }
+
+    pub fn compute_method(&self) -> ComputeMethod {
+        self.compute_method
+    }
+
+    pub fn set_compute_method(&mut self, method: ComputeMethod) {
+        self.compute_method = match method {
+            ComputeMethod::GPU if self.gpu_context.is_none() => ComputeMethod::CPU,
+            m => m,
+        };
     }
 
     pub fn set_cell(&mut self, x: usize, y: usize, kind: CellType, effect: Option<CellEffect>) {
@@ -207,7 +302,6 @@ impl FluidSim {
             self.density_temp[idx] = 0.0;
             self.velocity_x_temp[idx] = 0.0;
             self.velocity_y_temp[idx] = 0.0;
-            self.pressure_temp[idx] = 0.0;
             return;
         }
 
@@ -255,7 +349,39 @@ impl FluidSim {
         self.density_temp[idx] = self.density[idx];
         self.velocity_x_temp[idx] = self.velocity_x[idx];
         self.velocity_y_temp[idx] = self.velocity_y[idx];
-        self.pressure_temp[idx] = self.pressure[idx];
+    }
+
+
+    #[inline]
+    pub fn cell_velocity_from(vx: &[f32], vy: &[f32], w: usize, h: usize, x: usize, y: usize) -> (f32, f32) {
+        let i = x + y * w;
+        let ux = if x == 0 {
+            vx[i]
+        } else if x == w - 1 {
+            vx[i - 1]
+        } else {
+            0.5 * (vx[i - 1] + vx[i])
+        };
+        let uy = if y == 0 {
+            vy[i]
+        } else if y == h - 1 {
+            vy[i - w]
+        } else {
+            0.5 * (vy[i - w] + vy[i])
+        };
+        (ux, uy)
+    }
+
+    pub fn cell_velocity(&self, x: usize, y: usize) -> (f32, f32) {
+        Self::cell_velocity_from(&self.velocity_x, &self.velocity_y, self.width, self.height, x, y)
+    }
+
+    pub fn total_mass(&self) -> f64 {
+        let w = self.width;
+        (1..self.height - 1)
+            .into_par_iter()
+            .map(|y| self.density[1 + y * w..w - 1 + y * w].iter().map(|&d| d as f64).sum::<f64>())
+            .sum()
     }
 
     #[inline]
@@ -273,175 +399,444 @@ impl FluidSim {
         (distance_from_edge as f32 / offset as f32).clamp(0.0, 1.0)
     }
 
-    fn diffuse_field(field: &mut Vec<f32>, temp: &mut Vec<f32>, rhs: &mut Vec<f32>, solids: &[CellType], width: usize, height: usize, a: f32, iters: usize) {
-        rhs.copy_from_slice(field);
-        temp.copy_from_slice(field);
 
-        for _ in 0..iters {
-            {
-                let cur: &Vec<f32> = field;
-                let rhs: &Vec<f32> = rhs;
-                temp.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
-                    if y == 0 || y == height - 1 {
-                        return;
-                    }
-                    for x in 1..width - 1 {
-                        let idx = x + y * width;
-                        if solids[idx] == CellType::Wall {
-                            row[x] = 0.0;
-                            continue;
-                        }
-                        let c = cur[idx];
-                        let r = if solids[idx + 1] == CellType::Wall { c } else { cur[idx + 1] };
-                        let l = if solids[idx - 1] == CellType::Wall { c } else { cur[idx - 1] };
-                        let d = if solids[idx + width] == CellType::Wall { c } else { cur[idx + width] };
-                        let u = if solids[idx - width] == CellType::Wall { c } else { cur[idx - width] };
-                        row[x] = (rhs[idx] + a * (r + l + d + u)) / (1.0 + 4.0 * a);
-                    }
-                });
+    fn rebuild_masks(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let s = &self.solids;
+        let lo = self.left_boundary.boundary_type == BoundaryType::Outlet;
+        let ro = self.right_boundary.boundary_type == BoundaryType::Outlet;
+        let to = self.top_boundary.boundary_type == BoundaryType::Outlet;
+        let bo = self.bottom_boundary.boundary_type == BoundaryType::Outlet;
+
+        self.open_u.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            row.fill(0);
+            if y == 0 || y >= h - 1 {
+                return;
             }
-            std::mem::swap(field, temp);
-        }
+            for x in 0..w - 1 {
+                let i = x + y * w;
+                let open = if x == 0 {
+                    lo && s[i + 1] != CellType::Wall
+                } else if x == w - 2 {
+                    ro && s[i] != CellType::Wall
+                } else {
+                    s[i] != CellType::Wall && s[i + 1] != CellType::Wall
+                };
+                row[x] = open as u8;
+            }
+        });
+
+        self.open_v.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            row.fill(0);
+            if y >= h - 1 {
+                return;
+            }
+            for x in 1..w - 1 {
+                let i = x + y * w;
+                let open = if y == 0 {
+                    to && s[i + w] != CellType::Wall
+                } else if y == h - 2 {
+                    bo && s[i] != CellType::Wall
+                } else {
+                    s[i] != CellType::Wall && s[i + w] != CellType::Wall
+                };
+                row[x] = open as u8;
+            }
+        });
     }
 
-    pub fn diffuse_density(&mut self, dt: f32, diffusion_iters: usize) {
-        let a = self.diffusion_rate * dt;
-        Self::diffuse_field(&mut self.density, &mut self.density_temp, &mut self.density_rhs,
-                            &self.solids, self.width, self.height, a, diffusion_iters);
-    }
+    //  Advection semi-lagrangienne sur les faces
 
-    fn lerp(a: f32, b: f32, t: f32) -> f32 {
-        a + t * (b - a)
-    } //O(1)
 
-    fn sample_field(field: &Vec<f32>, width: usize, height: usize, x: f32, y: f32) -> f32 { //O(1)
-        let w = width as isize;
-        let h = height as isize;
+    fn sample_face(field: &[f32], solids: &[CellType], w: usize, h: usize, horiz: bool, px: f32, py: f32, fallback: f32) -> f32 {
+        let (gx, gy, xm, ym) = if horiz {
+            (px - 0.5, py, w - 2, h - 1)
+        } else {
+            (px, py - 0.5, w - 1, h - 2)
+        };
+        let gx = gx.clamp(0.0, xm as f32);
+        let gy = gy.clamp(0.0, ym as f32);
 
-        let x0 = x.floor().clamp(0.0, (w - 1) as f32) as isize;
-        let y0 = y.floor().clamp(0.0, (h - 1) as f32) as isize;
-        let x1 = (x0 + 1).min(w - 1);
-        let y1 = (y0 + 1).min(h - 1);
+        let x0 = gx.floor() as usize;
+        let y0 = gy.floor() as usize;
+        let x1 = (x0 + 1).min(xm);
+        let y1 = (y0 + 1).min(ym);
 
-        let sx = x - x0 as f32;
-        let sy = y - y0 as f32;
+        let sx = gx - x0 as f32;
+        let sy = gy - y0 as f32;
 
-        let idx_00 = (x0 as usize) + (y0 as usize) * width;
-        let idx_10 = (x1 as usize) + (y0 as usize) * width;
-        let idx_01 = (x0 as usize) + (y1 as usize) * width;
-        let idx_11 = (x1 as usize) + (y1 as usize) * width;
-
-        let v00 = field[idx_00];
-        let v10 = field[idx_10];
-        let v01 = field[idx_01];
-        let v11 = field[idx_11];
-
-        let a = Self::lerp(v00, v10, sx);
-        let b = Self::lerp(v01, v11, sx);
-        Self::lerp(a, b, sy)
-    }
-
-    fn sample_field_solid_aware(field: &[f32], solids: &[CellType], width: usize, height: usize, x: f32, y: f32, fallback: f32) -> f32 {
-        let x = x.clamp(0.0, (width - 1) as f32);
-        let y = y.clamp(0.0, (height - 1) as f32);
-
-        let x0 = x.floor() as usize;
-        let y0 = y.floor() as usize;
-        let x1 = (x0 + 1).min(width - 1);
-        let y1 = (y0 + 1).min(height - 1);
-
-        let sx = x - x0 as f32;
-        let sy = y - y0 as f32;
-
-        let taps = [(x0 + y0 * width, (1.0 - sx) * (1.0 - sy)), (x1 + y0 * width, sx * (1.0 - sy)),
-            (x0 + y1 * width, (1.0 - sx) * sy), (x1 + y1 * width, sx * sy)];
+        let stride = if horiz { 1 } else { w };
+        let taps = [
+            (x0, y0, (1.0 - sx) * (1.0 - sy)),
+            (x1, y0, sx * (1.0 - sy)),
+            (x0, y1, (1.0 - sx) * sy),
+            (x1, y1, sx * sy),
+        ];
 
         let mut sum = 0.0;
         let mut weight = 0.0;
-        for (idx, w) in taps {
-            if solids[idx] != CellType::Wall {
-                sum += field[idx] * w;
-                weight += w;
+        for (x, y, wt) in taps {
+            let i = x + y * w;
+            if solids[i] == CellType::Wall && solids[i + stride] == CellType::Wall {
+                continue;
             }
+            sum += field[i] * wt;
+            weight += wt;
         }
 
         if weight > 1e-6 { sum / weight } else { fallback }
     }
 
-    fn interior_mass(&self) -> f32 {
-        let w = self.width;
-        (1..self.height - 1)
-            .map(|y| self.density[1 + y * w..w - 1 + y * w].iter().sum::<f32>())
-            .sum()
-    }
+    pub fn advect_velocity(&mut self, dt: f32) {
+        let (w, h) = (self.width, self.height);
 
-    pub fn advect_density(&mut self, dt: f32) {
-        self.density_temp.copy_from_slice(&self.density);
+        self.velocity_x_temp.copy_from_slice(&self.velocity_x);
+        self.velocity_y_temp.copy_from_slice(&self.velocity_y);
 
-        let width = self.width;
-        let height = self.height;
-
-        let density = &self.density;
-        let velocity_x = &self.velocity_x;
-        let velocity_y = &self.velocity_y;
-        let solids = &self.solids;
-
-        let left_boundary = self.left_boundary;
-        let right_boundary = self.right_boundary;
-        let top_boundary = self.top_boundary;
-        let bottom_boundary = self.bottom_boundary;
-
-        self.density_temp
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                if y == 0 || y == height - 1 {
+        {
+            let (u, v, s, ou) = (&self.velocity_x, &self.velocity_y, &self.solids, &self.open_u);
+            self.velocity_x_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                if y == 0 || y >= h - 1 {
                     return;
                 }
+                for x in 1..w - 2 {
+                    let i = x + y * w;
+                    if ou[i] == 0 {
+                        continue; // face fermée : fixée par les conditions aux limites
+                    }
+                    let (px, py) = (x as f32 + 0.5, y as f32);
+                    let vx = u[i];
+                    let vy = Self::sample_face(v, s, w, h, false, px, py, 0.0);
+                    row[x] = Self::sample_face(u, s, w, h, true, px - vx * dt, py - vy * dt, vx);
+                }
+            });
+        }
 
-                for x in 1..width - 1 {
-                    let idx = x + y * width;
-                    if solids[idx] == CellType::Wall {
-                        row[x] = 0.0;
+        {
+            let (u, v, s, ov) = (&self.velocity_x, &self.velocity_y, &self.solids, &self.open_v);
+            self.velocity_y_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                if y == 0 || y >= h - 2 {
+                    return;
+                }
+                for x in 1..w - 1 {
+                    let i = x + y * w;
+                    if ov[i] == 0 {
                         continue;
                     }
+                    let (px, py) = (x as f32, y as f32 + 0.5);
+                    let vy = v[i];
+                    let vx = Self::sample_face(u, s, w, h, true, px, py, 0.0);
+                    row[x] = Self::sample_face(v, s, w, h, false, px - vx * dt, py - vy * dt, vy);
+                }
+            });
+        }
 
-                    let px = x as f32 - velocity_x[idx] * dt;
-                    let py = y as f32 - velocity_y[idx] * dt;
+        std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
+        std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
+    }
 
-                    row[x] = if px < 0.0 {
-                        match left_boundary.boundary_type {
-                            BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => left_boundary.density,
-                            BoundaryType::Wall => density[1 + y * width],
+    //CL des faces à appliquer avant la projection
+    fn edge_values(b: &Boundary, factor: f32, inlet_n: f32, inlet_t: f32, inner_n: f32, inner_t: f32) -> (f32, f32) {
+        match b.boundary_type {
+            BoundaryType::Wall => (0.0, inner_t), // free slip
+            BoundaryType::Outlet => (inner_n, inner_t), // grad = 0
+            BoundaryType::Inlet => (inlet_n * factor, inlet_t * factor),
+        }
+    }
+
+    fn apply_velocity_boundaries(&mut self) {
+        let (w, h) = (self.width, self.height);
+
+        // faces intérieures fermées par un solide -> 0
+        for y in 1..h - 1 {
+            for x in 1..w - 2 {
+                let i = x + y * w;
+                if self.open_u[i] == 0 {
+                    self.velocity_x[i] = 0.0;
+                }
+            }
+        }
+        for y in 1..h - 2 {
+            for x in 1..w - 1 {
+                let i = x + y * w;
+                if self.open_v[i] == 0 {
+                    self.velocity_y[i] = 0.0;
+                }
+            }
+        }
+
+        // gauche / droite : normale = velocity_x (face de bord), tangentielle = velocity_y (fantôme)
+        for y in 1..h - 1 {
+            let row = y * w;
+
+            let b = self.left_boundary;
+            let f = Self::offset_factor(y, h, b.offset);
+            let (n, t) = Self::edge_values(&b, f, b.velocity_x, b.velocity_y,
+                                           self.velocity_x[row + 1], self.velocity_y[row + 1]);
+            self.velocity_x[row] = if self.solids[row + 1] == CellType::Wall { 0.0 } else { n };
+            self.velocity_y[row] = t;
+
+            let b = self.right_boundary;
+            let f = Self::offset_factor(y, h, b.offset);
+            let (n, t) = Self::edge_values(&b, f, b.velocity_x, b.velocity_y,
+                                           self.velocity_x[row + w - 3], self.velocity_y[row + w - 2]);
+            self.velocity_x[row + w - 2] = if self.solids[row + w - 2] == CellType::Wall { 0.0 } else { n };
+            self.velocity_y[row + w - 1] = t;
+        }
+
+        // haut / bas : normale = velocity_y (face de bord), tangentielle = velocity_x (fantôme)
+        for x in 1..w - 1 {
+            let last = (h - 2) * w;
+
+            let b = self.top_boundary;
+            let f = Self::offset_factor(x, w, b.offset);
+            let (n, t) = Self::edge_values(&b, f, b.velocity_y, b.velocity_x,
+                                           self.velocity_y[x + w], self.velocity_x[x + w]);
+            self.velocity_y[x] = if self.solids[x + w] == CellType::Wall { 0.0 } else { n };
+            self.velocity_x[x] = t;
+
+            let b = self.bottom_boundary;
+            let f = Self::offset_factor(x, w, b.offset);
+            let (n, t) = Self::edge_values(&b, f, b.velocity_y, b.velocity_x,
+                                           self.velocity_y[x + last - w], self.velocity_x[x + last]);
+            self.velocity_y[x + last] = if self.solids[x + last] == CellType::Wall { 0.0 } else { n };
+            self.velocity_x[x + last + w] = t;
+        }
+    }
+
+    //truc de sous-pas
+    fn limit_velocity(&mut self, dt: f32) {
+        let vmax = CFL * MAX_SUBSTEPS as f32 / (4.0 * dt.max(1e-6));
+        let fix = |v: &mut f32| {
+            *v = if v.is_finite() { v.clamp(-vmax, vmax) } else { 0.0 };
+        };
+        self.velocity_x.par_iter_mut().for_each(fix);
+        self.velocity_y.par_iter_mut().for_each(fix);
+    }
+
+    fn apply_special_velocity(&mut self, dt: f32) {
+        for &(idx, effect) in self.special_cells.iter() {
+            match effect {
+                CellEffect::Emitter { vx, vy, .. } => {
+                    self.velocity_x[idx] = vx;
+                    self.velocity_y[idx] = vy;
+                }
+                CellEffect::Accelerator { ax, ay } => {
+                    self.velocity_x[idx] += ax * dt;
+                    self.velocity_y[idx] += ay * dt;
+                }
+                CellEffect::Teleporter { dest_idx } => {
+                    if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
+                        self.velocity_x[dest_idx] = self.velocity_x[idx];
+                        self.velocity_y[dest_idx] = self.velocity_y[idx];
+                    }
+                }
+                CellEffect::Sink { .. } => {}
+            }
+        }
+    }
+
+    fn calculate_divergence(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let (u, v, s) = (&self.velocity_x, &self.velocity_y, &self.solids);
+
+        self.divergence.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if y == 0 || y == h - 1 {
+                return;
+            }
+            for x in 1..w - 1 {
+                let i = x + y * w;
+                row[x] = if s[i] == CellType::Wall {
+                    0.0
+                } else {
+                    u[i] - u[i - 1] + v[i] - v[i - w]
+                };
+            }
+        });
+    }
+
+    fn solve_pressure(&mut self, iterations: usize) {
+        let (w, h) = (self.width, self.height);
+        let omega = self.sor_omega;
+        let shared = SharedMut(self.pressure.as_mut_ptr());
+        let (div, ou, ov, s) = (&self.divergence, &self.open_u, &self.open_v, &self.solids);
+
+        for _ in 0..iterations {
+            for color in 0..2usize {
+                (1..h - 1).into_par_iter().for_each(|y| {
+                    let p = shared.ptr();
+                    let mut x = if ((1 + y) & 1) == color { 1 } else { 2 };
+                    while x < w - 1 {
+                        let i = x + y * w;
+                        if s[i] != CellType::Wall {
+                            let a = ou[i] as f32;
+                            let b = ou[i - 1] as f32;
+                            let c = ov[i] as f32;
+                            let d = ov[i - w] as f32;
+                            let n = a + b + c + d;
+                            if n > 0.0 {
+                                unsafe {
+                                    let sum = a * *p.add(i + 1) + b * *p.add(i - 1)
+                                        + c * *p.add(i + w) + d * *p.add(i - w);
+                                    let p_new = (sum - div[i]) / n;
+                                    let old = *p.add(i);
+                                    *p.add(i) = old + omega * (p_new - old);
+                                }
+                            }
                         }
-                    } else if px >= width as f32 {
-                        match right_boundary.boundary_type {
-                            BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => right_boundary.density,
-                            BoundaryType::Wall => density[(width - 2) + y * width],
-                        }
-                    } else if py < 0.0 {
-                        match top_boundary.boundary_type {
-                            BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => top_boundary.density,
-                            BoundaryType::Wall => density[x + width],
-                        }
-                    } else if py >= height as f32 {
-                        match bottom_boundary.boundary_type {
-                            BoundaryType::Outlet => 0.0,
-                            BoundaryType::Inlet => bottom_boundary.density,
-                            BoundaryType::Wall => density[x + (height - 2) * width],
-                        }
+                        x += 2;
+                    }
+                });
+            }
+        }
+    }
+
+    fn correct_velocity(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let (p, ou, ov) = (&self.pressure, &self.open_u, &self.open_v);
+
+        self.velocity_x.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if y == 0 || y >= h - 1 {
+                return;
+            }
+            for x in 0..w - 1 {
+                let i = x + y * w;
+                if ou[i] != 0 {
+                    row[x] -= p[i + 1] - p[i];
+                }
+            }
+        });
+
+        self.velocity_y.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if y >= h - 1 {
+                return;
+            }
+            for x in 1..w - 1 {
+                let i = x + y * w;
+                if ov[i] != 0 {
+                    row[x] -= p[i + w] - p[i];
+                }
+            }
+        });
+    }
+
+    pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {
+        match (self.compute_method, &self.gpu_context) {
+            (ComputeMethod::GPU, Some(gpu)) => {
+                gpu.upload_flags(&self.solids, &self.open_u, &self.open_v);
+                gpu.upload_f32(&gpu.velocity_x_buf, &self.velocity_x);
+                gpu.upload_f32(&gpu.velocity_y_buf, &self.velocity_y);
+                gpu.upload_f32(&gpu.pressure_buf, &self.pressure);
+
+                gpu.enforce_incompressibility(
+                    pressure_iterations,
+                    self.sor_omega,
+                    &mut self.velocity_x,
+                    &mut self.velocity_y,
+                    &mut self.pressure,
+                    &mut self.divergence,
+                );
+            }
+            _ => {
+                self.calculate_divergence();
+                self.solve_pressure(pressure_iterations);
+                self.correct_velocity();
+                self.calculate_divergence(); // divergence résiduelle
+            }
+        }
+    }
+
+
+    fn prepare_ghost_density(&mut self) {
+        let (w, h) = (self.width, self.height);
+
+        for y in 1..h - 1 {
+            let (l, r) = (y * w, (w - 1) + y * w);
+            self.density[l] = match self.left_boundary.boundary_type {
+                BoundaryType::Inlet => self.left_boundary.density,
+                BoundaryType::Outlet => 0.0,
+                BoundaryType::Wall => self.density[l + 1],
+            };
+            self.density[r] = match self.right_boundary.boundary_type {
+                BoundaryType::Inlet => self.right_boundary.density,
+                BoundaryType::Outlet => 0.0,
+                BoundaryType::Wall => self.density[r - 1],
+            };
+        }
+        for x in 1..w - 1 {
+            let (t, b) = (x, x + (h - 1) * w);
+            self.density[t] = match self.top_boundary.boundary_type {
+                BoundaryType::Inlet => self.top_boundary.density,
+                BoundaryType::Outlet => 0.0,
+                BoundaryType::Wall => self.density[t + w],
+            };
+            self.density[b] = match self.bottom_boundary.boundary_type {
+                BoundaryType::Inlet => self.bottom_boundary.density,
+                BoundaryType::Outlet => 0.0,
+                BoundaryType::Wall => self.density[b - w],
+            };
+        }
+    }
+
+    /// nbr de sous-pas garantissant dt_sub * (flux sortant + diffusion) <= CFL
+    fn density_substeps(&self, dt: f32) -> usize {
+        let (w, h) = (self.width, self.height);
+        let (u, v, s) = (&self.velocity_x, &self.velocity_y, &self.solids);
+
+        let rate = (1..h - 1)
+            .into_par_iter()
+            .map(|y| {
+                let mut m = 0.0f32;
+                for x in 1..w - 1 {
+                    let i = x + y * w;
+                    if s[i] == CellType::Wall {
+                        continue;
+                    }
+                    let out = u[i].max(0.0) + (-u[i - 1]).max(0.0) + v[i].max(0.0) + (-v[i - w]).max(0.0);
+                    m = m.max(out);
+                }
+                m
+            })
+            .reduce(|| 0.0, f32::max);
+
+        let n = (dt * (rate + 4.0 * self.diffusion_rate) / CFL).ceil();
+        (n as usize).clamp(1, MAX_SUBSTEPS)
+    }
+
+    pub fn advect_diffuse_density(&mut self, dt: f32) {
+        let (w, h) = (self.width, self.height);
+
+        self.prepare_ghost_density();
+        let n = self.density_substeps(dt);
+        let dts = dt / n as f32;
+
+        for _ in 0..n {
+            self.density_temp.copy_from_slice(&self.density); // conserve les cellules fantômes
+
+            let kernel = DensityKernel {w, h, u: &self.velocity_x, v: &self.velocity_y,
+                open_u: &self.open_u, open_v: &self.open_v, d: self.diffusion_rate};
+            let (rho, s) = (&self.density, &self.solids);
+
+            self.density_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                if y == 0 || y == h - 1 {
+                    return;
+                }
+                for x in 1..w - 1 {
+                    let i = x + y * w;
+                    row[x] = if s[i] == CellType::Wall {
+                        0.0
                     } else {
-                        Self::sample_field_solid_aware(density, solids, width, height, px, py, 0.0)
+                        rho[i] - dts * (kernel.fx(rho, x, y) - kernel.fx(rho, x - 1, y)
+                            + kernel.fy(rho, x, y) - kernel.fy(rho, x, y - 1))
                     };
                 }
             });
 
-        std::mem::swap(&mut self.density, &mut self.density_temp);
+            std::mem::swap(&mut self.density, &mut self.density_temp);
+        }
     }
 
+    /// Cellules fantômes de la densité après advection
     fn apply_density_boundaries(&mut self) {
         //gauche
         for y in 1..self.height - 1 {
@@ -484,208 +879,6 @@ impl FluidSim {
         }
     }
 
-    pub fn advect_velocity(&mut self, dt: f32) {
-        self.velocity_x_temp.copy_from_slice(&self.velocity_x);
-        self.velocity_y_temp.copy_from_slice(&self.velocity_y);
-
-        let width = self.width;
-        let height = self.height;
-
-        let velocity_x = &self.velocity_x;
-        let velocity_y = &self.velocity_y;
-        let solids = &self.solids;
-
-        self.velocity_x_temp
-            .par_chunks_mut(width)
-            .zip(self.velocity_y_temp.par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(y, (row_x, row_y))| {
-                if y == 0 || y == height - 1 {
-                    return;
-                }
-
-                for x in 1..width - 1 {
-                    let idx = x + y * width;
-
-                    if solids[idx] == CellType::Wall {
-                        row_x[x] = 0.0;
-                        row_y[x] = 0.0;
-                        continue;
-                    }
-
-                    let vx = velocity_x[idx];
-                    let vy = velocity_y[idx];
-
-                    let px = (x as f32 - vx * dt).clamp(0.0, (width - 1) as f32);
-
-                    let py = (y as f32 - vy * dt).clamp(0.0, (height - 1) as f32);
-
-                    row_x[x] = Self::sample_field_solid_aware(velocity_x, solids, width, height, px, py, vx);
-                    row_y[x] = Self::sample_field_solid_aware(velocity_y, solids, width, height, px, py, vy);
-                }
-            });
-
-        std::mem::swap(
-            &mut self.velocity_x,
-            &mut self.velocity_x_temp,
-        );
-
-        std::mem::swap(
-            &mut self.velocity_y,
-            &mut self.velocity_y_temp,
-        );
-    }
-
-    fn apply_solid_velocity_boundaries(&mut self) {
-        let width = self.width;
-        let height = self.height;
-
-        for y in 1..height - 1 {
-            for x in 1..width - 1 {
-                let idx = self.idx(x, y);
-
-                if self.solids[idx] == CellType::Wall {
-                    self.velocity_x[idx] = 0.0;
-                    self.velocity_y[idx] = 0.0;
-                    continue;
-                }
-
-                let solid_left = self.solids[self.idx(x - 1, y)] == CellType::Wall;
-                let solid_right = self.solids[self.idx(x + 1, y)] == CellType::Wall;
-                let solid_top = self.solids[self.idx(x, y - 1)] == CellType::Wall;
-                let solid_bottom = self.solids[self.idx(x, y + 1)] == CellType::Wall;
-
-                if (solid_left && self.velocity_x[idx] < 0.0) || (solid_right && self.velocity_x[idx] > 0.0) {
-                    self.velocity_x[idx] = 0.0;
-                }
-
-                if (solid_top && self.velocity_y[idx] < 0.0) || (solid_bottom && self.velocity_y[idx] > 0.0) {
-                    self.velocity_y[idx] = 0.0;
-                }
-            }
-        }
-    }
-
-    fn apply_velocity_boundaries(&mut self) {
-        //gauche
-        for y in 1..self.height - 1 {
-            let idx = self.idx(0, y);
-
-            match self.left_boundary.boundary_type {
-                BoundaryType::Wall => {
-                    self.velocity_x[idx] = 0.0;
-                    //self.velocity_y[idx] = 0.0;
-                }
-
-                BoundaryType::Inlet => {
-                    let factor = Self::offset_factor(y, self.height, self.left_boundary.offset);
-                    self.velocity_x[idx] = self.left_boundary.velocity_x * factor;
-                    self.velocity_y[idx] = self.left_boundary.velocity_y * factor;
-                }
-
-                BoundaryType::Outlet => {
-                    let inside = self.idx(1, y);
-                    self.velocity_x[idx] = self.velocity_x[inside];
-                    self.velocity_y[idx] = self.velocity_y[inside];
-                }
-            }
-        }
-
-        //droite
-        for y in 1..self.height - 1 {
-            let idx = self.idx(self.width - 1, y);
-
-            match self.right_boundary.boundary_type {
-                BoundaryType::Wall => {
-                    self.velocity_x[idx] = 0.0;
-                    //self.velocity_y[idx] = 0.0;
-                }
-
-                BoundaryType::Inlet => {
-                    let factor = Self::offset_factor(y, self.height, self.right_boundary.offset);
-                    self.velocity_x[idx] = self.right_boundary.velocity_x * factor;
-                    self.velocity_y[idx] = self.right_boundary.velocity_y * factor;
-                }
-
-                BoundaryType::Outlet => {
-                    let inside = self.idx(self.width - 2, y);
-                    self.velocity_x[idx] = self.velocity_x[inside];
-                    self.velocity_y[idx] = self.velocity_y[inside];
-                }
-            }
-        }
-
-        //haut
-        for x in 1..self.width - 1 {
-            let idx = self.idx(x, 0);
-
-            match self.top_boundary.boundary_type {
-                BoundaryType::Wall => {
-                    //self.velocity_x[idx] = 0.0;
-                    self.velocity_y[idx] = 0.0;
-                }
-
-                BoundaryType::Inlet => {
-                    let factor = Self::offset_factor(x, self.width, self.top_boundary.offset);
-                    self.velocity_x[idx] = self.top_boundary.velocity_x * factor;
-                    self.velocity_y[idx] = self.top_boundary.velocity_y * factor;
-                }
-
-                BoundaryType::Outlet => {
-                    let inside = self.idx(x, 1);
-                    self.velocity_x[idx] = self.velocity_x[inside];
-                    self.velocity_y[idx] = self.velocity_y[inside];
-                }
-            }
-        }
-
-        //bas
-        for x in 1..self.width - 1 {
-            let idx = self.idx(x, self.height - 1);
-
-            match self.bottom_boundary.boundary_type {
-                BoundaryType::Wall => {
-                    //self.velocity_x[idx] = 0.0;
-                    self.velocity_y[idx] = 0.0;
-                }
-
-                BoundaryType::Inlet => {
-                    let factor = Self::offset_factor(x, self.width, self.bottom_boundary.offset, );
-                    self.velocity_x[idx] = self.bottom_boundary.velocity_x * factor;
-                    self.velocity_y[idx] = self.bottom_boundary.velocity_y * factor;
-                }
-
-                BoundaryType::Outlet => {
-                    let inside = self.idx(x, self.height - 2);
-                    self.velocity_x[idx] = self.velocity_x[inside];
-                    self.velocity_y[idx] = self.velocity_y[inside];
-                }
-            }
-        }
-    }
-
-    fn apply_special_velocity(&mut self, dt: f32) {
-        for &(idx, effect) in self.special_cells.iter() {
-            match effect {
-                CellEffect::Emitter { vx, vy, .. } => {
-                    self.velocity_x[idx] = vx;
-                    self.velocity_y[idx] = vy;
-                }
-                CellEffect::Accelerator { ax, ay } => {
-                    self.velocity_x[idx] += ax * dt;
-                    self.velocity_y[idx] += ay * dt;
-                }
-                CellEffect::Teleporter { dest_idx } => {
-                    if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
-                        self.velocity_x[dest_idx] = self.velocity_x[idx];
-                        self.velocity_y[dest_idx] = self.velocity_y[idx];
-                    }
-                }
-                CellEffect::Sink { .. } => {}
-            }
-        }
-    }
-
     fn apply_special_density(&mut self, dt: f32) {
         for &(idx, effect) in self.special_cells.iter() {
             match effect {
@@ -706,215 +899,19 @@ impl FluidSim {
         }
     }
 
-    fn calculate_divergence(&mut self) {
-        let width = self.width;
-        let height = self.height;
 
-        let velocity_x = &self.velocity_x;
-        let velocity_y = &self.velocity_y;
+    pub fn step(&mut self, dt: f32, pressure_iterations: usize) {
+        self.rebuild_masks(); // solides | types de bordure -> faces ouvertes
 
-        self.divergence
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                if y == 0 || y == height - 1 {
-                    return;
-                }
-
-                for x in 1..width - 1 {
-                    let idx = x + y * width;
-                    if self.solids[idx] == CellType::Wall {
-                        row[x] = 0.0;
-                        continue;
-                    }
-
-                    let vx_right = if self.solids[idx + 1] == CellType::Wall { 0.0 } else { velocity_x[idx + 1] };
-                    let vx_left = if self.solids[idx - 1] == CellType::Wall { 0.0 } else { velocity_x[idx - 1] };
-                    let vy_down = if self.solids[idx + width] == CellType::Wall { 0.0 } else { velocity_y[idx + width] };
-                    let vy_up = if self.solids[idx - width] == CellType::Wall { 0.0 } else { velocity_y[idx - width] };
-
-                    let divergence = 0.5 * (vx_right - vx_left + vy_down - vy_up);
-                    row[x] = -divergence;
-                }
-            });
-    }
-
-    fn solve_pressure(&mut self, iterations: usize) {
-        let width = self.width;
-        let height = self.height;
-
-        self.apply_pressure_boundaries();
-
-        for _ in 0..iterations {
-            let pressure = &self.pressure;
-            let divergence = &self.divergence;
-            let solids = &self.solids;
-
-            self.pressure_temp
-                .par_chunks_mut(width)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    if y == 0 || y == height - 1 {
-                        return;
-                    }
-
-                    for x in 1..width - 1 {
-                        let idx = x + y * width;
-
-                        if solids[idx] == CellType::Wall {
-                            row[x] = 0.0;
-                            continue;
-                        }
-
-                        let mut sum = divergence[idx];
-                        let neighbors = [idx + 1, idx - 1, idx + width, idx - width];
-
-                        for neighbor in neighbors {
-                            if solids[neighbor] == CellType::Wall {
-                                sum += pressure[idx]; // dp/dn = 0
-                            } else {
-                                sum += pressure[neighbor];
-                            }
-                        }
-
-                        row[x] = sum * 0.25;
-                    }
-                });
-
-            std::mem::swap(&mut self.pressure, &mut self.pressure_temp);
-            self.apply_pressure_boundaries();
-        }
-    }
-
-    fn apply_pressure_boundaries(&mut self) {
-        let width = self.width;
-        let height = self.height;
-
-        for y in 1..height - 1 {
-            let l0 = self.idx(0, y);
-
-            if self.solids[l0] == CellType::Wall {
-                self.pressure[l0] = 0.0;
-            } else {
-                self.pressure[l0] = match self.left_boundary.boundary_type {
-                        BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(1, y)] }
-                    };
-            }
-
-            let l1 = self.idx(width - 1, y);
-            if self.solids[l1] == CellType::Wall {
-                self.pressure[l1] = 0.0;
-            } else {
-                self.pressure[l1] = match self.right_boundary.boundary_type {
-                        BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(width - 2, y)] }
-                    };
-            }
-        }
-
-
-        for x in 1..width - 1 {
-            let l2 = self.idx(x, 0);
-            if self.solids[l2] == CellType::Wall {
-                self.pressure[l2] = 0.0;
-            } else {
-                self.pressure[l2] = match self.top_boundary.boundary_type {
-                        BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, 1)] }
-                    };
-            }
-
-            let l3 = self.idx(x, height - 1);
-            if self.solids[l3] == CellType::Wall {
-                self.pressure[l3] = 0.0;
-            } else {
-                self.pressure[l3] = match self.bottom_boundary.boundary_type {
-                        BoundaryType::Outlet => 0.0,
-                        BoundaryType::Wall | BoundaryType::Inlet => { self.pressure[self.idx(x, height - 2)] }
-                    };
-            }
-        }
-    }
-
-    fn correct_velocity(&mut self) {
-        let width = self.width;
-        let height = self.height;
-
-        let pressure = &self.pressure;
-
-        self.velocity_x
-            .par_chunks_mut(width)
-            .zip(self.velocity_y.par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(y, (row_x, row_y))| {
-                if y == 0 || y == height - 1 {
-                    return;
-                }
-
-                for x in 1..width - 1 {
-                    let idx = x + y * width;
-                    if self.solids[idx] == CellType::Wall {
-                        row_x[x] = 0.0;
-                        row_y[x] = 0.0;
-                        continue;
-                    }
-
-                    let pressure_right = if self.solids[idx + 1] == CellType::Wall { pressure[idx] } else { pressure[idx + 1] };
-                    let pressure_left = if self.solids[idx - 1] == CellType::Wall { pressure[idx] } else { pressure[idx - 1] };
-                    let pressure_down = if self.solids[idx + width] == CellType::Wall { pressure[idx] } else { pressure[idx + width] };
-                    let pressure_up = if self.solids[idx - width] == CellType::Wall { pressure[idx] } else { pressure[idx - width] };
-
-                    let pressure_gradient_x = 0.5 * (pressure_right - pressure_left);
-                    let pressure_gradient_y = 0.5 * (pressure_down - pressure_up);
-
-                    row_x[x] -= pressure_gradient_x;
-                    row_y[x] -= pressure_gradient_y;
-                }
-            });
-    }
-
-    pub fn enforce_incompressibility(&mut self, pressure_iterations: usize) {
-        if self.compute_method == ComputeMethod::CPU {
-            self.calculate_divergence();
-            self.solve_pressure(pressure_iterations);
-            self.correct_velocity();
-        } else if self.compute_method == ComputeMethod::GPU {
-            self.gpu_context.upload_solids(&self.solids);
-            self.gpu_context.upload_f32(&self.gpu_context.velocity_x_buf, &self.velocity_x);
-            self.gpu_context.upload_f32(&self.gpu_context.velocity_y_buf, &self.velocity_y);
-            self.gpu_context.upload_f32(&self.gpu_context.pressure_buf, &self.pressure);
-
-            self.gpu_context.enforce_incompressibility(
-                pressure_iterations,
-                self.left_boundary.boundary_type,
-                self.right_boundary.boundary_type,
-                self.top_boundary.boundary_type,
-                self.bottom_boundary.boundary_type,
-                &mut self.velocity_x,
-                &mut self.velocity_y,
-                &mut self.pressure,
-            );
-        }
-    }
-
-
-    pub fn step(&mut self, dt: f32, pressure_iterations: usize, diffusion_iterations: usize) {
-        self.advect_velocity(dt); //advection vitesse (v)
-        self.apply_velocity_boundaries(); //attention aux bordures (v)
-
-        self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
-
+        self.advect_velocity(dt); // advection semi-lagrangienne des faces
         self.apply_special_velocity(dt);
 
-        self.enforce_incompressibility(pressure_iterations); //divergence et pression -> vitesse
-        self.apply_velocity_boundaries(); //attention aux bordures (v)
+        self.apply_velocity_boundaries(); // CL + faces fermées = 0
+        self.limit_velocity(dt);
+        self.enforce_incompressibility(pressure_iterations); // plus aucune CL de vitesse
 
-        self.apply_solid_velocity_boundaries(); //attentions aux solides (v)
-
-        self.diffuse_density(dt, diffusion_iterations); //diffuser la densité (d)
-        self.advect_density(dt); //advection de la densité (d)
+        self.advect_diffuse_density(dt); // flux conservatif, sous-pas CFL
         self.apply_special_density(dt);
-        self.apply_density_boundaries(); //attention aux bordures (d)
+        self.apply_density_boundaries(); // fantômes, affichage
     }
 }
