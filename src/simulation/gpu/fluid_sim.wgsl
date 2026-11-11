@@ -6,10 +6,10 @@
 // Les faces ouvertes (open_u / open_v) ne sont plus stockées : elles sont
 // recalculées à la volée à partir de `cells` et du type des bordures.
 //
-// scratch (3 * width * height floats) :
-//   [0, n)   : velocity_x temporaire (advection)
-//   [n, 2n)  : velocity_y temporaire (advection)
-//   [2n, 3n) : density temporaire (sous-pas)
+// scratch (5 * width * height floats) :
+// [0, n) : velocity_x temporaire  [n, 2n) : velocity_y temporaire
+// [2n, 3n) : density temporaire   [3n, 4n) : temperature temporaire
+// [4n, 5n) : temperature (champ persistant)
 
 struct Params {
     width: u32,
@@ -20,6 +20,10 @@ struct Params {
     diffusion: f32,
     vmax: f32,
     special_count: u32,
+    visc_k: f32, // viscosity * dt / sous-pas
+    buoyancy: f32,
+    thermal_fluid: f32,
+    thermal_solid: f32,
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
     btype: vec4<u32>,
     // (velocity_x, velocity_y, density, offset)
@@ -27,6 +31,7 @@ struct Params {
     bright: vec4<f32>,
     btop: vec4<f32>,
     bbottom: vec4<f32>,
+    btemp: vec4<f32>, // temp des bords : gauche, droite, haut, bas
 };
 
 // kind : 1 = Sink (a = rate), 2 = Emitter (a = vx, b = vy, c = density),
@@ -562,4 +567,180 @@ fn density_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = w * params.height;
     let i = gid.x + gid.y * w;
     density[i] = scratch[2u * n + i];
+}
+
+@compute @workgroup_size(8, 8)
+fn diffuse_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.width;
+    let h = params.height;
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    let x = gid.x;
+    let y = gid.y;
+    let i = x + y * w;
+    let n = w * h;
+    let k = params.visc_k;
+
+    var nu = velocity_x[i];
+    var nv = velocity_y[i];
+
+    if (x >= 1u && x + 2u < w && y >= 1u && y + 1u < h && open_u_at(x, y)) {
+        let c = velocity_x[i];
+        var lap = 0.0;
+        if (open_u_at(x + 1u, y)) { lap += velocity_x[i + 1u] - c; }
+        if (open_u_at(x - 1u, y)) { lap += velocity_x[i - 1u] - c; }
+        if (open_u_at(x, y + 1u)) { lap += velocity_x[i + w] - c; }
+        if (open_u_at(x, y - 1u)) { lap += velocity_x[i - w] - c; }
+        nu = c + k * lap;
+    }
+
+    if (x >= 1u && x + 1u < w && y >= 1u && y + 2u < h && open_v_at(x, y)) {
+        let c = velocity_y[i];
+        var lap = 0.0;
+        if (open_v_at(x + 1u, y)) { lap += velocity_y[i + 1u] - c; }
+        if (open_v_at(x - 1u, y)) { lap += velocity_y[i - 1u] - c; }
+        if (open_v_at(x, y + 1u)) { lap += velocity_y[i + w] - c; }
+        if (open_v_at(x, y - 1u)) { lap += velocity_y[i - w] - c; }
+        nv = c + k * lap;
+    }
+
+    scratch[i] = nu;
+    scratch[n + i] = nv; // puis commit_velocity
+}
+
+fn temp_get(i: u32) -> f32 {
+    return scratch[4u * params.width * params.height + i];
+}
+
+fn temp_set(i: u32, v: f32) {
+    scratch[4u * params.width * params.height + i] = v;
+}
+
+@compute @workgroup_size(8, 8)
+fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.width;
+    let h = params.height;
+    let x = gid.x;
+    let y = gid.y;
+    if (x < 1u || y < 1u || x + 1u >= w || y + 2u >= h) {
+        return;
+    }
+    if (!open_v_at(x, y)) {
+        return;
+    }
+    let i = x + y * w;
+    velocity_y[i] = velocity_y[i] - params.buoyancy * params.dt * 0.5 * (temp_get(i) + temp_get(i + w));
+}
+
+fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {
+    if (t == BT_INLET) {
+        return inlet_t;
+    }
+    if (t == BT_OUTLET && mode == 0u) {
+        return 0.0;
+    }
+    return inner;
+}
+
+fn ghost_temperature(t: u32, mode: u32) {
+    let w = params.width;
+    let h = params.height;
+    if (t >= 1u && t < h - 1u) {
+        let l = t * w;
+        let r = l + w - 1u;
+        temp_set(l, ghost_temp_value(params.btype.x, params.btemp.x, mode, temp_get(l + 1u)));
+        temp_set(r, ghost_temp_value(params.btype.y, params.btemp.y, mode, temp_get(r - 1u)));
+    }
+    if (t >= 1u && t < w - 1u) {
+        let bt = t + (h - 1u) * w;
+        temp_set(t, ghost_temp_value(params.btype.z, params.btemp.z, mode, temp_get(t + w)));
+        temp_set(bt, ghost_temp_value(params.btype.w, params.btemp.w, mode, temp_get(bt - w)));
+    }
+}
+
+@compute @workgroup_size(64)
+fn prepare_ghost_temperature(@builtin(global_invocation_id) gid: vec3<u32>) {
+    ghost_temperature(gid.x, 0u);
+}
+
+@compute @workgroup_size(64)
+fn apply_temperature_boundaries(@builtin(global_invocation_id) gid: vec3<u32>) {
+    ghost_temperature(gid.x, 1u);
+}
+
+fn alpha_of(i: u32) -> f32 {
+    if (is_solid(i)) {
+        return params.thermal_solid;
+    }
+    return params.thermal_fluid;
+}
+
+fn face_alpha(a: u32, b: u32) -> f32 {
+    let aa = alpha_of(a);
+    let ab = alpha_of(b);
+    let s = aa + ab;
+    if (s <= 0.0) {
+        return 0.0;
+    }
+    return 2.0 * aa * ab / s;
+}
+
+fn tflux_x(x: u32, y: u32) -> f32 {
+    let w = params.width;
+    let i = x + y * w;
+    let uf = velocity_x[i];
+    var adv: f32;
+    if (uf > 0.0) {
+        adv = uf * temp_get(i);
+    } else {
+        adv = uf * temp_get(i + 1u);
+    }
+    var dif = 0.0;
+    if (x >= 1u && x + 2u < w) {
+        dif = -face_alpha(i, i + 1u) * (temp_get(i + 1u) - temp_get(i));
+    }
+    return adv + dif;
+}
+
+fn tflux_y(x: u32, y: u32) -> f32 {
+    let w = params.width;
+    let h = params.height;
+    let i = x + y * w;
+    let vf = velocity_y[i];
+    var adv: f32;
+    if (vf > 0.0) {
+        adv = vf * temp_get(i);
+    } else {
+        adv = vf * temp_get(i + w);
+    }
+    var dif = 0.0;
+    if (y >= 1u && y + 2u < h) {
+        dif = -face_alpha(i, i + w) * (temp_get(i + w) - temp_get(i));
+    }
+    return adv + dif;
+}
+
+@compute @workgroup_size(8, 8)
+fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (!interior(x, y)) {
+        return;
+    }
+    let w = params.width;
+    let n = w * params.height;
+    let i = x + y * w;
+    scratch[3u * n + i] = temp_get(i) - params.dts * (tflux_x(x, y) - tflux_x(x - 1u, y) + tflux_y(x, y) - tflux_y(x, y - 1u));
+}
+
+@compute @workgroup_size(8, 8)
+fn temperature_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (!interior(gid.x, gid.y)) {
+        return;
+    }
+    let w = params.width;
+    let n = w * params.height;
+    let i = gid.x + gid.y * w;
+    temp_set(i, scratch[3u * n + i]);
 }

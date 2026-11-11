@@ -9,6 +9,10 @@ pub struct SimulationSettings {
     pub height: usize,
     pub precision: usize,
     pub start_density: f32,
+    pub viscosity: f32,
+    pub thermal_diffusion: f32,
+    pub solid_thermal_diffusion: f32,
+    pub buoyancy: f32,
     pub max_density_color: [u8; 4],
     pub diffusion_rate: f32,
     pub pressure_iters: usize,
@@ -25,6 +29,10 @@ impl Default for SimulationSettings {
             height: 600,
             precision: 10,
             start_density: 0.2,
+            viscosity: 0.0,
+            thermal_diffusion: 0.1,
+            solid_thermal_diffusion: 0.05,
+            buoyancy: 30.0,
             max_density_color: [255, 255, 255, 255],
             diffusion_rate: 0.1,
             pressure_iters: 30,
@@ -64,6 +72,10 @@ impl StartingGui {
                 ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
                 ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
+                ui.add(egui::Slider::new(&mut self.settings.viscosity, 0.0..=20.0).text("Viscosity"));
+                ui.add(egui::Slider::new(&mut self.settings.thermal_diffusion, 0.0..=5.0).text("Fluid conduction"));
+                ui.add(egui::Slider::new(&mut self.settings.solid_thermal_diffusion, 0.0..=5.0).text("Solid conduction"));
+                ui.add(egui::Slider::new(&mut self.settings.buoyancy, 0.0..=200.0).text("Buoyancy"));
 
                 ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
 
@@ -116,6 +128,7 @@ pub fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
                 ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
                 ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
+                ui.add(egui::Slider::new(&mut boundary.temperature, -1.0..=1.0).text("Temperature"));
             }
             BoundaryType::Wall => {}
             BoundaryType::Outlet => {}

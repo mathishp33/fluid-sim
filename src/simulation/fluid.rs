@@ -23,6 +23,7 @@ pub struct Boundary {
     pub velocity_y: f32,
     pub density: f32,
     pub offset: usize,
+    pub temperature: f32,
 }
 
 impl Boundary {
@@ -33,6 +34,7 @@ impl Boundary {
             velocity_y: 0.0,
             density: 0.0,
             offset: 1,
+            temperature: 0.0,
         }
     }
 }
@@ -140,6 +142,13 @@ pub struct FluidSim {
 
     compute_method: ComputeMethod,
     gpu_context: Option<GpuContext>,
+
+    pub viscosity: f32,
+    pub temperature: Vec<f32>,
+    pub thermal_diffusion: f32, // conduction dans les fluides
+    pub solid_thermal_diffusion: f32, // conduction dans les solides
+    pub buoyancy: f32,
+    pub(crate) temperature_temp: Vec<f32>,
 }
 
 impl FluidSim {
@@ -187,6 +196,13 @@ impl FluidSim {
 
             compute_method,
             gpu_context,
+
+            viscosity: 0.0,
+            temperature: vec![0.0; size],
+            thermal_diffusion: 0.1,
+            solid_thermal_diffusion: 0.05,
+            buoyancy: 30.0,
+            temperature_temp: vec![0.0; size],
         }
     }
 
@@ -340,6 +356,11 @@ impl FluidSim {
             omega: self.sor_omega,
             diffusion: self.diffusion_rate,
             vmax: self.velocity_limit(dt),
+            viscosity: self.viscosity,
+            viscosity_substeps: self.viscosity_substeps(dt),
+            buoyancy: self.buoyancy,
+            thermal_fluid: self.thermal_diffusion,
+            thermal_solid: self.solid_thermal_diffusion,
             boundaries: [self.left_boundary, self.right_boundary, self.top_boundary, self.bottom_boundary],
             special_cells: &self.special_cells,
         };
@@ -350,10 +371,11 @@ impl FluidSim {
             pressure: &mut self.pressure,
             divergence: &mut self.divergence,
             density: &mut self.density,
+            temperature: &mut self.temperature,
             solids: &self.solids,
         });
 
         let substeps = self.density_substeps(dt);
-        gpu.step_density(&cfg, substeps, &mut self.density);
+        gpu.step_density(&cfg, substeps, &mut self.density, &mut self.temperature);
     }
 }

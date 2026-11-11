@@ -11,8 +11,13 @@ struct GpuParams {
     diffusion: f32,
     vmax: f32,
     special_count: u32,
+    visc_k: f32,
+    buoyancy: f32,
+    thermal_fluid: f32,
+    thermal_solid: f32,
     boundary_type: [u32; 4], // gauche, droite, haut, bas
     boundary: [[f32; 4]; 4], // (vx, vy, density, offset) x 4
+    boundary_temp: [f32; 4],
 }
 
 #[repr(C)]
@@ -56,6 +61,11 @@ pub struct StepConfig<'a> {
     // gauche, droite, haut, bas
     pub boundaries: [Boundary; 4],
     pub special_cells: &'a [(usize, CellEffect)],
+    pub viscosity: f32,
+    pub viscosity_substeps: usize,
+    pub buoyancy: f32,
+    pub thermal_fluid: f32,
+    pub thermal_solid: f32,
 }
 
 pub struct GpuFields<'a> {
@@ -65,6 +75,7 @@ pub struct GpuFields<'a> {
     pub divergence: &'a mut [f32],
     pub density: &'a mut [f32],
     pub solids: &'a [CellType],
+    pub temperature: &'a mut [f32],
 }
 
 struct Pipelines {
@@ -84,6 +95,12 @@ struct Pipelines {
     density_commit: wgpu::ComputePipeline,
     special_density: wgpu::ComputePipeline,
     apply_density_boundaries: wgpu::ComputePipeline,
+    diffuse_velocity: wgpu::ComputePipeline,
+    buoyancy: wgpu::ComputePipeline,
+    prepare_ghost_temperature: wgpu::ComputePipeline,
+    temperature_step: wgpu::ComputePipeline,
+    temperature_commit: wgpu::ComputePipeline,
+    apply_temperature_boundaries:wgpu::ComputePipeline,
 }
 
 pub struct GpuContext {
@@ -150,7 +167,7 @@ impl GpuContext {
         let pressure_buf = make_buffer("pressure", f32_bytes);
         let divergence_buf = make_buffer("divergence", f32_bytes);
         let density_buf = make_buffer("density", f32_bytes);
-        let scratch_buf = make_buffer("scratch", 3 * f32_bytes);
+        let scratch_buf = make_buffer("scratch", 5 * f32_bytes);
         let cells_buf = make_buffer("cells", (size * size_of::<u32>()) as u64);
 
         let special_capacity = 16;
@@ -247,6 +264,12 @@ impl GpuContext {
             density_commit: make_pipeline("density_commit"),
             special_density: make_pipeline("special_density"),
             apply_density_boundaries: make_pipeline("apply_density_boundaries"),
+            diffuse_velocity: make_pipeline("diffuse_velocity"),
+            buoyancy: make_pipeline("buoyancy"),
+            prepare_ghost_temperature: make_pipeline("prepare_ghost_temperature"),
+            temperature_step: make_pipeline("temperature_step"),
+            temperature_commit: make_pipeline("temperature_commit"),
+            apply_temperature_boundaries: make_pipeline("apply_temperature_boundaries"),
         };
 
         Some(Self {
@@ -292,6 +315,10 @@ impl GpuContext {
 
     fn upload_f32(&self, buffer: &wgpu::Buffer, data: &[f32]) {
         self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    fn temperature_offset(&self) -> u64 {
+        (4 * self.width * self.height * size_of::<f32>()) as u64
     }
 
     fn upload_specials(&mut self, specials: &[(usize, CellEffect)]) {
@@ -341,6 +368,11 @@ impl GpuContext {
             special_count: cfg.special_cells.len() as u32,
             boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
             boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],
+            visc_k: cfg.viscosity * cfg.dt / cfg.viscosity_substeps.max(1) as f32,
+            buoyancy: cfg.buoyancy,
+            thermal_fluid: cfg.thermal_fluid,
+            thermal_solid: cfg.thermal_solid,
+            boundary_temp: [b[0].temperature, b[1].temperature, b[2].temperature, b[3].temperature],
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
     }
@@ -371,6 +403,7 @@ impl GpuContext {
         assert_eq!(f.divergence.len(), size, "divergence: wrong size");
         assert_eq!(f.density.len(), size, "density: wrong size");
         assert_eq!(f.solids.len(), size, "solids: wrong size");
+        assert_eq!(f.temperature.len(), size, "temperature: wrong size");
 
         self.upload_specials(cfg.special_cells);
         self.upload_cells(f.solids);
@@ -378,6 +411,7 @@ impl GpuContext {
         self.upload_f32(&self.velocity_y_buf, f.velocity_y);
         self.upload_f32(&self.pressure_buf, f.pressure);
         self.upload_f32(&self.density_buf, f.density);
+        self.queue.write_buffer(&self.scratch_buf, self.temperature_offset(), bytemuck::cast_slice(f.temperature));
         self.write_params(cfg, 0.0);
 
         let (w, h) = (self.width as u32, self.height as u32);
@@ -396,6 +430,7 @@ impl GpuContext {
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
 
+            //trop de magie noire :(
             macro_rules! run {
                 ($pipeline:expr, $x:expr, $y:expr) => {{
                     pass.set_pipeline(&$pipeline);
@@ -405,6 +440,15 @@ impl GpuContext {
 
             run!(p.advect_velocity, gx, gy);
             run!(p.commit_velocity, gx, gy);
+            if cfg.viscosity > 0.0 {
+                for _ in 0..cfg.viscosity_substeps {
+                    run!(p.diffuse_velocity, gx, gy);
+                    run!(p.commit_velocity, gx, gy);
+                }
+            }
+            if cfg.buoyancy != 0.0 {
+                run!(p.buoyancy, gx, gy);
+            }
             run!(p.special_velocity, 1, 1);
 
             run!(p.close_faces, gx, gy);
@@ -436,14 +480,13 @@ impl GpuContext {
         });
     }
 
-    /// Phase 2 : advection/diffusion de la densité en `substeps` sous-pas, cellules spéciales,
-    /// cellules fantômes. À appeler après `step_velocity` (les buffers GPU y sont déjà à jour).
-    ///
-    /// `substeps` dépend de la vitesse max après projection : il est calculé côté CPU
-    /// entre les deux phases.
-    pub fn step_density(&mut self, cfg: &StepConfig, substeps: usize, density: &mut [f32]) {
+    // advection/diffusion de la densité en `substeps` sous-pas, cellules spéciales,
+    // cellules fantômes
+    // `substeps` dépend vmax après proj, calculé côté CPU
+    pub fn step_density(&mut self, cfg: &StepConfig, substeps: usize, density: &mut [f32], temperature: &mut [f32]) {
         let size = self.width * self.height;
         assert_eq!(density.len(), size, "density: wrong size");
+        assert_eq!(temperature.len(), size, "temperature: wrong size");
 
         let substeps = substeps.max(1);
         self.write_params(cfg, cfg.dt / substeps as f32);
@@ -473,20 +516,26 @@ impl GpuContext {
             }
 
             run!(p.prepare_ghost_density, lines, 1);
+            run!(p.prepare_ghost_temperature, lines, 1);
             for _ in 0..substeps {
                 run!(p.density_step, gx, gy);
                 run!(p.density_commit, gx, gy);
+                run!(p.temperature_step, gx, gy);
+                run!(p.temperature_commit, gx, gy);
             }
             run!(p.special_density, 1, 1);
             run!(p.apply_density_boundaries, lines, 1);
+            run!(p.apply_temperature_boundaries, lines, 1);
         }
 
         let field_bytes = (size * size_of::<f32>()) as u64;
         encoder.copy_buffer_to_buffer(&self.density_buf, 0, &self.readback_buf, 0, field_bytes);
+        encoder.copy_buffer_to_buffer(&self.scratch_buf, self.temperature_offset(), &self.readback_buf, field_bytes, field_bytes);
         self.queue.submit(Some(encoder.finish()));
 
-        self.read_back(field_bytes, |floats| {
+        self.read_back(2 * field_bytes, |floats| {
             density.copy_from_slice(&floats[0..size]);
+            temperature.copy_from_slice(&floats[size..2 * size]);
         });
     }
 }

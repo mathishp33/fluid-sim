@@ -22,17 +22,19 @@ enum DisplayMode {
     Pressure,
     Divergence,
     Velocity,
+    Temperature,
 }
 
 impl DisplayMode {
-    const ALL: [Self; 4] = [Self::Density, Self::Pressure, Self::Divergence, Self::Velocity];
+    const ALL: [Self; 5] = [Self::Density, Self::Pressure, Self::Divergence, Self::Velocity, Self::Temperature];
 
     fn next(self) -> Self {
         match self {
             Self::Density => Self::Pressure,
             Self::Pressure => Self::Divergence,
             Self::Divergence => Self::Velocity,
-            Self::Velocity => Self::Density,
+            Self::Velocity => Self::Temperature,
+            Self::Temperature => Self::Density,
         }
     }
 
@@ -42,6 +44,7 @@ impl DisplayMode {
             Self::Pressure => "PRESSURE",
             Self::Divergence => "DIVERGENCE",
             Self::Velocity => "VELOCITY",
+            Self::Temperature => "TEMPERATURE",
         }
     }
 }
@@ -81,6 +84,16 @@ fn cycle_radius(current: usize, reverse: bool) -> usize {
     } else {
         RADII.iter().copied().find(|&r| r > current).unwrap_or(RADII[0])
     }
+}
+
+fn temperature_color(t: f32) -> u32 { // noir -> rouge -> jaune / noir -> bleu -> cyan
+    let t = t.clamp(-1.0, 1.0);
+    let (r, g, b) = if t >= 0.0 {
+        ((2.0 * t).min(1.0), (2.0 * t - 1.0).max(0.0), 0.0)
+    } else {
+        (0.0, (-2.0 * t - 1.0).max(0.0), (-2.0 * t).min(1.0))
+    };
+    (((r * 255.0) as u32) << 16) | (((g * 255.0) as u32) << 8) | (b * 255.0) as u32
 }
 
 fn signed_color(value: f32, max_abs: f32) -> u32 {
@@ -192,6 +205,7 @@ struct MouseInput {
     right: bool,
     middle: bool,
     ctrl: bool,
+    shift: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -231,6 +245,8 @@ pub struct FluidWindow {
     picking_destination: bool,
     last_effect_type: CellType,
 
+    brush_temperature: f32,
+
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
     stats: Stats,
@@ -252,6 +268,11 @@ impl FluidWindow {
         fluid.right_boundary = settings.right_boundary;
         fluid.top_boundary = settings.top_boundary;
         fluid.bottom_boundary = settings.bottom_boundary;
+
+        fluid.viscosity = settings.viscosity;
+        fluid.thermal_diffusion = settings.thermal_diffusion;
+        fluid.solid_thermal_diffusion = settings.solid_thermal_diffusion;
+        fluid.buoyancy = settings.buoyancy;
 
         let size = fluid.width * fluid.height * 4;
         let now = Instant::now();
@@ -282,6 +303,8 @@ impl FluidWindow {
             teleporter_dest: None,
             picking_destination: false,
             last_effect_type: CellType::Wall,
+
+            brush_temperature: 1.0,
 
             last_mouse: None,
             hovered_cell: None,
@@ -489,6 +512,18 @@ impl FluidWindow {
                 ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
                 ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
                 ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
+                ui.add(egui::Slider::new(&mut self.fluid.viscosity, 0.0..=20.0).text("Viscosity"));
+                ui.separator();
+                ui.heading("Temperature");
+                ui.add(egui::Slider::new(&mut self.fluid.thermal_diffusion, 0.0..=5.0).text("Fluid conduction"));
+                ui.add(egui::Slider::new(&mut self.fluid.solid_thermal_diffusion, 0.0..=5.0).text("Solid conduction"));
+                ui.add(egui::Slider::new(&mut self.fluid.buoyancy, 0.0..=200.0).text("Buoyancy"));
+                ui.add(egui::Slider::new(&mut self.brush_temperature, -1.0..=1.0).text("Brush temp (Shift+LMB)"));
+                if ui.button("Reset temperature").clicked() {
+                    self.fluid.temperature.fill(0.0);
+                    self.status = "Temperature reset".into();
+                }
+                ui.separator();
                 ui.separator();
                 ui.label("Boundaries");
                 boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary);
@@ -510,28 +545,6 @@ impl FluidWindow {
                     self.picking_destination = false;
                 }
                 self.effect_ui(ui);
-                // self.current_cell_effect = CellEffect::default_for(self.selected_cell_type);
-                // ui.collapsing(self.selected_cell_type.to_string(), |ui| {
-                //     if (self.current_cell_effect != None) {
-                //         match self.current_cell_effect.unwrap() {
-                //             CellEffect::Sink { mut rate } => {
-                //                 ui.add(egui::Slider::new(&mut rate, 0.0..=100.0).text("Density Rate"));
-                //             }
-                //             CellEffect::Emitter { mut density, mut vx, mut vy } => {
-                //                 ui.add(egui::Slider::new(&mut density, 0.0..=1.0).text("Density"));
-                //                 ui.add(egui::Slider::new(&mut vx, -200.0..=200.0).text("X velocity"));
-                //                 ui.add(egui::Slider::new(&mut vy, -200.0..=200.0).text("Y velocity"));
-                //             }
-                //             CellEffect::Accelerator { mut ax, mut ay } => {
-                //                 ui.add(egui::Slider::new(&mut ax, -200.0..=200.0).text("X acceleration"));
-                //                 ui.add(egui::Slider::new(&mut ay, -200.0..=200.0).text("Y acceleration"));
-                //             }
-                //             CellEffect::Teleporter { .. } => {
-                //                 //todo
-                //             }
-                //         }
-                //     }
-                // });
             });
         });
     }
@@ -621,6 +634,7 @@ impl FluidWindow {
                             row("Density", format!("{:.3}", self.fluid.density[idx]));
                             row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
                             row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
+                            row("Temperature", format!("{:.3}", self.fluid.temperature[idx]));
                             row("Solid", format!("{}", self.fluid.solids[idx].to_string()));
                         });
                     }
@@ -699,6 +713,7 @@ impl FluidWindow {
                     right: i.pointer.button_down(PointerButton::Secondary),
                     middle: i.pointer.button_down(PointerButton::Middle),
                     ctrl: i.modifiers.command, // Ctrl (Win/Linux) ou Cmd (macOS)
+                    shift: i.modifiers.shift,
                 },
             )
         });
@@ -773,6 +788,9 @@ impl FluidWindow {
         let radius = self.mouse_radius as f32;
         let mouse_mode = self.mouse_mode;
         let r = (radius / precision).ceil() as isize;
+        let brush_t = self.brush_temperature;
+        let heating = input.shift && !input.ctrl;
+        let blend = (5.0 * dt).min(1.0);
 
         for dx in -r..=r {
             for dy in -r..=r {
@@ -799,7 +817,9 @@ impl FluidWindow {
                 let idx = x + y * w;
 
                 if input.left {
-                    if input.ctrl {
+                    if heating {
+                        fluid.temperature[idx] += (brush_t - fluid.temperature[idx]) * blend;
+                    } else if input.ctrl {
                         if self.selected_cell_type == CellType::Wall {
                             fluid.set_cell(x, y, CellType::Wall, None);
                         }
@@ -816,7 +836,9 @@ impl FluidWindow {
                     fluid.velocity_y[idx] += fy * 0.07;
                 }
 
-                if input.middle {
+                if heating {
+                    fluid.temperature[idx] -= fluid.temperature[idx] * blend;
+                } else if input.middle {
                     if input.ctrl {
                         fluid.set_cell(x, y, CellType::Fluid, None);
                     } else {
@@ -880,6 +902,7 @@ impl FluidWindow {
         let grid_h = h;
         let solids = &self.fluid.solids[..];
         let show_effects = self.show_cell_effects;
+        let temperature = &self.fluid.temperature[..];
 
         self.rgba
             .par_chunks_exact_mut(w * 4)
@@ -908,13 +931,13 @@ impl FluidWindow {
                                     let (vx, vy) = FluidSim::cell_velocity_from(velocity_x, velocity_y, w, grid_h, x, y);
                                     velocity_color(vx, vy, velocity_max)
                                 }
+                                DisplayMode::Temperature => temperature_color(temperature[idx]),
                             }
                         }
-                        CellType::Wall => {
-                            match mode {
-                                DisplayMode::Density => 0x000000,
-                                _ => solid_color,
-                            }
+                        CellType::Wall => match mode {
+                            DisplayMode::Density => 0x000000,
+                            DisplayMode::Temperature => temperature_color(temperature[idx]),
+                            _ => solid_color,
                         }
                         CellType::Sink => { //red
                             0xff0000

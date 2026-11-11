@@ -3,6 +3,7 @@ use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType, Flu
 
 const CFL: f32 = 0.9;
 const MAX_SUBSTEPS: usize = 64;
+const MAX_VISC_SUBSTEPS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct SharedMut(*mut f32);
@@ -15,7 +16,57 @@ impl SharedMut {
     }
 }
 
-/// Flux de densité (advection + diffusion) les faces de la grille MAC.
+struct TemperatureKernel<'a> {
+    w: usize,
+    h: usize,
+    u: &'a [f32],
+    v: &'a [f32],
+    solids: &'a [CellType],
+    alpha_fluid: f32,
+    alpha_solid: f32,
+}
+
+impl TemperatureKernel<'_> {
+    #[inline]
+    fn alpha(&self, i: usize) -> f32 {
+        if self.solids[i] == CellType::Wall { self.alpha_solid } else { self.alpha_fluid }
+    }
+
+    #[inline]
+    fn face_alpha(&self, i: usize, j: usize) -> f32 {
+        let (a, b) = (self.alpha(i), self.alpha(j));
+        let s = a + b;
+        if s <= 0.0 { 0.0 } else { 2.0 * a * b / s } // moyenne harmonique
+    }
+
+    #[inline]
+    fn fx(&self, t: &[f32], x: usize, y: usize) -> f32 {
+        let i = x + y * self.w;
+        let uf = self.u[i];
+        let adv = uf * if uf > 0.0 { t[i] } else { t[i + 1] };
+        let dif = if x >= 1 && x + 2 < self.w {
+            -self.face_alpha(i, i + 1) * (t[i + 1] - t[i])
+        } else {
+            0.0
+        };
+        adv + dif
+    }
+
+    #[inline]
+    fn fy(&self, t: &[f32], x: usize, y: usize) -> f32 {
+        let i = x + y * self.w;
+        let vf = self.v[i];
+        let adv = vf * if vf > 0.0 { t[i] } else { t[i + self.w] };
+        let dif = if y >= 1 && y + 2 < self.h {
+            -self.face_alpha(i, i + self.w) * (t[i + self.w] - t[i])
+        } else {
+            0.0
+        };
+        adv + dif
+    }
+}
+
+// Flux de densité (advection + diffusion) les faces de la grille MAC.
 struct DensityKernel<'a> {
     w: usize,
     h: usize,
@@ -63,6 +114,139 @@ impl DensityKernel<'_> {
 }
 
 impl FluidSim {
+
+    pub(crate) fn viscosity_substeps(&self, dt: f32) -> usize {
+        ((4.0 * self.viscosity * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
+    }
+
+    pub fn diffuse_velocity(&mut self, dt: f32) {
+        if self.viscosity <= 0.0 {
+            return;
+        }
+        let (w, h) = (self.width, self.height);
+        let n = self.viscosity_substeps(dt);
+        let k = self.viscosity * dt / n as f32;
+
+        for _ in 0..n {
+            self.velocity_x_temp.copy_from_slice(&self.velocity_x);
+            self.velocity_y_temp.copy_from_slice(&self.velocity_y);
+
+            {
+                let (u, ou) = (&self.velocity_x, &self.open_u);
+                self.velocity_x_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                    if y == 0 || y >= h - 1 {
+                        return;
+                    }
+                    for x in 1..w - 2 {
+                        let i = x + y * w;
+                        if ou[i] == 0 {
+                            continue;
+                        }
+                        let c = u[i];
+                        let mut lap = 0.0;
+                        if ou[i + 1] != 0 { lap += u[i + 1] - c; }
+                        if ou[i - 1] != 0 { lap += u[i - 1] - c; }
+                        if ou[i + w] != 0 { lap += u[i + w] - c; }
+                        if ou[i - w] != 0 { lap += u[i - w] - c; }
+                        row[x] = c + k * lap;
+                    }
+                });
+            }
+            {
+                let (v, ov) = (&self.velocity_y, &self.open_v);
+                self.velocity_y_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                    if y == 0 || y >= h - 2 {
+                        return;
+                    }
+                    for x in 1..w - 1 {
+                        let i = x + y * w;
+                        if ov[i] == 0 {
+                            continue;
+                        }
+                        let c = v[i];
+                        let mut lap = 0.0;
+                        if ov[i + 1] != 0 { lap += v[i + 1] - c; }
+                        if ov[i - 1] != 0 { lap += v[i - 1] - c; }
+                        if ov[i + w] != 0 { lap += v[i + w] - c; }
+                        if ov[i - w] != 0 { lap += v[i - w] - c; }
+                        row[x] = c + k * lap;
+                    }
+                });
+            }
+
+            std::mem::swap(&mut self.velocity_x, &mut self.velocity_x_temp);
+            std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
+        }
+    }
+
+    // dv/dt = -buoyancy * T (T > 0 monte, y pointe vers le bas)
+    fn apply_buoyancy(&mut self, dt: f32) {
+        if self.buoyancy == 0.0 {
+            return;
+        }
+        let (w, h) = (self.width, self.height);
+        let (t, ov, g) = (&self.temperature, &self.open_v, self.buoyancy * dt);
+        self.velocity_y.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if y == 0 || y >= h - 2 {
+                return;
+            }
+            for x in 1..w - 1 {
+                let i = x + y * w;
+                if ov[i] != 0 {
+                    row[x] -= g * 0.5 * (t[i] + t[i + w]);
+                }
+            }
+        });
+    }
+
+    // fantômes : Inlet = valeur, Wall = adiabatique,
+    // Outlet = ambiante (0) avant l'advection copie après
+    fn update_ghost_temperature(&mut self, before_advection: bool) {
+        let (w, h) = (self.width, self.height);
+        let ghost = |b: &Boundary, inner: f32| match b.boundary_type {
+            BoundaryType::Inlet => b.temperature,
+            BoundaryType::Outlet if before_advection => 0.0,
+            _ => inner,
+        };
+        for y in 1..h - 1 {
+            let (l, r) = (y * w, (w - 1) + y * w);
+            self.temperature[l] = ghost(&self.left_boundary, self.temperature[l + 1]);
+            self.temperature[r] = ghost(&self.right_boundary, self.temperature[r - 1]);
+        }
+        for x in 1..w - 1 {
+            let (t, b) = (x, x + (h - 1) * w);
+            self.temperature[t] = ghost(&self.top_boundary, self.temperature[t + w]);
+            self.temperature[b] = ghost(&self.bottom_boundary, self.temperature[b - w]);
+        }
+    }
+
+    fn temperature_substep(&mut self, dts: f32) {
+        let (w, h) = (self.width, self.height);
+        self.temperature_temp.copy_from_slice(&self.temperature); // conserve les fantômes
+
+        let kernel = TemperatureKernel {
+            w, h,
+            u: &self.velocity_x,
+            v: &self.velocity_y,
+            solids: &self.solids,
+            alpha_fluid: self.thermal_diffusion,
+            alpha_solid: self.solid_thermal_diffusion,
+        };
+        let t = &self.temperature;
+
+        self.temperature_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if y == 0 || y == h - 1 {
+                return;
+            }
+            for x in 1..w - 1 {
+                row[x] = t[x + y * w]
+                    - dts * (kernel.fx(t, x, y) - kernel.fx(t, x - 1, y)
+                    + kernel.fy(t, x, y) - kernel.fy(t, x, y - 1));
+            }
+        });
+        std::mem::swap(&mut self.temperature, &mut self.temperature_temp);
+    }
+
     #[inline]
     fn offset_factor(x: usize, size: usize, offset: usize) -> f32 {
         if offset == 0 {
@@ -467,7 +651,8 @@ impl FluidSim {
             })
             .reduce(|| 0.0, f32::max);
 
-        let n = (dt * (rate + 4.0 * self.diffusion_rate) / CFL).ceil();
+        let alpha = self.diffusion_rate.max(self.thermal_diffusion).max(self.solid_thermal_diffusion);
+        let n = (dt * (rate + 4.0 * alpha) / CFL).ceil();
         (n as usize).clamp(1, MAX_SUBSTEPS)
     }
 
@@ -475,6 +660,7 @@ impl FluidSim {
         let (w, h) = (self.width, self.height);
 
         self.prepare_ghost_density();
+        self.update_ghost_temperature(true);
         let n = self.density_substeps(dt);
         let dts = dt / n as f32;
 
@@ -501,6 +687,7 @@ impl FluidSim {
             });
 
             std::mem::swap(&mut self.density, &mut self.density_temp);
+            self.temperature_substep(dts);
         }
     }
 
@@ -571,6 +758,8 @@ impl FluidSim {
         self.rebuild_masks(); // solides | types de bordure -> faces ouvertes
 
         self.advect_velocity(dt); // advection semi-lagrangienne des faces
+        self.diffuse_velocity(dt);
+        self.apply_buoyancy(dt);
         self.apply_special_velocity(dt);
 
         self.apply_velocity_boundaries(); // CL + faces fermées = 0
@@ -580,5 +769,6 @@ impl FluidSim {
         self.advect_diffuse_density(dt); // flux conservatif, sous-pas CFL
         self.apply_special_density(dt);
         self.apply_density_boundaries(); // fantômes, affichage
+        self.update_ghost_temperature(false);
     }
 }
