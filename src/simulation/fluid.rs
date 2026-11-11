@@ -50,7 +50,7 @@ pub enum CellType {
 
 impl CellType {
 
-    pub const ALL_EXCEPT_ONE: [Self; 4] = [Self::Wall, Self::Sink, Self::Emitter, Self::Accelerator];
+    pub const PAINTABLE: [Self; 5] = [Self::Wall, Self::Sink, Self::Emitter, Self::Accelerator, Self::Teleporter];
     #[inline]
     pub fn is_special(self) -> bool {
         self as u8 >= 2

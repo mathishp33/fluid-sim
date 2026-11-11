@@ -55,6 +55,11 @@ const BT_WALL: u32 = 0u;
 const BT_INLET: u32 = 1u;
 const BT_OUTLET: u32 = 2u;
 
+const CELL_SINK: u32 = 2u;
+
+fn is_sink(i: u32) -> bool {
+    return cells[i] == CELL_SINK;
+}
 
 fn is_solid(i: u32) -> bool {
     return cells[i] == CELL_WALL;
@@ -233,7 +238,14 @@ fn commit_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn special_velocity() {
     for (var k = 0u; k < params.special_count; k++) {
         let s = specials[k];
-        if (s.kind == 2u) {
+        if (s.kind == 1u) {
+            let w = params.width;
+            velocity_x[s.idx] = -s.a;
+            velocity_x[s.idx - 1u] = s.a;
+            velocity_y[s.idx] = -s.a;
+            velocity_y[s.idx - w] = s.a;
+            pressure[s.idx] = 0.0;
+        } else if (s.kind == 2u) {
             velocity_x[s.idx] = s.a;
             velocity_y[s.idx] = s.b;
         } else if (s.kind == 3u) {
@@ -252,7 +264,9 @@ fn special_velocity() {
 fn special_density() {
     for (var k = 0u; k < params.special_count; k++) {
         let s = specials[k];
-        if (s.kind == 2u) {
+        if (s.kind == 1u) {
+            density[s.idx] = 0.0;
+        } else if (s.kind == 2u) {
             density[s.idx] = s.c;
         } else if (s.kind == 1u) {
             density[s.idx] = density[s.idx] * max(1.0 - s.a * params.dt, 0.0);
@@ -383,7 +397,7 @@ fn calculate_divergence(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
     let i = gid.x + gid.y * w;
 
-    if (is_solid(i)) {
+    if (is_solid(i) || is_sink(i)) {
         divergence[i] = 0.0;
         return;
     }
@@ -400,7 +414,7 @@ fn rb_sweep(gid: vec3<u32>, color: u32) {
     let y = gid.y;
     let i = x + y * w;
 
-    if (is_solid(i)) {
+    if (is_solid(i) || is_sink(i)) {
         return;
     }
 
