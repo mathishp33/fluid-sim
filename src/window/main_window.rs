@@ -226,6 +226,10 @@ pub struct FluidWindow {
     inverse_solid_color: bool,
     selected_cell_type: CellType,
     current_cell_effect: Option<CellEffect>,
+    show_cell_effects: bool,
+    teleporter_dest: Option<usize>,
+    picking_destination: bool,
+    last_effect_type: CellType,
 
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
@@ -274,6 +278,10 @@ impl FluidWindow {
             inverse_solid_color: true,
             selected_cell_type: CellType::Wall,
             current_cell_effect: None,
+            show_cell_effects: true,
+            teleporter_dest: None,
+            picking_destination: false,
+            last_effect_type: CellType::Wall,
 
             last_mouse: None,
             hovered_cell: None,
@@ -455,119 +463,172 @@ impl FluidWindow {
 
     fn controls_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("controls").default_width(240.0).show(ctx, |ui| {
-            ui.heading("Controls");
-            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Controls");
+                ui.separator();
 
-            ui.label("Display (V)");
-            for mode in DisplayMode::ALL {
-                ui.selectable_value(&mut self.display_mode, mode, mode.name());
-            }
-
-            ui.separator();
-            ui.label("Brush shape (M)");
-            for mode in MouseMode::ALL {
-                ui.selectable_value(&mut self.mouse_mode, mode, mode.name());
-            }
-            ui.add(egui::Slider::new(&mut self.mouse_radius, 1..=350).text("Radius (C)"));
-
-            ui.separator();
-            ui.checkbox(&mut self.inverse_solid_color, "White solids (I)");
-
-            ui.separator();
-            ui.heading("Live Settings");
-            ui.separator();
-            ui.label("Solver");
-            ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
-            ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
-            ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
-            ui.separator();
-            ui.label("Boundaries");
-            boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary);
-            boundary_ui(ui, "Right Boundary", &mut self.fluid.right_boundary);
-            boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary);
-            boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary);
-
-            ui.separator();
-            ui.heading("Cell Effects");
-            for cell_type in CellType::ALL_EXCEPT_ONE {
-                ui.selectable_value(&mut self.selected_cell_type, cell_type, cell_type.to_string());
-            }
-            self.current_cell_effect = CellEffect::default_for(self.selected_cell_type);
-            ui.collapsing(self.selected_cell_type.to_string(), |ui| {
-                if (self.current_cell_effect != None) {
-                    match self.current_cell_effect.unwrap() {
-                        CellEffect::Sink { mut rate } => {
-                            ui.add(egui::Slider::new(&mut rate, 0.0..=10.0).text("Density Rate"));
-                        }
-                        CellEffect::Emitter { mut density, mut vx, mut vy } => {
-                            ui.add(egui::Slider::new(&mut density, 0.0..=1.0).text("Density"));
-                            ui.add(egui::Slider::new(&mut vx, -200.0..=200.0).text("X velocity"));
-                            ui.add(egui::Slider::new(&mut vy, -200.0..=200.0).text("Y velocity"));
-                        }
-                        CellEffect::Accelerator { mut ax, mut ay } => {
-                            ui.add(egui::Slider::new(&mut ax, -50.0..=50.0).text("X acceleration"));
-                            ui.add(egui::Slider::new(&mut ay, -50.0..=50.0).text("Y acceleration"));
-                        }
-                        CellEffect::Teleporter { .. } => {
-                            //todo
-                        }
-                    }
+                ui.label("Display (V)");
+                for mode in DisplayMode::ALL {
+                    ui.selectable_value(&mut self.display_mode, mode, mode.name());
                 }
+
+                ui.separator();
+                ui.label("Brush shape (M)");
+                for mode in MouseMode::ALL {
+                    ui.selectable_value(&mut self.mouse_mode, mode, mode.name());
+                }
+                ui.add(egui::Slider::new(&mut self.mouse_radius, 1..=350).text("Radius (C)"));
+
+                ui.separator();
+                ui.checkbox(&mut self.inverse_solid_color, "White solids (I)");
+
+                ui.separator();
+                ui.heading("Live Settings");
+                ui.separator();
+                ui.label("Solver");
+                ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
+                ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
+                ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
+                ui.separator();
+                ui.label("Boundaries");
+                boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary);
+                boundary_ui(ui, "Right Boundary", &mut self.fluid.right_boundary);
+                boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary);
+                boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary);
+
+                ui.separator();
+                ui.heading("Cell Effects");
+                ui.checkbox(&mut self.show_cell_effects, "Show cell effects");
+                ui.separator();
+                for cell_type in CellType::PAINTABLE {
+                    ui.selectable_value(&mut self.selected_cell_type, cell_type, cell_type.to_string());
+                }
+                ui.separator();
+                if self.selected_cell_type != self.last_effect_type {
+                    self.last_effect_type = self.selected_cell_type;
+                    self.current_cell_effect = CellEffect::default_for(self.selected_cell_type);
+                    self.picking_destination = false;
+                }
+                self.effect_ui(ui);
+                // self.current_cell_effect = CellEffect::default_for(self.selected_cell_type);
+                // ui.collapsing(self.selected_cell_type.to_string(), |ui| {
+                //     if (self.current_cell_effect != None) {
+                //         match self.current_cell_effect.unwrap() {
+                //             CellEffect::Sink { mut rate } => {
+                //                 ui.add(egui::Slider::new(&mut rate, 0.0..=100.0).text("Density Rate"));
+                //             }
+                //             CellEffect::Emitter { mut density, mut vx, mut vy } => {
+                //                 ui.add(egui::Slider::new(&mut density, 0.0..=1.0).text("Density"));
+                //                 ui.add(egui::Slider::new(&mut vx, -200.0..=200.0).text("X velocity"));
+                //                 ui.add(egui::Slider::new(&mut vy, -200.0..=200.0).text("Y velocity"));
+                //             }
+                //             CellEffect::Accelerator { mut ax, mut ay } => {
+                //                 ui.add(egui::Slider::new(&mut ax, -200.0..=200.0).text("X acceleration"));
+                //                 ui.add(egui::Slider::new(&mut ay, -200.0..=200.0).text("Y acceleration"));
+                //             }
+                //             CellEffect::Teleporter { .. } => {
+                //                 //todo
+                //             }
+                //         }
+                //     }
+                // });
             });
         });
     }
 
-    fn info_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("info").default_width(240.0).show(ctx, |ui| {
-            ui.heading("Info");
-            ui.separator();
-
-            egui::Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                let mut row = |name: &str, value: String| {
-                    ui.label(name);
-                    ui.label(value);
-                    ui.end_row();
-                };
-
-                row("FPS", format!("{:.1}", self.fps));
-                row("State", if self.paused { "PAUSED".to_string() } else { "RUNNING".to_string() });
-                row("Grid", format!("{} x {}", self.fluid.width, self.fluid.height));
-                row("Precision", format!("{} px", self.precision));
-                row("Display", self.display_mode.name().to_string());
-                row("Brush", format!("{} ({} px)", self.mouse_mode.name(), self.mouse_radius));
-                row("Max |pressure|", format!("{:.3}", self.stats.pressure_max));
-                row("Max |divergence|", format!("{:.3}", self.stats.divergence_max));
-                row("Max speed", format!("{:.3}", self.stats.velocity_max));
-                row("Total density", format!("{:.4}", self.stats.total_density));
-                row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
-            });
-
-            ui.separator();
-            ui.heading("Cell under cursor");
-
-            match self.hovered_cell {
-                Some((x, y)) => {
-                    let idx = x + y * self.fluid.width;
-                    egui::Grid::new("cell_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                        let mut row = |name: &str, value: String| {
-                            ui.label(name);
-                            ui.label(value);
-                            ui.end_row();
-                        };
-                        row("Position", format!("{x}, {y}"));
-                        let (cvx, cvy) = self.fluid.cell_velocity(x, y);
-                        row("Velocity X", format!("{:.3}", cvx));
-                        row("Velocity Y", format!("{:.3}", cvy));
-                        row("Density", format!("{:.3}", self.fluid.density[idx]));
-                        row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
-                        row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
-                        row("Solid", format!("{}", self.fluid.solids[idx].to_string()));
-                    });
+    fn effect_ui(&mut self, ui: &mut egui::Ui) {
+        if self.selected_cell_type == CellType::Teleporter {
+            ui.label("1. Pick a destination\n2. Ctrl+LMB to paint teleporters");
+            let label = if self.picking_destination { "Click on the canvas..." } else { "Pick destination" };
+            if ui.button(label).clicked() {
+                self.picking_destination = !self.picking_destination;
+            }
+            match self.teleporter_dest {
+                Some(idx) => {
+                    let w = self.fluid.width;
+                    ui.label(format!("Destination: {}, {}", idx % w, idx / w));
                 }
                 None => {
-                    ui.weak("—");
+                    ui.weak("No destination set");
                 }
             }
+            self.current_cell_effect =
+                self.teleporter_dest.map(|d| CellEffect::Teleporter { dest_idx: d });
+            return;
+        }
+
+        if let Some(effect) = &mut self.current_cell_effect {
+            match effect {
+                CellEffect::Sink { rate } => {
+                    ui.add(egui::Slider::new(rate, 0.0..=200.0).text("Suction"));
+                }
+                CellEffect::Emitter { density, vx, vy } => {
+                    ui.add(egui::Slider::new(density, 0.0..=1.0).text("Density"));
+                    ui.add(egui::Slider::new(vx, -200.0..=200.0).text("X velocity"));
+                    ui.add(egui::Slider::new(vy, -200.0..=200.0).text("Y velocity"));
+                }
+                CellEffect::Accelerator { ax, ay } => {
+                    ui.add(egui::Slider::new(ax, -200.0..=200.0).text("X acceleration"));
+                    ui.add(egui::Slider::new(ay, -200.0..=200.0).text("Y acceleration"));
+                }
+                CellEffect::Teleporter { .. } => {}
+            }
+        }
+    }
+
+    fn info_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("info").default_width(240.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Info");
+                ui.separator();
+
+                egui::Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                    let mut row = |name: &str, value: String| {
+                        ui.label(name);
+                        ui.label(value);
+                        ui.end_row();
+                    };
+
+                    row("FPS", format!("{:.1}", self.fps));
+                    row("State", if self.paused { "PAUSED".to_string() } else { "RUNNING".to_string() });
+                    row("Grid", format!("{} x {}", self.fluid.width, self.fluid.height));
+                    row("Precision", format!("{} px", self.precision));
+                    row("Display", self.display_mode.name().to_string());
+                    row("Brush", format!("{} ({} px)", self.mouse_mode.name(), self.mouse_radius));
+                    row("Max |pressure|", format!("{:.3}", self.stats.pressure_max));
+                    row("Max |divergence|", format!("{:.3}", self.stats.divergence_max));
+                    row("Max speed", format!("{:.3}", self.stats.velocity_max));
+                    row("Total density", format!("{:.4}", self.stats.total_density));
+                    row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
+                });
+
+                ui.separator();
+                ui.heading("Cell under cursor");
+
+                match self.hovered_cell {
+                    Some((x, y)) => {
+                        let idx = x + y * self.fluid.width;
+                        egui::Grid::new("cell_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                            let mut row = |name: &str, value: String| {
+                                ui.label(name);
+                                ui.label(value);
+                                ui.end_row();
+                            };
+                            row("Position", format!("{x}, {y}"));
+                            let (cvx, cvy) = self.fluid.cell_velocity(x, y);
+                            row("Velocity X", format!("{:.3}", cvx));
+                            row("Velocity Y", format!("{:.3}", cvy));
+                            row("Density", format!("{:.3}", self.fluid.density[idx]));
+                            row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
+                            row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
+                            row("Solid", format!("{}", self.fluid.solids[idx].to_string()));
+                        });
+                    }
+                    None => {
+                        ui.weak("—");
+                    }
+                }
+            });
         });
     }
 
@@ -671,11 +732,33 @@ impl FluidWindow {
         };
         self.last_mouse = Some((mx, my));
 
+        if self.picking_destination {
+            if response.clicked() {
+                let w = self.fluid.width;
+                let h = self.fluid.height;
+                let idx = gx + gy * w;
+                if gx < 1 || gx >= w - 1 || gy < 1 || gy >= h - 1 {
+                    self.status = "Destination must be inside the grid".into();
+                } else if self.fluid.solids[idx] == CellType::Wall {
+                    self.status = "Destination can't be a wall".into();
+                } else {
+                    self.teleporter_dest = Some(idx);
+                    self.picking_destination = false;
+                    self.status = format!("Teleporter destination: {gx}, {gy}");
+                }
+            }
+            return;
+        }
+
         self.apply_brush(gx, gy, fx, fy, dt, input);
     }
 
     fn apply_brush(&mut self, gx: usize, gy: usize, fx: f32, fy: f32, dt: f32, input: MouseInput) {
         if !(input.left || input.right || input.middle) {
+            return;
+        }
+        if input.left && input.ctrl && self.selected_cell_type == CellType::Teleporter  && self.current_cell_effect.is_none() {
+            self.status = "Teleporter: pick a destination first".into();
             return;
         }
 
@@ -796,6 +879,7 @@ impl FluidWindow {
         let velocity_y = &self.fluid.velocity_y[..];
         let grid_h = h;
         let solids = &self.fluid.solids[..];
+        let show_effects = self.show_cell_effects;
 
         self.rgba
             .par_chunks_exact_mut(w * 4)
@@ -804,26 +888,45 @@ impl FluidWindow {
                 for (x, px) in row.chunks_exact_mut(4).enumerate() {
                     let idx = x + y * w;
 
-                    let color: u32 = if solids[idx] == CellType::Wall {
-                        match mode {
-                            DisplayMode::Density => 0x000000,
-                            _ => solid_color,
+                    let kind = match solids[idx] {
+                        k if k.is_special() && !show_effects => CellType::Fluid,
+                        k => k,
+                    };
+                    let color: u32 = match kind {
+                        CellType::Fluid => {
+                            match mode {
+                                DisplayMode::Density => {
+                                    let d = density[idx].clamp(0.0, 1.0);
+                                    let r = (d * ((max_color >> 16) & 0xFF) as f32) as u32;
+                                    let g = (d * ((max_color >> 8) & 0xFF) as f32) as u32;
+                                    let b = (d * (max_color & 0xFF) as f32) as u32;
+                                    (r << 16) | (g << 8) | b
+                                }
+                                DisplayMode::Pressure => signed_color(pressure[idx], pressure_max),
+                                DisplayMode::Divergence => signed_color(divergence[idx], divergence_max),
+                                DisplayMode::Velocity => {
+                                    let (vx, vy) = FluidSim::cell_velocity_from(velocity_x, velocity_y, w, grid_h, x, y);
+                                    velocity_color(vx, vy, velocity_max)
+                                }
+                            }
                         }
-                    } else {
-                        match mode {
-                            DisplayMode::Density => {
-                                let d = density[idx].clamp(0.0, 1.0);
-                                let r = (d * ((max_color >> 16) & 0xFF) as f32) as u32;
-                                let g = (d * ((max_color >> 8) & 0xFF) as f32) as u32;
-                                let b = (d * (max_color & 0xFF) as f32) as u32;
-                                (r << 16) | (g << 8) | b
+                        CellType::Wall => {
+                            match mode {
+                                DisplayMode::Density => 0x000000,
+                                _ => solid_color,
                             }
-                            DisplayMode::Pressure => signed_color(pressure[idx], pressure_max),
-                            DisplayMode::Divergence => signed_color(divergence[idx], divergence_max),
-                            DisplayMode::Velocity => {
-                                let (vx, vy) = FluidSim::cell_velocity_from(velocity_x, velocity_y, w, grid_h, x, y);
-                                velocity_color(vx, vy, velocity_max)
-                            }
+                        }
+                        CellType::Sink => { //red
+                            0xff0000
+                        }
+                        CellType::Emitter => { //green
+                            0x00ff00
+                        }
+                        CellType::Accelerator => { //violet
+                            0xff00ff
+                        }
+                        CellType::Teleporter => {
+                            0x0000ff
                         }
                     };
 
@@ -834,6 +937,26 @@ impl FluidWindow {
                 }
             });
 
+        if show_effects {
+            let mut mark = |rgba: &mut Vec<u8>, idx: usize| {
+                let p = idx * 4;
+                if p + 2 < rgba.len() && solids[idx] == CellType::Fluid {
+                    rgba[p] = 0x00;
+                    rgba[p + 1] = 0xff;
+                    rgba[p + 2] = 0xff;
+                }
+            };
+            for &(_, effect) in &self.fluid.special_cells {
+                if let CellEffect::Teleporter { dest_idx } = effect {
+                    mark(&mut self.rgba, dest_idx);
+                }
+            }
+            if self.selected_cell_type == CellType::Teleporter {
+                if let Some(d) = self.teleporter_dest {
+                    mark(&mut self.rgba, d);
+                }
+            }
+        }
         let image = ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
         match &mut self.texture {
             Some(tex) => tex.set(image, TextureOptions::NEAREST),

@@ -1,10 +1,8 @@
 
 
 ## Prioritaire
-1. ajouter Teleporter(), fix les bugs des CellEffect(), faire en sorte que Sink enleve de la divergence ou de la pression
-1. scinder fluid.rs en fluid.rs et cpu.rs
-2. basculer tout step() sur le GPU en mode GPU
-3. faire implémentation des SpecialCell
+1. Teleporter() kind of broken, destination size is not customizable.
+
 
 ## Moins prioritaire
 1. backtrace RK2 ou MacCormack

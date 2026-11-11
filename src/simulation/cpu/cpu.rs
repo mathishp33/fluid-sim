@@ -313,7 +313,13 @@ impl FluidSim {
                         self.velocity_y[dest_idx] = self.velocity_y[idx];
                     }
                 }
-                CellEffect::Sink { .. } => {}
+                CellEffect::Sink { rate } => {
+                    self.velocity_x[idx] = -rate;
+                    self.velocity_x[idx - 1] = rate;
+                    self.velocity_y[idx] = -rate;
+                    self.velocity_y[idx - self.width] = rate;
+                    self.pressure[idx] = 0.0;
+                }
             }
         }
     }
@@ -328,7 +334,7 @@ impl FluidSim {
             }
             for x in 1..w - 1 {
                 let i = x + y * w;
-                row[x] = if s[i] == CellType::Wall {
+                row[x] = if s[i] == CellType::Wall || s[i] == CellType::Sink {
                     0.0
                 } else {
                     u[i] - u[i - 1] + v[i] - v[i - w]
@@ -350,7 +356,7 @@ impl FluidSim {
                     let mut x = if ((1 + y) & 1) == color { 1 } else { 2 };
                     while x < w - 1 {
                         let i = x + y * w;
-                        if s[i] != CellType::Wall {
+                        if s[i] != CellType::Wall && s[i] != CellType::Wall {
                             let a = ou[i] as f32;
                             let b = ou[i - 1] as f32;
                             let c = ov[i] as f32;
@@ -548,7 +554,7 @@ impl FluidSim {
                     self.density[idx] = density;
                 }
                 CellEffect::Sink { rate } => {
-                    self.density[idx] *= (1.0 - rate * dt).max(0.0);
+                    self.density[idx] = 0.0;
                 }
                 CellEffect::Teleporter { dest_idx } => {
                     if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
