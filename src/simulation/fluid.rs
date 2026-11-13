@@ -1,8 +1,17 @@
 use std::cmp::PartialEq;
+use std::fmt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use crate::simulation::gpu::gpu::{GpuContext, GpuFields, StepConfig};
 use crate::simulation::materials::{FluidKind, FluidMaterial};
+
+// voca :
+// - tracer : colorant, sans dimension, 0..1. pas de la physique.
+// - rho : masse volumique (kg/m^3), déduite de T et P.
+// - temperature : K, absolue.
+// - pressure : pression du solveur (interne, dépend de dt).
+// - pressure_pa : pression réelle (Pa) = P_ref + hydrostatique + dynamique.
+// - p_th : pression thermodynamique uniforme (Pa), utilisée par gaz parfait.
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeMethod {
@@ -20,11 +29,11 @@ pub enum BoundaryType {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Boundary {
     pub boundary_type: BoundaryType,
-    pub velocity_x: f32,
-    pub velocity_y: f32,
-    pub density: f32,
+    pub velocity_x: f32, // cellules/s (solveur)
+    pub velocity_y: f32, // cellules/s (solveur)
+    pub tracer: f32, // 0..1
     pub offset: usize,
-    pub temperature: f32,
+    pub temperature: f32, // K
 }
 
 impl Boundary {
@@ -33,9 +42,9 @@ impl Boundary {
             boundary_type: BoundaryType::Wall,
             velocity_x: 0.0,
             velocity_y: 0.0,
-            density: 0.0,
+            tracer: 0.0,
             offset: 1,
-            temperature: 293.0,
+            temperature: 293.15,
         }
     }
 }
@@ -52,41 +61,31 @@ pub enum CellType {
 }
 
 impl CellType {
-
     pub const PAINTABLE: [Self; 5] = [Self::Wall, Self::Sink, Self::Emitter, Self::Accelerator, Self::Teleporter];
+
     #[inline]
     pub fn is_special(self) -> bool {
         self as u8 >= 2
     }
+}
 
-    pub fn to_string(self) -> String {
-        match self {
-            CellType::Fluid => {
-                "Fluid".parse().unwrap()
-            }
-            CellType::Wall => {
-                "Wall".parse().unwrap()
-            }
-            CellType::Sink => {
-                "Sink".parse().unwrap()
-            }
-            CellType::Emitter => {
-                "Emitter".parse().unwrap()
-            }
-            CellType::Accelerator => {
-                "Accelerator".parse().unwrap()
-            }
-            CellType::Teleporter => {
-                "Teleporter".parse().unwrap()
-            }
-        }
+impl fmt::Display for CellType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CellType::Fluid => "Fluid",
+            CellType::Wall => "Wall",
+            CellType::Sink => "Sink",
+            CellType::Emitter => "Emitter",
+            CellType::Accelerator => "Accelerator",
+            CellType::Teleporter => "Teleporter",
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CellEffect {
     Sink { rate: f32 },
-    Emitter { vx: f32, vy: f32, density: f32 },
+    Emitter { vx: f32, vy: f32, tracer: f32 },
     Accelerator { ax: f32, ay: f32 },
     Teleporter { dest_idx: usize },
 }
@@ -94,23 +93,18 @@ pub enum CellEffect {
 impl CellEffect {
     pub fn default_for(kind: CellType) -> Option<Self> {
         match kind {
-            CellType::Sink => Some(Self::Sink {
-                rate: 5.0
-            }),
-            CellType::Emitter => Some(Self::Emitter {
-                vx: 0.0, vy: 0.0, density: 1.0
-            }),
-            CellType::Accelerator => Some(Self::Accelerator {
-                ax: 50.0, ay: 0.0
-            }),
+            CellType::Sink => Some(Self::Sink { rate: 5.0 }),
+            CellType::Emitter => Some(Self::Emitter { vx: 0.0, vy: 0.0, tracer: 1.0 }),
+            CellType::Accelerator => Some(Self::Accelerator { ax: 50.0, ay: 0.0 }),
             CellType::Teleporter => None, // dest_idx dépend de la cellule, voir set_cell
             _ => None,
         }
     }
 }
 
-
-// les cellules en bordure (x = 0, x = w-1, y = 0, y = h-1) sont des cellules fantômes.
+// Les cellules en bordure (x = 0, x = w-1, y = 0, y = h-1) sont des cellules fantômes.
+// Unités : le solveur en cellules (vitesses en cellules/s, ν et α divisés par dx^2)
+// Les interfaces (matériau, rho, T, pressure_pa) sont en SI
 pub struct FluidSim {
     pub width: usize,
     pub height: usize,
@@ -119,20 +113,27 @@ pub struct FluidSim {
     pub dx: f32, // m/cellule
     pub gravity: f32, // m/s^2
     pub p_th: f32, // pression thermodynamique (Pa)
+    pub dpdt: f32, // dP_th/dt (Pa/s), dernier pas (boîte fermée)
+    pub last_dt: f32, // dernier dt utilisé (s), pour convertir la pression du solveur en Pa
+    pub rho_min: f32, // kg/m^3, cellules non solides
+
+    // Gaz : true = low-Mach (rho variable, divergence != 0, CPU seulement).
+    // false (ou liquide) = incompressible + Boussinesq (CPU ou GPU).
+    pub low_mach: bool,
 
     pub tracer: Vec<f32>,
     pub rho: Vec<f32>, // kg/m^3, dérivé de T
     pub pressure: Vec<f32>, // pression du SOLVEUR (interne)
     pub pressure_pa: Vec<f32>, // pression réelle (Pa)
     pub temperature: Vec<f32>, // K
+    pub heat_source: Vec<f32>, // W/m^3, consommé puis remis à zéro à chaque pas (pinceau)
     pub velocity_x: Vec<f32>,
     pub velocity_y: Vec<f32>,
-    pub divergence: Vec<f32>,
+    pub divergence: Vec<f32>, // divergence réelle après projection (1/s)
+    pub source: Vec<f32>, // divergence cible S (1/s) ; 0 si incompressible
     pub solids: Vec<CellType>,
     pub special_cells: Vec<(usize, CellEffect)>,
-    // Facteur de sur-relaxation du Red-Black Gauss-Seidel (1.0 = Gauss-Seidel pur).
-    // Avec peu d'itérations par frame, rester vers 1.0-1.5 ; 2/(1+sin(pi/n)) ne vaut que
-    // si le solveur a le temps de converger.
+    // Facteur de sur-relaxation du Red-Black Gauss-Seidel (1.0 = Gauss-Seidel pur)
     pub sor_omega: f32,
 
     pub(crate) tracer_temp: Vec<f32>,
@@ -141,9 +142,12 @@ pub struct FluidSim {
     pub(crate) temperature_temp: Vec<f32>,
 
     // 1 si la face droite (resp. basse) de la cellule i laisse passer le fluide
-    // (aucune des deux cellules n'est solide, ou face de bord vers un Outlet).
     pub(crate) open_u: Vec<u8>,
     pub(crate) open_v: Vec<u8>,
+    // conductance de la face pour le solveur de pression : open * (rho_ref/rho_face)
+    // (= open si incompressible)
+    pub(crate) cond_u: Vec<f32>,
+    pub(crate) cond_v: Vec<f32>,
 
     pub left_boundary: Boundary,
     pub right_boundary: Boundary,
@@ -179,14 +183,21 @@ impl FluidSim {
             dx,
             gravity: g,
             p_th: fm.p_ref,
+            dpdt: 0.0,
+            last_dt: 0.016,
+            rho_min: fm.rho_ambient(),
+            low_mach: fm.kind == FluidKind::Gas,
+
             tracer: vec![0.0; size],
             velocity_x: vec![0.0; size],
             velocity_y: vec![0.0; size],
             pressure: vec![0.0; size],
-            rho: vec![fm.rho_ref; size],
+            rho: vec![fm.rho_ambient(); size],
             pressure_pa: vec![fm.p_ref; size],
             divergence: vec![0.0; size],
+            source: vec![0.0; size],
             temperature: vec![fm.t_ref; size],
+            heat_source: vec![0.0; size],
 
             solids: vec![CellType::Fluid; size],
             special_cells: Vec::new(),
@@ -199,6 +210,8 @@ impl FluidSim {
 
             open_u: vec![0; size],
             open_v: vec![0; size],
+            cond_u: vec![0.0; size],
+            cond_v: vec![0.0; size],
 
             left_boundary: Boundary::wall(),
             right_boundary: Boundary::wall(),
@@ -210,7 +223,7 @@ impl FluidSim {
         }
     }
 
-
+    // conversions SI -> unités de grille
     #[inline] fn inv_dx2(&self) -> f32 { 1.0 / (self.dx * self.dx) }
     pub(crate) fn nu_grid(&self) -> f32 { self.material.viscosity * self.inv_dx2() }
     pub(crate) fn tracer_diff_grid(&self) -> f32 { self.material.tracer_diffusion * self.inv_dx2() }
@@ -218,19 +231,64 @@ impl FluidSim {
     pub(crate) fn alpha_solid_grid(&self) -> f32 { self.material.alpha_solid() * self.inv_dx2() }
     pub(crate) fn gravity_grid(&self) -> f32 { self.gravity / self.dx }
 
-    pub fn update_derived(&mut self, dt: f32) {
-        let m = self.material;
-        let (w, p_th, g, dx) = (self.width, self.p_th, self.gravity, self.dx);
-        let k = m.rho_ref * dx * dx / dt.max(1e-6); // p_solveur -> Pa dynamique
+    // Le mode low-Mach n'existe que pour un gaz (et seulement sur CPU pour maintenant)
+    pub fn low_mach_active(&self) -> bool {
+        self.low_mach && self.material.kind == FluidKind::Gas
+    }
 
+    pub fn has_outlet(&self) -> bool {
+        [self.left_boundary, self.right_boundary, self.top_boundary, self.bottom_boundary]
+            .iter()
+            .any(|b| b.boundary_type == BoundaryType::Outlet)
+    }
+
+    pub fn has_sink(&self) -> bool {
+        self.special_cells.iter().any(|(_, e)| matches!(e, CellEffect::Sink { .. }))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        !self.has_outlet() && !self.has_sink()
+    }
+
+    // rho (kg/m^3) depuis T et P_th
+    pub fn update_rho(&mut self) {
+        let m = self.material;
+        let p_th = self.p_th;
         self.rho.par_iter_mut().zip(self.temperature.par_iter())
             .for_each(|(r, &t)| *r = m.density(t, p_th));
 
+        self.rho_min = self.rho.par_iter().zip(self.solids.par_iter())
+            .filter(|&(_, &s)| s != CellType::Wall)
+            .map(|(&r, _)| r)
+            .reduce(|| f32::INFINITY, f32::min);
+        if !self.rho_min.is_finite() {
+            self.rho_min = m.rho_ambient();
+        }
+    }
+
+    // Pression réelle en Pa : P_th + hydrostatique + dynamique (solveur *rho_ref*dx^2/dt).
+    pub fn update_pressure_pa(&mut self, dt: f32) {
+        let m = self.material;
+        let (w, g, dx) = (self.width, self.gravity, self.dx);
+        let base = if m.kind == FluidKind::Gas { self.p_th } else { m.p_ref };
+        self.last_dt = dt;
+        let k = self.pressure_scale();
+
         self.pressure_pa.par_iter_mut().zip(self.pressure.par_iter()).enumerate()
             .for_each(|(i, (pa, &ps))| {
-                let depth = (i / w) as f32 * dx; // y vers le bas, réf = bord haut
-                *pa = m.p_ref + m.rho_ref * g * depth + k * ps;
+                let depth = (i / w) as f32 * dx;
+                *pa = base + m.rho_ambient() * g * depth + k * ps;
             });
+    }
+
+    // Facteur solveur -> Pa : P_dyn = pressure *rho_ref*dx^2/dt
+    pub fn pressure_scale(&self) -> f32 {
+        self.material.rho_ambient() * self.dx * self.dx / self.last_dt.max(1e-6)
+    }
+
+    pub fn update_derived(&mut self, dt: f32) {
+        self.update_rho();
+        self.update_pressure_pa(dt);
     }
 
     pub fn compute_method(&self) -> ComputeMethod {
@@ -276,6 +334,7 @@ impl FluidSim {
             self.velocity_y[idx] = 0.0;
             self.pressure[idx] = 0.0;
             self.divergence[idx] = 0.0;
+            self.source[idx] = 0.0;
 
             self.tracer_temp[idx] = 0.0;
             self.velocity_x_temp[idx] = 0.0;
@@ -287,6 +346,7 @@ impl FluidSim {
             return;
         }
 
+        // une cellule solide redevient fluide : on prend la moyenne des voisins fluides
         let neighbors = [
             self.idx(x - 1, y),
             self.idx(x + 1, y),
@@ -294,7 +354,7 @@ impl FluidSim {
             self.idx(x, y + 1),
         ];
 
-        let mut density_sum = 0.0;
+        let mut tracer_sum = 0.0;
         let mut velocity_x_sum = 0.0;
         let mut velocity_y_sum = 0.0;
         let mut pressure_sum = 0.0;
@@ -304,7 +364,7 @@ impl FluidSim {
             if self.solids[neighbor] == CellType::Wall {
                 continue;
             }
-            density_sum += self.tracer[neighbor];
+            tracer_sum += self.tracer[neighbor];
             velocity_x_sum += self.velocity_x[neighbor];
             velocity_y_sum += self.velocity_y[neighbor];
             pressure_sum += self.pressure[neighbor];
@@ -312,7 +372,7 @@ impl FluidSim {
         }
 
         if count > 0.0 {
-            self.tracer[idx] = density_sum / count;
+            self.tracer[idx] = tracer_sum / count;
             self.velocity_x[idx] = velocity_x_sum / count;
             self.velocity_y[idx] = velocity_y_sum / count;
             self.pressure[idx] = pressure_sum / count;
@@ -324,11 +384,11 @@ impl FluidSim {
         }
 
         self.divergence[idx] = 0.0;
+        self.source[idx] = 0.0;
         self.tracer_temp[idx] = self.tracer[idx];
         self.velocity_x_temp[idx] = self.velocity_x[idx];
         self.velocity_y_temp[idx] = self.velocity_y[idx];
     }
-
 
     #[inline]
     pub fn cell_velocity_from(vx: &[f32], vy: &[f32], w: usize, h: usize, x: usize, y: usize) -> (f32, f32) {
@@ -354,7 +414,8 @@ impl FluidSim {
         Self::cell_velocity_from(&self.velocity_x, &self.velocity_y, self.width, self.height, x, y)
     }
 
-    pub fn total_mass(&self) -> f64 {
+    // Somme du tracer
+    pub fn total_tracer(&self) -> f64 {
         let w = self.width;
         (1..self.height - 1)
             .into_par_iter()
@@ -362,11 +423,66 @@ impl FluidSim {
             .sum()
     }
 
+    // Masse du fluide en kg par mètre de profondeur (2D) : sum(rho*dx^2)
+    pub fn total_mass(&self) -> f64 {
+        let w = self.width;
+        let dx2 = (self.dx * self.dx) as f64;
+        (1..self.height - 1)
+            .into_par_iter()
+            .map(|y| {
+                (1..w - 1)
+                    .map(|x| {
+                        let i = x + y * w;
+                        if self.solids[i] == CellType::Wall { 0.0 } else { self.rho[i] as f64 }
+                    })
+                    .sum::<f64>()
+            })
+            .sum::<f64>() * dx2
+    }
+
+    // Pinceau de chauffage : source de chaleur (W/m^3) qui tire T vers target avec une constante de temps 1/rate
+    pub fn heat_towards(&mut self, idx: usize, target: f32, rate: f32) {
+        let c = if self.solids[idx] == CellType::Wall {
+            self.material.heat_capacity_solid()
+        } else {
+            self.rho[idx] * self.material.cp
+        };
+        self.heat_source[idx] = c * rate * (target - self.temperature[idx]);
+    }
+
+    // Capacité thermique volumique (J/(m^3*K))
+    #[inline]
+    pub(crate) fn heat_capacity(&self, i: usize) -> f32 {
+        if self.solids[i] == CellType::Wall {
+            self.material.heat_capacity_solid()
+        } else if self.low_mach_active() {
+            self.rho[i] * self.material.cp
+        } else {
+            self.material.heat_capacity_ref()
+        }
+    }
+
+    // Chemin GPU / Boussinesq : pas d'expansion
+    fn apply_heat_source_direct(&mut self, dt: f32) {
+        for i in 0..self.temperature.len() {
+            let q = self.heat_source[i];
+            if q != 0.0 {
+                self.temperature[i] += dt * q / self.heat_capacity(i).max(1.0);
+                self.heat_source[i] = 0.0;
+            }
+        }
+    }
+
     pub fn step(&mut self, dt: f32, pressure_iterations: usize) {
-        if self.compute_method == ComputeMethod::GPU {
+        if self.compute_method == ComputeMethod::GPU && !self.low_mach_active() {
             if let Some(mut gpu) = self.gpu_context.take() {
+                self.apply_heat_source_direct(dt);
+                self.update_rho(); // shader utilise que T
+                self.dpdt = 0.0;
+                self.source.fill(0.0);
                 self.step_gpu(&mut gpu, dt, pressure_iterations);
                 self.gpu_context = Some(gpu);
+                self.update_derived(dt);
                 return;
             }
         }
@@ -374,12 +490,12 @@ impl FluidSim {
     }
 
     // Pas complet sur GPU, en deux phases (une seule synchronisation par phase) :
-    //  1. vitesses : advection, cellules spéciales, CL, limitation, projection ;
-    //  2. densité : sous-pas, cellules spéciales, fantômes.
+    //  1. vitesses : advection, flottabilité, cellules spéciales, CL, limitation, projection ;
+    //  2. scalaires : sous-pas tracer + température, cellules spéciales, fantômes.
     fn step_gpu(&mut self, gpu: &mut GpuContext, dt: f32, pressure_iterations: usize) {
         let cfg = StepConfig {
             dt, pressure_iterations, omega: self.sor_omega,
-            tracer: self.tracer_diff_grid(),
+            tracer_diffusion: self.tracer_diff_grid(),
             vmax: self.velocity_limit(dt),
             viscosity: self.nu_grid(),
             viscosity_substeps: self.viscosity_substeps(dt),
@@ -399,12 +515,12 @@ impl FluidSim {
             velocity_y: &mut self.velocity_y,
             pressure: &mut self.pressure,
             divergence: &mut self.divergence,
-            density: &mut self.tracer,
+            tracer: &mut self.tracer,
             temperature: &mut self.temperature,
             solids: &self.solids,
         });
 
-        let substeps = self.density_substeps(dt);
-        gpu.step_density(&cfg, substeps, &mut self.tracer, &mut self.temperature);
+        let substeps = self.scalar_substeps(dt);
+        gpu.step_scalars(&cfg, substeps, &mut self.tracer, &mut self.temperature);
     }
 }

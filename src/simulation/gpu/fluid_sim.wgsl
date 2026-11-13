@@ -8,7 +8,7 @@
 //
 // scratch (5 * width * height floats) :
 // [0, n) : velocity_x temporaire  [n, 2n) : velocity_y temporaire
-// [2n, 3n) : density temporaire   [3n, 4n) : temperature temporaire
+// [2n, 3n) : tracer temporaire   [3n, 4n) : temperature temporaire
 // [4n, 5n) : temperature (champ persistant)
 
 struct Params {
@@ -21,7 +21,7 @@ struct Params {
     vmax: f32,
     special_count: u32,
     visc_k: f32, // viscosity * dt / sous-pas
-    buoyancy: f32,
+    gravity: f32, // g / dx (cellules/s^2)
     thermal_fluid: f32,
     thermal_solid: f32,
     t_ref: f32,
@@ -30,7 +30,7 @@ struct Params {
     pad: u32,
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
     btype: vec4<u32>,
-    // (velocity_x, velocity_y, density, offset)
+    // (velocity_x, velocity_y, tracer, offset)
     bleft: vec4<f32>,
     bright: vec4<f32>,
     btop: vec4<f32>,
@@ -38,8 +38,7 @@ struct Params {
     btemp: vec4<f32>, // temp des bords : gauche, droite, haut, bas
 };
 
-// kind : 1 = Sink (a = rate), 2 = Emitter (a = vx, b = vy, c = density),
-//        3 = Accelerator (a = ax, b = ay), 4 = Teleporter (dest)
+// kind : 1 = Sink (a = rate), 2 = Emitter (a = vx, b = vy, c = tracer), 3 = Accelerator (a = ax, b = ay), 4 = Teleporter (dest)
 struct Special {
     idx: u32,
     kind: u32,
@@ -54,7 +53,7 @@ struct Special {
 @group(0) @binding(2) var<storage, read_write> pressure: array<f32>;
 @group(0) @binding(3) var<storage, read_write> divergence: array<f32>;
 @group(0) @binding(4) var<storage, read> cells: array<u32>;
-@group(0) @binding(5) var<storage, read_write> density: array<f32>;
+@group(0) @binding(5) var<storage, read_write> tracer: array<f32>;
 @group(0) @binding(6) var<storage, read_write> scratch: array<f32>;
 @group(0) @binding(7) var<storage, read> specials: array<Special>;
 @group(0) @binding(8) var<uniform> params: Params;
@@ -270,19 +269,17 @@ fn special_velocity() {
 }
 
 @compute @workgroup_size(1)
-fn special_density() {
+fn special_tracer() {
     for (var k = 0u; k < params.special_count; k++) {
         let s = specials[k];
         if (s.kind == 1u) {
-            density[s.idx] = 0.0;
+            tracer[s.idx] = 0.0;
         } else if (s.kind == 2u) {
-            density[s.idx] = s.c;
-        } else if (s.kind == 1u) {
-            density[s.idx] = density[s.idx] * max(1.0 - s.a * params.dt, 0.0);
+            tracer[s.idx] = s.c;
         } else if (s.kind == 4u) {
             if (s.dest != s.idx && !is_solid(s.dest)) {
-                density[s.dest] = min(density[s.dest] + density[s.idx], 1.0);
-                density[s.idx] = 0.0;
+                tracer[s.dest] = min(tracer[s.dest] + tracer[s.idx], 1.0);
+                tracer[s.idx] = 0.0;
             }
         }
     }
@@ -378,7 +375,6 @@ fn boundary_tb(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn sanitize(v: f32) -> f32 {
-    //juste un clamp connard
     if ((bitcast<u32>(v) & 0x7f800000u) == 0x7f800000u) {
         return 0.0;
     }
@@ -480,32 +476,32 @@ fn ghost_value(t: u32, inlet_d: f32, mode: u32, inner: f32) -> f32 {
     return inner;
 }
 
-fn ghost_density(t: u32, mode: u32) {
+fn ghost_tracer(t: u32, mode: u32) {
     let w = params.width;
     let h = params.height;
 
     if (t >= 1u && t < h - 1u) {
         let l = t * w;
         let r = l + w - 1u;
-        density[l] = ghost_value(params.btype.x, params.bleft.z, mode, density[l + 1u]);
-        density[r] = ghost_value(params.btype.y, params.bright.z, mode, density[r - 1u]);
+        tracer[l] = ghost_value(params.btype.x, params.bleft.z, mode, tracer[l + 1u]);
+        tracer[r] = ghost_value(params.btype.y, params.bright.z, mode, tracer[r - 1u]);
     }
     if (t >= 1u && t < w - 1u) {
         let tp = t;
         let bt = t + (h - 1u) * w;
-        density[tp] = ghost_value(params.btype.z, params.btop.z, mode, density[tp + w]);
-        density[bt] = ghost_value(params.btype.w, params.bbottom.z, mode, density[bt - w]);
+        tracer[tp] = ghost_value(params.btype.z, params.btop.z, mode, tracer[tp + w]);
+        tracer[bt] = ghost_value(params.btype.w, params.bbottom.z, mode, tracer[bt - w]);
     }
 }
 
 @compute @workgroup_size(64)
-fn prepare_ghost_density(@builtin(global_invocation_id) gid: vec3<u32>) {
-    ghost_density(gid.x, 0u);
+fn prepare_ghost_tracer(@builtin(global_invocation_id) gid: vec3<u32>) {
+    ghost_tracer(gid.x, 0u);
 }
 
 @compute @workgroup_size(64)
-fn apply_density_boundaries(@builtin(global_invocation_id) gid: vec3<u32>) {
-    ghost_density(gid.x, 1u);
+fn apply_tracer_boundaries(@builtin(global_invocation_id) gid: vec3<u32>) {
+    ghost_tracer(gid.x, 1u);
 }
 
 fn flux_x(x: u32, y: u32) -> f32 {
@@ -514,13 +510,13 @@ fn flux_x(x: u32, y: u32) -> f32 {
     let uf = velocity_x[i];
     var adv: f32;
     if (uf > 0.0) {
-        adv = uf * density[i];
+        adv = uf * tracer[i];
     } else {
-        adv = uf * density[i + 1u];
+        adv = uf * tracer[i + 1u];
     }
     var dif = 0.0;
     if (x >= 1u && x + 2u < w && open_u_at(x, y)) {
-        dif = -params.diffusion * (density[i + 1u] - density[i]);
+        dif = -params.diffusion * (tracer[i + 1u] - tracer[i]);
     }
     return adv + dif;
 }
@@ -532,20 +528,20 @@ fn flux_y(x: u32, y: u32) -> f32 {
     let vf = velocity_y[i];
     var adv: f32;
     if (vf > 0.0) {
-        adv = vf * density[i];
+        adv = vf * tracer[i];
     } else {
-        adv = vf * density[i + w];
+        adv = vf * tracer[i + w];
     }
     var dif = 0.0;
     if (y >= 1u && y + 2u < h && open_v_at(x, y)) {
-        dif = -params.diffusion * (density[i + w] - density[i]);
+        dif = -params.diffusion * (tracer[i + w] - tracer[i]);
     }
     return adv + dif;
 }
 
-// Un sous-pas : lit density, écrit scratch[2n + i] (cellules intérieures).
+// Un sous-pas : lit tracer, écrit scratch[2n + i] (cellules intérieures).
 @compute @workgroup_size(8, 8)
-fn density_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn tracer_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
     let y = gid.y;
     if (!interior(x, y)) {
@@ -559,18 +555,18 @@ fn density_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         scratch[2u * n + i] = 0.0;
         return;
     }
-    scratch[2u * n + i] = density[i] - params.dts * (flux_x(x, y) - flux_x(x - 1u, y) + flux_y(x, y) - flux_y(x, y - 1u));
+    scratch[2u * n + i] = tracer[i] - params.dts * (flux_x(x, y) - flux_x(x - 1u, y) + flux_y(x, y) - flux_y(x, y - 1u));
 }
 
 @compute @workgroup_size(8, 8)
-fn density_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn tracer_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!interior(gid.x, gid.y)) {
         return;
     }
     let w = params.width;
     let n = w * params.height;
     let i = gid.x + gid.y * w;
-    density[i] = scratch[2u * n + i];
+    tracer[i] = scratch[2u * n + i];
 }
 
 @compute @workgroup_size(8, 8)
@@ -639,7 +635,7 @@ fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let i = x + y * w;
-    velocity_y[i] = velocity_y[i] - params.buoyancy * params.dt * 0.5 * (buoyancy_factor(temp_get(i)) + buoyancy_factor(temp_get(i + w)));
+    velocity_y[i] = velocity_y[i] - params.gravity * params.dt * 0.5 * (buoyancy_factor(temp_get(i)) + buoyancy_factor(temp_get(i + w)));
 }
 
 fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {

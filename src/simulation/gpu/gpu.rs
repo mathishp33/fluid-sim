@@ -21,7 +21,7 @@ struct GpuParams {
     kind: u32,
     _pad: u32,
     boundary_type: [u32; 4], // gauche, droite, haut, bas
-    boundary: [[f32; 4]; 4], // (vx, vy, density, offset) x 4
+    boundary: [[f32; 4]; 4], // (vx, vy, tracer, offset) x 4
     boundary_temp: [f32; 4],
 }
 
@@ -43,8 +43,8 @@ impl GpuSpecial {
             CellEffect::Sink { rate } => Self {
                 idx, kind: 1, a: rate, b: 0.0, c: 0.0, dest: 0
             },
-            CellEffect::Emitter { vx, vy, density } => Self {
-                idx, kind: 2, a: vx, b: vy, c: density, dest: 0
+            CellEffect::Emitter { vx, vy, tracer } => Self {
+                idx, kind: 2, a: vx, b: vy, c: tracer, dest: 0
             },
             CellEffect::Accelerator { ax, ay } => Self {
                 idx, kind: 3, a: ax, b: ay, c: 0.0, dest: 0
@@ -61,7 +61,7 @@ pub struct StepConfig<'a> {
     pub dt: f32,
     pub pressure_iterations: usize,
     pub omega: f32,
-    pub tracer: f32,
+    pub tracer_diffusion: f32,
     pub vmax: f32,
     // gauche, droite, haut, bas
     pub special_cells: &'a [(usize, CellEffect)],
@@ -81,7 +81,7 @@ pub struct GpuFields<'a> {
     pub velocity_y: &'a mut [f32],
     pub pressure: &'a mut [f32],
     pub divergence: &'a mut [f32],
-    pub density: &'a mut [f32],
+    pub tracer: &'a mut [f32],
     pub solids: &'a [CellType],
     pub temperature: &'a mut [f32],
 }
@@ -98,11 +98,11 @@ struct Pipelines {
     solve_red: wgpu::ComputePipeline,
     solve_black: wgpu::ComputePipeline,
     correct_velocity: wgpu::ComputePipeline,
-    prepare_ghost_density: wgpu::ComputePipeline,
-    density_step: wgpu::ComputePipeline,
-    density_commit: wgpu::ComputePipeline,
-    special_density: wgpu::ComputePipeline,
-    apply_density_boundaries: wgpu::ComputePipeline,
+    prepare_ghost_tracer: wgpu::ComputePipeline,
+    tracer_step: wgpu::ComputePipeline,
+    tracer_commit: wgpu::ComputePipeline,
+    special_tracer: wgpu::ComputePipeline,
+    apply_tracer_boundaries: wgpu::ComputePipeline,
     diffuse_velocity: wgpu::ComputePipeline,
     gravity: wgpu::ComputePipeline,
     prepare_ghost_temperature: wgpu::ComputePipeline,
@@ -123,7 +123,7 @@ pub struct GpuContext {
     pressure_buf: wgpu::Buffer,
     divergence_buf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
-    density_buf: wgpu::Buffer,
+    tracer_buf: wgpu::Buffer,
     scratch_buf: wgpu::Buffer,
     special_buf: wgpu::Buffer,
     special_capacity: usize,
@@ -174,7 +174,7 @@ impl GpuContext {
         let velocity_y_buf = make_buffer("velocity_y", f32_bytes);
         let pressure_buf = make_buffer("pressure", f32_bytes);
         let divergence_buf = make_buffer("divergence", f32_bytes);
-        let density_buf = make_buffer("density", f32_bytes);
+        let tracer_buf = make_buffer("tracer", f32_bytes);
         let scratch_buf = make_buffer("scratch", 5 * f32_bytes);
         let cells_buf = make_buffer("cells", (size * size_of::<u32>()) as u64);
 
@@ -220,7 +220,7 @@ impl GpuContext {
                 storage_entry(2, false), // pressure
                 storage_entry(3, false), // divergence
                 storage_entry(4, true),  // cells
-                storage_entry(5, false), // density
+                storage_entry(5, false), // tracer
                 storage_entry(6, false), // scratch
                 storage_entry(7, true),  // specials
                 wgpu::BindGroupLayoutEntry {
@@ -239,7 +239,7 @@ impl GpuContext {
         let bind_group = Self::make_bind_group(
             &device, &bind_group_layout,
             &velocity_x_buf, &velocity_y_buf, &pressure_buf, &divergence_buf,
-            &cells_buf, &density_buf, &scratch_buf, &special_buf, &params_buf,
+            &cells_buf, &tracer_buf, &scratch_buf, &special_buf, &params_buf,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -267,11 +267,11 @@ impl GpuContext {
             solve_red: make_pipeline("solve_red"),
             solve_black: make_pipeline("solve_black"),
             correct_velocity: make_pipeline("correct_velocity"),
-            prepare_ghost_density: make_pipeline("prepare_ghost_density"),
-            density_step: make_pipeline("density_step"),
-            density_commit: make_pipeline("density_commit"),
-            special_density: make_pipeline("special_density"),
-            apply_density_boundaries: make_pipeline("apply_density_boundaries"),
+            prepare_ghost_tracer: make_pipeline("prepare_ghost_tracer"),
+            tracer_step: make_pipeline("tracer_step"),
+            tracer_commit: make_pipeline("tracer_commit"),
+            special_tracer: make_pipeline("special_tracer"),
+            apply_tracer_boundaries: make_pipeline("apply_tracer_boundaries"),
             diffuse_velocity: make_pipeline("diffuse_velocity"),
             gravity: make_pipeline("buoyancy"),
             prepare_ghost_temperature: make_pipeline("prepare_ghost_temperature"),
@@ -283,7 +283,7 @@ impl GpuContext {
         Some(Self {
             device, queue, width, height,
             velocity_x_buf, velocity_y_buf, pressure_buf, divergence_buf,
-            cells_buf, density_buf, scratch_buf, special_buf, special_capacity,
+            cells_buf, tracer_buf, scratch_buf, special_buf, special_capacity,
             params_buf,
             bind_group_layout, bind_group, pipelines,
             readback_buf,
@@ -299,7 +299,7 @@ impl GpuContext {
         pressure: &wgpu::Buffer,
         divergence: &wgpu::Buffer,
         cells: &wgpu::Buffer,
-        density: &wgpu::Buffer,
+        tracer: &wgpu::Buffer,
         scratch: &wgpu::Buffer,
         specials: &wgpu::Buffer,
         params: &wgpu::Buffer,
@@ -313,7 +313,7 @@ impl GpuContext {
                 wgpu::BindGroupEntry { binding: 2, resource: pressure.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: divergence.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cells.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: density.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: tracer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: scratch.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: specials.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: params.as_entire_binding() },
@@ -342,7 +342,7 @@ impl GpuContext {
             self.bind_group = Self::make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.velocity_x_buf, &self.velocity_y_buf, &self.pressure_buf, &self.divergence_buf,
-                &self.cells_buf, &self.density_buf, &self.scratch_buf, &self.special_buf, &self.params_buf,
+                &self.cells_buf, &self.tracer_buf, &self.scratch_buf, &self.special_buf, &self.params_buf,
             );
         }
         if !specials.is_empty() {
@@ -362,7 +362,7 @@ impl GpuContext {
             BoundaryType::Inlet => 1,
             BoundaryType::Outlet => 2,
         };
-        let data = |b: &Boundary| [b.velocity_x, b.velocity_y, b.density, b.offset as f32];
+        let data = |b: &Boundary| [b.velocity_x, b.velocity_y, b.tracer, b.offset as f32];
         let b = &cfg.boundaries;
 
         let params = GpuParams {
@@ -371,7 +371,7 @@ impl GpuContext {
             omega: cfg.omega,
             dt: cfg.dt,
             dts,
-            diffusion: cfg.tracer,
+            diffusion: cfg.tracer_diffusion,
             vmax: cfg.vmax,
             special_count: cfg.special_cells.len() as u32,
             boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
@@ -413,7 +413,7 @@ impl GpuContext {
         assert_eq!(f.velocity_y.len(), size, "velocity_y: wrong size");
         assert_eq!(f.pressure.len(), size, "pressure: wrong size");
         assert_eq!(f.divergence.len(), size, "divergence: wrong size");
-        assert_eq!(f.density.len(), size, "density: wrong size");
+        assert_eq!(f.tracer.len(), size, "tracer: wrong size");
         assert_eq!(f.solids.len(), size, "solids: wrong size");
         assert_eq!(f.temperature.len(), size, "temperature: wrong size");
 
@@ -422,7 +422,7 @@ impl GpuContext {
         self.upload_f32(&self.velocity_x_buf, f.velocity_x);
         self.upload_f32(&self.velocity_y_buf, f.velocity_y);
         self.upload_f32(&self.pressure_buf, f.pressure);
-        self.upload_f32(&self.density_buf, f.density);
+        self.upload_f32(&self.tracer_buf, f.tracer);
         self.queue.write_buffer(&self.scratch_buf, self.temperature_offset(), bytemuck::cast_slice(f.temperature));
         self.write_params(cfg, 0.0);
 
@@ -492,12 +492,12 @@ impl GpuContext {
         });
     }
 
-    // advection/diffusion de la densité en `substeps` sous-pas, cellules spéciales,
+    // advection/diffusion du tracer et de la température en `substeps` sous-pas, cellules spéciales,
     // cellules fantômes
     // `substeps` dépend vmax après proj, calculé côté CPU
-    pub fn step_density(&mut self, cfg: &StepConfig, substeps: usize, density: &mut [f32], temperature: &mut [f32]) {
+    pub fn step_scalars(&mut self, cfg: &StepConfig, substeps: usize, tracer: &mut [f32], temperature: &mut [f32]) {
         let size = self.width * self.height;
-        assert_eq!(density.len(), size, "density: wrong size");
+        assert_eq!(tracer.len(), size, "tracer: wrong size");
         assert_eq!(temperature.len(), size, "temperature: wrong size");
 
         let substeps = substeps.max(1);
@@ -509,12 +509,12 @@ impl GpuContext {
         let p = &self.pipelines;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("density encoder"),
+            label: Some("tracer encoder"),
         });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("density"),
+                label: Some("tracer"),
                 timestamp_writes: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -527,26 +527,26 @@ impl GpuContext {
                 }};
             }
 
-            run!(p.prepare_ghost_density, lines, 1);
+            run!(p.prepare_ghost_tracer, lines, 1);
             run!(p.prepare_ghost_temperature, lines, 1);
             for _ in 0..substeps {
-                run!(p.density_step, gx, gy);
-                run!(p.density_commit, gx, gy);
+                run!(p.tracer_step, gx, gy);
+                run!(p.tracer_commit, gx, gy);
                 run!(p.temperature_step, gx, gy);
                 run!(p.temperature_commit, gx, gy);
             }
-            run!(p.special_density, 1, 1);
-            run!(p.apply_density_boundaries, lines, 1);
+            run!(p.special_tracer, 1, 1);
+            run!(p.apply_tracer_boundaries, lines, 1);
             run!(p.apply_temperature_boundaries, lines, 1);
         }
 
         let field_bytes = (size * size_of::<f32>()) as u64;
-        encoder.copy_buffer_to_buffer(&self.density_buf, 0, &self.readback_buf, 0, field_bytes);
+        encoder.copy_buffer_to_buffer(&self.tracer_buf, 0, &self.readback_buf, 0, field_bytes);
         encoder.copy_buffer_to_buffer(&self.scratch_buf, self.temperature_offset(), &self.readback_buf, field_bytes, field_bytes);
         self.queue.submit(Some(encoder.finish()));
 
         self.read_back(2 * field_bytes, |floats| {
-            density.copy_from_slice(&floats[0..size]);
+            tracer.copy_from_slice(&floats[0..size]);
             temperature.copy_from_slice(&floats[size..2 * size]);
         });
     }

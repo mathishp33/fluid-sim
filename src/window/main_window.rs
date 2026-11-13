@@ -6,12 +6,14 @@ use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOpti
 use rayon::prelude::*;
 use rfd::FileDialog;
 
-use crate::simulation::fluid::{BoundaryType, CellEffect, FluidSim};
+use crate::simulation::fluid::{BoundaryType, CellEffect, ComputeMethod, FluidSim};
+use crate::simulation::materials::FluidKind;
 use crate::simulation::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
 
 const MAX_DT: f32 = 0.05;
+const HEAT_RATE: f32 = 5.0;
 
 pub enum WindowAction {
     None,
@@ -25,10 +27,11 @@ enum DisplayMode {
     Divergence,
     Velocity,
     Temperature,
+    Rho,
 }
 
 impl DisplayMode {
-    const ALL: [Self; 5] = [Self::Tracer, Self::Pressure, Self::Divergence, Self::Velocity, Self::Temperature];
+    const ALL: [Self; 6] = [Self::Tracer, Self::Pressure, Self::Divergence, Self::Velocity, Self::Temperature, Self::Rho];
 
     fn next(self) -> Self {
         match self {
@@ -36,17 +39,19 @@ impl DisplayMode {
             Self::Pressure => Self::Divergence,
             Self::Divergence => Self::Velocity,
             Self::Velocity => Self::Temperature,
-            Self::Temperature => Self::Tracer,
+            Self::Temperature => Self::Rho,
+            Self::Rho => Self::Tracer,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Tracer => "TRACER",
-            Self::Pressure => "PRESSURE",
+            Self::Pressure => "PRESSURE (dyn)",
             Self::Divergence => "DIVERGENCE",
             Self::Velocity => "VELOCITY",
             Self::Temperature => "TEMPERATURE",
+            Self::Rho => "RHO (kg/m^3)",
         }
     }
 }
@@ -88,15 +93,14 @@ fn cycle_radius(current: usize, reverse: bool) -> usize {
     }
 }
 
-fn temperature_color(t: f32) -> u32 {
-    let t = t.clamp(0.0, 1000.0);
-
-    let (r, g, b) = if t >= 500.0 {
-        let x = (t - 500.0) / 500.0;
-        (0.0, 1.0 - x, x)
-    } else {
-        let x = t / 500.0;
+/// x = (T − T_ref) / échelle : bleu/cyan (froid) -> noir (ambiant) -> rouge -> jaune (chaud)
+fn temperature_color(x: f32) -> u32 {
+    let x = x.clamp(-1.0, 1.0);
+    let (r, g, b) = if x >= 0.0 {
         ((2.0 * x).min(1.0), (2.0 * x - 1.0).max(0.0), 0.0)
+    } else {
+        let c = -x;
+        (0.0, (2.0 * c - 1.0).max(0.0), (2.0 * c).min(1.0))
     };
     (((r * 255.0) as u32) << 16) | (((g * 255.0) as u32) << 8) | (b * 255.0) as u32
 }
@@ -215,15 +219,25 @@ struct MouseInput {
 
 #[derive(Clone, Copy, Default)]
 struct Stats {
-    pressure_max: f32,
-    divergence_max: f32,
-    velocity_max: f32,
-    total_density: f64,
-    kinetic_energy: f32,
-    pub pressure_residual: f32,
-    pub divergence_rms: f32,
-    pub velocity_rms: f32,
-    pub cfl: f32,
+    pressure_max: f32, // unités du solveur (sert à la colorisation)
+    pressure_dyn_pa: f32, // Pa
+    divergence_max: f32, // 1/s : divergence réelle
+    velocity_max: f32, // cellules/s (colorisation, CFL)
+    velocity_max_ms: f32, // m/s
+    total_tracer: f64, // sans dimension
+    total_mass: f64, // kg par mètre de profondeur
+    kinetic_energy: f32, // J par mètre de profondeur
+    pressure_residual: f32, // max |div − S| (1/s) sur les cellules vues par le solveur
+    divergence_rms: f32, // RMS de (div − S) (1/s)
+    velocity_rms: f32, // m/s
+    cfl: f32, // max|v|·dt en cellules
+    p_th: f32,
+    dpdt: f32,
+    rho_min: f32,
+    rho_max: f32,
+    rho_dev_max: f32, // max |ρ − ρ_ambiant|
+    t_min: f32,
+    t_max: f32,
 }
 
 
@@ -255,6 +269,7 @@ pub struct FluidWindow {
     last_effect_type: CellType,
 
     brush_temperature: f32,
+    temperature_scale: f32, // K, échelle d'affichage de dT
 
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
@@ -279,10 +294,6 @@ impl FluidWindow {
         fluid.top_boundary = settings.top_boundary;
         fluid.bottom_boundary = settings.bottom_boundary;
 
-        fluid.material.viscosity = settings.material.viscosity;
-        fluid.material.conductivity = settings.material.conductivity;
-        fluid.material.solid_conductivity = settings.material.solid_conductivity;
-        fluid.gravity = settings.gravity;
 
         let size = fluid.width * fluid.height * 4;
         let now = Instant::now();
@@ -314,7 +325,8 @@ impl FluidWindow {
             picking_destination: false,
             last_effect_type: CellType::Wall,
 
-            brush_temperature: settings.material.t_ref + 50.0,
+            brush_temperature: settings.material.t_ref + 100.0,
+            temperature_scale: 100.0,
 
             last_mouse: None,
             hovered_cell: None,
@@ -394,7 +406,7 @@ impl FluidWindow {
         if key(egui::Key::R) {
             self.reset_flow();
         }
-        // C se répète quand on le maintient (comme KeyRepeat::Yes)
+
         if ctx.input(|i| i.key_pressed(egui::Key::C)) {
             self.mouse_radius = cycle_radius(self.mouse_radius, shift);
         }
@@ -406,6 +418,7 @@ impl FluidWindow {
     fn reset_flow(&mut self) {
         self.fluid.pressure.fill(0.0);
         self.fluid.divergence.fill(0.0);
+        self.fluid.source.fill(0.0);
         self.fluid.velocity_x.fill(0.0);
         self.fluid.velocity_y.fill(0.0);
         self.status = "Flow reset".into();
@@ -488,7 +501,7 @@ impl FluidWindow {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("LMB: density (Ctrl: solid) | RMB: push | MMB: erase (Ctrl: remove solid)");
+                    ui.weak("LMB: tracer (Ctrl: solid) | RMB: push | MMB: erase (Ctrl: remove solid) | Shift+MMB: heat to brush T");
                 });
             });
         });
@@ -521,25 +534,45 @@ impl FluidWindow {
                 ui.label("Solver");
                 ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
                 ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
-                ui.add(egui::Slider::new(&mut self.fluid.material.tracer_diffusion, 0.0..=5.0).text("Tracer rate"));
-                ui.add(egui::Slider::new(&mut self.fluid.material.viscosity, 0.0..=20.0).text("Viscosity"));
+                ui.horizontal(|ui| {
+                    ui.label("Backend");
+                    let current = self.fluid.compute_method();
+                    let mut method = current;
+                    ui.selectable_value(&mut method, ComputeMethod::CPU, "CPU");
+                    ui.selectable_value(&mut method, ComputeMethod::GPU, "GPU");
+                    if method != current {
+                        self.fluid.set_compute_method(method);
+                    }
+                });
+                if self.fluid.material.kind == FluidKind::Gas {
+                    ui.checkbox(&mut self.fluid.low_mach, "Low-Mach (compressible, CPU only)");
+                }
+
+                ui.separator();
+                ui.heading("Fluid (SI)");
+                ui.add(egui::Slider::new(&mut self.fluid.material.viscosity, 1e-7..=1e-2).logarithmic(true).text("Viscosity ν (m²/s)"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.tracer_diffusion, 1e-10..=1e-2).logarithmic(true).text("Tracer diffusion D (m²/s)"));
+
                 ui.separator();
                 ui.heading("Temperature");
-                ui.add(egui::Slider::new(&mut self.fluid.material.conductivity, 0.0..=5.0).text("Fluid conduction(W/(m*K))"));
-                ui.add(egui::Slider::new(&mut self.fluid.material.solid_conductivity, 0.0..=5.0).text("Solid conduction (W/(m*K))"));
-                ui.add(egui::Slider::new(&mut self.fluid.gravity, 0.0..=100.0).text("Gravity (m/s^2)"));
-                ui.add(egui::Slider::new(&mut self.brush_temperature, 10.0..=1500.0).text("Brush temp (K)"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.conductivity, 0.01..=400.0).logarithmic(true).text("Fluid k (W/(m·K))"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.solid_conductivity, 0.01..=400.0).logarithmic(true).text("Solid k (W/(m·K))"));
+                ui.add(egui::Slider::new(&mut self.fluid.gravity, 0.0..=100.0).text("Gravity (m/s²)"));
+                ui.add(egui::Slider::new(&mut self.brush_temperature, 100.0..=2000.0).text("Brush temp (K)"));
+                ui.add(egui::Slider::new(&mut self.temperature_scale, 1.0..=1000.0).logarithmic(true).text("Display ΔT scale (K)"));
                 if ui.button("Reset temperature").clicked() {
                     self.fluid.temperature.fill(self.fluid.material.t_ref);
+                    self.fluid.p_th = self.fluid.material.p_ref;
                     self.status = "Temperature reset".into();
                 }
-                ui.separator();
+
                 ui.separator();
                 ui.label("Boundaries");
-                boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary);
-                boundary_ui(ui, "Right Boundary", &mut self.fluid.right_boundary);
-                boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary);
-                boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary);
+                let dx = self.fluid.dx;
+                boundary_ui(ui, "Left Boundary", &mut self.fluid.left_boundary, dx);
+                boundary_ui(ui, "Right Boundary", &mut self.fluid.right_boundary, dx);
+                boundary_ui(ui, "Top Boundary", &mut self.fluid.top_boundary, dx);
+                boundary_ui(ui, "Bottom Boundary", &mut self.fluid.bottom_boundary, dx);
 
                 ui.separator();
                 ui.heading("Cell Effects");
@@ -585,8 +618,8 @@ impl FluidWindow {
                 CellEffect::Sink { rate } => {
                     ui.add(egui::Slider::new(rate, 0.0..=200.0).text("Suction"));
                 }
-                CellEffect::Emitter { density, vx, vy } => {
-                    ui.add(egui::Slider::new(density, 0.0..=1.0).text("Density"));
+                CellEffect::Emitter { tracer, vx, vy } => {
+                    ui.add(egui::Slider::new(tracer, 0.0..=1.0).text("Tracer"));
                     ui.add(egui::Slider::new(vx, -200.0..=200.0).text("X velocity"));
                     ui.add(egui::Slider::new(vy, -200.0..=200.0).text("Y velocity"));
                 }
@@ -604,7 +637,7 @@ impl FluidWindow {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Info");
                 ui.separator();
-
+                ui.collapsing("Info", |ui| {
                 egui::Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                     let mut row = |name: &str, value: String| {
                         ui.label(name);
@@ -612,23 +645,33 @@ impl FluidWindow {
                         ui.end_row();
                     };
 
+                    let f = &self.fluid;
                     row("FPS", format!("{:.1}", self.fps));
                     row("State", if self.paused { "PAUSED".to_string() } else { "RUNNING".to_string() });
-                    row("Grid", format!("{} x {}", self.fluid.width, self.fluid.height));
+                    row("Fluid", format!("{:?}{}", f.material.kind, if f.low_mach_active() { " (low-Mach)" } else { "" }));
+                    row("Backend", format!("{:?}", f.compute_method()));
+                    row("Grid", format!("{} x {}", f.width, f.height));
+                    row("Domain (m)", format!("{:.3} x {:.3}", f.width as f32 * f.dx, f.height as f32 * f.dx));
+                    row("Cell size (m)", format!("{:.4}", f.dx));
                     row("Precision", format!("{} px", self.precision));
                     row("Display", self.display_mode.name().to_string());
                     row("Brush", format!("{} ({} px)", self.mouse_mode.name(), self.mouse_radius));
-                    row("Max |pressure|", format!("{:.3}", self.stats.pressure_max));
-                    row("Max |divergence|", format!("{:.3}", self.stats.divergence_max));
-                    row("Max speed", format!("{:.3}", self.stats.velocity_max));
-                    row("Total density", format!("{:.4}", self.stats.total_density));
-                    row("Total kinetic energy", format!("{:.2}", self.stats.kinetic_energy));
-                    row("Pressure residual", format!("{:.4e}", self.stats.pressure_residual));
-                    row("Divergence RMS", format!("{:.4e}", self.stats.divergence_rms));
-                    row("Velocity RMS", format!("{:.3}", self.stats.velocity_rms));
-                    row("CFL (max|v|·dt)", format!("{:.3}", self.stats.cfl));
+                    row("P_th (Pa)", format!("{:.1}", self.stats.p_th));
+                    row("dP_th/dt (Pa/s)", format!("{:.2}", self.stats.dpdt));
+                    row("Max |P dyn| (Pa)", format!("{:.4}", self.stats.pressure_dyn_pa));
+                    row("Max |div| (1/s)", format!("{:.4}", self.stats.divergence_max));
+                    row("Max speed (m/s)", format!("{:.4}", self.stats.velocity_max_ms));
+                    row("rho min / max (kg/m³)", format!("{:.4} / {:.4}", self.stats.rho_min, self.stats.rho_max));
+                    row("T min / max (K)", format!("{:.2} / {:.2}", self.stats.t_min, self.stats.t_max));
+                    row("Total tracer", format!("{:.4}", self.stats.total_tracer));
+                    row("Total mass (kg/m)", format!("{:.5}", self.stats.total_mass));
+                    row("Kinetic energy (J/m)", format!("{:.4e}", self.stats.kinetic_energy));
+                    row("|div − S| max (1/s)", format!("{:.4e}", self.stats.pressure_residual));
+                    row("|div − S| RMS (1/s)", format!("{:.4e}", self.stats.divergence_rms));
+                    row("Velocity RMS (m/s)", format!("{:.4}", self.stats.velocity_rms));
+                    row("CFL (max|v|·dt, cells)", format!("{:.3}", self.stats.cfl));
                 });
-
+            });
                 ui.separator();
                 ui.heading("Cell under cursor");
 
@@ -642,14 +685,18 @@ impl FluidWindow {
                                 ui.end_row();
                             };
                             row("Position", format!("{x}, {y}"));
+                            let dx = self.fluid.dx;
                             let (cvx, cvy) = self.fluid.cell_velocity(x, y);
-                            row("Velocity X", format!("{:.3}", cvx));
-                            row("Velocity Y", format!("{:.3}", cvy));
-                            row("Density", format!("{:.3}", self.fluid.tracer[idx]));
-                            row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
-                            row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
-                            row("Temperature", format!("{:.3}", self.fluid.temperature[idx]));
-                            row("Solid", format!("{}", self.fluid.solids[idx].to_string()));
+                            row("Velocity X (m/s)", format!("{:.4}", cvx * dx));
+                            row("Velocity Y (m/s)", format!("{:.4}", cvy * dx));
+                            row("Tracer", format!("{:.3}", self.fluid.tracer[idx]));
+                            row("rho (kg/m³)", format!("{:.4}", self.fluid.rho[idx]));
+                            row("Temperature (K)", format!("{:.2}", self.fluid.temperature[idx]));
+                            row("P total (Pa)", format!("{:.2}", self.fluid.pressure_pa[idx]));
+                            row("P dyn (Pa)", format!("{:.4}", self.fluid.pressure[idx] * self.fluid.pressure_scale()));
+                            row("Divergence (1/s)", format!("{:.4}", self.fluid.divergence[idx]));
+                            row("Source S (1/s)", format!("{:.4}", self.fluid.source[idx]));
+                            row("Solid", self.fluid.solids[idx].to_string());
                         });
                     }
                     None => {
@@ -674,11 +721,12 @@ impl FluidWindow {
                         ("M", "Brush shape"),
                         ("C / Shift+C", "Brush radius up / down"),
                         ("I", "Invert solid color"),
-                        ("R", "Reset pressure, divergence and velocity"),
+                        ("R", "Reset pressure, divergence, source and velocity"),
                         ("Esc", "Back to settings"),
-                        ("LMB", "Add density (Ctrl/Cmd: draw solid)"),
+                        ("LMB", "Add tracer (Ctrl/Cmd: draw solid)"),
                         ("RMB", "Push fluid"),
-                        ("MMB", "Erase density (Ctrl/Cmd: remove solid)"),
+                        ("MMB", "Erase tracer (Ctrl/Cmd: remove solid)"),
+                        ("Shift+MMB", "Heat / cool toward brush temperature"),
                     ] {
                         ui.strong(k);
                         ui.label(v);
@@ -806,7 +854,6 @@ impl FluidWindow {
         let r = (radius / precision).ceil() as isize;
         let brush_t = self.brush_temperature;
         let heating = input.shift && !input.ctrl;
-        let blend = (5.0 * dt).min(1.0);
 
         for dx in -r..=r {
             for dy in -r..=r {
@@ -833,14 +880,11 @@ impl FluidWindow {
                 let idx = x + y * w;
 
                 if input.left {
-                    if heating && input.middle {
-                        fluid.temperature[idx] += (brush_t - fluid.temperature[idx]) * blend;
-                    } else if input.ctrl {
+                    if input.ctrl {
                         if self.selected_cell_type == CellType::Wall {
                             fluid.set_cell(x, y, CellType::Wall, None);
-                        }
-                        else {
-                            fluid.set_cell(x, y, self.selected_cell_type, Option::from(self.current_cell_effect));
+                        } else {
+                            fluid.set_cell(x, y, self.selected_cell_type, self.current_cell_effect);
                         }
                     } else if fluid.solids[idx] == CellType::Fluid {
                         fluid.tracer[idx] = (fluid.tracer[idx] + 2.0 * dt).min(1.0);
@@ -852,10 +896,11 @@ impl FluidWindow {
                     fluid.velocity_y[idx] += fy * 0.07;
                 }
 
-                if heating {
-                    fluid.temperature[idx] -= fluid.temperature[idx] * blend;
-                } else if input.middle {
-                    if input.ctrl {
+                if input.middle {
+                    if heating {
+                        // source de chaleur (W/m^3) : passe par l'équation d'énergie
+                        fluid.heat_towards(idx, brush_t, HEAT_RATE);
+                    } else if input.ctrl {
                         fluid.set_cell(x, y, CellType::Fluid, None);
                     } else {
                         fluid.tracer[idx] = (fluid.tracer[idx] - 2.0 * dt).max(0.0);
@@ -876,6 +921,7 @@ impl FluidWindow {
         let f = &self.fluid;
         let (w, h) = (f.width, f.height);
         let s = &f.solids;
+        let dx = f.dx;
 
         let lo = f.left_boundary.boundary_type == BoundaryType::Outlet;
         let ro = f.right_boundary.boundary_type == BoundaryType::Outlet;
@@ -898,52 +944,89 @@ impl FluidWindow {
             else { !wall(i) && !wall(i + w) }
         };
 
-        // (max s^2, Ec, sum(div^2), sum(|v|^2), nbr cell actives, max(residu))
-        let (speed2_max, kinetic, div2_sum, v2_sum, count, residual) = (0..h)
+        // (max s^2, sum(rho*s^2), sum((div−S)^2), sum(|v|^2), nb cellules actives, max |div−S|)
+        let (speed2_max, rho_s2, resid2_sum, v2_sum, count, residual) = (0..h)
             .into_par_iter()
             .map(|y| {
                 let (mut m, mut e) = (0.0f32, 0.0f32);
-                let (mut d2, mut v2, mut n_cells, mut res) = (0.0f64, 0.0f64, 0u64, 0.0f32);
+                let (mut r2, mut v2, mut n_cells, mut res) = (0.0f64, 0.0f64, 0u64, 0.0f32);
                 for x in 0..w {
                     let i = x + y * w;
                     let (vx, vy) = FluidSim::cell_velocity_from(&f.velocity_x, &f.velocity_y, w, h, x, y);
                     let s2 = vx * vx + vy * vy;
                     m = m.max(s2);
-                    e += f.tracer[i] * s2;
+                    if s[i] != CellType::Wall {
+                        e += f.rho[i] * s2;
+                    }
 
                     let interior = x >= 1 && x < w - 1 && y >= 1 && y < h - 1;
                     if !interior || s[i] == CellType::Wall || s[i] == CellType::Sink {
                         continue;
                     }
-                    let dv = f.divergence[i];
-                    d2 += (dv * dv) as f64;
+                    let r = f.divergence[i] - f.source[i]; // résidu du Poisson : div u − S
+                    r2 += (r * r) as f64;
                     v2 += s2 as f64;
                     n_cells += 1;
 
                     let n = open_u(x, y) as u8 + open_u(x - 1, y) as u8
                         + open_v(x, y) as u8 + open_v(x, y - 1) as u8;
                     if n > 0 {
-                        res = res.max(dv.abs());
+                        res = res.max(r.abs());
                     }
                 }
-                (m, 0.5 * e, d2, v2, n_cells, res)
+                (m, e, r2, v2, n_cells, res)
             })
             .reduce(|| (0.0, 0.0, 0.0, 0.0, 0, 0.0),
                     |a, b| (a.0.max(b.0), a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4, a.5.max(b.5)));
 
-        let speed_max = speed2_max.sqrt();
+        // plages de rho et T sur les cellules intérieures non solides
+        let rho_amb = f.material.rho_ambient();
+        let (rho_min, rho_max, t_min, t_max) = (1..h - 1)
+            .into_par_iter()
+            .map(|y| {
+                let (mut rmin, mut rmax) = (f32::INFINITY, f32::NEG_INFINITY);
+                let (mut tmin, mut tmax) = (f32::INFINITY, f32::NEG_INFINITY);
+                for x in 1..w - 1 {
+                    let i = x + y * w;
+                    if s[i] == CellType::Wall {
+                        continue;
+                    }
+                    rmin = rmin.min(f.rho[i]);
+                    rmax = rmax.max(f.rho[i]);
+                    tmin = tmin.min(f.temperature[i]);
+                    tmax = tmax.max(f.temperature[i]);
+                }
+                (rmin, rmax, tmin, tmax)
+            })
+            .reduce(|| (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY),
+                    |a, b| (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3)));
+        let fin = |v: f32| if v.is_finite() { v } else { 0.0 };
+        let (rho_min, rho_max, t_min, t_max) = (fin(rho_min), fin(rho_max), fin(t_min), fin(t_max));
+
+        let speed_max = speed2_max.sqrt(); // cellules/s
         let n = count.max(1) as f64;
+        let pressure_max = f.pressure.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max);
 
         self.stats = Stats {
-            pressure_max: f.pressure.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max),
+            pressure_max,
+            pressure_dyn_pa: pressure_max * f.pressure_scale(),
             divergence_max: f.divergence.par_iter().map(|v| v.abs()).reduce(|| 0.0, f32::max),
             velocity_max: speed_max,
-            total_density: f.total_mass(),
-            kinetic_energy: kinetic,
+            velocity_max_ms: speed_max * dx,
+            total_tracer: f.total_tracer(),
+            total_mass: f.total_mass(),
+            kinetic_energy: 0.5 * rho_s2 * dx.powi(4), // 0.5 * sum(rho*v^2*dx^2) (aire d'une cellule dx^2), v en m/s
             pressure_residual: residual,
-            divergence_rms: (div2_sum / n).sqrt() as f32,
-            velocity_rms: (v2_sum / n).sqrt() as f32,
-            cfl: speed_max * dt,
+            divergence_rms: (resid2_sum / n).sqrt() as f32,
+            velocity_rms: ((v2_sum / n).sqrt() as f32) * dx,
+            cfl: speed_max * dt, // dx = 1 cellule (l'advection recule de v*dt en unités de cellule)
+            p_th: f.p_th,
+            dpdt: f.dpdt,
+            rho_min,
+            rho_max,
+            rho_dev_max: (rho_max - rho_amb).abs().max((rho_min - rho_amb).abs()),
+            t_min,
+            t_max,
         };
     }
 
@@ -955,9 +1038,13 @@ impl FluidWindow {
         let mode = self.display_mode;
         let max_color = self.max_color;
         let solid_color: u32 = if self.inverse_solid_color { 0xffffff } else { 0x000000 };
-        let Stats { pressure_max, divergence_max, velocity_max, .. } = self.stats;
+        let Stats { pressure_max, divergence_max, velocity_max, rho_dev_max, .. } = self.stats;
 
-        let density = &self.fluid.tracer[..];
+        let tracer = &self.fluid.tracer[..];
+        let rho = &self.fluid.rho[..];
+        let rho_amb = self.fluid.material.rho_ambient();
+        let t_ref = self.fluid.material.t_ref;
+        let t_scale = self.temperature_scale.max(1e-3);
         let pressure = &self.fluid.pressure[..];
         let divergence = &self.fluid.divergence[..];
         let velocity_x = &self.fluid.velocity_x[..];
@@ -982,7 +1069,7 @@ impl FluidWindow {
                         CellType::Fluid => {
                             match mode {
                                 DisplayMode::Tracer => {
-                                    let d = density[idx].clamp(0.0, 1.0);
+                                    let d = tracer[idx].clamp(0.0, 1.0);
                                     let r = (d * ((max_color >> 16) & 0xFF) as f32) as u32;
                                     let g = (d * ((max_color >> 8) & 0xFF) as f32) as u32;
                                     let b = (d * (max_color & 0xFF) as f32) as u32;
@@ -994,12 +1081,13 @@ impl FluidWindow {
                                     let (vx, vy) = FluidSim::cell_velocity_from(velocity_x, velocity_y, w, grid_h, x, y);
                                     velocity_color(vx, vy, velocity_max)
                                 }
-                                DisplayMode::Temperature => temperature_color(temperature[idx]),
+                                DisplayMode::Temperature => temperature_color((temperature[idx] - t_ref) / t_scale),
+                                DisplayMode::Rho => signed_color(rho[idx] - rho_amb, rho_dev_max),
                             }
                         }
                         CellType::Wall => match mode {
                             DisplayMode::Tracer => 0x000000,
-                            DisplayMode::Temperature => temperature_color(temperature[idx]),
+                            DisplayMode::Temperature => temperature_color((temperature[idx] - t_ref) / t_scale),
                             _ => solid_color,
                         }
                         CellType::Sink => { //red
@@ -1024,7 +1112,7 @@ impl FluidWindow {
             });
 
         if show_effects {
-            let mut mark = |rgba: &mut Vec<u8>, idx: usize| {
+            let mark = |rgba: &mut Vec<u8>, idx: usize| {
                 let p = idx * 4;
                 if p + 2 < rgba.len() && solids[idx] == CellType::Fluid {
                     rgba[p] = 0x00;
