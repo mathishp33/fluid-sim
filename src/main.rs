@@ -19,7 +19,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Fluid Simulation",
+        "SFSDM : Simulation Fluide/Solide Dynamique de Mathis",
         options,
         Box::new(|_cc| Ok(Box::new(window::app::App::new()))),
     )

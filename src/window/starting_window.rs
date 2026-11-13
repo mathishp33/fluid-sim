@@ -78,6 +78,7 @@ impl StartingGui {
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(false, "Air (gas, low-Mach)").clicked() { self.settings.material = FluidMaterial::air(); }
                         if ui.selectable_label(false, "Water (liquid)").clicked() { self.settings.material = FluidMaterial::water(); }
+                        if ui.selectable_label(false, "Honey (liquid)").clicked() { self.settings.material = FluidMaterial::honey(); }
                     });
                 ui.add(egui::Slider::new(&mut self.settings.material.viscosity, 1e-7..=1e-3).logarithmic(true).text("ν (m²/s)"));
                 ui.add(egui::Slider::new(&mut self.settings.material.conductivity, 0.01..=400.0).logarithmic(true).text("k fluid (W/m/K)"));

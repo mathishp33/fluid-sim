@@ -10,7 +10,7 @@ pub enum FluidKind {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct FluidMaterial {
     pub kind: FluidKind,
-    pub rho_ref: f32, // kg/m³ à (t_ref, p_ref) : référence hydrostatique et de flottabilité
+    pub rho_ref: f32, // g/m³ à (t_ref, p_ref) : référence hydrostatique et de flottabilité
     pub t_ref: f32, // K
     pub p_ref: f32, // Pa
     pub viscosity: f32, // ν, m^2/s (cinématique, supposée constante)
@@ -35,6 +35,13 @@ impl FluidMaterial {
     pub fn water() -> Self {
         Self { kind: FluidKind::Liquid, rho_ref: 998.0, t_ref: 293.15, p_ref: 101_325.0,
             viscosity: 1.0e-6, tracer_diffusion: 1.0e-9, conductivity: 0.6, cp: 4182.0,
+            r_spec: 0.0, beta: 2.07e-4,
+            solid_rho: 2400.0, solid_cp: 880.0, solid_conductivity: 1.0 }
+    }
+
+    pub fn honey() -> Self {
+        Self { kind: FluidKind::Liquid, rho_ref: 1420.0, t_ref: 293.15, p_ref: 101_325.0,
+            viscosity: 0.099276, tracer_diffusion: 1.0e-9, conductivity: 0.6, cp: 4182.0,
             r_spec: 0.0, beta: 2.07e-4,
             solid_rho: 2400.0, solid_cp: 880.0, solid_conductivity: 1.0 }
     }

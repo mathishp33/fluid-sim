@@ -7,11 +7,12 @@ P peut varier de -inf à +inf
 T peut varier de 0 à +inf 
 Si jamais c'est trop d'un coup, n'implémente pas (complétement) les gaz d'un coup
 
-CONFIGURER PRESSION_OUT POUR BOUNDARIES
-AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS)
+AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS) ?
 
 ## Prioritaire
-
+ - plus d'exemples de materiaux (créateur de matériaux)
+ - créateur personnalisé de matériaux
+ - viscosité considéré constante mais varie en fonction de la température
 
 1. encodeur de conditions initiales (ex: je veux créer une condition initiale particulière de vitesses
  donc j'entre une formule f(x,y)=... dans une fenetre spéciale puis j'importe ces CI. cette fenetre sera 
@@ -19,9 +20,8 @@ AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS)
 2. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
 3. PCG (Ax = b) ? pas sur
 4. force externes
-5. viscosité pas ouf
 5. Teleporter() kind of broken, destination size is not customizable.
-
+6. Ajouter une cellule spéciale Heater()
 
 ## Moins prioritaire
 1. backtrace RK2 ou MacCormack
@@ -60,3 +60,4 @@ Indicateur vorticité
  - diagnostiques de divergence, pression, énérgie, masse, CFL, ...
  - température fluide & solide
  - viscosité (faible)
+ - equations Low-Mach pour gaz et Boussinesq pour liquides
