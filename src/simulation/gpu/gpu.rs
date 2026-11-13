@@ -1,4 +1,5 @@
 use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType};
+use crate::simulation::materials::FluidKind;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -12,9 +13,13 @@ struct GpuParams {
     vmax: f32,
     special_count: u32,
     visc_k: f32,
-    buoyancy: f32,
+    gravity: f32,
     thermal_fluid: f32,
     thermal_solid: f32,
+    t_ref: f32,
+    beta: f32,
+    kind: u32,
+    _pad: u32,
     boundary_type: [u32; 4], // gauche, droite, haut, bas
     boundary: [[f32; 4]; 4], // (vx, vy, density, offset) x 4
     boundary_temp: [f32; 4],
@@ -56,16 +61,19 @@ pub struct StepConfig<'a> {
     pub dt: f32,
     pub pressure_iterations: usize,
     pub omega: f32,
-    pub diffusion: f32,
+    pub tracer: f32,
     pub vmax: f32,
     // gauche, droite, haut, bas
-    pub boundaries: [Boundary; 4],
     pub special_cells: &'a [(usize, CellEffect)],
     pub viscosity: f32,
     pub viscosity_substeps: usize,
-    pub buoyancy: f32,
+    pub gravity: f32,
     pub thermal_fluid: f32,
     pub thermal_solid: f32,
+    pub t_ref: f32,
+    pub beta: f32,
+    pub kind: u32,
+    pub boundaries: [Boundary; 4],
 }
 
 pub struct GpuFields<'a> {
@@ -96,7 +104,7 @@ struct Pipelines {
     special_density: wgpu::ComputePipeline,
     apply_density_boundaries: wgpu::ComputePipeline,
     diffuse_velocity: wgpu::ComputePipeline,
-    buoyancy: wgpu::ComputePipeline,
+    gravity: wgpu::ComputePipeline,
     prepare_ghost_temperature: wgpu::ComputePipeline,
     temperature_step: wgpu::ComputePipeline,
     temperature_commit: wgpu::ComputePipeline,
@@ -265,7 +273,7 @@ impl GpuContext {
             special_density: make_pipeline("special_density"),
             apply_density_boundaries: make_pipeline("apply_density_boundaries"),
             diffuse_velocity: make_pipeline("diffuse_velocity"),
-            buoyancy: make_pipeline("buoyancy"),
+            gravity: make_pipeline("buoyancy"),
             prepare_ghost_temperature: make_pipeline("prepare_ghost_temperature"),
             temperature_step: make_pipeline("temperature_step"),
             temperature_commit: make_pipeline("temperature_commit"),
@@ -363,13 +371,17 @@ impl GpuContext {
             omega: cfg.omega,
             dt: cfg.dt,
             dts,
-            diffusion: cfg.diffusion,
+            diffusion: cfg.tracer,
             vmax: cfg.vmax,
             special_count: cfg.special_cells.len() as u32,
             boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
             boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],
             visc_k: cfg.viscosity * cfg.dt / cfg.viscosity_substeps.max(1) as f32,
-            buoyancy: cfg.buoyancy,
+            gravity: cfg.gravity,
+            t_ref: cfg.t_ref,
+            beta: cfg.beta,
+            kind: cfg.kind,
+            _pad: 0,
             thermal_fluid: cfg.thermal_fluid,
             thermal_solid: cfg.thermal_solid,
             boundary_temp: [b[0].temperature, b[1].temperature, b[2].temperature, b[3].temperature],
@@ -446,8 +458,8 @@ impl GpuContext {
                     run!(p.commit_velocity, gx, gy);
                 }
             }
-            if cfg.buoyancy != 0.0 {
-                run!(p.buoyancy, gx, gy);
+            if cfg.gravity != 0.0 {
+                run!(p.gravity, gx, gy);
             }
             run!(p.special_velocity, 1, 1);
 

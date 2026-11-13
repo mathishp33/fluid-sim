@@ -24,6 +24,10 @@ struct Params {
     buoyancy: f32,
     thermal_fluid: f32,
     thermal_solid: f32,
+    t_ref: f32,
+    beta: f32,
+    kind: u32, // 0 = gaz, 1 = liquide
+    pad: u32,
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
     btype: vec4<u32>,
     // (velocity_x, velocity_y, density, offset)
@@ -617,6 +621,11 @@ fn temp_set(i: u32, v: f32) {
     scratch[4u * params.width * params.height + i] = v;
 }
 
+fn buoyancy_factor(t: f32) -> f32 {
+    if (params.kind == 0u) { return (t - params.t_ref) / max(t, 1.0); }
+    return params.beta * (t - params.t_ref);
+}
+
 @compute @workgroup_size(8, 8)
 fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
@@ -630,7 +639,7 @@ fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let i = x + y * w;
-    velocity_y[i] = velocity_y[i] - params.buoyancy * params.dt * 0.5 * (temp_get(i) + temp_get(i + w));
+    velocity_y[i] = velocity_y[i] - params.buoyancy * params.dt * 0.5 * (buoyancy_factor(temp_get(i)) + buoyancy_factor(temp_get(i + w)));
 }
 
 fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {
@@ -638,7 +647,7 @@ fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {
         return inlet_t;
     }
     if (t == BT_OUTLET && mode == 0u) {
-        return 0.0;
+        return params.t_ref;
     }
     return inner;
 }

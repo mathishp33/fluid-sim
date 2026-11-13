@@ -116,16 +116,16 @@ impl DensityKernel<'_> {
 impl FluidSim {
 
     pub(crate) fn viscosity_substeps(&self, dt: f32) -> usize {
-        ((4.0 * self.viscosity * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
+        ((4.0 * self.nu_grid() * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
     }
 
     pub fn diffuse_velocity(&mut self, dt: f32) {
-        if self.viscosity <= 0.0 {
+        if self.nu_grid() <= 0.0 {
             return;
         }
         let (w, h) = (self.width, self.height);
         let n = self.viscosity_substeps(dt);
-        let k = self.viscosity * dt / n as f32;
+        let k = self.nu_grid() * dt / n as f32;
 
         for _ in 0..n {
             self.velocity_x_temp.copy_from_slice(&self.velocity_x);
@@ -181,19 +181,20 @@ impl FluidSim {
 
     // dv/dt = -buoyancy * T (T > 0 monte, y pointe vers le bas)
     fn apply_buoyancy(&mut self, dt: f32) {
-        if self.buoyancy == 0.0 {
+        let g = self.gravity_grid();
+        if g == 0.0 {
             return;
         }
         let (w, h) = (self.width, self.height);
-        let (t, ov, g) = (&self.temperature, &self.open_v, self.buoyancy * dt);
+        let m = self.material;
+        let a = g * dt;
+        let (t, ov) = (&self.temperature, &self.open_v);
         self.velocity_y.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            if y == 0 || y >= h - 2 {
-                return;
-            }
+            if y == 0 || y >= h - 2 { return; }
             for x in 1..w - 1 {
                 let i = x + y * w;
                 if ov[i] != 0 {
-                    row[x] -= g * 0.5 * (t[i] + t[i + w]);
+                    row[x] -= a * 0.5 * (m.buoyancy_factor(t[i]) + m.buoyancy_factor(t[i + w]));
                 }
             }
         });
@@ -203,9 +204,10 @@ impl FluidSim {
     // Outlet = ambiante (0) avant l'advection copie après
     fn update_ghost_temperature(&mut self, before_advection: bool) {
         let (w, h) = (self.width, self.height);
+        let t_ref = self.material.t_ref;
         let ghost = |b: &Boundary, inner: f32| match b.boundary_type {
             BoundaryType::Inlet => b.temperature,
-            BoundaryType::Outlet if before_advection => 0.0,
+            BoundaryType::Outlet if before_advection => t_ref,
             _ => inner,
         };
         for y in 1..h - 1 {
@@ -229,8 +231,8 @@ impl FluidSim {
             u: &self.velocity_x,
             v: &self.velocity_y,
             solids: &self.solids,
-            alpha_fluid: self.thermal_diffusion,
-            alpha_solid: self.solid_thermal_diffusion,
+            alpha_fluid: self.material.conductivity,
+            alpha_solid: self.material.solid_conductivity,
         };
         let t = &self.temperature;
 
@@ -604,28 +606,28 @@ impl FluidSim {
 
         for y in 1..h - 1 {
             let (l, r) = (y * w, (w - 1) + y * w);
-            self.density[l] = match self.left_boundary.boundary_type {
+            self.tracer[l] = match self.left_boundary.boundary_type {
                 BoundaryType::Inlet => self.left_boundary.density,
                 BoundaryType::Outlet => 0.0,
-                BoundaryType::Wall => self.density[l + 1],
+                BoundaryType::Wall => self.tracer[l + 1],
             };
-            self.density[r] = match self.right_boundary.boundary_type {
+            self.tracer[r] = match self.right_boundary.boundary_type {
                 BoundaryType::Inlet => self.right_boundary.density,
                 BoundaryType::Outlet => 0.0,
-                BoundaryType::Wall => self.density[r - 1],
+                BoundaryType::Wall => self.tracer[r - 1],
             };
         }
         for x in 1..w - 1 {
             let (t, b) = (x, x + (h - 1) * w);
-            self.density[t] = match self.top_boundary.boundary_type {
+            self.tracer[t] = match self.top_boundary.boundary_type {
                 BoundaryType::Inlet => self.top_boundary.density,
                 BoundaryType::Outlet => 0.0,
-                BoundaryType::Wall => self.density[t + w],
+                BoundaryType::Wall => self.tracer[t + w],
             };
-            self.density[b] = match self.bottom_boundary.boundary_type {
+            self.tracer[b] = match self.bottom_boundary.boundary_type {
                 BoundaryType::Inlet => self.bottom_boundary.density,
                 BoundaryType::Outlet => 0.0,
-                BoundaryType::Wall => self.density[b - w],
+                BoundaryType::Wall => self.tracer[b - w],
             };
         }
     }
@@ -651,7 +653,7 @@ impl FluidSim {
             })
             .reduce(|| 0.0, f32::max);
 
-        let alpha = self.diffusion_rate.max(self.thermal_diffusion).max(self.solid_thermal_diffusion);
+        let alpha = self.material.conductivity.max(self.material.solid_conductivity); //je crois que ça marche
         let n = (dt * (rate + 4.0 * alpha) / CFL).ceil();
         (n as usize).clamp(1, MAX_SUBSTEPS)
     }
@@ -665,13 +667,13 @@ impl FluidSim {
         let dts = dt / n as f32;
 
         for _ in 0..n {
-            self.density_temp.copy_from_slice(&self.density); // conserve les cellules fantômes
+            self.tracer_temp.copy_from_slice(&self.tracer); // conserve les cellules fantômes
 
             let kernel = DensityKernel {w, h, u: &self.velocity_x, v: &self.velocity_y,
-                open_u: &self.open_u, open_v: &self.open_v, d: self.diffusion_rate};
-            let (rho, s) = (&self.density, &self.solids);
+                open_u: &self.open_u, open_v: &self.open_v, d: self.material.tracer_diffusion};
+            let (rho, s) = (&self.tracer, &self.solids);
 
-            self.density_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            self.tracer_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
                 if y == 0 || y == h - 1 {
                     return;
                 }
@@ -686,20 +688,20 @@ impl FluidSim {
                 }
             });
 
-            std::mem::swap(&mut self.density, &mut self.density_temp);
+            std::mem::swap(&mut self.tracer, &mut self.tracer_temp);
             self.temperature_substep(dts);
         }
     }
 
-    /// Cellules fantômes de la densité après advection
+    // Cellules fantômes de la densité après advection
     fn apply_density_boundaries(&mut self) {
         //gauche
         for y in 1..self.height - 1 {
             let idx = self.idx(0, y);
 
             match self.left_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(1, y)]; }
-                BoundaryType::Inlet => { self.density[idx] = self.left_boundary.density; }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.tracer[idx] = self.tracer[self.idx(1, y)]; }
+                BoundaryType::Inlet => { self.tracer[idx] = self.left_boundary.density; }
             }
         }
 
@@ -708,8 +710,8 @@ impl FluidSim {
             let idx = self.idx(self.width - 1, y);
 
             match self.right_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(self.width - 2, y)]; }
-                BoundaryType::Inlet => { self.density[idx] = self.right_boundary.density; }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.tracer[idx] = self.tracer[self.idx(self.width - 2, y)]; }
+                BoundaryType::Inlet => { self.tracer[idx] = self.right_boundary.density; }
             }
         }
 
@@ -718,8 +720,8 @@ impl FluidSim {
             let idx = self.idx(x, 0);
 
             match self.top_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(x, 1)]; }
-                BoundaryType::Inlet => { self.density[idx] = self.top_boundary.density; }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.tracer[idx] = self.tracer[self.idx(x, 1)]; }
+                BoundaryType::Inlet => { self.tracer[idx] = self.top_boundary.density; }
             }
         }
 
@@ -728,8 +730,8 @@ impl FluidSim {
             let idx = self.idx(x, self.height - 1);
 
             match self.bottom_boundary.boundary_type {
-                BoundaryType::Wall | BoundaryType::Outlet => { self.density[idx] = self.density[self.idx(x, self.height - 2)]; }
-                BoundaryType::Inlet => { self.density[idx] = self.bottom_boundary.density; }
+                BoundaryType::Wall | BoundaryType::Outlet => { self.tracer[idx] = self.tracer[self.idx(x, self.height - 2)]; }
+                BoundaryType::Inlet => { self.tracer[idx] = self.bottom_boundary.density; }
             }
         }
     }
@@ -738,15 +740,15 @@ impl FluidSim {
         for &(idx, effect) in self.special_cells.iter() {
             match effect {
                 CellEffect::Emitter { density, .. } => {
-                    self.density[idx] = density;
+                    self.tracer[idx] = density;
                 }
                 CellEffect::Sink { rate } => {
-                    self.density[idx] = 0.0;
+                    self.tracer[idx] = 0.0;
                 }
                 CellEffect::Teleporter { dest_idx } => {
                     if dest_idx != idx && self.solids[dest_idx] != CellType::Wall {
-                        self.density[dest_idx] = (self.density[dest_idx] + self.density[idx]).min(1.0); //todo attention au surplus
-                        self.density[idx] = 0.0;
+                        self.tracer[dest_idx] = (self.tracer[dest_idx] + self.tracer[idx]).min(1.0); //todo attention au surplus
+                        self.tracer[idx] = 0.0;
                     }
                 }
                 CellEffect::Accelerator { .. } => {}

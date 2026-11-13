@@ -20,7 +20,7 @@ pub enum WindowAction {
 
 #[derive(Clone, Copy, PartialEq)]
 enum DisplayMode {
-    Density,
+    Tracer,
     Pressure,
     Divergence,
     Velocity,
@@ -28,21 +28,21 @@ enum DisplayMode {
 }
 
 impl DisplayMode {
-    const ALL: [Self; 5] = [Self::Density, Self::Pressure, Self::Divergence, Self::Velocity, Self::Temperature];
+    const ALL: [Self; 5] = [Self::Tracer, Self::Pressure, Self::Divergence, Self::Velocity, Self::Temperature];
 
     fn next(self) -> Self {
         match self {
-            Self::Density => Self::Pressure,
+            Self::Tracer => Self::Pressure,
             Self::Pressure => Self::Divergence,
             Self::Divergence => Self::Velocity,
             Self::Velocity => Self::Temperature,
-            Self::Temperature => Self::Density,
+            Self::Temperature => Self::Tracer,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Self::Density => "DENSITY",
+            Self::Tracer => "TRACER",
             Self::Pressure => "PRESSURE",
             Self::Divergence => "DIVERGENCE",
             Self::Velocity => "VELOCITY",
@@ -88,12 +88,15 @@ fn cycle_radius(current: usize, reverse: bool) -> usize {
     }
 }
 
-fn temperature_color(t: f32) -> u32 { // noir -> rouge -> jaune / noir -> bleu -> cyan
-    let t = t.clamp(-1.0, 1.0);
-    let (r, g, b) = if t >= 0.0 {
-        ((2.0 * t).min(1.0), (2.0 * t - 1.0).max(0.0), 0.0)
+fn temperature_color(t: f32) -> u32 {
+    let t = t.clamp(0.0, 1000.0);
+
+    let (r, g, b) = if t >= 500.0 {
+        let x = (t - 500.0) / 500.0;
+        (0.0, 1.0 - x, x)
     } else {
-        (0.0, (-2.0 * t - 1.0).max(0.0), (-2.0 * t).min(1.0))
+        let x = t / 500.0;
+        ((2.0 * x).min(1.0), (2.0 * x - 1.0).max(0.0), 0.0)
     };
     (((r * 255.0) as u32) << 16) | (((g * 255.0) as u32) << 8) | (b * 255.0) as u32
 }
@@ -267,18 +270,19 @@ impl FluidWindow {
         let mut fluid = FluidSim::new(
             settings.width / precision,
             settings.height / precision,
-            settings.start_density,
-            settings.diffusion_rate,
+            settings.dx,
+            settings.material,
+            settings.gravity,
         );
         fluid.left_boundary = settings.left_boundary;
         fluid.right_boundary = settings.right_boundary;
         fluid.top_boundary = settings.top_boundary;
         fluid.bottom_boundary = settings.bottom_boundary;
 
-        fluid.viscosity = settings.viscosity;
-        fluid.thermal_diffusion = settings.thermal_diffusion;
-        fluid.solid_thermal_diffusion = settings.solid_thermal_diffusion;
-        fluid.buoyancy = settings.buoyancy;
+        fluid.material.viscosity = settings.material.viscosity;
+        fluid.material.conductivity = settings.material.conductivity;
+        fluid.material.solid_conductivity = settings.material.solid_conductivity;
+        fluid.gravity = settings.gravity;
 
         let size = fluid.width * fluid.height * 4;
         let now = Instant::now();
@@ -300,7 +304,7 @@ impl FluidWindow {
 
             paused: false,
             step_frame: 0,
-            display_mode: DisplayMode::Density,
+            display_mode: DisplayMode::Tracer,
             mouse_mode: MouseMode::Rectangle,
             inverse_solid_color: true,
             selected_cell_type: CellType::Wall,
@@ -310,7 +314,7 @@ impl FluidWindow {
             picking_destination: false,
             last_effect_type: CellType::Wall,
 
-            brush_temperature: 1.0,
+            brush_temperature: settings.material.t_ref + 50.0,
 
             last_mouse: None,
             hovered_cell: None,
@@ -517,16 +521,16 @@ impl FluidWindow {
                 ui.label("Solver");
                 ui.add(egui::Slider::new(&mut self.pressure_iters, 0..=200).text("Pressure iters"));
                 ui.add(egui::Slider::new(&mut self.fluid.sor_omega, 1.0..=1.95).text("SOR omega"));
-                ui.add(egui::Slider::new(&mut self.fluid.diffusion_rate, 0.0..=5.0).text("Diffusion rate"));
-                ui.add(egui::Slider::new(&mut self.fluid.viscosity, 0.0..=20.0).text("Viscosity"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.tracer_diffusion, 0.0..=5.0).text("Tracer rate"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.viscosity, 0.0..=20.0).text("Viscosity"));
                 ui.separator();
                 ui.heading("Temperature");
-                ui.add(egui::Slider::new(&mut self.fluid.thermal_diffusion, 0.0..=5.0).text("Fluid conduction"));
-                ui.add(egui::Slider::new(&mut self.fluid.solid_thermal_diffusion, 0.0..=5.0).text("Solid conduction"));
-                ui.add(egui::Slider::new(&mut self.fluid.buoyancy, 0.0..=200.0).text("Buoyancy"));
-                ui.add(egui::Slider::new(&mut self.brush_temperature, -1.0..=1.0).text("Brush temp (Shift+LMB)"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.conductivity, 0.0..=5.0).text("Fluid conduction(W/(m*K))"));
+                ui.add(egui::Slider::new(&mut self.fluid.material.solid_conductivity, 0.0..=5.0).text("Solid conduction (W/(m*K))"));
+                ui.add(egui::Slider::new(&mut self.fluid.gravity, 0.0..=100.0).text("Gravity (m/s^2)"));
+                ui.add(egui::Slider::new(&mut self.brush_temperature, 10.0..=1500.0).text("Brush temp (K)"));
                 if ui.button("Reset temperature").clicked() {
-                    self.fluid.temperature.fill(0.0);
+                    self.fluid.temperature.fill(self.fluid.material.t_ref);
                     self.status = "Temperature reset".into();
                 }
                 ui.separator();
@@ -641,7 +645,7 @@ impl FluidWindow {
                             let (cvx, cvy) = self.fluid.cell_velocity(x, y);
                             row("Velocity X", format!("{:.3}", cvx));
                             row("Velocity Y", format!("{:.3}", cvy));
-                            row("Density", format!("{:.3}", self.fluid.density[idx]));
+                            row("Density", format!("{:.3}", self.fluid.tracer[idx]));
                             row("Pressure", format!("{:.3}", self.fluid.pressure[idx]));
                             row("Divergence", format!("{:.3}", self.fluid.divergence[idx]));
                             row("Temperature", format!("{:.3}", self.fluid.temperature[idx]));
@@ -829,7 +833,7 @@ impl FluidWindow {
                 let idx = x + y * w;
 
                 if input.left {
-                    if heating {
+                    if heating && input.middle {
                         fluid.temperature[idx] += (brush_t - fluid.temperature[idx]) * blend;
                     } else if input.ctrl {
                         if self.selected_cell_type == CellType::Wall {
@@ -839,7 +843,7 @@ impl FluidWindow {
                             fluid.set_cell(x, y, self.selected_cell_type, Option::from(self.current_cell_effect));
                         }
                     } else if fluid.solids[idx] == CellType::Fluid {
-                        fluid.density[idx] = (fluid.density[idx] + 2.0 * dt).min(1.0);
+                        fluid.tracer[idx] = (fluid.tracer[idx] + 2.0 * dt).min(1.0);
                     }
                 }
 
@@ -854,7 +858,7 @@ impl FluidWindow {
                     if input.ctrl {
                         fluid.set_cell(x, y, CellType::Fluid, None);
                     } else {
-                        fluid.density[idx] = (fluid.density[idx] - 2.0 * dt).max(0.0);
+                        fluid.tracer[idx] = (fluid.tracer[idx] - 2.0 * dt).max(0.0);
                     }
                 }
             }
@@ -905,7 +909,7 @@ impl FluidWindow {
                     let (vx, vy) = FluidSim::cell_velocity_from(&f.velocity_x, &f.velocity_y, w, h, x, y);
                     let s2 = vx * vx + vy * vy;
                     m = m.max(s2);
-                    e += f.density[i] * s2;
+                    e += f.tracer[i] * s2;
 
                     let interior = x >= 1 && x < w - 1 && y >= 1 && y < h - 1;
                     if !interior || s[i] == CellType::Wall || s[i] == CellType::Sink {
@@ -953,7 +957,7 @@ impl FluidWindow {
         let solid_color: u32 = if self.inverse_solid_color { 0xffffff } else { 0x000000 };
         let Stats { pressure_max, divergence_max, velocity_max, .. } = self.stats;
 
-        let density = &self.fluid.density[..];
+        let density = &self.fluid.tracer[..];
         let pressure = &self.fluid.pressure[..];
         let divergence = &self.fluid.divergence[..];
         let velocity_x = &self.fluid.velocity_x[..];
@@ -977,7 +981,7 @@ impl FluidWindow {
                     let color: u32 = match kind {
                         CellType::Fluid => {
                             match mode {
-                                DisplayMode::Density => {
+                                DisplayMode::Tracer => {
                                     let d = density[idx].clamp(0.0, 1.0);
                                     let r = (d * ((max_color >> 16) & 0xFF) as f32) as u32;
                                     let g = (d * ((max_color >> 8) & 0xFF) as f32) as u32;
@@ -994,7 +998,7 @@ impl FluidWindow {
                             }
                         }
                         CellType::Wall => match mode {
-                            DisplayMode::Density => 0x000000,
+                            DisplayMode::Tracer => 0x000000,
                             DisplayMode::Temperature => temperature_color(temperature[idx]),
                             _ => solid_color,
                         }

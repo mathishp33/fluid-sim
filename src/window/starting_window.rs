@@ -2,19 +2,17 @@ use egui::ComboBox;
 use serde::{Deserialize, Serialize};
 
 use crate::simulation::fluid::{Boundary, BoundaryType};
+use crate::simulation::materials::FluidMaterial;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SimulationSettings {
     pub width: usize,
     pub height: usize,
+    pub material: FluidMaterial,
+    pub dx: f32,
+    pub gravity: f32,
     pub precision: usize,
-    pub start_density: f32,
-    pub viscosity: f32,
-    pub thermal_diffusion: f32,
-    pub solid_thermal_diffusion: f32,
-    pub buoyancy: f32,
     pub max_density_color: [u8; 4],
-    pub diffusion_rate: f32,
     pub pressure_iters: usize,
     pub left_boundary: Boundary,
     pub right_boundary: Boundary,
@@ -27,14 +25,11 @@ impl Default for SimulationSettings {
         Self {
             width: 800,
             height: 600,
+            material: FluidMaterial::water(),
+            dx: 1.0,
+            gravity: 0.0,
             precision: 10,
-            start_density: 0.2,
-            viscosity: 0.0,
-            thermal_diffusion: 0.1,
-            solid_thermal_diffusion: 0.05,
-            buoyancy: 30.0,
             max_density_color: [255, 255, 255, 255],
-            diffusion_rate: 0.1,
             pressure_iters: 30,
             left_boundary: Boundary::wall(),
             right_boundary: Boundary::wall(),
@@ -71,11 +66,23 @@ impl StartingGui {
                 ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
                 ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
-                ui.add(egui::Slider::new(&mut self.settings.diffusion_rate, 0.0..=5.0).text("Diffusion Rate"));
-                ui.add(egui::Slider::new(&mut self.settings.viscosity, 0.0..=20.0).text("Viscosity"));
-                ui.add(egui::Slider::new(&mut self.settings.thermal_diffusion, 0.0..=5.0).text("Fluid conduction"));
-                ui.add(egui::Slider::new(&mut self.settings.solid_thermal_diffusion, 0.0..=5.0).text("Solid conduction"));
-                ui.add(egui::Slider::new(&mut self.settings.buoyancy, 0.0..=200.0).text("Buoyancy"));
+                ComboBox::from_label("Fluid preset").selected_text(format!("{:?}", self.settings.material.kind))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(false, "Air (gas)").clicked() { self.settings.material = FluidMaterial::air(); }
+                        if ui.selectable_label(false, "Water (liquid)").clicked() { self.settings.material = FluidMaterial::water(); }
+                    });
+                ui.add(egui::Slider::new(&mut self.settings.material.viscosity, 1e-7..=1e-3).logarithmic(true).text("ν (m²/s)"));
+                ui.add(egui::Slider::new(&mut self.settings.material.conductivity, 0.01..=400.0).logarithmic(true).text("k (W/m/K)"));
+                ui.add(egui::Slider::new(&mut self.settings.material.t_ref, 200.0..=500.0).text("T ambient (K)"));
+                ComboBox::from_label("Cell scale").selected_text(format!("{:?}", self.settings.dx))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(false, "1 mm").clicked() { self.settings.dx = 1e-3; }
+                        if ui.selectable_label(false, "1 cm").clicked() { self.settings.dx = 1e-2; }
+                        if ui.selectable_label(false, "1 dm").clicked() { self.settings.dx = 1e-1; }
+                        if ui.selectable_label(false, "1 m").clicked() { self.settings.dx = 1.0; }
+                    });
+                ui.label(format!("Domaine : {:.2} × {:.2} m", self.settings.width as f32 * self.settings.dx / self.settings.precision as f32,
+                                 self.settings.height as f32 * self.settings.dx / self.settings.precision as f32));
 
                 ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
 
@@ -87,7 +94,7 @@ impl StartingGui {
                         }
                     });
 
-                ui.add(egui::Slider::new(&mut self.settings.start_density, 0.0..=1.0).text("Default Density"));
+                //ui.add(egui::Slider::new(&mut self.settings.start_tracer, 0.0..=1.0).text("Default Tracer"));
 
                 boundary_ui(ui, "Left Boundary", &mut self.settings.left_boundary);
                 boundary_ui(ui, "Right Boundary", &mut self.settings.right_boundary);
@@ -128,7 +135,7 @@ pub fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary) {
                 ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y"));
                 ui.add(egui::Slider::new(&mut boundary.density, 0.0..=1.0).text("Density"));
                 ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
-                ui.add(egui::Slider::new(&mut boundary.temperature, -1.0..=1.0).text("Temperature"));
+                ui.add(egui::Slider::new(&mut boundary.temperature, 0.0..=2000.0).text("Temperature"));
             }
             BoundaryType::Wall => {}
             BoundaryType::Outlet => {}
