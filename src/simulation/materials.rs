@@ -70,7 +70,6 @@ impl FluidMaterial {
     pub fn gamma(&self) -> f32 {
         self.cp / (self.cp - self.r_spec).max(1.0)
     }
-
     // Boussinesq (liquide, ou gaz sur GPU) : (rho_ref − rho)/rho_ref
     #[inline]
     pub fn buoyancy_factor(&self, t: f32) -> f32 {
@@ -85,10 +84,16 @@ impl FluidMaterial {
     pub fn buoyancy_from_rho(&self, rho: f32) -> f32 {
         self.rho_ambient() / rho.max(1e-6) - 1.0
     }
-    
-    pub fn heat_capacity_ref(&self) -> f32 { self.rho_ambient() * self.cp }
-    pub fn heat_capacity_solid(&self) -> f32 { self.solid_rho * self.solid_cp }
-    
-    pub fn alpha_fluid(&self) -> f32 { self.conductivity / (self.rho_ambient() * self.cp) }
-    pub fn alpha_solid(&self) -> f32 { self.solid_conductivity / (self.solid_rho * self.solid_cp) }
+    pub fn heat_capacity_ref(&self) -> f32 {
+        self.rho_ambient() * self.cp
+    }
+    pub fn heat_capacity_solid(&self) -> f32 {
+        self.solid_rho * self.solid_cp
+    }
+    pub fn alpha_fluid(&self) -> f32 {
+        self.conductivity / (self.rho_ambient() * self.cp)
+    }
+    pub fn alpha_solid(&self) -> f32 {
+        self.solid_conductivity / (self.solid_rho * self.solid_cp)
+    }
 }

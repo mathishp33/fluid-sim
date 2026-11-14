@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType, FluidSim};
+use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType, FluidSim, GridBoundary};
 
 const CFL: f32 = 0.9;
 const MAX_SUBSTEPS: usize = 64;
@@ -16,7 +16,7 @@ impl SharedMut {
     }
 }
 
-// Flux du tracer (advection + diffusion) aux faces de la grille MAC
+// Flux du TRACEUR (advection + diffusion) aux faces de la grille MAC. Unités de grille.
 struct TracerKernel<'a> {
     w: usize,
     h: usize,
@@ -24,7 +24,7 @@ struct TracerKernel<'a> {
     v: &'a [f32],
     open_u: &'a [u8],
     open_v: &'a [u8],
-    d: f32, // diffusion du tracer en cellules^2/s
+    d: f32, // diffusion du tracer en cellules²/s
 }
 
 impl TracerKernel<'_> {
@@ -56,12 +56,18 @@ impl TracerKernel<'_> {
 }
 
 impl FluidSim {
-    // viscosité
+    // ------------------------------------------------------------------ viscosité
 
     pub(crate) fn viscosity_substeps(&self, dt: f32) -> usize {
         ((4.0 * self.nu_grid() * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
     }
 
+    // Laplacien de la vitesse sur les faces. Contribution d'un voisin (face de même orientation) :
+    //  - face ouverte : v_voisin − c
+    //  - fermée, glissement libre (no_slip = false) : 0 (gradient nul)
+    //  - fermée, no-slip : direction normale ou voisin = cellule fantôme du bord -> valeur stockée − c
+    //    (0 pour une face fermée par un solide, valeur de CL au bord) ; direction tangentielle contre
+    //    un solide -> −2c (paroi à mi-cellule, adhérence)
     pub fn diffuse_velocity(&mut self, dt: f32) {
         if self.nu_grid() <= 0.0 {
             return;
@@ -69,6 +75,10 @@ impl FluidSim {
         let (w, h) = (self.width, self.height);
         let n = self.viscosity_substeps(dt);
         let k = self.nu_grid() * dt / n as f32;
+        let ns = self.no_slip;
+        let term = move |open: bool, val: f32, c: f32, normal: bool, ghost: bool| -> f32 {
+            if open { val - c } else if !ns { 0.0 } else if normal || ghost { val - c } else { -2.0 * c }
+        };
 
         for _ in 0..n {
             self.velocity_x_temp.copy_from_slice(&self.velocity_x);
@@ -86,11 +96,10 @@ impl FluidSim {
                             continue;
                         }
                         let c = u[i];
-                        let mut lap = 0.0;
-                        if ou[i + 1] != 0 { lap += u[i + 1] - c; }
-                        if ou[i - 1] != 0 { lap += u[i - 1] - c; }
-                        if ou[i + w] != 0 { lap += u[i + w] - c; }
-                        if ou[i - w] != 0 { lap += u[i - w] - c; }
+                        let lap = term(ou[i + 1] != 0, u[i + 1], c, true, false)
+                            + term(ou[i - 1] != 0, u[i - 1], c, true, false)
+                            + term(ou[i + w] != 0, u[i + w], c, false, y + 1 == h - 1)
+                            + term(ou[i - w] != 0, u[i - w], c, false, y == 1);
                         row[x] = c + k * lap;
                     }
                 });
@@ -107,11 +116,10 @@ impl FluidSim {
                             continue;
                         }
                         let c = v[i];
-                        let mut lap = 0.0;
-                        if ov[i + 1] != 0 { lap += v[i + 1] - c; }
-                        if ov[i - 1] != 0 { lap += v[i - 1] - c; }
-                        if ov[i + w] != 0 { lap += v[i + w] - c; }
-                        if ov[i - w] != 0 { lap += v[i - w] - c; }
+                        let lap = term(ov[i + 1] != 0, v[i + 1], c, false, x + 1 == w - 1)
+                            + term(ov[i - 1] != 0, v[i - 1], c, false, x == 1)
+                            + term(ov[i + w] != 0, v[i + w], c, true, false)
+                            + term(ov[i - w] != 0, v[i - w], c, true, false);
                         row[x] = c + k * lap;
                     }
                 });
@@ -122,10 +130,11 @@ impl FluidSim {
         }
     }
 
-    // flottabilité
+    // ------------------------------------------------------------------ flottabilité
 
-    // - low-Mach (gaz) : a_haut = g*(rho_ref/rho − 1), avec rho(T, P_th)
-    // - Boussinesq (autres) : a_haut = g*(rho_ref − rho)/rho_ref via buoyancy_factor(T)
+    // y pointe vers le bas : dv/dt = -(accélération vers le haut).
+    //  - low-Mach (gaz)         : a_haut = g·(ρ_ref/ρ − 1), avec ρ(T, P_th)
+    //  - Boussinesq (autres)    : a_haut = g·(ρ_ref − ρ)/ρ_ref via buoyancy_factor(T)
     fn apply_buoyancy(&mut self, dt: f32) {
         let g = self.gravity_grid();
         if g == 0.0 {
@@ -148,7 +157,7 @@ impl FluidSim {
         });
     }
 
-    // température
+    // ------------------------------------------------------------------ température
 
     // fantômes : Inlet = valeur, Wall = adiabatique,
     // Outlet = ambiante (t_ref) avant l'advection, copie de l'intérieur après
@@ -173,7 +182,7 @@ impl FluidSim {
     }
 
     // Équation d'énergie (forme non conservative, valable avec div u ≠ 0) :
-    //   dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt) / (ρ·cp) (pas de moi ces singeries)
+    //   dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt) / (ρ·cp)
     // - advection : upwind sur les seules faces entrantes (= flux conservatif − T·div u)
     // - conduction : Σ k_face·(T_j − T_i)/dx², k_face = moyenne harmonique ; chaque cellule
     //   divise par SA capacité thermique (fluide ρ·cp, solide ρ_s·cp_s) -> l'énergie est conservée
@@ -234,7 +243,7 @@ impl FluidSim {
         std::mem::swap(&mut self.temperature, &mut self.temperature_temp);
     }
 
-    // diffusivité thermique max en cellules^2/s
+    // diffusivité thermique max en cellules²/s (pour la stabilité des sous-pas)
     fn thermal_alpha_max_grid(&self) -> f32 {
         let m = self.material;
         let rho_f = if self.low_mach_active() { self.rho_min } else { m.rho_ambient() };
@@ -243,7 +252,7 @@ impl FluidSim {
         a_f.max(a_s) / (self.dx * self.dx)
     }
 
-    // masques et conductances
+    // ------------------------------------------------------------------ masques / conductances
 
     #[inline]
     fn offset_factor(x: usize, size: usize, offset: usize) -> f32 {
@@ -305,8 +314,9 @@ impl FluidSim {
         });
     }
 
-    // Conductance des faces pour le solveur de pression : open*(rho_ref/rho_face)
-    // rho_face = moyenne arithmétique des deux cellules
+    // Conductance des faces pour le solveur de pression : open · (ρ_ref/ρ_face).
+    // ρ_face = moyenne arithmétique des deux cellules. Incompressible / Boussinesq : 1 si ouverte.
+    // C'est le « /ρ » de l'équation de quantité de mouvement (projection à densité variable).
     fn rebuild_conductances(&mut self) {
         let w = self.width;
         let varrho = self.low_mach_active();
@@ -328,7 +338,7 @@ impl FluidSim {
         });
     }
 
-    // advection de la vitesse
+    // ------------------------------------------------------------------ advection de la vitesse
 
     fn sample_face(field: &[f32], solids: &[CellType], w: usize, h: usize, horiz: bool, px: f32, py: f32, fallback: f32) -> f32 {
         let (gx, gy, xm, ym) = if horiz {
@@ -417,20 +427,24 @@ impl FluidSim {
         std::mem::swap(&mut self.velocity_y, &mut self.velocity_y_temp);
     }
 
-    // conditions aux limites
+    // ------------------------------------------------------------------ conditions aux limites
 
-    fn edge_values(b: &Boundary, factor: f32, inlet_n: f32, inlet_t: f32, inner_n: f32, inner_t: f32) -> (f32, f32) {
+    // CL des faces à appliquer avant la projection
+    // (composante normale, composante tangentielle fantôme). no-slip : fantôme = 2·U_paroi − intérieur.
+    fn edge_values(b: &GridBoundary, no_slip: bool, factor: f32, inlet_n: f32, inlet_t: f32, inner_n: f32, inner_t: f32) -> (f32, f32) {
         match b.boundary_type {
-            BoundaryType::Wall => (0.0, inner_t), // free slip
+            BoundaryType::Wall => (0.0, if no_slip { -inner_t } else { inner_t }),
             BoundaryType::Outlet => (inner_n, inner_t), // grad = 0
-            BoundaryType::Inlet => (inlet_n * factor, inlet_t * factor),
+            BoundaryType::Inlet => (inlet_n * factor, if no_slip { 2.0 * inlet_t * factor - inner_t } else { inlet_t * factor }),
         }
     }
 
     fn apply_velocity_boundaries(&mut self) {
         let (w, h) = (self.width, self.height);
+        let ns = self.no_slip;
+        let dx = self.dx;
 
-        // solides
+        // faces intérieures fermées par un solide -> 0
         for y in 1..h - 1 {
             for x in 1..w - 2 {
                 let i = x + y * w;
@@ -452,16 +466,16 @@ impl FluidSim {
         for y in 1..h - 1 {
             let row = y * w;
 
-            let b = self.left_boundary;
+            let b = self.left_boundary.to_grid(dx);
             let f = Self::offset_factor(y, h, b.offset);
-            let (n, t) = Self::edge_values(&b, f, b.velocity_x, b.velocity_y,
+            let (n, t) = Self::edge_values(&b, ns, f, b.vx, b.vy,
                                            self.velocity_x[row + 1], self.velocity_y[row + 1]);
             self.velocity_x[row] = if self.solids[row + 1] == CellType::Wall { 0.0 } else { n };
             self.velocity_y[row] = t;
 
-            let b = self.right_boundary;
+            let b = self.right_boundary.to_grid(dx);
             let f = Self::offset_factor(y, h, b.offset);
-            let (n, t) = Self::edge_values(&b, f, b.velocity_x, b.velocity_y,
+            let (n, t) = Self::edge_values(&b, ns, f, b.vx, b.vy,
                                            self.velocity_x[row + w - 3], self.velocity_y[row + w - 2]);
             self.velocity_x[row + w - 2] = if self.solids[row + w - 2] == CellType::Wall { 0.0 } else { n };
             self.velocity_y[row + w - 1] = t;
@@ -471,24 +485,24 @@ impl FluidSim {
         for x in 1..w - 1 {
             let last = (h - 2) * w;
 
-            let b = self.top_boundary;
+            let b = self.top_boundary.to_grid(dx);
             let f = Self::offset_factor(x, w, b.offset);
-            let (n, t) = Self::edge_values(&b, f, b.velocity_y, b.velocity_x,
+            let (n, t) = Self::edge_values(&b, ns, f, b.vy, b.vx,
                                            self.velocity_y[x + w], self.velocity_x[x + w]);
             self.velocity_y[x] = if self.solids[x + w] == CellType::Wall { 0.0 } else { n };
             self.velocity_x[x] = t;
 
-            let b = self.bottom_boundary;
+            let b = self.bottom_boundary.to_grid(dx);
             let f = Self::offset_factor(x, w, b.offset);
-            let (n, t) = Self::edge_values(&b, f, b.velocity_y, b.velocity_x,
+            let (n, t) = Self::edge_values(&b, ns, f, b.vy, b.vx,
                                            self.velocity_y[x + last - w], self.velocity_x[x + last]);
             self.velocity_y[x + last] = if self.solids[x + last] == CellType::Wall { 0.0 } else { n };
             self.velocity_x[x + last + w] = t;
         }
     }
 
-    // Vitesse maximale autorisée pour que le nombre de sous-pas de scalaires reste <= MAX_SUBSTEPS
-    // Partagée avec le GPU (limit_velocity dans le shader)
+    /// Vitesse maximale autorisée pour que le nombre de sous-pas de scalaires reste <= MAX_SUBSTEPS.
+    /// Partagée avec le GPU (limit_velocity dans le shader).
     pub(crate) fn velocity_limit(&self, dt: f32) -> f32 {
         CFL * MAX_SUBSTEPS as f32 / (4.0 * dt.max(1e-6))
     }
@@ -503,8 +517,9 @@ impl FluidSim {
     }
 
     fn apply_special_velocity(&mut self, dt: f32) {
+        let dx = self.dx;
         for &(idx, effect) in self.special_cells.iter() {
-            match effect {
+            match effect.to_grid(dx) {
                 CellEffect::Emitter { vx, vy, .. } => {
                     self.velocity_x[idx] = vx;
                     self.velocity_y[idx] = vy;
@@ -530,8 +545,10 @@ impl FluidSim {
         }
     }
 
-    // low-Mach
+    // ------------------------------------------------------------------ low-Mach : divergence cible
 
+    /// Flux volumique sortant par les faces du bord (somme sur les faces de bord, cellules/s·cellule).
+    /// Les faces fermées par un solide valent déjà 0 (apply_velocity_boundaries).
     fn boundary_outflow(&self) -> f64 {
         let (w, h) = (self.width, self.height);
         let (u, v) = (&self.velocity_x, &self.velocity_y);
@@ -545,16 +562,52 @@ impl FluidSim {
         q
     }
 
+    /// Même flux sortant que `boundary_outflow`, mais déduit des seules conditions aux limites
+    /// (valeurs de bord après apply_velocity_boundaries + limit_velocity), donc calculable AVANT
+    /// d'avoir les vitesses du pas. Valable en boîte fermée (aucun Outlet) : bord = 0 (Wall)
+    /// ou facteur·vitesse (Inlet), 0 si la cellule voisine est solide.
+    pub(crate) fn boundary_outflow_analytic(&self, dt: f32) -> f64 {
+        let (w, h) = (self.width, self.height);
+        let vmax = self.velocity_limit(dt);
+        let s = &self.solids;
+        let dx = self.dx;
+        let face = |b: &GridBoundary, f: f32, comp: f32, solid_neighbor: bool| -> f64 {
+            if solid_neighbor || b.boundary_type != BoundaryType::Inlet {
+                return 0.0;
+            }
+            let v = comp * f;
+            (if v.is_finite() { v.clamp(-vmax, vmax) } else { 0.0 }) as f64
+        };
+        let mut q = 0.0f64;
+        for y in 1..h - 1 {
+            let row = y * w;
+            let (bl, br) = (self.left_boundary.to_grid(dx), self.right_boundary.to_grid(dx));
+            q -= face(&bl, Self::offset_factor(y, h, bl.offset), bl.vx, s[row + 1] == CellType::Wall);
+            q += face(&br, Self::offset_factor(y, h, br.offset), br.vx, s[row + w - 2] == CellType::Wall);
+        }
+        for x in 1..w - 1 {
+            let last = (h - 2) * w;
+            let (bt, bb) = (self.top_boundary.to_grid(dx), self.bottom_boundary.to_grid(dx));
+            q -= face(&bt, Self::offset_factor(x, w, bt.offset), bt.vy, s[x + w] == CellType::Wall);
+            q += face(&bb, Self::offset_factor(x, w, bb.offset), bb.vy, s[x + last] == CellType::Wall);
+        }
+        q
+    }
+
     // Gaz low-Mach : on impose  div u = S  avec
-    //   S = (∇·(k∇T) + q)/(ρ·cp·T)  −  (1/(γ·P_th))·dP_th/dt (singeries)
+    //   S = (∇·(k∇T) + q)/(ρ·cp·T)  −  (1/(γ·P_th))·dP_th/dt
     // - domaine ouvert (Outlet ou Sink) : P_th = P_ref, dP_th/dt = 0
     // - boîte fermée : dP_th/dt est choisi pour que le problème de Poisson (Neumann) soit
-    //   résoluble, i.e. Σ S = flux sortant par les faces de bord (Inlets)
-    // Incompressible / Boussinesq : S = 0
-    fn compute_source(&mut self, dt: f32) {
+    //   résoluble, i.e. Σ S = flux sortant par les faces de bord (Inlets).
+    // Incompressible / Boussinesq : S = 0.
+    //
+    // `q_out` : flux de bord déjà connu (chemin GPU, où les vitesses ne sont pas encore calculées) ;
+    // None = on le lit dans les tableaux de vitesse (chemin CPU).
+    pub(crate) fn compute_source(&mut self, dt: f32, q_out: Option<f64>) {
         if !self.low_mach_active() {
             self.source.fill(0.0);
             self.dpdt = 0.0;
+            self.p_th = self.material.p_ref;
             return;
         }
         let (w, h) = (self.width, self.height);
@@ -599,7 +652,18 @@ impl FluidSim {
         };
 
         if self.is_closed() && n_active > 0 {
-            let delta = ((sum_a - self.boundary_outflow()) / n_active as f64) as f32; // = dP_th/dt / (γ·P_th)
+            let q_out = match q_out {
+                Some(q) => q,
+                None => {
+                    let q = self.boundary_outflow();
+                    debug_assert!(
+                        (q - self.boundary_outflow_analytic(dt)).abs() <= 1e-3 * (1.0 + q.abs()),
+                        "flux de bord analytique != flux lu dans les vitesses"
+                    );
+                    q
+                }
+            };
+            let delta = ((sum_a - q_out) / n_active as f64) as f32; // = dP_th/dt / (γ·P_th)
             let gamma = m.gamma();
             self.dpdt = gamma * self.p_th * delta;
             self.p_th = (self.p_th + self.dpdt * dt).max(1.0);
@@ -622,7 +686,7 @@ impl FluidSim {
         }
     }
 
-    // projection
+    // ------------------------------------------------------------------ projection
 
     fn calculate_divergence(&mut self) {
         let (w, h) = (self.width, self.height);
@@ -644,7 +708,7 @@ impl FluidSim {
     }
 
     // Poisson à coefficients variables : Σ_faces c_f·(p_voisin − p_i) = div_i − S_i
-    // Red-Black SOR
+    // (c_f = conductance de la face, voir rebuild_conductances), Red-Black SOR.
     fn solve_pressure(&mut self, iterations: usize) {
         let (w, h) = (self.width, self.height);
         let omega = self.sor_omega;
@@ -681,8 +745,9 @@ impl FluidSim {
         }
     }
 
-    // Problème de Neumann (boite fermée)
-    fn remove_pressure_mean(&mut self) {
+    // Problème de Neumann pur (boîte fermée) : la pression n'est définie qu'à une constante près.
+    // On retire la moyenne pour qu'elle ne dérive pas.
+    pub(crate) fn remove_pressure_mean(&mut self) {
         let (w, h) = (self.width, self.height);
         let s = &self.solids;
         let p = &self.pressure;
@@ -750,11 +815,12 @@ impl FluidSim {
             self.remove_pressure_mean();
         }
         self.correct_velocity();
-        self.calculate_divergence(); // divergence résiduelle = S
+        self.calculate_divergence(); // divergence résiduelle : doit valoir S
     }
 
-    // tracer
+    // ------------------------------------------------------------------ tracer (colorant)
 
+    // fantômes du tracer : Inlet = valeur, Wall = copie, Outlet = 0 avant l'advection, copie après
     fn ghost_tracer(&mut self, before_advection: bool) {
         let (w, h) = (self.width, self.height);
         let ghost = |b: &Boundary, inner: f32| match b.boundary_type {
@@ -774,8 +840,8 @@ impl FluidSim {
         }
     }
 
-    // Nombre de sous-pas des scalaires (tracer + température), garantissant
-    // dt_sub * (flux sortant + 4*diffusion max) ≤ CFL
+    /// Nombre de sous-pas des scalaires (tracer + température), garantissant
+    /// dt_sub · (flux sortant + 4·diffusion max) <= CFL.
     pub(crate) fn scalar_substeps(&self, dt: f32) -> usize {
         let (w, h) = (self.width, self.height);
         let (u, v, s) = (&self.velocity_x, &self.velocity_y, &self.solids);
@@ -801,8 +867,9 @@ impl FluidSim {
         (n as usize).clamp(1, MAX_SUBSTEPS)
     }
 
-    // Tracer + température en sous-pas. Le tracer est une fraction
+    // Tracer + température en sous-pas. Le tracer est une FRACTION (pas une densité) :
     // avec div u ≠ 0 (low-Mach) on advecte sa forme non conservative (flux − Y·div u),
+    // sinon il serait comprimé/dilué par l'expansion du gaz.
     pub fn advect_diffuse_scalars(&mut self, dt: f32) {
         let (w, h) = (self.width, self.height);
 
@@ -866,12 +933,12 @@ impl FluidSim {
         }
     }
 
-    // pas complet
+    // ------------------------------------------------------------------ pas complet
 
     pub(crate) fn step_cpu(&mut self, dt: f32, pressure_iterations: usize) {
-        self.update_rho(); // rho(T, P_th)
+        self.update_rho(); // ρ(T, P_th)
         self.rebuild_masks(); // solides | types de bordure -> faces ouvertes
-        self.rebuild_conductances(); // faces ouvertes * rho_ref/rho_face
+        self.rebuild_conductances(); // faces ouvertes * ρ_ref/ρ_face
 
         self.advect_velocity(dt); // advection semi-lagrangienne des faces
         self.diffuse_velocity(dt);
@@ -881,12 +948,12 @@ impl FluidSim {
         self.apply_velocity_boundaries(); // CL + faces fermées = 0
         self.limit_velocity(dt);
 
-        self.compute_source(dt); // low-Mach : S et dP_th/dt (0 sinon)
+        self.compute_source(dt, None); // low-Mach : S et dP_th/dt (0 sinon)
         self.enforce_incompressibility_cpu(pressure_iterations); // div u = S
 
         self.advect_diffuse_scalars(dt); // tracer + température, sous-pas CFL
         self.apply_special_tracer(dt);
-        self.ghost_tracer(false); // fantomes, affichage
+        self.ghost_tracer(false); // fantômes, affichage
         self.update_ghost_temperature(false);
 
         self.update_pressure_pa(dt);

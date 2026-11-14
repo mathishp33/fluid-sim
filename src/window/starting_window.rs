@@ -13,7 +13,7 @@ pub struct SimulationSettings {
     pub height: usize,
     pub material: FluidMaterial,
     pub dx: f32, // m / cellule
-    pub gravity: f32, // m/s^2
+    pub gravity: f32, // m/s²
     pub precision: usize,
     #[serde(alias = "max_density_color")]
     pub max_tracer_color: [u8; 4],
@@ -78,7 +78,6 @@ impl StartingGui {
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(false, "Air (gas, low-Mach)").clicked() { self.settings.material = FluidMaterial::air(); }
                         if ui.selectable_label(false, "Water (liquid)").clicked() { self.settings.material = FluidMaterial::water(); }
-                        if ui.selectable_label(false, "Honey (liquid)").clicked() { self.settings.material = FluidMaterial::honey(); }
                     });
                 ui.add(egui::Slider::new(&mut self.settings.material.viscosity, 1e-7..=1e-3).logarithmic(true).text("ν (m²/s)"));
                 ui.add(egui::Slider::new(&mut self.settings.material.conductivity, 0.01..=400.0).logarithmic(true).text("k fluid (W/m/K)"));
@@ -135,6 +134,7 @@ impl StartingGui {
     }
 }
 
+/// Vitesses en m/s (SI). `dx` (m/cellule) sert à afficher l'offset en mm.
 pub fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary, dx: f32) {
     ui.collapsing(name, |ui| {
         ComboBox::from_label("Type")
@@ -147,11 +147,11 @@ pub fn boundary_ui(ui: &mut egui::Ui, name: &str, boundary: &mut Boundary, dx: f
 
         match boundary.boundary_type {
             BoundaryType::Inlet => {
-                ui.add(egui::Slider::new(&mut boundary.velocity_x, -200.0..=200.0).text("Velocity X (cells/s)"));
-                ui.add(egui::Slider::new(&mut boundary.velocity_y, -200.0..=200.0).text("Velocity Y (cells/s)"));
-                ui.weak(format!("= {:.3} m/s, {:.3} m/s", boundary.velocity_x * dx, boundary.velocity_y * dx));
+                ui.add(egui::Slider::new(&mut boundary.velocity_x_ms, -10.0..=10.0).text("Velocity X (m/s)"));
+                ui.add(egui::Slider::new(&mut boundary.velocity_y_ms, -10.0..=10.0).text("Velocity Y (m/s)"));
                 ui.add(egui::Slider::new(&mut boundary.tracer, 0.0..=1.0).text("Tracer"));
-                ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset"));
+                ui.add(egui::Slider::new(&mut boundary.offset, 0..=500).text("Offset (cells)"));
+                ui.weak(format!("offset = {:.1} mm", boundary.offset as f32 * dx * 1000.0));
                 ui.add(egui::Slider::new(&mut boundary.temperature, 100.0..=2000.0).text("Temperature (K)"));
             }
             BoundaryType::Wall => {}

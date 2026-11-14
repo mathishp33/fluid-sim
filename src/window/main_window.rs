@@ -6,14 +6,15 @@ use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOpti
 use rayon::prelude::*;
 use rfd::FileDialog;
 
-use crate::simulation::fluid::{BoundaryType, CellEffect, ComputeMethod, FluidSim};
+use crate::simulation::fluid::{BoundaryType, CellEffect, ComputeMethod, FluidSim, ThermalCell};
 use crate::simulation::materials::FluidKind;
 use crate::simulation::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
 
 const MAX_DT: f32 = 0.05;
-const HEAT_RATE: f32 = 5.0;
+const HEAT_RATE: f32 = 5.0; // 1/s : vitesse à laquelle le pinceau tire T vers la cible
+const PUSH_RATE: f32 = 20.0; // 1/s : vitesse à laquelle le fluide rejoint la vitesse du curseur (clic droit)
 
 pub enum WindowAction {
     None,
@@ -51,7 +52,7 @@ impl DisplayMode {
             Self::Divergence => "DIVERGENCE",
             Self::Velocity => "VELOCITY",
             Self::Temperature => "TEMPERATURE",
-            Self::Rho => "RHO (kg/m^3)",
+            Self::Rho => "RHO (kg/m³)",
         }
     }
 }
@@ -78,6 +79,13 @@ impl MouseMode {
             Self::Circle => "CIRCLE",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ThermalMode {
+    Passive,
+    Isothermal,
+    Heater,
 }
 
 const RADII: &[usize] = &[
@@ -269,7 +277,10 @@ pub struct FluidWindow {
     last_effect_type: CellType,
 
     brush_temperature: f32,
-    temperature_scale: f32, // K, échelle d'affichage de dT
+    temperature_scale: f32, // K, échelle d'affichage de ΔT
+    thermal_mode: ThermalMode,
+    thermal_temp: f32,  // K (solide isotherme)
+    thermal_power: f32, // W/m³ (solide chauffant)
 
     last_mouse: Option<(f32, f32)>,
     hovered_cell: Option<(usize, usize)>,
@@ -327,6 +338,9 @@ impl FluidWindow {
 
             brush_temperature: settings.material.t_ref + 100.0,
             temperature_scale: 100.0,
+            thermal_mode: ThermalMode::Passive,
+            thermal_temp: settings.material.t_ref + 100.0,
+            thermal_power: 1e6,
 
             last_mouse: None,
             hovered_cell: None,
@@ -406,7 +420,7 @@ impl FluidWindow {
         if key(egui::Key::R) {
             self.reset_flow();
         }
-
+        // C se répète quand on le maintient (comme KeyRepeat::Yes)
         if ctx.input(|i| i.key_pressed(egui::Key::C)) {
             self.mouse_radius = cycle_radius(self.mouse_radius, shift);
         }
@@ -545,8 +559,9 @@ impl FluidWindow {
                     }
                 });
                 if self.fluid.material.kind == FluidKind::Gas {
-                    ui.checkbox(&mut self.fluid.low_mach, "Low-Mach (compressible, CPU only)");
+                    ui.checkbox(&mut self.fluid.low_mach, "Low-Mach (compressible gas)");
                 }
+                ui.checkbox(&mut self.fluid.no_slip, "No-slip walls (adhérence)");
 
                 ui.separator();
                 ui.heading("Fluid (SI)");
@@ -588,6 +603,23 @@ impl FluidWindow {
                     self.picking_destination = false;
                 }
                 self.effect_ui(ui);
+
+                ui.separator();
+                ui.heading("Solid thermal (Wall + Ctrl+LMB)");
+                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Passive, "Passive solid");
+                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Isothermal, "Isothermal (fixed T)");
+                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Heater, "Heater (W/m³)");
+                match self.thermal_mode {
+                    ThermalMode::Passive => {}
+                    ThermalMode::Isothermal => {
+                        ui.add(egui::Slider::new(&mut self.thermal_temp, 100.0..=2000.0).text("T (K)"));
+                    }
+                    ThermalMode::Heater => {
+                        ui.add(egui::Slider::new(&mut self.thermal_power, 1e2..=1e9).logarithmic(true).text("Power (W/m³)"));
+                        let dx = self.fluid.dx;
+                        ui.weak(format!("= {:.2} W per metre of depth per cell", self.thermal_power * dx * dx));
+                    }
+                }
             });
         });
     }
@@ -616,16 +648,16 @@ impl FluidWindow {
         if let Some(effect) = &mut self.current_cell_effect {
             match effect {
                 CellEffect::Sink { rate } => {
-                    ui.add(egui::Slider::new(rate, 0.0..=200.0).text("Suction"));
+                    ui.add(egui::Slider::new(rate, 0.0..=10.0).text("Suction (m/s)"));
                 }
                 CellEffect::Emitter { tracer, vx, vy } => {
                     ui.add(egui::Slider::new(tracer, 0.0..=1.0).text("Tracer"));
-                    ui.add(egui::Slider::new(vx, -200.0..=200.0).text("X velocity"));
-                    ui.add(egui::Slider::new(vy, -200.0..=200.0).text("Y velocity"));
+                    ui.add(egui::Slider::new(vx, -10.0..=10.0).text("X velocity (m/s)"));
+                    ui.add(egui::Slider::new(vy, -10.0..=10.0).text("Y velocity (m/s)"));
                 }
                 CellEffect::Accelerator { ax, ay } => {
-                    ui.add(egui::Slider::new(ax, -200.0..=200.0).text("X acceleration"));
-                    ui.add(egui::Slider::new(ay, -200.0..=200.0).text("Y acceleration"));
+                    ui.add(egui::Slider::new(ax, -20.0..=20.0).text("X acceleration (m/s²)"));
+                    ui.add(egui::Slider::new(ay, -20.0..=20.0).text("Y acceleration (m/s²)"));
                 }
                 CellEffect::Teleporter { .. } => {}
             }
@@ -724,7 +756,7 @@ impl FluidWindow {
                         ("R", "Reset pressure, divergence, source and velocity"),
                         ("Esc", "Back to settings"),
                         ("LMB", "Add tracer (Ctrl/Cmd: draw solid)"),
-                        ("RMB", "Push fluid"),
+                        ("RMB", "Drag fluid toward cursor velocity"),
                         ("MMB", "Erase tracer (Ctrl/Cmd: remove solid)"),
                         ("Shift+MMB", "Heat / cool toward brush temperature"),
                     ] {
@@ -841,6 +873,11 @@ impl FluidWindow {
             return;
         }
 
+        let thermal = match self.thermal_mode {
+            ThermalMode::Passive => None,
+            ThermalMode::Isothermal => Some(ThermalCell::Isothermal(self.thermal_temp)),
+            ThermalMode::Heater => Some(ThermalCell::Heater(self.thermal_power)),
+        };
         let fluid = &mut self.fluid;
         let (w, h) = (fluid.width, fluid.height);
 
@@ -854,6 +891,9 @@ impl FluidWindow {
         let r = (radius / precision).ceil() as isize;
         let brush_t = self.brush_temperature;
         let heating = input.shift && !input.ctrl;
+        // vitesse du curseur : pixels/s -> cellules/s (= m/s ÷ dx)
+        let (cursor_x, cursor_y) = (fx / precision, fy / precision);
+        let push = 1.0 - (-PUSH_RATE * dt).exp();
 
         for dx in -r..=r {
             for dy in -r..=r {
@@ -883,6 +923,7 @@ impl FluidWindow {
                     if input.ctrl {
                         if self.selected_cell_type == CellType::Wall {
                             fluid.set_cell(x, y, CellType::Wall, None);
+                            fluid.set_thermal(x, y, thermal);
                         } else {
                             fluid.set_cell(x, y, self.selected_cell_type, self.current_cell_effect);
                         }
@@ -891,14 +932,15 @@ impl FluidWindow {
                     }
                 }
 
-                if input.right {
-                    fluid.velocity_x[idx] += fx * 0.07;
-                    fluid.velocity_y[idx] += fy * 0.07;
+                if input.right && (cursor_x != 0.0 || cursor_y != 0.0) {
+                    // la vitesse du fluide rejoint celle du curseur (indépendant du framerate)
+                    fluid.velocity_x[idx] += (cursor_x - fluid.velocity_x[idx]) * push;
+                    fluid.velocity_y[idx] += (cursor_y - fluid.velocity_y[idx]) * push;
                 }
 
                 if input.middle {
                     if heating {
-                        // source de chaleur (W/m^3) : passe par l'équation d'énergie
+                        // source de chaleur (W/m³) : passe par l'équation d'énergie
                         fluid.heat_towards(idx, brush_t, HEAT_RATE);
                     } else if input.ctrl {
                         fluid.set_cell(x, y, CellType::Fluid, None);
@@ -944,7 +986,7 @@ impl FluidWindow {
             else { !wall(i) && !wall(i + w) }
         };
 
-        // (max s^2, sum(rho*s^2), sum((div−S)^2), sum(|v|^2), nb cellules actives, max |div−S|)
+        // (max s², Σ ρ·s², Σ (div−S)², Σ |v|², nb cellules actives, max |div−S|)
         let (speed2_max, rho_s2, resid2_sum, v2_sum, count, residual) = (0..h)
             .into_par_iter()
             .map(|y| {
@@ -1015,7 +1057,7 @@ impl FluidWindow {
             velocity_max_ms: speed_max * dx,
             total_tracer: f.total_tracer(),
             total_mass: f.total_mass(),
-            kinetic_energy: 0.5 * rho_s2 * dx.powi(4), // 0.5 * sum(rho*v^2*dx^2) (aire d'une cellule dx^2), v en m/s
+            kinetic_energy: 0.5 * rho_s2 * dx.powi(4), // ½·Σ ρ·v²·dx² (aire d'une cellule dx²), v en m/s
             pressure_residual: residual,
             divergence_rms: (resid2_sum / n).sqrt() as f32,
             velocity_rms: ((v2_sum / n).sqrt() as f32) * dx,
@@ -1053,6 +1095,7 @@ impl FluidWindow {
         let solids = &self.fluid.solids[..];
         let show_effects = self.show_cell_effects;
         let temperature = &self.fluid.temperature[..];
+        let thermal_kind = &self.fluid.thermal_kind[..];
 
         self.rgba
             .par_chunks_exact_mut(w * 4)
@@ -1085,9 +1128,11 @@ impl FluidWindow {
                                 DisplayMode::Rho => signed_color(rho[idx] - rho_amb, rho_dev_max),
                             }
                         }
-                        CellType::Wall => match mode {
-                            DisplayMode::Tracer => 0x000000,
-                            DisplayMode::Temperature => temperature_color((temperature[idx] - t_ref) / t_scale),
+                        CellType::Wall => match (mode, thermal_kind[idx]) {
+                            (DisplayMode::Temperature, _) => temperature_color((temperature[idx] - t_ref) / t_scale),
+                            (_, 1) if show_effects => 0x2060d0, // isotherme : bleu
+                            (_, 2) if show_effects => 0xd08020, // chauffage : orange
+                            (DisplayMode::Tracer, _) => 0x000000,
                             _ => solid_color,
                         }
                         CellType::Sink => { //red

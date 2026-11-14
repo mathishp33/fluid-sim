@@ -1,6 +1,6 @@
-use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType};
-use crate::simulation::materials::FluidKind;
+use crate::simulation::fluid::{BoundaryType, CellEffect, CellType, GridBoundary};
 
+// Doit correspondre EXACTEMENT à `struct Params` de fluid_sim.wgsl (24 scalaires = 96 octets, puis vec4).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuParams {
@@ -14,12 +14,20 @@ struct GpuParams {
     special_count: u32,
     visc_k: f32,
     gravity: f32,
-    thermal_fluid: f32,
-    thermal_solid: f32,
     t_ref: f32,
     beta: f32,
-    kind: u32,
-    _pad: u32,
+    kind: u32,    // 0 = gaz, 1 = liquide
+    lowmach: u32, // 1 = gaz low-Mach
+    p_th: f32,
+    r_spec: f32,
+    rho_amb: f32,
+    dpdt: f32,
+    k_fluid: f32,
+    k_solid: f32,
+    cp: f32,
+    cap_solid: f32,
+    inv_dx2: f32,
+    noslip: u32, // 1 = parois à adhérence
     boundary_type: [u32; 4], // gauche, droite, haut, bas
     boundary: [[f32; 4]; 4], // (vx, vy, tracer, offset) x 4
     boundary_temp: [f32; 4],
@@ -68,12 +76,23 @@ pub struct StepConfig<'a> {
     pub viscosity: f32,
     pub viscosity_substeps: usize,
     pub gravity: f32,
-    pub thermal_fluid: f32,
-    pub thermal_solid: f32,
     pub t_ref: f32,
     pub beta: f32,
     pub kind: u32,
-    pub boundaries: [Boundary; 4],
+    // low-Mach (gaz) : ρ = p_th/(r_spec·T), poids de face ρ_amb/ρ_face, S envoyé depuis le CPU
+    pub low_mach: bool,
+    pub no_slip: bool,
+    pub p_th: f32,
+    pub r_spec: f32,
+    pub rho_amb: f32,
+    pub dpdt: f32,
+    // énergie : conduction k (W/m/K), capacités thermiques (J/m³/K), 1/dx²
+    pub k_fluid: f32,
+    pub k_solid: f32,
+    pub cp: f32,
+    pub cap_solid: f32,
+    pub inv_dx2: f32,
+    pub boundaries: [GridBoundary; 4], // vitesses en cellules/s
 }
 
 pub struct GpuFields<'a> {
@@ -84,6 +103,8 @@ pub struct GpuFields<'a> {
     pub tracer: &'a mut [f32],
     pub solids: &'a [CellType],
     pub temperature: &'a mut [f32],
+    pub source: &'a [f32],      // divergence cible S (1/s), low-Mach
+    pub heat_source: &'a [f32], // W/m³
 }
 
 struct Pipelines {
@@ -175,7 +196,7 @@ impl GpuContext {
         let pressure_buf = make_buffer("pressure", f32_bytes);
         let divergence_buf = make_buffer("divergence", f32_bytes);
         let tracer_buf = make_buffer("tracer", f32_bytes);
-        let scratch_buf = make_buffer("scratch", 5 * f32_bytes);
+        let scratch_buf = make_buffer("scratch", 7 * f32_bytes);
         let cells_buf = make_buffer("cells", (size * size_of::<u32>()) as u64);
 
         let special_capacity = 16;
@@ -325,8 +346,14 @@ impl GpuContext {
         self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
+    // scratch = 7 champs : [0,n) vx tmp, [n,2n) vy tmp, [2n,3n) tracer tmp, [3n,4n) T tmp,
+    // [4n,5n) température (persistant), [5n,6n) source S, [6n,7n) source de chaleur q
+    fn scratch_offset(&self, field: usize) -> u64 {
+        (field * self.width * self.height * size_of::<f32>()) as u64
+    }
+
     fn temperature_offset(&self) -> u64 {
-        (4 * self.width * self.height * size_of::<f32>()) as u64
+        self.scratch_offset(4)
     }
 
     fn upload_specials(&mut self, specials: &[(usize, CellEffect)]) {
@@ -357,12 +384,12 @@ impl GpuContext {
     }
 
     fn write_params(&self, cfg: &StepConfig, dts: f32) {
-        let ty = |b: &Boundary| match b.boundary_type {
+        let ty = |b: &GridBoundary| match b.boundary_type {
             BoundaryType::Wall => 0u32,
             BoundaryType::Inlet => 1,
             BoundaryType::Outlet => 2,
         };
-        let data = |b: &Boundary| [b.velocity_x, b.velocity_y, b.tracer, b.offset as f32];
+        let data = |b: &GridBoundary| [b.vx, b.vy, b.tracer, b.offset as f32];
         let b = &cfg.boundaries;
 
         let params = GpuParams {
@@ -374,16 +401,24 @@ impl GpuContext {
             diffusion: cfg.tracer_diffusion,
             vmax: cfg.vmax,
             special_count: cfg.special_cells.len() as u32,
-            boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
-            boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],
             visc_k: cfg.viscosity * cfg.dt / cfg.viscosity_substeps.max(1) as f32,
             gravity: cfg.gravity,
             t_ref: cfg.t_ref,
             beta: cfg.beta,
             kind: cfg.kind,
-            _pad: 0,
-            thermal_fluid: cfg.thermal_fluid,
-            thermal_solid: cfg.thermal_solid,
+            lowmach: cfg.low_mach as u32,
+            p_th: cfg.p_th,
+            r_spec: cfg.r_spec,
+            rho_amb: cfg.rho_amb,
+            dpdt: cfg.dpdt,
+            k_fluid: cfg.k_fluid,
+            k_solid: cfg.k_solid,
+            cp: cfg.cp,
+            cap_solid: cfg.cap_solid,
+            inv_dx2: cfg.inv_dx2,
+            noslip: cfg.no_slip as u32,
+            boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
+            boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],
             boundary_temp: [b[0].temperature, b[1].temperature, b[2].temperature, b[3].temperature],
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -416,6 +451,8 @@ impl GpuContext {
         assert_eq!(f.tracer.len(), size, "tracer: wrong size");
         assert_eq!(f.solids.len(), size, "solids: wrong size");
         assert_eq!(f.temperature.len(), size, "temperature: wrong size");
+        assert_eq!(f.source.len(), size, "source: wrong size");
+        assert_eq!(f.heat_source.len(), size, "heat_source: wrong size");
 
         self.upload_specials(cfg.special_cells);
         self.upload_cells(f.solids);
@@ -424,6 +461,8 @@ impl GpuContext {
         self.upload_f32(&self.pressure_buf, f.pressure);
         self.upload_f32(&self.tracer_buf, f.tracer);
         self.queue.write_buffer(&self.scratch_buf, self.temperature_offset(), bytemuck::cast_slice(f.temperature));
+        self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(5), bytemuck::cast_slice(f.source));
+        self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(6), bytemuck::cast_slice(f.heat_source));
         self.write_params(cfg, 0.0);
 
         let (w, h) = (self.width as u32, self.height as u32);

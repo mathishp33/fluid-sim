@@ -7,9 +7,14 @@ P peut varier de -inf à +inf
 T peut varier de 0 à +inf 
 Si jamais c'est trop d'un coup, n'implémente pas (complétement) les gaz d'un coup
 
-AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS) ?
+AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS) ? ????????????
 
 ## Prioritaire
+
+Viscosité variable : μ constant, ν = μ/ρ. Ça compte pour un gaz chaud, où ν varie beaucoup.
+Propriétés dépendant de T : k(T), μ(T) avec une loi de Sutherland pour l’air.
+Advection moins diffusive : la semi-lagrangienne bilinéaire lisse beaucoup les panaches. MacCormack ou BFECC améliorent nettement le rendu visuel pour un coût modéré.
+
  - plus d'exemples de materiaux (créateur de matériaux)
  - créateur personnalisé de matériaux
  - viscosité considéré constante mais varie en fonction de la température

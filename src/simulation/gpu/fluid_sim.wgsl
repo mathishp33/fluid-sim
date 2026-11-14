@@ -6,10 +6,20 @@
 // Les faces ouvertes (open_u / open_v) ne sont plus stockées : elles sont
 // recalculées à la volée à partir de `cells` et du type des bordures.
 //
-// scratch (5 * width * height floats) :
+// scratch (7 * width * height floats) :
 // [0, n) : velocity_x temporaire  [n, 2n) : velocity_y temporaire
 // [2n, 3n) : tracer temporaire   [3n, 4n) : temperature temporaire
-// [4n, 5n) : temperature (champ persistant)
+// [4n, 5n) : temperature (champ persistant, en K)
+// [5n, 6n) : divergence cible S (1/s), low-Mach, calculée côté CPU
+// [6n, 7n) : source de chaleur q (W/m³)
+//
+// Low-Mach (params.lowmach == 1) : ρ = p_th/(r_spec·T) est recalculé à la volée depuis T.
+//   - projection à densité variable : poids de face = ρ_amb/ρ_face (voir cond_u / cond_v)
+//   - Poisson : Σ poids·(p_voisin − p) = div − S
+//   - flottabilité : g·(ρ_amb/ρ − 1)
+//   - tracer : forme non conservative (flux − Y·div u)
+// Équation d'énergie (temperature_step) identique pour tous les fluides :
+//   dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
 
 struct Params {
     width: u32,
@@ -21,13 +31,21 @@ struct Params {
     vmax: f32,
     special_count: u32,
     visc_k: f32, // viscosity * dt / sous-pas
-    gravity: f32, // g / dx (cellules/s^2)
-    thermal_fluid: f32,
-    thermal_solid: f32,
+    gravity: f32, // g / dx (cellules/s²)
     t_ref: f32,
     beta: f32,
     kind: u32, // 0 = gaz, 1 = liquide
-    pad: u32,
+    lowmach: u32, // 1 = gaz low-Mach
+    p_th: f32, // pression thermodynamique du début de pas (Pa)
+    r_spec: f32,
+    rho_amb: f32, // kg/m³ de référence
+    dpdt: f32, // dP_th/dt (Pa/s)
+    k_fluid: f32, // W/(m·K)
+    k_solid: f32,
+    cp: f32, // J/(kg·K)
+    cap_solid: f32, // ρ_s·cp_s, J/(m³·K)
+    inv_dx2: f32, // 1/dx²
+    noslip: u32, // 1 = parois à adhérence
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
     btype: vec4<u32>,
     // (velocity_x, velocity_y, tracer, offset)
@@ -38,7 +56,8 @@ struct Params {
     btemp: vec4<f32>, // temp des bords : gauche, droite, haut, bas
 };
 
-// kind : 1 = Sink (a = rate), 2 = Emitter (a = vx, b = vy, c = tracer), 3 = Accelerator (a = ax, b = ay), 4 = Teleporter (dest)
+// kind : 1 = Sink (a = rate), 2 = Emitter (a = vx, b = vy, c = tracer),
+//        3 = Accelerator (a = ax, b = ay), 4 = Teleporter (dest)
 struct Special {
     idx: u32,
     kind: u32,
@@ -117,6 +136,44 @@ fn open_u_f(x: u32, y: u32) -> f32 {
 fn open_v_f(x: u32, y: u32) -> f32 {
     if (open_v_at(x, y)) { return 1.0; }
     return 0.0;
+}
+
+// ρ (kg/m³) d'un gaz parfait à P_th uniforme
+fn rho_of_t(t: f32) -> f32 {
+    return params.p_th / (params.r_spec * max(t, 1.0));
+}
+
+// poids de face du solveur de pression : ρ_amb/ρ_face (ρ_face = moyenne arithmétique), 1 si incompressible
+fn beta_face(i: u32, j: u32) -> f32 {
+    if (params.lowmach == 0u) {
+        return 1.0;
+    }
+    return 2.0 * params.rho_amb / max(rho_of_t(temp_get(i)) + rho_of_t(temp_get(j)), 1e-9);
+}
+
+// conductance = face ouverte * poids de densité
+fn cond_u(x: u32, y: u32) -> f32 {
+    if (!open_u_at(x, y)) {
+        return 0.0;
+    }
+    let i = x + y * params.width;
+    return beta_face(i, i + 1u);
+}
+
+fn cond_v(x: u32, y: u32) -> f32 {
+    if (!open_v_at(x, y)) {
+        return 0.0;
+    }
+    let i = x + y * params.width;
+    return beta_face(i, i + params.width);
+}
+
+// divergence cible S de la cellule i (0 si incompressible)
+fn source_at(i: u32) -> f32 {
+    if (params.lowmach == 0u) {
+        return 0.0;
+    }
+    return scratch[5u * params.width * params.height + i];
 }
 
 
@@ -317,13 +374,20 @@ fn offset_factor(x: u32, size: u32, offset: u32) -> f32 {
     return clamp(f32(dist) / f32(offset), 0.0, 1.0);
 }
 
-// (composante normale, composante tangentielle)
+// (composante normale, composante tangentielle fantôme)
+// no-slip : fantôme = 2·U_paroi − intérieur ; glissement libre : copie de l'intérieur
 fn edge_values(t: u32, f: f32, in_n: f32, in_t: f32, inner_n: f32, inner_t: f32) -> vec2<f32> {
     if (t == BT_WALL) {
-        return vec2<f32>(0.0, inner_t); // free slip
+        if (params.noslip == 1u) {
+            return vec2<f32>(0.0, -inner_t);
+        }
+        return vec2<f32>(0.0, inner_t);
     }
     if (t == BT_OUTLET) {
         return vec2<f32>(inner_n, inner_t); // gradient = 0
+    }
+    if (params.noslip == 1u) {
+        return vec2<f32>(in_n * f, 2.0 * in_t * f - inner_t);
     }
     return vec2<f32>(in_n * f, in_t * f);
 }
@@ -375,6 +439,7 @@ fn boundary_tb(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn sanitize(v: f32) -> f32 {
+    // NaN/Inf -> 0, sinon clamp à ±vmax
     if ((bitcast<u32>(v) & 0x7f800000u) == 0x7f800000u) {
         return 0.0;
     }
@@ -423,17 +488,17 @@ fn rb_sweep(gid: vec3<u32>, color: u32) {
         return;
     }
 
-    let a = open_u_f(x, y);
-    let b = open_u_f(x - 1u, y);
-    let c = open_v_f(x, y);
-    let d = open_v_f(x, y - 1u);
+    let a = cond_u(x, y);
+    let b = cond_u(x - 1u, y);
+    let c = cond_v(x, y);
+    let d = cond_v(x, y - 1u);
     let n = a + b + c + d;
     if (n == 0.0) {
         return;
     }
 
     let s = a * pressure[i + 1u] + b * pressure[i - 1u] + c * pressure[i + w] + d * pressure[i - w];
-    let p_new = (s - divergence[i]) / n;
+    let p_new = (s - (divergence[i] - source_at(i))) / n;
     pressure[i] = mix(pressure[i], p_new, params.omega);
 }
 
@@ -458,11 +523,13 @@ fn correct_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let i = x + y * w;
 
-    if (open_u_at(x, y)) {
-        velocity_x[i] = velocity_x[i] - (pressure[i + 1u] - pressure[i]);
+    let cu = cond_u(x, y);
+    if (cu > 0.0) {
+        velocity_x[i] = velocity_x[i] - cu * (pressure[i + 1u] - pressure[i]);
     }
-    if (open_v_at(x, y)) {
-        velocity_y[i] = velocity_y[i] - (pressure[i + w] - pressure[i]);
+    let cv = cond_v(x, y);
+    if (cv > 0.0) {
+        velocity_y[i] = velocity_y[i] - cv * (pressure[i + w] - pressure[i]);
     }
 }
 
@@ -555,7 +622,13 @@ fn tracer_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         scratch[2u * n + i] = 0.0;
         return;
     }
-    scratch[2u * n + i] = tracer[i] - params.dts * (flux_x(x, y) - flux_x(x - 1u, y) + flux_y(x, y) - flux_y(x, y - 1u));
+    var val = tracer[i] - params.dts * (flux_x(x, y) - flux_x(x - 1u, y) + flux_y(x, y) - flux_y(x, y - 1u));
+    if (params.lowmach == 1u) {
+        // fraction (pas une densité) : on retire Y·div u pour ne pas la comprimer/diluer
+        let div = velocity_x[i] - velocity_x[i - 1u] + velocity_y[i] - velocity_y[i - w];
+        val += params.dts * tracer[i] * div;
+    }
+    scratch[2u * n + i] = val;
 }
 
 @compute @workgroup_size(8, 8)
@@ -567,6 +640,22 @@ fn tracer_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = w * params.height;
     let i = gid.x + gid.y * w;
     tracer[i] = scratch[2u * n + i];
+}
+
+// Contribution d'un voisin au laplacien (même règles que le CPU) :
+//  face ouverte : val − c ; fermée : 0 (glissement libre) ; no-slip : normale ou fantôme -> val − c,
+//  tangentielle contre un solide -> −2c (paroi à mi-cellule)
+fn nb_term(open: bool, val: f32, c: f32, normal: bool, ghost: bool) -> f32 {
+    if (open) {
+        return val - c;
+    }
+    if (params.noslip == 0u) {
+        return 0.0;
+    }
+    if (normal || ghost) {
+        return val - c;
+    }
+    return -2.0 * c;
 }
 
 @compute @workgroup_size(8, 8)
@@ -587,21 +676,19 @@ fn diffuse_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (x >= 1u && x + 2u < w && y >= 1u && y + 1u < h && open_u_at(x, y)) {
         let c = velocity_x[i];
-        var lap = 0.0;
-        if (open_u_at(x + 1u, y)) { lap += velocity_x[i + 1u] - c; }
-        if (open_u_at(x - 1u, y)) { lap += velocity_x[i - 1u] - c; }
-        if (open_u_at(x, y + 1u)) { lap += velocity_x[i + w] - c; }
-        if (open_u_at(x, y - 1u)) { lap += velocity_x[i - w] - c; }
+        let lap = nb_term(open_u_at(x + 1u, y), velocity_x[i + 1u], c, true, false)
+            + nb_term(open_u_at(x - 1u, y), velocity_x[i - 1u], c, true, false)
+            + nb_term(open_u_at(x, y + 1u), velocity_x[i + w], c, false, y + 1u == h - 1u)
+            + nb_term(open_u_at(x, y - 1u), velocity_x[i - w], c, false, y == 1u);
         nu = c + k * lap;
     }
 
     if (x >= 1u && x + 1u < w && y >= 1u && y + 2u < h && open_v_at(x, y)) {
         let c = velocity_y[i];
-        var lap = 0.0;
-        if (open_v_at(x + 1u, y)) { lap += velocity_y[i + 1u] - c; }
-        if (open_v_at(x - 1u, y)) { lap += velocity_y[i - 1u] - c; }
-        if (open_v_at(x, y + 1u)) { lap += velocity_y[i + w] - c; }
-        if (open_v_at(x, y - 1u)) { lap += velocity_y[i - w] - c; }
+        let lap = nb_term(open_v_at(x + 1u, y), velocity_y[i + 1u], c, false, x + 1u == w - 1u)
+            + nb_term(open_v_at(x - 1u, y), velocity_y[i - 1u], c, false, x == 1u)
+            + nb_term(open_v_at(x, y + 1u), velocity_y[i + w], c, true, false)
+            + nb_term(open_v_at(x, y - 1u), velocity_y[i - w], c, true, false);
         nv = c + k * lap;
     }
 
@@ -618,6 +705,7 @@ fn temp_set(i: u32, v: f32) {
 }
 
 fn buoyancy_factor(t: f32) -> f32 {
+    if (params.lowmach == 1u) { return params.rho_amb / rho_of_t(t) - 1.0; }
     if (params.kind == 0u) { return (t - params.t_ref) / max(t, 1.0); }
     return params.beta * (t - params.t_ref);
 }
@@ -674,58 +762,29 @@ fn apply_temperature_boundaries(@builtin(global_invocation_id) gid: vec3<u32>) {
     ghost_temperature(gid.x, 1u);
 }
 
-fn alpha_of(i: u32) -> f32 {
+fn k_of(i: u32) -> f32 {
     if (is_solid(i)) {
-        return params.thermal_solid;
+        return params.k_solid;
     }
-    return params.thermal_fluid;
+    return params.k_fluid;
 }
 
-fn face_alpha(a: u32, b: u32) -> f32 {
-    let aa = alpha_of(a);
-    let ab = alpha_of(b);
-    let s = aa + ab;
+// conductivité de face : moyenne harmonique
+fn k_face(a: u32, b: u32) -> f32 {
+    let ka = k_of(a);
+    let kb = k_of(b);
+    let s = ka + kb;
     if (s <= 0.0) {
         return 0.0;
     }
-    return 2.0 * aa * ab / s;
+    return 2.0 * ka * kb / s;
 }
 
-fn tflux_x(x: u32, y: u32) -> f32 {
-    let w = params.width;
-    let i = x + y * w;
-    let uf = velocity_x[i];
-    var adv: f32;
-    if (uf > 0.0) {
-        adv = uf * temp_get(i);
-    } else {
-        adv = uf * temp_get(i + 1u);
-    }
-    var dif = 0.0;
-    if (x >= 1u && x + 2u < w) {
-        dif = -face_alpha(i, i + 1u) * (temp_get(i + 1u) - temp_get(i));
-    }
-    return adv + dif;
-}
-
-fn tflux_y(x: u32, y: u32) -> f32 {
-    let w = params.width;
-    let h = params.height;
-    let i = x + y * w;
-    let vf = velocity_y[i];
-    var adv: f32;
-    if (vf > 0.0) {
-        adv = vf * temp_get(i);
-    } else {
-        adv = vf * temp_get(i + w);
-    }
-    var dif = 0.0;
-    if (y >= 1u && y + 2u < h) {
-        dif = -face_alpha(i, i + w) * (temp_get(i + w) - temp_get(i));
-    }
-    return adv + dif;
-}
-
+// dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
+//  - advection : upwind sur les seules faces entrantes (= flux conservatif − T·div u)
+//  - conduction : Σ k_face·(T_j − T_i)/dx², divisée par la capacité thermique de LA cellule i
+//    (énergie conservée aux interfaces fluide/solide) ; pas de conduction par les faces du bord
+//  - dP_th/dt : travail de pression, fluide seulement (0 hors boîte fermée low-Mach)
 @compute @workgroup_size(8, 8)
 fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
@@ -734,9 +793,42 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let w = params.width;
-    let n = w * params.height;
+    let h = params.height;
+    let n = w * h;
     let i = x + y * w;
-    scratch[3u * n + i] = temp_get(i) - params.dts * (tflux_x(x, y) - tflux_x(x - 1u, y) + tflux_y(x, y) - tflux_y(x, y - 1u));
+    let ti = temp_get(i);
+
+    var adv = 0.0;
+    let fr = velocity_x[i];
+    let fl = -velocity_x[i - 1u];
+    let fd = velocity_y[i];
+    let fu = -velocity_y[i - w];
+    if (fr < 0.0) { adv += fr * (temp_get(i + 1u) - ti); }
+    if (fl < 0.0) { adv += fl * (temp_get(i - 1u) - ti); }
+    if (fd < 0.0) { adv += fd * (temp_get(i + w) - ti); }
+    if (fu < 0.0) { adv += fu * (temp_get(i - w) - ti); }
+
+    var cond = 0.0;
+    if (x + 2u < w) { cond += k_face(i, i + 1u) * (temp_get(i + 1u) - ti); }
+    if (x >= 2u) { cond += k_face(i, i - 1u) * (temp_get(i - 1u) - ti); }
+    if (y + 2u < h) { cond += k_face(i, i + w) * (temp_get(i + w) - ti); }
+    if (y >= 2u) { cond += k_face(i, i - w) * (temp_get(i - w) - ti); }
+
+    let wall = is_solid(i);
+    var cap = params.rho_amb * params.cp;
+    if (wall) {
+        cap = params.cap_solid;
+    } else if (params.lowmach == 1u) {
+        cap = rho_of_t(ti) * params.cp;
+    }
+    cap = max(cap, 1.0);
+
+    let q = scratch[6u * n + i];
+    var dtdt = -adv + (cond * params.inv_dx2 + q) / cap;
+    if (!wall) {
+        dtdt += params.dpdt / cap;
+    }
+    scratch[3u * n + i] = ti + params.dts * dtdt;
 }
 
 @compute @workgroup_size(8, 8)
