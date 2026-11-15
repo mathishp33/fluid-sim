@@ -79,7 +79,7 @@ pub struct StepConfig<'a> {
     pub t_ref: f32,
     pub beta: f32,
     pub kind: u32,
-    // low-Mach (gaz) : ρ = p_th/(r_spec·T), poids de face ρ_amb/ρ_face, S envoyé depuis le CPU
+    // low-Mach (gaz) : ρ persistant (advecté avec ρT), poids de face ρ_amb/ρ_face, S envoyé depuis le CPU
     pub low_mach: bool,
     pub no_slip: bool,
     pub p_th: f32,
@@ -103,6 +103,7 @@ pub struct GpuFields<'a> {
     pub tracer: &'a mut [f32],
     pub solids: &'a [CellType],
     pub temperature: &'a mut [f32],
+    pub rho: &'a [f32],         // kg/m³, persistant en low-Mach (envoyé tel quel au GPU)
     pub source: &'a [f32],      // divergence cible S (1/s), low-Mach
     pub heat_source: &'a [f32], // W/m³
 }
@@ -196,7 +197,8 @@ impl GpuContext {
         let pressure_buf = make_buffer("pressure", f32_bytes);
         let divergence_buf = make_buffer("divergence", f32_bytes);
         let tracer_buf = make_buffer("tracer", f32_bytes);
-        let scratch_buf = make_buffer("scratch", 7 * f32_bytes);
+        // 9 champs (voir scratch_offset) : 9 * 4 octets * 2 M cellules = ~75 Mo au maximum (limite par défaut : 128 Mo)
+        let scratch_buf = make_buffer("scratch", 9 * f32_bytes);
         let cells_buf = make_buffer("cells", (size * size_of::<u32>()) as u64);
 
         let special_capacity = 16;
@@ -346,14 +348,19 @@ impl GpuContext {
         self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
-    // scratch = 7 champs : [0,n) vx tmp, [n,2n) vy tmp, [2n,3n) tracer tmp, [3n,4n) T tmp,
-    // [4n,5n) température (persistant), [5n,6n) source S, [6n,7n) source de chaleur q
+    // scratch = 9 champs : [0,n) vx tmp, [n,2n) vy tmp, [2n,3n) tracer tmp, [3n,4n) T tmp,
+    // [4n,5n) température (persistant), [5n,6n) source S, [6n,7n) source de chaleur q,
+    // [7n,8n) ρ (persistant, low-Mach), [8n,9n) ρ tmp
     fn scratch_offset(&self, field: usize) -> u64 {
         (field * self.width * self.height * size_of::<f32>()) as u64
     }
 
     fn temperature_offset(&self) -> u64 {
         self.scratch_offset(4)
+    }
+
+    fn rho_offset(&self) -> u64 {
+        self.scratch_offset(7)
     }
 
     fn upload_specials(&mut self, specials: &[(usize, CellEffect)]) {
@@ -451,6 +458,7 @@ impl GpuContext {
         assert_eq!(f.tracer.len(), size, "tracer: wrong size");
         assert_eq!(f.solids.len(), size, "solids: wrong size");
         assert_eq!(f.temperature.len(), size, "temperature: wrong size");
+        assert_eq!(f.rho.len(), size, "rho: wrong size");
         assert_eq!(f.source.len(), size, "source: wrong size");
         assert_eq!(f.heat_source.len(), size, "heat_source: wrong size");
 
@@ -463,6 +471,7 @@ impl GpuContext {
         self.queue.write_buffer(&self.scratch_buf, self.temperature_offset(), bytemuck::cast_slice(f.temperature));
         self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(5), bytemuck::cast_slice(f.source));
         self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(6), bytemuck::cast_slice(f.heat_source));
+        self.queue.write_buffer(&self.scratch_buf, self.rho_offset(), bytemuck::cast_slice(f.rho));
         self.write_params(cfg, 0.0);
 
         let (w, h) = (self.width as u32, self.height as u32);
@@ -531,13 +540,21 @@ impl GpuContext {
         });
     }
 
-    // advection/diffusion du tracer et de la température en `substeps` sous-pas, cellules spéciales,
-    // cellules fantômes
+    // advection/diffusion du tracer et de la température (+ ρ en low-Mach) en `substeps` sous-pas,
+    // cellules spéciales, cellules fantômes
     // `substeps` dépend vmax après proj, calculé côté CPU
-    pub fn step_scalars(&mut self, cfg: &StepConfig, substeps: usize, tracer: &mut [f32], temperature: &mut [f32]) {
+    pub fn step_scalars(
+        &mut self,
+        cfg: &StepConfig,
+        substeps: usize,
+        tracer: &mut [f32],
+        temperature: &mut [f32],
+        rho: &mut [f32],
+    ) {
         let size = self.width * self.height;
         assert_eq!(tracer.len(), size, "tracer: wrong size");
         assert_eq!(temperature.len(), size, "temperature: wrong size");
+        assert_eq!(rho.len(), size, "rho: wrong size");
 
         let substeps = substeps.max(1);
         self.write_params(cfg, cfg.dt / substeps as f32);
@@ -582,11 +599,13 @@ impl GpuContext {
         let field_bytes = (size * size_of::<f32>()) as u64;
         encoder.copy_buffer_to_buffer(&self.tracer_buf, 0, &self.readback_buf, 0, field_bytes);
         encoder.copy_buffer_to_buffer(&self.scratch_buf, self.temperature_offset(), &self.readback_buf, field_bytes, field_bytes);
+        encoder.copy_buffer_to_buffer(&self.scratch_buf, self.rho_offset(), &self.readback_buf, 2 * field_bytes, field_bytes);
         self.queue.submit(Some(encoder.finish()));
 
-        self.read_back(2 * field_bytes, |floats| {
+        self.read_back(3 * field_bytes, |floats| {
             tracer.copy_from_slice(&floats[0..size]);
             temperature.copy_from_slice(&floats[size..2 * size]);
+            rho.copy_from_slice(&floats[2 * size..3 * size]);
         });
     }
 }

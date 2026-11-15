@@ -1,15 +1,27 @@
-Noter que pour le moment on ne supporte qu'un seul type de fluide en même temps.
- - faire une disjection de cas: 
-   - gaz : formule de gaz parfait (ou autre), compressible
-   - liquide : formule (choisir un modèle réaliste) , incompressible 
-rho peut varier de 0 à +inf
-P peut varier de -inf à +inf
-T peut varier de 0 à +inf 
-Si jamais c'est trop d'un coup, n'implémente pas (complétement) les gaz d'un coup
+Propriétés du fluide
+ν, k, cp sont constants. Pour un gaz, μ ∝ T^0,7 environ et k ∝ T^0,8, donc ν varie fortement avec T et P. Pour le miel, ν(T) est énorme.
+Le liquide n’a ni compressibilité, ni ébullition, ni cavitation. L’eau est monophasique : pas de surface libre, de vagues ni d’éclaboussures.
+Le traceur est passif : il ne change ni la densité, ni la masse molaire, ni la chaleur spécifique. Un « panache de fumée chaude » ne se comporte donc pas comme un mélange réel.
+Il n’y a pas de rayonnement, alors qu’il domine à 1000 K ou plus. Pas de combustion, ni de changement de phase, ni d’humidité.
 
-AJOUTER LA MASSE DANS CHAQUE CELLULE (LA DENSITE ACTUELLE NE LE REPRESENTE PAS) ? ????????????
+Physique manquante
+Pas de chauffage visqueux (voir question 3).
+Le low-Mach filtre les ondes acoustiques et les chocs. C’est voulu, mais le son n’existe pas.
+Pression thermodynamique uniforme : l’effet de la stratification hydrostatique sur ρ et sur le travail de pression est négligé. C’est acceptable pour quelques mètres.
+2D uniquement. La turbulence 2D (cascade inverse) diffère de la 3D, et il n’y a pas de modèle de sous-maille.
+
+L’énergie cinétique diminue : où part-elle ?
+Dans ton code, elle part dans cinq puits, dont aucun n’alimente la température :
+Dissipation numérique de l’advection semi-lagrangienne. C’est de loin le puits principal à cette résolution, et il n’a pas de contrepartie physique.
+Viscosité diffuse_velocity. C’est la partie physique, mais l’énergie est simplement supprimée.
+Projection. Ton pinceau clic droit injecte une vitesse non solénoïdale, et la projection retire la partie compressible. Dans un vrai gaz, cette énergie deviendrait des ondes sonores, puis de la chaleur.
+Parois no-slip, avec le même mécanisme que la viscosité et la dissipation numérique.
+Limiteur vmax et mesure : ton KE est calculé avec la vitesse moyennée aux centres de cellules, ce qui sous-estime l’énergie des modes à petite échelle.
 
 ## Prioritaire
+
+Advection moins diffusive (MacCormack ou BFECC) : elle réduirait les +8 % de vitesse de la cavité à Ra = 1e5.
+GPU résident : ne plus recopier tout l’état à chaque pas.
 
 Viscosité variable : μ constant, ν = μ/ρ. Ça compte pour un gaz chaud, où ν varie beaucoup.
 Propriétés dépendant de T : k(T), μ(T) avec une loi de Sutherland pour l’air.
@@ -26,7 +38,6 @@ Advection moins diffusive : la semi-lagrangienne bilinéaire lisse beaucoup les 
 3. PCG (Ax = b) ? pas sur
 4. force externes
 5. Teleporter() kind of broken, destination size is not customizable.
-6. Ajouter une cellule spéciale Heater()
 
 ## Moins prioritaire
 1. backtrace RK2 ou MacCormack
@@ -65,4 +76,5 @@ Indicateur vorticité
  - diagnostiques de divergence, pression, énérgie, masse, CFL, ...
  - température fluide & solide
  - viscosité (faible)
- - equations Low-Mach pour gaz et Boussinesq pour liquides
+ - equation Low-Mach pour gaz
+ - equation de Boussinesq pour liquides

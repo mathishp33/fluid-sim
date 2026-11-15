@@ -6,20 +6,26 @@
 // Les faces ouvertes (open_u / open_v) ne sont plus stockées : elles sont
 // recalculées à la volée à partir de `cells` et du type des bordures.
 //
-// scratch (7 * width * height floats) :
+// scratch (9 * width * height floats) :
 // [0, n) : velocity_x temporaire  [n, 2n) : velocity_y temporaire
 // [2n, 3n) : tracer temporaire   [3n, 4n) : temperature temporaire
 // [4n, 5n) : temperature (champ persistant, en K)
 // [5n, 6n) : divergence cible S (1/s), low-Mach, calculée côté CPU
 // [6n, 7n) : source de chaleur q (W/m³)
+// [7n, 8n) : rho (kg/m³), champ PERSISTANT en low-Mach (masse), envoyé et relu par le CPU
+// [8n, 9n) : rho temporaire
 //
-// Low-Mach (params.lowmach == 1) : ρ = p_th/(r_spec·T) est recalculé à la volée depuis T.
+// Low-Mach (params.lowmach == 1) : ρ est un champ persistant, advecté de façon conservative avec ρT
+// (même flux de masse upwind) ; T = (ρT)/ρ. Les fantômes et les murs ont ρ = p_th/(r_spec·T).
+// Ce ρ persistant ne sert QU'À l'advection (masse) ; la quantité de mouvement utilise ρ = EOS(T, P_th) :
 //   - projection à densité variable : poids de face = ρ_amb/ρ_face (voir cond_u / cond_v)
 //   - Poisson : Σ poids·(p_voisin − p) = div − S
-//   - flottabilité : g·(ρ_amb/ρ − 1)
+//   - flottabilité : g·(ρ_amb/ρ_EOS − 1)
 //   - tracer : forme non conservative (flux − Y·div u)
-// Équation d'énergie (temperature_step) identique pour tous les fluides :
+// Équation d'énergie (temperature_step), hors low-Mach :
 //   dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
+// Low-Mach, cellules de gaz ordinaires :
+//   ∂ρ/∂t = −∇·(ρu)     ∂(ρT)/∂t = −∇·(ρuT) + (∇·(k∇T) + q + dP_th/dt)/cp
 
 struct Params {
     width: u32,
@@ -83,6 +89,7 @@ const BT_INLET: u32 = 1u;
 const BT_OUTLET: u32 = 2u;
 
 const CELL_SINK: u32 = 2u;
+const CELL_EMITTER: u32 = 3u;
 
 fn is_sink(i: u32) -> bool {
     return cells[i] == CELL_SINK;
@@ -143,11 +150,21 @@ fn rho_of_t(t: f32) -> f32 {
     return params.p_th / (params.r_spec * max(t, 1.0));
 }
 
+// ρ persistant (low-Mach)
+fn rho_get(i: u32) -> f32 {
+    return scratch[7u * params.width * params.height + i];
+}
+
+fn rho_set(i: u32, v: f32) {
+    scratch[7u * params.width * params.height + i] = v;
+}
+
 // poids de face du solveur de pression : ρ_amb/ρ_face (ρ_face = moyenne arithmétique), 1 si incompressible
 fn beta_face(i: u32, j: u32) -> f32 {
     if (params.lowmach == 0u) {
         return 1.0;
     }
+    // ρ de l'EOS (T, P_th), PAS le ρ persistant : un résidu de projection ne doit pas pouvoir raidir le solveur
     return 2.0 * params.rho_amb / max(rho_of_t(temp_get(i)) + rho_of_t(temp_get(j)), 1e-9);
 }
 
@@ -705,9 +722,16 @@ fn temp_set(i: u32, v: f32) {
 }
 
 fn buoyancy_factor(t: f32) -> f32 {
-    if (params.lowmach == 1u) { return params.rho_amb / rho_of_t(t) - 1.0; }
     if (params.kind == 0u) { return (t - params.t_ref) / max(t, 1.0); }
     return params.beta * (t - params.t_ref);
+}
+
+// facteur de flottabilité de la cellule i : low-Mach -> ρ = EOS(T, P_th), sinon Boussinesq via T
+fn buoyancy_cell(i: u32) -> f32 {
+    if (params.lowmach == 1u) {
+        return params.rho_amb / rho_of_t(temp_get(i)) - 1.0;
+    }
+    return buoyancy_factor(temp_get(i));
 }
 
 @compute @workgroup_size(8, 8)
@@ -723,7 +747,7 @@ fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let i = x + y * w;
-    velocity_y[i] = velocity_y[i] - params.gravity * params.dt * 0.5 * (buoyancy_factor(temp_get(i)) + buoyancy_factor(temp_get(i + w)));
+    velocity_y[i] = velocity_y[i] - params.gravity * params.dt * 0.5 * (buoyancy_cell(i) + buoyancy_cell(i + w));
 }
 
 fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {
@@ -736,19 +760,27 @@ fn ghost_temp_value(t: u32, inlet_t: f32, mode: u32, inner: f32) -> f32 {
     return inner;
 }
 
+// fantôme : T, et ρ = EOS(T) en low-Mach (sert aux flux de masse des faces de bord)
+fn set_ghost(i: u32, tv: f32) {
+    temp_set(i, tv);
+    if (params.lowmach == 1u) {
+        rho_set(i, rho_of_t(tv));
+    }
+}
+
 fn ghost_temperature(t: u32, mode: u32) {
     let w = params.width;
     let h = params.height;
     if (t >= 1u && t < h - 1u) {
         let l = t * w;
         let r = l + w - 1u;
-        temp_set(l, ghost_temp_value(params.btype.x, params.btemp.x, mode, temp_get(l + 1u)));
-        temp_set(r, ghost_temp_value(params.btype.y, params.btemp.y, mode, temp_get(r - 1u)));
+        set_ghost(l, ghost_temp_value(params.btype.x, params.btemp.x, mode, temp_get(l + 1u)));
+        set_ghost(r, ghost_temp_value(params.btype.y, params.btemp.y, mode, temp_get(r - 1u)));
     }
     if (t >= 1u && t < w - 1u) {
         let bt = t + (h - 1u) * w;
-        temp_set(t, ghost_temp_value(params.btype.z, params.btemp.z, mode, temp_get(t + w)));
-        temp_set(bt, ghost_temp_value(params.btype.w, params.btemp.w, mode, temp_get(bt - w)));
+        set_ghost(t, ghost_temp_value(params.btype.z, params.btemp.z, mode, temp_get(t + w)));
+        set_ghost(bt, ghost_temp_value(params.btype.w, params.btemp.w, mode, temp_get(bt - w)));
     }
 }
 
@@ -780,11 +812,49 @@ fn k_face(a: u32, b: u32) -> f32 {
     return 2.0 * ka * kb / s;
 }
 
-// dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
+// flux de masse (cellules/s · kg/m³) à travers la face droite / basse de i, upwind
+fn mflux_x(i: u32) -> f32 {
+    let uf = velocity_x[i];
+    if (uf > 0.0) {
+        return uf * rho_get(i);
+    }
+    return uf * rho_get(i + 1u);
+}
+
+fn mflux_y(i: u32) -> f32 {
+    let vf = velocity_y[i];
+    if (vf > 0.0) {
+        return vf * rho_get(i);
+    }
+    return vf * rho_get(i + params.width);
+}
+
+// flux de ρT : même flux de masse × T de la cellule amont
+fn tflux_x(i: u32) -> f32 {
+    let uf = velocity_x[i];
+    if (uf > 0.0) {
+        return uf * rho_get(i) * temp_get(i);
+    }
+    return uf * rho_get(i + 1u) * temp_get(i + 1u);
+}
+
+fn tflux_y(i: u32) -> f32 {
+    let vf = velocity_y[i];
+    let j = i + params.width;
+    if (vf > 0.0) {
+        return vf * rho_get(i) * temp_get(i);
+    }
+    return vf * rho_get(j) * temp_get(j);
+}
+
+// Hors low-Mach : dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
 //  - advection : upwind sur les seules faces entrantes (= flux conservatif − T·div u)
 //  - conduction : Σ k_face·(T_j − T_i)/dx², divisée par la capacité thermique de LA cellule i
 //    (énergie conservée aux interfaces fluide/solide) ; pas de conduction par les faces du bord
 //  - dP_th/dt : travail de pression, fluide seulement (0 hors boîte fermée low-Mach)
+// Low-Mach, cellules de gaz ordinaires : advection CONSERVATIVE de (ρ, ρT) avec le même flux de masse
+//  upwind (masse conservée exactement), T = (ρT)/ρ ; ρ est écrit dans scratch[8n + i].
+// Low-Mach, murs / Sink / Emitter : équation de T ci-dessus (capacité ρ·cp du ρ persistant), ρ = EOS(T).
 @compute @workgroup_size(8, 8)
 fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
@@ -798,6 +868,34 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = x + y * w;
     let ti = temp_get(i);
 
+    var cond = 0.0;
+    if (x + 2u < w) { cond += k_face(i, i + 1u) * (temp_get(i + 1u) - ti); }
+    if (x >= 2u) { cond += k_face(i, i - 1u) * (temp_get(i - 1u) - ti); }
+    if (y + 2u < h) { cond += k_face(i, i + w) * (temp_get(i + w) - ti); }
+    if (y >= 2u) { cond += k_face(i, i - w) * (temp_get(i - w) - ti); }
+
+    let q = scratch[6u * n + i];
+    let wall = is_solid(i);
+
+    if (params.lowmach == 1u && !wall && cells[i] != CELL_SINK && cells[i] != CELL_EMITTER) {
+        let rho_i = rho_get(i);
+        let dm = mflux_x(i) - mflux_x(i - 1u) + mflux_y(i) - mflux_y(i - w);
+        let dq = tflux_x(i) - tflux_x(i - 1u) + tflux_y(i) - tflux_y(i - w);
+        // sous CFL (sorties <= 0,9/dts) rho_new >= 0,1·rho_i : positif
+        let rho_new = max(rho_i - params.dts * dm, 1e-6);
+        // partie advective de T : combinaison convexe des T amont (donc bornée)
+        let t_adv = (rho_i * ti - params.dts * dq) / rho_new;
+        // sources divisées par une capacité thermique bornée par l'EOS (ρ persistant ~0 = résidu de projection)
+        let rho_eos = rho_of_t(ti);
+        let t_new = t_adv + params.dts * (cond * params.inv_dx2 + q + params.dpdt)
+            / (params.cp * max(rho_new, 0.3 * rho_eos));
+        // garde-fou : ρ persistant dans [0,3 ; 3]·ρ_EOS (inactif en fonctionnement normal)
+        let rho_eos_new = rho_of_t(t_new);
+        scratch[8u * n + i] = clamp(rho_new, 0.3 * rho_eos_new, 3.0 * rho_eos_new);
+        scratch[3u * n + i] = t_new;
+        return;
+    }
+
     var adv = 0.0;
     let fr = velocity_x[i];
     let fl = -velocity_x[i - 1u];
@@ -808,13 +906,6 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (fd < 0.0) { adv += fd * (temp_get(i + w) - ti); }
     if (fu < 0.0) { adv += fu * (temp_get(i - w) - ti); }
 
-    var cond = 0.0;
-    if (x + 2u < w) { cond += k_face(i, i + 1u) * (temp_get(i + 1u) - ti); }
-    if (x >= 2u) { cond += k_face(i, i - 1u) * (temp_get(i - 1u) - ti); }
-    if (y + 2u < h) { cond += k_face(i, i + w) * (temp_get(i + w) - ti); }
-    if (y >= 2u) { cond += k_face(i, i - w) * (temp_get(i - w) - ti); }
-
-    let wall = is_solid(i);
     var cap = params.rho_amb * params.cp;
     if (wall) {
         cap = params.cap_solid;
@@ -823,12 +914,15 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     cap = max(cap, 1.0);
 
-    let q = scratch[6u * n + i];
     var dtdt = -adv + (cond * params.inv_dx2 + q) / cap;
     if (!wall) {
         dtdt += params.dpdt / cap;
     }
-    scratch[3u * n + i] = ti + params.dts * dtdt;
+    let tn = ti + params.dts * dtdt;
+    scratch[3u * n + i] = tn;
+    if (params.lowmach == 1u) {
+        scratch[8u * n + i] = rho_of_t(tn);
+    }
 }
 
 @compute @workgroup_size(8, 8)
@@ -840,4 +934,7 @@ fn temperature_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = w * params.height;
     let i = gid.x + gid.y * w;
     temp_set(i, scratch[3u * n + i]);
+    if (params.lowmach == 1u) {
+        rho_set(i, scratch[8u * n + i]);
+    }
 }

@@ -5,6 +5,10 @@ const CFL: f32 = 0.9;
 const MAX_SUBSTEPS: usize = 64;
 const MAX_VISC_SUBSTEPS: usize = 16;
 
+// Relaxation de ρ vers l'EOS (fraction de l'écart résorbée par pas, via la divergence cible S).
+// 0 = désactivé. 0,1–0,5 : les écarts locaux ρ ≠ P_th/(r·T) sont résorbés en quelques pas.
+const EOS_RELAX: f32 = 0.2;
+
 #[derive(Clone, Copy)]
 struct SharedMut(*mut f32);
 unsafe impl Send for SharedMut {}
@@ -133,7 +137,7 @@ impl FluidSim {
     // ------------------------------------------------------------------ flottabilité
 
     // y pointe vers le bas : dv/dt = -(accélération vers le haut).
-    //  - low-Mach (gaz)         : a_haut = g·(ρ_ref/ρ − 1), avec ρ(T, P_th)
+    //  - low-Mach (gaz)         : a_haut = g·(ρ_ref/ρ − 1), avec ρ = EOS(T, P_th)
     //  - Boussinesq (autres)    : a_haut = g·(ρ_ref − ρ)/ρ_ref via buoyancy_factor(T)
     fn apply_buoyancy(&mut self, dt: f32) {
         let g = self.gravity_grid();
@@ -144,8 +148,10 @@ impl FluidSim {
         let m = self.material;
         let low = self.low_mach_active();
         let a = g * dt;
-        let (t, rho, ov) = (&self.temperature, &self.rho, &self.open_v);
-        let factor = |i: usize| if low { m.buoyancy_from_rho(rho[i]) } else { m.buoyancy_factor(t[i]) };
+        let p_th = self.p_th;
+        let (t, ov) = (&self.temperature, &self.open_v);
+        // ρ de l'EOS, PAS le ρ persistant : un résidu de projection ne doit pas pouvoir raidir la flottabilité
+        let factor = |i: usize| if low { m.buoyancy_from_rho(m.density(t[i], p_th)) } else { m.buoyancy_factor(t[i]) };
         self.velocity_y.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             if y == 0 || y >= h - 2 { return; }
             for x in 1..w - 1 {
@@ -181,6 +187,23 @@ impl FluidSim {
         }
     }
 
+    // ρ des fantômes = EOS(T fantôme, P_th) (low-Mach). Sert aux flux de masse des faces de bord.
+    fn update_ghost_rho(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let m = self.material;
+        let p = self.p_th;
+        for y in 1..h - 1 {
+            for i in [y * w, (w - 1) + y * w] {
+                self.rho[i] = m.density(self.temperature[i], p);
+            }
+        }
+        for x in 1..w - 1 {
+            for i in [x, x + (h - 1) * w] {
+                self.rho[i] = m.density(self.temperature[i], p);
+            }
+        }
+    }
+
     // Équation d'énergie (forme non conservative, valable avec div u ≠ 0) :
     //   dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt) / (ρ·cp)
     // - advection : upwind sur les seules faces entrantes (= flux conservatif − T·div u)
@@ -188,6 +211,8 @@ impl FluidSim {
     //   divise par SA capacité thermique (fluide ρ·cp, solide ρ_s·cp_s) -> l'énergie est conservée
     //   aux interfaces fluide/solide ; pas de conduction à travers les faces du bord (adiabatique)
     // - q : source de chaleur (W/m³), dP_th/dt : travail de pression (fluide seulement)
+    //
+    // Utilisé hors low-Mach (ρ constant ou dérivé de T, la masse n'y est pas un invariant).
     fn temperature_substep(&mut self, dts: f32) {
         let (w, h) = (self.width, self.height);
         let m = self.material;
@@ -241,6 +266,116 @@ impl FluidSim {
             }
         });
         std::mem::swap(&mut self.temperature, &mut self.temperature_temp);
+    }
+
+    // Sous-pas CONSERVATIF du gaz low-Mach : on advecte (ρ, ρT) avec le MÊME flux de masse upwind.
+    //   ∂ρ/∂t    = −∇·(ρu)
+    //   ∂(ρT)/∂t = −∇·(ρuT) + (∇·(k∇T) + q + dP_th/dt)/cp        (= ρ·DT/Dt, d'après la continuité)
+    //   T = (ρT)/ρ
+    // - la masse est conservée exactement : les flux télescopent, et sont nuls sur les faces fermées
+    //   (murs, bords Wall) ; seuls Inlet/Outlet/Sink/Emitter en créent ou en retirent ;
+    // - T_new est une moyenne pondérée (poids ≥ 0 sous CFL) de T_i et des T amont : pas de sur/sous-oscillation ;
+    // - murs : équation de T inchangée (capacité ρ_s·cp_s), ρ = EOS(T), sans masse ;
+    // - Sink / Emitter : cellules à état imposé (elles créent/détruisent de la masse par nature) :
+    //   T par l'ancienne équation, ρ = EOS(T).
+    fn thermo_substep_conservative(&mut self, dts: f32) {
+        let (w, h) = (self.width, self.height);
+        let m = self.material;
+        let inv_dx2 = 1.0 / (self.dx * self.dx);
+        let dpdt = self.dpdt;
+        let p_th = self.p_th;
+        let r_spec = m.r_spec;
+        let (kf, ks, cp) = (m.conductivity, m.solid_conductivity, m.cp);
+        let cap_solid = m.heat_capacity_solid();
+
+        self.temperature_temp.copy_from_slice(&self.temperature); // conserve les fantômes
+        self.rho_temp.copy_from_slice(&self.rho);
+
+        {
+            let (t, u, v, s, rho, q) = (&self.temperature, &self.velocity_x, &self.velocity_y,
+                                        &self.solids, &self.rho, &self.heat_source);
+            let k_of = |i: usize| if s[i] == CellType::Wall { ks } else { kf };
+            let k_face = |a: usize, b: usize| {
+                let (ka, kb) = (k_of(a), k_of(b));
+                let sum = ka + kb;
+                if sum <= 0.0 { 0.0 } else { 2.0 * ka * kb / sum }
+            };
+
+            // flux de masse (cellules/s · kg/m³) à travers la face droite / basse de i, upwind
+            let mfx = |i: usize| { let uf = u[i]; uf * if uf > 0.0 { rho[i] } else { rho[i + 1] } };
+            let mfy = |i: usize| { let vf = v[i]; vf * if vf > 0.0 { rho[i] } else { rho[i + w] } };
+            // flux de ρT : même flux de masse × T de la cellule amont
+            let tfx = |i: usize| {
+                let uf = u[i];
+                if uf > 0.0 { uf * rho[i] * t[i] } else { uf * rho[i + 1] * t[i + 1] }
+            };
+            let tfy = |i: usize| {
+                let vf = v[i];
+                if vf > 0.0 { vf * rho[i] * t[i] } else { vf * rho[i + w] * t[i + w] }
+            };
+
+            self.temperature_temp.par_chunks_mut(w)
+                .zip(self.rho_temp.par_chunks_mut(w))
+                .enumerate()
+                .for_each(|(y, (trow, rrow))| {
+                    if y == 0 || y == h - 1 {
+                        return;
+                    }
+                    for x in 1..w - 1 {
+                        let i = x + y * w;
+                        let ti = t[i];
+
+                        // conduction (faces intérieures seulement)
+                        let mut cond = 0.0;
+                        if x + 2 < w { cond += k_face(i, i + 1) * (t[i + 1] - ti); }
+                        if x >= 2 { cond += k_face(i, i - 1) * (t[i - 1] - ti); }
+                        if y + 2 < h { cond += k_face(i, i + w) * (t[i + w] - ti); }
+                        if y >= 2 { cond += k_face(i, i - w) * (t[i - w] - ti); }
+
+                        let kind = s[i];
+                        if kind != CellType::Wall && kind != CellType::Sink && kind != CellType::Emitter {
+                            let rho_i = rho[i];
+                            let dm = mfx(i) - mfx(i - 1) + mfy(i) - mfy(i - w);
+                            let dq = tfx(i) - tfx(i - 1) + tfy(i) - tfy(i - w);
+                            // Sous CFL (sorties <= 0,9/dts) rho_new >= 0,1·rho_i : positif.
+                            let rho_new = (rho_i - dts * dm).max(1e-6);
+                            // partie advective de T : combinaison convexe des T amont (donc bornée)
+                            let t_adv = (rho_i * ti - dts * dq) / rho_new;
+                            // sources : divisées par une capacité thermique bornée par l'EOS, sinon un ρ
+                            // persistant proche de 0 (résidu de projection) amplifierait q et dP_th/dt
+                            let rho_eos = p_th / (r_spec * ti.max(1.0));
+                            let t_new = t_adv
+                                + dts * (cond * inv_dx2 + q[i] + dpdt) / (cp * rho_new.max(0.3 * rho_eos));
+                            // Garde-fou : ρ persistant dans [0,3 ; 3]·ρ_EOS. Inactif en fonctionnement normal
+                            // (écart ~1e-3) ; ne mord que si le solveur de pression diverge (pinceau violent
+                            // avec peu d'itérations). La masse n'est alors plus exacte, mais rien n'explose.
+                            let rho_eos_new = p_th / (r_spec * t_new.max(1.0));
+                            rrow[x] = rho_new.clamp(0.3 * rho_eos_new, 3.0 * rho_eos_new);
+                            trow[x] = t_new;
+                        } else {
+                            // mur, Sink, Emitter : ancienne équation de T (advection upwind non conservative)
+                            let mut adv = 0.0;
+                            let (fr, fl, fd, fu) = (u[i], -u[i - 1], v[i], -v[i - w]);
+                            if fr < 0.0 { adv += fr * (t[i + 1] - ti); }
+                            if fl < 0.0 { adv += fl * (t[i - 1] - ti); }
+                            if fd < 0.0 { adv += fd * (t[i + w] - ti); }
+                            if fu < 0.0 { adv += fu * (t[i - w] - ti); }
+
+                            let wall = kind == CellType::Wall;
+                            let cap = if wall { cap_solid } else { p_th / (r_spec * ti.max(1.0)) * cp }.max(1.0);
+                            let mut dtdt = -adv + (cond * inv_dx2 + q[i]) / cap;
+                            if !wall {
+                                dtdt += dpdt / cap;
+                            }
+                            let tn = ti + dts * dtdt;
+                            trow[x] = tn;
+                            rrow[x] = p_th / (r_spec * tn.max(1.0));
+                        }
+                    }
+                });
+        }
+        std::mem::swap(&mut self.temperature, &mut self.temperature_temp);
+        std::mem::swap(&mut self.rho, &mut self.rho_temp);
     }
 
     // diffusivité thermique max en cellules²/s (pour la stabilité des sous-pas)
@@ -321,8 +456,11 @@ impl FluidSim {
         let w = self.width;
         let varrho = self.low_mach_active();
         let rho_ref = self.material.rho_ambient();
-        let (rho, ou, ov) = (&self.rho, &self.open_u, &self.open_v);
-        let beta = |a: usize, b: usize| 2.0 * rho_ref / (rho[a] + rho[b]).max(1e-9);
+        let (m, p_th) = (self.material, self.p_th);
+        let (t, ou, ov) = (&self.temperature, &self.open_u, &self.open_v);
+        // ρ de l'EOS (T, P_th), PAS le ρ persistant : le poids de la projection reste borné par T,
+        // même si le solveur de pression laisse un résidu et fait dériver le ρ persistant.
+        let beta = |a: usize, b: usize| 2.0 * rho_ref / (m.density(t[a], p_th) + m.density(t[b], p_th)).max(1e-9);
 
         self.cond_u.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for x in 0..w {
@@ -595,7 +733,14 @@ impl FluidSim {
     }
 
     // Gaz low-Mach : on impose  div u = S  avec
-    //   S = (∇·(k∇T) + q)/(ρ·cp·T)  −  (1/(γ·P_th))·dP_th/dt
+    //   S = (∇·(k∇T) + q)/(ρ·cp·T)  −  (1/(γ·P_th))·dP_th/dt   +   S_eos
+    // - (ρ·T = P_th/r par l'EOS, donc le premier terme vaut (∇·(k∇T) + q)·r/(cp·P_th) : il ne dépend
+    //   pas du ρ persistant, et dP_th/dt reste purement énergétique)
+    // - S_eos = EOS_RELAX/dt · (ρ − ρ_eos)/ρ, avec ρ_eos = P_th/(r·T) : si le ρ persistant dérive de l'EOS
+    //   (erreurs de schéma, résidu du SOR), le gaz se dilate ou se comprime légèrement pour le résorber.
+    //   En boîte fermée, on en retire la moyenne (la compatibilité de Neumann ΣS = flux de bord est
+    //   respectée et P_th ne dépend que de l'énergie). Un écart UNIFORME ρ/ρ_eos n'est donc pas
+    //   corrigé : il vaut la différence entre la masse suivie et P_th suivie, deux grandeurs exactes.
     // - domaine ouvert (Outlet ou Sink) : P_th = P_ref, dP_th/dt = 0
     // - boîte fermée : dP_th/dt est choisi pour que le problème de Poisson (Neumann) soit
     //   résoluble, i.e. Σ S = flux sortant par les faces de bord (Inlets).
@@ -614,8 +759,14 @@ impl FluidSim {
         let m = self.material;
         let inv_dx2 = 1.0 / (self.dx * self.dx);
         let (kf, ks, cp) = (m.conductivity, m.solid_conductivity, m.cp);
+        let closed = self.is_closed();
+        // pression de l'EOS : P_th en boîte fermée, P_ref en domaine ouvert
+        let p_eos = if closed { self.p_th.max(1.0) } else { m.p_ref };
+        let eos_k = m.r_spec / (cp * p_eos); // 1/(ρ·cp·T) = r/(cp·P)
+        let r_spec = m.r_spec;
+        let relax = EOS_RELAX / dt.max(1e-6);
 
-        let (sum_a, n_active) = {
+        let (sum_a, sum_c, n_active) = {
             let (t, s, rho, q) = (&self.temperature, &self.solids, &self.rho, &self.heat_source);
             let k_of = |i: usize| if s[i] == CellType::Wall { ks } else { kf };
             let k_face = |a: usize, b: usize| {
@@ -627,9 +778,9 @@ impl FluidSim {
             self.source.par_chunks_mut(w).enumerate().map(|(y, row)| {
                 row.fill(0.0);
                 if y == 0 || y >= h - 1 {
-                    return (0.0f64, 0u64);
+                    return (0.0f64, 0.0f64, 0u64);
                 }
-                let (mut sum, mut n) = (0.0f64, 0u64);
+                let (mut sum, mut sum_c, mut n) = (0.0f64, 0.0f64, 0u64);
                 for x in 1..w - 1 {
                     let i = x + y * w;
                     if s[i] == CellType::Wall || s[i] == CellType::Sink {
@@ -642,16 +793,22 @@ impl FluidSim {
                     if y + 2 < h { cond += k_face(i, i + w) * (t[i + w] - ti); }
                     if y >= 2 { cond += k_face(i, i - w) * (t[i - w] - ti); }
 
-                    let a = (cond * inv_dx2 + q[i]) / (rho[i] * cp * ti.max(1.0));
-                    row[x] = a;
+                    let a = (cond * inv_dx2 + q[i]) * eos_k;
+
+                    let rho_eos = p_eos / (r_spec * ti.max(1.0));
+                    let ratio = ((rho[i] - rho_eos) / rho[i].max(1e-6)).clamp(-0.5, 0.5);
+                    let c = relax * ratio;
+
+                    row[x] = a + c;
                     sum += a as f64;
+                    sum_c += c as f64;
                     n += 1;
                 }
-                (sum, n)
-            }).reduce(|| (0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+                (sum, sum_c, n)
+            }).reduce(|| (0.0, 0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
         };
 
-        if self.is_closed() && n_active > 0 {
+        if closed && n_active > 0 {
             let q_out = match q_out {
                 Some(q) => q,
                 None => {
@@ -664,10 +821,12 @@ impl FluidSim {
                 }
             };
             let delta = ((sum_a - q_out) / n_active as f64) as f32; // = dP_th/dt / (γ·P_th)
+            let mean_c = (sum_c / n_active as f64) as f32;
             let gamma = m.gamma();
             self.dpdt = gamma * self.p_th * delta;
             self.p_th = (self.p_th + self.dpdt * dt).max(1.0);
 
+            let shift = delta + mean_c;
             let s = &self.solids;
             self.source.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
                 if y == 0 || y >= h - 1 {
@@ -676,7 +835,7 @@ impl FluidSim {
                 for x in 1..w - 1 {
                     let i = x + y * w;
                     if s[i] != CellType::Wall && s[i] != CellType::Sink {
-                        row[x] -= delta;
+                        row[x] -= shift;
                     }
                 }
             });
@@ -870,14 +1029,18 @@ impl FluidSim {
     // Tracer + température en sous-pas. Le tracer est une FRACTION (pas une densité) :
     // avec div u ≠ 0 (low-Mach) on advecte sa forme non conservative (flux − Y·div u),
     // sinon il serait comprimé/dilué par l'expansion du gaz.
+    // Low-Mach : (ρ, ρT) sont advectés de façon conservative (thermo_substep_conservative).
     pub fn advect_diffuse_scalars(&mut self, dt: f32) {
         let (w, h) = (self.width, self.height);
 
         self.ghost_tracer(true);
         self.update_ghost_temperature(true);
+        let expansion = self.low_mach_active();
+        if expansion {
+            self.update_ghost_rho();
+        }
         let n = self.scalar_substeps(dt);
         let dts = dt / n as f32;
-        let expansion = self.low_mach_active();
         let d = self.tracer_diff_grid();
 
         for _ in 0..n {
@@ -908,7 +1071,11 @@ impl FluidSim {
             });
 
             std::mem::swap(&mut self.tracer, &mut self.tracer_temp);
-            self.temperature_substep(dts);
+            if expansion {
+                self.thermo_substep_conservative(dts);
+            } else {
+                self.temperature_substep(dts);
+            }
         }
         self.heat_source.fill(0.0); // la source de chaleur du pinceau est consommée
     }
@@ -936,7 +1103,7 @@ impl FluidSim {
     // ------------------------------------------------------------------ pas complet
 
     pub(crate) fn step_cpu(&mut self, dt: f32, pressure_iterations: usize) {
-        self.update_rho(); // ρ(T, P_th)
+        self.refresh_rho(); // low-Mach : ρ persistant (masse) ; sinon ρ(T, P_th)
         self.rebuild_masks(); // solides | types de bordure -> faces ouvertes
         self.rebuild_conductances(); // faces ouvertes * ρ_ref/ρ_face
 
@@ -951,10 +1118,13 @@ impl FluidSim {
         self.compute_source(dt, None); // low-Mach : S et dP_th/dt (0 sinon)
         self.enforce_incompressibility_cpu(pressure_iterations); // div u = S
 
-        self.advect_diffuse_scalars(dt); // tracer + température, sous-pas CFL
+        self.advect_diffuse_scalars(dt); // tracer + (ρ, ρT) / T, sous-pas CFL
         self.apply_special_tracer(dt);
         self.ghost_tracer(false); // fantômes, affichage
         self.update_ghost_temperature(false);
+        if self.low_mach_active() {
+            self.update_ghost_rho();
+        }
 
         self.update_pressure_pa(dt);
     }

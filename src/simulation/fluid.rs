@@ -7,11 +7,20 @@ use crate::simulation::materials::{FluidKind, FluidMaterial};
 
 // Vocabulaire (à ne pas confondre) :
 //   tracer       : colorant passif, sans dimension, 0..1. Il ne pèse rien et n'influence jamais la physique.
-//   rho          : masse volumique réelle (kg/m³), DÉDUITE de T et P_th. Jamais advectée.
+//   rho          : masse volumique réelle (kg/m³).
+//                  - gaz low-Mach : champ PERSISTANT, advecté de façon conservative avec ρT (la masse est
+//                    conservée exactement en boîte fermée). Il ne sert QU'À l'advection : projection,
+//                    flottabilité et capacités thermiques utilisent ρ = EOS(T, P_th), pour qu'un résidu du
+//                    solveur de pression ne puisse pas les raidir. Il est rappelé vers l'EOS, à masse
+//                    constante (relax_rho_to_eos) et par la divergence cible S (voir compute_source).
+//                  - autres cas : DÉDUITE de T (et P_th), recalculée à chaque pas.
 //   temperature  : K, absolue.
 //   pressure     : pression du SOLVEUR (interne, dépend de dt). Ne pas l'afficher en Pa.
 //   pressure_pa  : pression réelle (Pa) = P_ref + hydrostatique + dynamique.
 //   p_th         : pression thermodynamique uniforme (Pa), utilisée par le gaz parfait.
+
+// Fraction de l'écart ρ − ρ_EOS résorbée à chaque pas (à masse totale constante, voir relax_rho_to_eos).
+const RHO_RELAX: f32 = 0.3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeMethod {
@@ -176,7 +185,7 @@ pub struct FluidSim {
     pub no_slip: bool,
 
     pub tracer: Vec<f32>,
-    pub rho: Vec<f32>, // kg/m³, dérivé de T
+    pub rho: Vec<f32>, // kg/m³ (persistant en low-Mach, dérivé de T sinon)
     pub pressure: Vec<f32>, // pression du SOLVEUR (interne)
     pub pressure_pa: Vec<f32>, // pression réelle (Pa)
     pub temperature: Vec<f32>, // K
@@ -198,6 +207,11 @@ pub struct FluidSim {
     pub(crate) velocity_x_temp: Vec<f32>,
     pub(crate) velocity_y_temp: Vec<f32>,
     pub(crate) temperature_temp: Vec<f32>,
+    pub(crate) rho_temp: Vec<f32>,
+
+    // true : `rho` doit être recalculé depuis l'EOS au prochain pas (état initial, reset de T,
+    // changement de mode). Tant que c'est false, le low-Mach garde son ρ persistant.
+    pub(crate) rho_dirty: bool,
 
     // 1 si la face droite (resp. basse) de la cellule i laisse passer le fluide
     pub(crate) open_u: Vec<u8>,
@@ -269,6 +283,8 @@ impl FluidSim {
             velocity_x_temp: vec![0.0; size],
             velocity_y_temp: vec![0.0; size],
             temperature_temp: vec![0.0; size],
+            rho_temp: vec![fm.rho_ambient(); size],
+            rho_dirty: true,
 
             open_u: vec![0; size],
             open_v: vec![0; size],
@@ -311,20 +327,107 @@ impl FluidSim {
         !self.has_outlet() && !self.has_sink()
     }
 
-    /// ρ (kg/m³) depuis T et P_th. Met aussi à jour rho_min (cellules non solides).
+    /// ρ (kg/m³) depuis T et P_th sur TOUTES les cellules (resynchronisation avec l'EOS).
+    /// Met aussi à jour rho_min (cellules non solides).
     pub fn update_rho(&mut self) {
         let m = self.material;
         let p_th = self.p_th;
         self.rho.par_iter_mut().zip(self.temperature.par_iter())
             .for_each(|(r, &t)| *r = m.density(t, p_th));
+        self.update_rho_min();
+    }
 
-        self.rho_min = self.rho.par_iter().zip(self.solids.par_iter())
+    fn update_rho_min(&mut self) {
+        let m = self.material;
+        let p_th = self.p_th;
+        // ρ_min de l'EOS (stabilité de la diffusion thermique) : indépendant d'un ρ persistant qui aurait dérivé
+        self.rho_min = self.temperature.par_iter().zip(self.solids.par_iter())
             .filter(|&(_, &s)| s != CellType::Wall)
-            .map(|(&r, _)| r)
+            .map(|(&t, _)| m.density(t, p_th))
             .reduce(|| f32::INFINITY, f32::min);
         if !self.rho_min.is_finite() {
             self.rho_min = m.rho_ambient();
         }
+    }
+
+    /// Appelé au début de chaque pas.
+    /// - hors low-Mach : ρ = EOS(T, P_th) partout (comme avant), et on marque ρ « sale » pour qu'un
+    ///   passage ultérieur en low-Mach reparte de l'EOS ;
+    /// - low-Mach, ρ sale : resynchronisation complète avec l'EOS ;
+    /// - low-Mach, ρ propre : ρ est conservé tel quel (c'est lui qui porte la masse). Seuls les murs et
+    ///   les fantômes, qui ne portent pas de masse, sont recalculés depuis l'EOS.
+    pub fn refresh_rho(&mut self) {
+        if !self.low_mach_active() {
+            self.rho_dirty = true;
+            self.update_rho();
+            return;
+        }
+        if self.rho_dirty {
+            self.update_rho();
+            self.rho_dirty = false;
+            return;
+        }
+        let m = self.material;
+        let p_th = self.p_th;
+        let (w, h) = (self.width, self.height);
+        {
+            let (t, s) = (&self.temperature, &self.solids);
+            self.rho.par_iter_mut().enumerate().for_each(|(i, r)| {
+                let (x, y) = (i % w, i / w);
+                if x == 0 || y == 0 || x == w - 1 || y == h - 1 || s[i] == CellType::Wall {
+                    *r = m.density(t[i], p_th);
+                }
+            });
+        }
+        self.relax_rho_to_eos();
+        self.update_rho_min();
+    }
+
+    /// Rappel du ρ persistant vers l'EOS, à MASSE TOTALE CONSTANTE.
+    /// Si le solveur de pression laisse un résidu (div u ≠ S, typiquement quand le pinceau injecte des
+    /// vitesses de plusieurs centaines de cellules/s avec peu d'itérations), l'advection conservative
+    /// comprime/dilate ρ à tort. Ici on résorbe une fraction RHO_RELAX de l'écart ρ − ρ_EOS à chaque pas,
+    /// en retirant la moyenne de la correction en boîte fermée : la masse totale ne bouge pas.
+    /// En fonctionnement normal l'écart est ~1e-3 et la correction est négligeable.
+    fn relax_rho_to_eos(&mut self) {
+        if RHO_RELAX <= 0.0 {
+            return;
+        }
+        let m = self.material;
+        let p_th = self.p_th;
+        let (w, h) = (self.width, self.height);
+        let closed = self.is_closed();
+        let active = |i: usize, s: &[CellType]| {
+            let (x, y) = (i % w, i / w);
+            x > 0 && y > 0 && x < w - 1 && y < h - 1
+                && !matches!(s[i], CellType::Wall | CellType::Sink | CellType::Emitter)
+        };
+        let (sum, n) = {
+            let (t, s, rho) = (&self.temperature, &self.solids, &self.rho);
+            (0..rho.len()).into_par_iter()
+                .filter(|&i| active(i, s))
+                .map(|i| ((m.density(t[i], p_th) - rho[i]) as f64, 1u64))
+                .reduce(|| (0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
+        if n == 0 {
+            return;
+        }
+        let mean = if closed { (sum / n as f64) as f32 } else { 0.0 };
+        let (t, s) = (&self.temperature, &self.solids);
+        self.rho.par_iter_mut().enumerate().for_each(|(i, r)| {
+            if active(i, s) {
+                let err = m.density(t[i], p_th) - *r;
+                *r += RHO_RELAX * (err - mean);
+            }
+        });
+    }
+
+    /// Remet T et P_th à l'ambiante (et donc ρ, ce qui change la masse totale : c'est une action de l'utilisateur).
+    pub fn reset_temperature(&mut self) {
+        self.temperature.fill(self.material.t_ref);
+        self.p_th = self.material.p_ref;
+        self.dpdt = 0.0;
+        self.rho_dirty = true;
     }
 
     /// Pression réelle en Pa : P_th + hydrostatique + dynamique (solveur * ρ_ref·dx²/dt).
@@ -349,7 +452,7 @@ impl FluidSim {
     }
 
     pub fn update_derived(&mut self, dt: f32) {
-        self.update_rho();
+        self.refresh_rho(); // pas update_rho : en low-Mach il écraserait le ρ persistant (la masse)
         self.update_pressure_pa(dt);
     }
 
@@ -453,6 +556,9 @@ impl FluidSim {
         self.tracer_temp[idx] = self.tracer[idx];
         self.velocity_x_temp[idx] = self.velocity_x[idx];
         self.velocity_y_temp[idx] = self.velocity_y[idx];
+
+        // le gaz qui apparaît a la masse volumique de l'EOS à la température de la cellule
+        self.rho[idx] = self.material.density(self.temperature[idx], self.p_th);
     }
 
     #[inline]
@@ -511,7 +617,7 @@ impl FluidSim {
         let c = if self.solids[idx] == CellType::Wall {
             self.material.heat_capacity_solid()
         } else {
-            self.rho[idx] * self.material.cp
+            self.material.density(self.temperature[idx], self.p_th) * self.material.cp
         };
         self.heat_source[idx] = c * rate * (target - self.temperature[idx]);
     }
@@ -588,7 +694,7 @@ impl FluidSim {
         self.apply_thermal_cells();
         if self.compute_method == ComputeMethod::GPU {
             if let Some(mut gpu) = self.gpu_context.take() {
-                self.update_rho(); // ρ(T, P_th) : rho_min pour les sous-pas
+                self.refresh_rho(); // ρ persistant (low-Mach) ou ρ(T, P_th) : rho_min pour les sous-pas
                 let p_th_old = self.p_th; // le GPU projette avec ρ(P_th du début de pas), comme le CPU
 
                 // Low-Mach : S et dP_th/dt sont calculés ici (CPU, O(n)) puis envoyés au GPU.
@@ -618,9 +724,8 @@ impl FluidSim {
 
     // Pas complet sur GPU, en deux phases (une seule synchronisation par phase) :
     //  1. vitesses : advection, flottabilité, cellules spéciales, CL, limitation, projection (div u = S) ;
-    //  2. scalaires : sous-pas tracer + température, cellules spéciales, fantômes.
-    // Même algorithme que step_cpu. Différence connue : la capacité thermique ρ·cp du gaz low-Mach
-    // utilise le T courant du sous-pas (le CPU utilise le ρ du début de pas).
+    //  2. scalaires : sous-pas tracer + (ρ, ρT) conservatifs, cellules spéciales, fantômes.
+    // Même algorithme que step_cpu (ρ persistant en low-Mach, advecté avec ρT).
     fn step_gpu(&mut self, gpu: &mut GpuContext, dt: f32, pressure_iterations: usize, p_th: f32) {
         let m = self.material;
         let dx = self.dx;
@@ -659,12 +764,13 @@ impl FluidSim {
             divergence: &mut self.divergence,
             tracer: &mut self.tracer,
             temperature: &mut self.temperature,
+            rho: &self.rho,
             solids: &self.solids,
             source: &self.source,
             heat_source: &self.heat_source,
         });
 
         let substeps = self.scalar_substeps(dt);
-        gpu.step_scalars(&cfg, substeps, &mut self.tracer, &mut self.temperature);
+        gpu.step_scalars(&cfg, substeps, &mut self.tracer, &mut self.temperature, &mut self.rho);
     }
 }

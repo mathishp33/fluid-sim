@@ -576,8 +576,7 @@ impl FluidWindow {
                 ui.add(egui::Slider::new(&mut self.brush_temperature, 100.0..=2000.0).text("Brush temp (K)"));
                 ui.add(egui::Slider::new(&mut self.temperature_scale, 1.0..=1000.0).logarithmic(true).text("Display ΔT scale (K)"));
                 if ui.button("Reset temperature").clicked() {
-                    self.fluid.temperature.fill(self.fluid.material.t_ref);
-                    self.fluid.p_th = self.fluid.material.p_ref;
+                    self.fluid.reset_temperature();
                     self.status = "Temperature reset".into();
                 }
 

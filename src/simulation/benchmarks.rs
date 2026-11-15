@@ -20,6 +20,10 @@ fn all_finite(f: &FluidSim) -> bool {
         .all(|v| v.is_finite())
 }
 
+fn finite(f: &FluidSim) -> bool {
+    f.temperature.iter().chain(&f.velocity_x).chain(&f.velocity_y).chain(&f.pressure).chain(&f.rho).all(|v| v.is_finite())
+}
+
 fn vmax_ms(f: &FluidSim) -> f32 {
     let mut m = 0.0f32;
     for y in 1..f.height - 1 {
@@ -385,4 +389,198 @@ fn gpu_matches_cpu_special_cells() {
     assert!(dv < 1e-3 * vmax.max(1.0), "dv = {dv} m/s (vmax {vmax})");
     let dtr = c.tracer.iter().zip(&g.tracer).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
     assert!(dtr < 1e-3, "écart de tracer : {dtr}");
+}
+
+#[test]
+fn low_mach_closed_heat_then_cool_returns_mass() {
+    let dt = 0.01f32;
+    let mut f = cpu_sim(40, 40, 0.01, FluidMaterial::air(), 0.0);
+    let w = f.width;
+    f.refresh_rho();
+    let m0 = f.total_mass();
+    for _ in 0..200 {
+        for y in 18..22 { for x in 18..22 { f.heat_towards(x + y * w, 2000.0, 5.0); } }
+        f.step(dt, 100);
+    }
+    for _ in 0..600 {
+        for y in 1..f.height - 1 { for x in 1..w - 1 { f.heat_towards(x + y * w, f.material.t_ref, 5.0); } }
+        f.step(dt, 100);
+    }
+    assert!(((f.total_mass() - m0) / m0).abs() < 1e-3, "dM/M = {}", (f.total_mass() - m0) / m0);
+}
+
+
+#[test]
+fn conduction_mass() {
+    let mut f = cpu_sim(40, 40, 0.01, FluidMaterial::air(), 0.0);
+    let w = f.width;
+    for y in 15..25 { for x in 15..25 { f.temperature[x + y * w] = 600.0; } }
+    f.update_rho();
+    let (m0, p0) = (f.total_mass(), f.p_th);
+    for _ in 0..300 { f.step(0.01, 200); }
+    println!("conduction dM/M = {:e}  dP/P = {:e}", (f.total_mass() - m0) / m0, (f.p_th - p0) / p0);
+    assert!(finite(&f));
+}
+
+#[test]
+fn heat_then_cool() {
+    let dt = 0.01f32;
+    let mut f = cpu_sim(40, 40, 0.01, FluidMaterial::air(), 0.0);
+    let w = f.width;
+    f.refresh_rho();
+    let m0 = f.total_mass();
+    for _ in 0..200 {
+        for y in 18..22 { for x in 18..22 { f.heat_towards(x + y * w, 2000.0, 5.0); } }
+        f.step(dt, 100);
+    }
+    println!("après chauffe dM/M = {:e}", (f.total_mass() - m0) / m0);
+    for _ in 0..600 {
+        for y in 1..f.height - 1 { for x in 1..w - 1 { f.heat_towards(x + y * w, f.material.t_ref, 5.0); } }
+        f.step(dt, 100);
+    }
+    println!("après refroidissement dM/M = {:e}", (f.total_mass() - m0) / m0);
+    assert!(finite(&f));
+}
+
+// Pinceau clic droit : la vitesse rejoint celle du curseur (cellules/s), appliquée chaque frame
+fn brush_run(heated: bool, iters: usize, dt: f32, cursor: f32, frames: usize) -> Option<usize> {
+    let mut f = cpu_sim(120, 80, 0.01, FluidMaterial::air(), 9.81);
+    let w = f.width;
+    if heated {
+        for y in 30..50 { for x in 40..60 { f.temperature[x + y * w] = 800.0; } }
+    }
+    f.refresh_rho();
+    let m0 = f.total_mass();
+    let push = 1.0 - (-20.0f32 * dt).exp();
+    for frame in 0..frames {
+        for y in 30..50 {
+            for x in 20 + (frame % 60)..40 + (frame % 60) {
+                let i = x + y * w;
+                f.velocity_x[i] += (cursor - f.velocity_x[i]) * push;
+                f.velocity_y[i] += (0.3 * cursor - f.velocity_y[i]) * push;
+            }
+        }
+        f.step(dt, iters);
+        if !finite(&f) { return Some(frame); }
+    }
+    let (mn, mx) = f.rho.iter().fold((f32::MAX, f32::MIN), |a, &r| (a.0.min(r), a.1.max(r)));
+    println!("  fin : rho [{mn:.4}, {mx:.4}]  dM/M {:.2e}", (f.total_mass() - m0) / m0);
+    None
+}
+
+#[test]
+fn brush() {
+    for &(heated, iters, dt, cursor) in &[
+        (false, 30, 0.016, 200.0), (false, 30, 0.016, 1000.0), (true, 30, 0.016, 1000.0),
+        (false, 30, 0.0001, 1000.0), (true, 100, 0.016, 2000.0),
+    ] {
+        let r = brush_run(heated, iters, dt, cursor, 200);
+        println!("heated={heated} iters={iters} dt={dt} cursor={cursor} cells/s -> NaN à la frame {:?}", r);
+    }
+}
+
+#[test]
+fn brush_trace() {
+    let (dt, cursor) = (0.016f32, 1000.0f32);
+    let mut f = cpu_sim(120, 80, 0.01, FluidMaterial::air(), 9.81);
+    let w = f.width;
+    f.refresh_rho();
+    let push = 1.0 - (-20.0f32 * dt).exp();
+    for frame in 0..70 {
+        for y in 30..50 { for x in 20 + (frame % 60)..40 + (frame % 60) {
+            let i = x + y * w;
+            f.velocity_x[i] += (cursor - f.velocity_x[i]) * push;
+            f.velocity_y[i] += (0.3 * cursor - f.velocity_y[i]) * push;
+        } }
+        f.step(dt, 30);
+        let res = (0..f.divergence.len()).map(|i| (f.divergence[i] - f.source[i]).abs()).fold(0.0f32, f32::max);
+        let smax = f.source.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+        let (mn, mx) = f.rho.iter().enumerate().filter(|(i, _)| f.solids[*i] == CellType::Fluid && i % w > 0 && i % w < w-1 && i / w > 0 && i / w < f.height-1)
+            .fold((f32::MAX, f32::MIN), |a, (_, &r)| (a.0.min(r), a.1.max(r)));
+        let (tmn, tmx) = f.temperature.iter().fold((f32::MAX, f32::MIN), |a, &t| (a.0.min(t), a.1.max(t)));
+        let vmax = f.velocity_x.iter().chain(&f.velocity_y).fold(0.0f32, |a, &v| a.max(v.abs()));
+        if frame % 5 == 0 || frame > 50 {
+            println!("f{frame:3} |div-S| {res:9.3e} |S| {smax:8.2e} rho [{mn:8.4},{mx:8.4}] T [{tmn:8.2},{tmx:9.2}] vmax {vmax:8.1} dpdt {:.2e}", f.dpdt);
+        }
+        if !finite(&f) { println!("NaN"); break; }
+    }
+}
+
+#[test]
+fn closed_heating_ideal_gas() {
+    let dt = 0.01f32;
+    let mut f = cpu_sim(40, 40, 0.01, FluidMaterial::air(), 0.0);
+    f.update_rho();
+    let (p0, w) = (f.p_th, f.width);
+    let gamma = f.material.gamma() as f64;
+    let mut e_added = 0.0f64;
+    for _ in 0..200 {
+        for y in 18..22 { for x in 18..22 { f.heat_towards(x + y * w, 900.0, 5.0); } }
+        e_added += f.heat_source.iter().map(|&q| q as f64).sum::<f64>() * dt as f64 * (f.dx * f.dx) as f64;
+        f.step(dt, 200);
+    }
+    let volume = ((f.width - 2) * (f.height - 2)) as f64 * (f.dx * f.dx) as f64;
+    let ratio = (f.p_th - p0) as f64 / ((gamma - 1.0) * e_added / volume);
+    println!("ΔP/ΔP_attendu = {ratio}");
+    assert!((ratio - 1.0).abs() < 0.01);
+}
+
+#[test]
+fn heater_energy() {
+    let (dt, power) = (0.01f32, 2e6f32);
+    let mut mat = FluidMaterial::air();
+    mat.solid_rho = 10.0;
+    let mut f = cpu_sim(40, 40, 0.01, mat, 0.0);
+    let mut cells = Vec::new();
+    for y in 18..22 { for x in 18..22 {
+        f.set_cell(x, y, CellType::Wall, None);
+        f.set_thermal(x, y, Some(ThermalCell::Heater(power)));
+        cells.push(x + y * f.width);
+    } }
+    let (p0, t0) = (f.p_th, f.material.t_ref);
+    for _ in 0..300 { f.step(dt, 200); }
+    let dx2 = (f.dx * f.dx) as f64;
+    let e_in = power as f64 * cells.len() as f64 * dx2 * 300.0 * dt as f64;
+    let n_gas = (0..f.solids.len()).filter(|&i| { let (x, y) = (i % f.width, i / f.width);
+        x >= 1 && x < f.width - 1 && y >= 1 && y < f.height - 1 && f.solids[i] != CellType::Wall }).count();
+    let e_gas = (f.p_th - p0) as f64 * n_gas as f64 * dx2 / (f.material.gamma() as f64 - 1.0);
+    let e_solid: f64 = cells.iter().map(|&i| f.material.heat_capacity_solid() as f64 * (f.temperature[i] - t0) as f64 * dx2).sum();
+    let balance = (e_gas + e_solid) / e_in;
+    println!("bilan énergie = {balance}");
+    assert!((balance - 1.0).abs() < 0.02);
+}
+
+fn cavity(low_mach: bool) -> (f32, f32) {
+    let mut mat = FluidMaterial::air();
+    mat.solid_conductivity = 100.0;
+    let alpha = mat.conductivity / (mat.rho_ambient() * mat.cp);
+    let (t0, dtemp, g, n) = (mat.t_ref, 10.0f32, 9.81f32, 40usize);
+    let l = (1e4f32 * mat.viscosity * alpha * t0 / (g * dtemp)).cbrt();
+    let dx = l / n as f32;
+    let (w, h) = (n + 4, n + 2);
+    let mut f = cpu_sim(w, h, dx, mat, g);
+    f.low_mach = low_mach;
+    let (th, tc) = (t0 + 5.0, t0 - 5.0);
+    for y in 1..h - 1 {
+        f.set_cell(1, y, CellType::Wall, None); f.set_cell(w - 2, y, CellType::Wall, None);
+        f.set_thermal(1, y, Some(ThermalCell::Isothermal(th))); f.set_thermal(w - 2, y, Some(ThermalCell::Isothermal(tc)));
+    }
+    for y in 0..h { for x in 0..w {
+        let s = ((x as f32 - 2.0) / n as f32).clamp(0.0, 1.0);
+        f.temperature[x + y * w] = th + (tc - th) * s;
+    } }
+    for _ in 0..(20.0f32 / 0.02) as usize { f.step(0.02, 150); }
+    let (xm, ym) = (2 + n / 2, 1 + (n + 1) / 2);
+    let norm = alpha / l;
+    let u = (1..h - 1).map(|y| f.cell_velocity(xm, y).0.abs()).fold(0.0, f32::max) * dx / norm;
+    let v = (2..w - 2).map(|x| f.cell_velocity(x, ym).1.abs()).fold(0.0, f32::max) * dx / norm;
+    (u, v)
+}
+
+#[test]
+fn cavity_lowmach_vs_boussinesq() {
+    let b = cavity(false);
+    let l = cavity(true);
+    println!("Boussinesq u={:.3} v={:.3} | low-Mach u={:.3} v={:.3}  (réf. de Vahl Davis u=16.18 v=19.62)", b.0, b.1, l.0, l.1);
+    assert!((l.0 - b.0).abs() / b.0 < 0.02 && (l.1 - b.1).abs() / b.1 < 0.02);
 }
