@@ -1,6 +1,6 @@
 use crate::simulation::fluid::{BoundaryType, CellEffect, CellType, GridBoundary};
 
-// Doit correspondre EXACTEMENT à `struct Params` de fluid_sim.wgsl (24 scalaires = 96 octets, puis vec4).
+// Doit correspondre EXACTEMENT à `struct Params` de fluid_sim.wgsl (28 scalaires = 112 octets, puis vec4 alignés sur 16).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuParams {
@@ -28,6 +28,9 @@ struct GpuParams {
     cap_solid: f32,
     inv_dx2: f32,
     noslip: u32, // 1 = parois à adhérence
+    maccormack: u32, // 1 = advection de la vitesse en MacCormack limité
+    muscl: u32,      // 1 = advection des scalaires en MUSCL (van Leer), 0 = upwind
+    pad: [u32; 2],   // complète à 28 scalaires (112 octets) : les vec4 qui suivent exigent un alignement de 16
     boundary_type: [u32; 4], // gauche, droite, haut, bas
     boundary: [[f32; 4]; 4], // (vx, vy, tracer, offset) x 4
     boundary_temp: [f32; 4],
@@ -82,6 +85,7 @@ pub struct StepConfig<'a> {
     // low-Mach (gaz) : ρ persistant (advecté avec ρT), poids de face ρ_amb/ρ_face, S envoyé depuis le CPU
     pub low_mach: bool,
     pub no_slip: bool,
+    pub maccormack: bool,
     pub p_th: f32,
     pub r_spec: f32,
     pub rho_amb: f32,
@@ -110,7 +114,9 @@ pub struct GpuFields<'a> {
 
 struct Pipelines {
     advect_velocity: wgpu::ComputePipeline,
+    advect_correct: wgpu::ComputePipeline,
     commit_velocity: wgpu::ComputePipeline,
+    commit_velocity_mc: wgpu::ComputePipeline,
     special_velocity: wgpu::ComputePipeline,
     close_faces: wgpu::ComputePipeline,
     boundary_lr: wgpu::ComputePipeline,
@@ -280,7 +286,9 @@ impl GpuContext {
 
         let pipelines = Pipelines {
             advect_velocity: make_pipeline("advect_velocity"),
+            advect_correct: make_pipeline("advect_correct"),
             commit_velocity: make_pipeline("commit_velocity"),
+            commit_velocity_mc: make_pipeline("commit_velocity_mc"),
             special_velocity: make_pipeline("special_velocity"),
             close_faces: make_pipeline("close_faces"),
             boundary_lr: make_pipeline("boundary_lr"),
@@ -390,7 +398,7 @@ impl GpuContext {
         self.queue.write_buffer(&self.cells_buf, 0, bytemuck::cast_slice(&cells));
     }
 
-    fn write_params(&self, cfg: &StepConfig, dts: f32) {
+    fn write_params(&self, cfg: &StepConfig, dts: f32, muscl: bool) {
         let ty = |b: &GridBoundary| match b.boundary_type {
             BoundaryType::Wall => 0u32,
             BoundaryType::Inlet => 1,
@@ -424,6 +432,9 @@ impl GpuContext {
             cap_solid: cfg.cap_solid,
             inv_dx2: cfg.inv_dx2,
             noslip: cfg.no_slip as u32,
+            maccormack: cfg.maccormack as u32,
+            muscl: muscl as u32,
+            pad: [0; 2],
             boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
             boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],
             boundary_temp: [b[0].temperature, b[1].temperature, b[2].temperature, b[3].temperature],
@@ -472,7 +483,7 @@ impl GpuContext {
         self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(5), bytemuck::cast_slice(f.source));
         self.queue.write_buffer(&self.scratch_buf, self.scratch_offset(6), bytemuck::cast_slice(f.heat_source));
         self.queue.write_buffer(&self.scratch_buf, self.rho_offset(), bytemuck::cast_slice(f.rho));
-        self.write_params(cfg, 0.0);
+        self.write_params(cfg, 0.0, false);
 
         let (w, h) = (self.width as u32, self.height as u32);
         let (gx, gy) = ((w + 7) / 8, (h + 7) / 8);
@@ -499,7 +510,12 @@ impl GpuContext {
             }
 
             run!(p.advect_velocity, gx, gy);
-            run!(p.commit_velocity, gx, gy);
+            if cfg.maccormack {
+                run!(p.advect_correct, gx, gy); // q' = q̂ + ½(q − q̃), limité ; sortie dans scratch[2n, 4n)
+                run!(p.commit_velocity_mc, gx, gy);
+            } else {
+                run!(p.commit_velocity, gx, gy);
+            }
             if cfg.viscosity > 0.0 {
                 for _ in 0..cfg.viscosity_substeps {
                     run!(p.diffuse_velocity, gx, gy);
@@ -547,6 +563,7 @@ impl GpuContext {
         &mut self,
         cfg: &StepConfig,
         substeps: usize,
+        high_order: bool, // advection d'ordre 2 (MUSCL) des scalaires ; sinon upwind
         tracer: &mut [f32],
         temperature: &mut [f32],
         rho: &mut [f32],
@@ -557,7 +574,7 @@ impl GpuContext {
         assert_eq!(rho.len(), size, "rho: wrong size");
 
         let substeps = substeps.max(1);
-        self.write_params(cfg, cfg.dt / substeps as f32);
+        self.write_params(cfg, cfg.dt / substeps as f32, high_order);
 
         let (w, h) = (self.width as u32, self.height as u32);
         let (gx, gy) = ((w + 7) / 8, (h + 7) / 8);

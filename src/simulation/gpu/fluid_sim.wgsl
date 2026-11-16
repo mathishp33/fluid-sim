@@ -52,6 +52,10 @@ struct Params {
     cap_solid: f32, // ρ_s·cp_s, J/(m³·K)
     inv_dx2: f32, // 1/dx²
     noslip: u32, // 1 = parois à adhérence
+    maccormack: u32, // 1 = advection de la vitesse en MacCormack limité (sinon semi-lagrangienne)
+    muscl: u32, // 1 = advection des scalaires (tracer, T, rho) en MUSCL van Leer, 0 = upwind
+    pad1: u32,
+    pad2: u32,
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
     btype: vec4<u32>,
     // (velocity_x, velocity_y, tracer, offset)
@@ -194,7 +198,28 @@ fn source_at(i: u32) -> f32 {
 }
 
 
+// valeur de la face i : mode 0 = vitesse courante, mode 1 = prédiction semi-lagrangienne q̂ (scratch)
+fn face_val(horiz: bool, mode: u32, i: u32) -> f32 {
+    if (mode == 0u) {
+        if (horiz) {
+            return velocity_x[i];
+        }
+        return velocity_y[i];
+    }
+    let n = params.width * params.height;
+    if (horiz) {
+        return scratch[i];
+    }
+    return scratch[n + i];
+}
+
 fn sample_face(horiz: bool, px: f32, py: f32, fallback: f32) -> f32 {
+    return sample_face_ex(horiz, 0u, px, py, fallback).x;
+}
+
+// Interpolation bilinéaire d'une composante de vitesse. Renvoie (valeur, min, max) des taps valides :
+// min/max servent de limiteur au MacCormack.
+fn sample_face_ex(horiz: bool, mode: u32, px: f32, py: f32, fallback: f32) -> vec3<f32> {
     let w = params.width;
     let h = params.height;
 
@@ -230,6 +255,8 @@ fn sample_face(horiz: bool, px: f32, py: f32, fallback: f32) -> f32 {
 
     var sum = 0.0;
     var weight = 0.0;
+    var lo = 3.0e38;
+    var hi = -3.0e38;
     for (var k = 0u; k < 4u; k++) {
         var tx = x0;
         var ty = y0;
@@ -249,20 +276,17 @@ fn sample_face(horiz: bool, px: f32, py: f32, fallback: f32) -> f32 {
         if (is_solid(i) && is_solid(i + stride)) {
             continue;
         }
-        var val: f32;
-        if (horiz) {
-            val = velocity_x[i];
-        } else {
-            val = velocity_y[i];
-        }
+        let val = face_val(horiz, mode, i);
         sum += val * wt;
         weight += wt;
+        lo = min(lo, val);
+        hi = max(hi, val);
     }
 
     if (weight > 1e-6) {
-        return sum / weight;
+        return vec3<f32>(sum / weight, lo, hi);
     }
-    return fallback;
+    return vec3<f32>(fallback, fallback, fallback);
 }
 
 // Écrit les deux composantes dans scratch
@@ -300,6 +324,66 @@ fn advect_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     scratch[i] = nu;
     scratch[n + i] = nv;
+}
+
+// MacCormack limité : q' = q̂ + ½(q − q̃), borné par le min/max des taps de la prédiction.
+//   q  = vitesse courante (velocity_x / velocity_y, NON modifiée par advect_velocity)
+//   q̂  = prédiction semi-lagrangienne (scratch[0, 2n), écrite par advect_velocity)
+//   q̃  = prédiction ré-advectée en sens inverse (échantillonnée dans q̂ à +v·dt)
+// Sortie dans scratch[2n, 4n) (régions libres pendant la phase vitesse), recopiée par commit_velocity_mc.
+@compute @workgroup_size(8, 8)
+fn advect_correct(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.width;
+    let h = params.height;
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    let x = gid.x;
+    let y = gid.y;
+    let i = x + y * w;
+    let n = w * h;
+    let dt = params.dt;
+
+    var ru = velocity_x[i];
+    var rv = velocity_y[i];
+
+    if (x >= 1u && x + 2u < w && y >= 1u && y + 1u < h && open_u_at(x, y)) {
+        let px = f32(x) + 0.5;
+        let py = f32(y);
+        let vx = velocity_x[i];
+        let vy = sample_face(false, px, py, 0.0);
+        let a = sample_face_ex(true, 0u, px - vx * dt, py - vy * dt, vx);
+        let back = sample_face_ex(true, 1u, px + vx * dt, py + vy * dt, scratch[i]).x;
+        let mc = scratch[i] + 0.5 * (velocity_x[i] - back);
+        ru = min(max(mc, a.y), a.z);
+    }
+
+    if (x >= 1u && x + 1u < w && y >= 1u && y + 2u < h && open_v_at(x, y)) {
+        let px = f32(x);
+        let py = f32(y) + 0.5;
+        let vy = velocity_y[i];
+        let vx = sample_face(true, px, py, 0.0);
+        let a = sample_face_ex(false, 0u, px - vx * dt, py - vy * dt, vy);
+        let back = sample_face_ex(false, 1u, px + vx * dt, py + vy * dt, scratch[n + i]).x;
+        let mc = scratch[n + i] + 0.5 * (velocity_y[i] - back);
+        rv = min(max(mc, a.y), a.z);
+    }
+
+    scratch[2u * n + i] = ru;
+    scratch[3u * n + i] = rv;
+}
+
+@compute @workgroup_size(8, 8)
+fn commit_velocity_mc(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.width;
+    let h = params.height;
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    let i = gid.x + gid.y * w;
+    let n = w * h;
+    velocity_x[i] = scratch[2u * n + i];
+    velocity_y[i] = scratch[3u * n + i];
 }
 
 @compute @workgroup_size(8, 8)
@@ -588,15 +672,61 @@ fn apply_tracer_boundaries(@builtin(global_invocation_id) gid: vec3<u32>) {
     ghost_tracer(gid.x, 1u);
 }
 
+// ---- Advection d'ordre 2 des scalaires (même algorithme que le CPU : recon/pick de cpu.rs) ----
+// Face entre l'amont U et l'aval D, UU = amont de U (aucun au bord, contre un mur ou si muscl = 0) :
+//  a = φ_U − φ_UU, b = φ_D − φ_U, φ_face = φ_U + ½(a|b| + |a|b)/(|a| + |b|)   (van Leer : TVD)
+const NO_CELL: u32 = 0xffffffffu;
+
+fn recon(fu: f32, fd: f32, fuu: f32, has_uu: bool) -> f32 {
+    if (!has_uu) {
+        return fu;
+    }
+    let a = fu - fuu;
+    let b = fd - fu;
+    let den = abs(a) + abs(b);
+    if (den > 0.0) {
+        return fu + 0.5 * (a * abs(b) + abs(a) * b) / den;
+    }
+    return fu;
+}
+
+// k = cellule « avant » de la face (face entre k et k+stride), along = coordonnée le long de l'axe, len = taille de l'axe
+// résultat : (U, D, UU)
+fn pick(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> vec3<u32> {
+    var r = vec3<u32>(0u, 0u, NO_CELL);
+    let hi = params.muscl == 1u;
+    if (uf > 0.0) {
+        r.x = k;
+        r.y = k + stride;
+        if (hi && along >= 1u && cells[k - stride] != CELL_WALL) {
+            r.z = k - stride;
+        }
+    } else {
+        r.x = k + stride;
+        r.y = k;
+        if (hi && along + 2u < len && cells[k + 2u * stride] != CELL_WALL) {
+            r.z = k + 2u * stride;
+        }
+    }
+    return r;
+}
+
+fn tracer_face(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> f32 {
+    let p = pick(k, stride, along, len, uf);
+    var fuu = 0.0;
+    if (p.z != NO_CELL) {
+        fuu = tracer[p.z];
+    }
+    return recon(tracer[p.x], tracer[p.y], fuu, p.z != NO_CELL);
+}
+
 fn flux_x(x: u32, y: u32) -> f32 {
     let w = params.width;
     let i = x + y * w;
     let uf = velocity_x[i];
-    var adv: f32;
-    if (uf > 0.0) {
-        adv = uf * tracer[i];
-    } else {
-        adv = uf * tracer[i + 1u];
+    var adv = 0.0;
+    if (uf != 0.0) {
+        adv = uf * tracer_face(i, 1u, x, w, uf);
     }
     var dif = 0.0;
     if (x >= 1u && x + 2u < w && open_u_at(x, y)) {
@@ -610,11 +740,9 @@ fn flux_y(x: u32, y: u32) -> f32 {
     let h = params.height;
     let i = x + y * w;
     let vf = velocity_y[i];
-    var adv: f32;
-    if (vf > 0.0) {
-        adv = vf * tracer[i];
-    } else {
-        adv = vf * tracer[i + w];
+    var adv = 0.0;
+    if (vf != 0.0) {
+        adv = vf * tracer_face(i, w, y, h, vf);
     }
     var dif = 0.0;
     if (y >= 1u && y + 2u < h && open_v_at(x, y)) {
@@ -812,39 +940,34 @@ fn k_face(a: u32, b: u32) -> f32 {
     return 2.0 * ka * kb / s;
 }
 
-// flux de masse (cellules/s · kg/m³) à travers la face droite / basse de i, upwind
-fn mflux_x(i: u32) -> f32 {
-    let uf = velocity_x[i];
-    if (uf > 0.0) {
-        return uf * rho_get(i);
+// Flux (masse, ρT) à travers la face « droite » (stride 1) / « basse » (stride w) de la cellule k, en cellules/s·kg/m³.
+// Un seul flux par face, partagé par ses deux cellules voisines (masse conservée exactement) ; ρT utilise le même
+// flux de masse ρ_face·u. ρ_face et T_face : MUSCL van Leer (muscl = 1) ou upwind.
+fn mt_flux(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> vec2<f32> {
+    if (uf == 0.0) {
+        return vec2<f32>(0.0, 0.0);
     }
-    return uf * rho_get(i + 1u);
+    let p = pick(k, stride, along, len, uf);
+    var ruu = 0.0;
+    var tuu = 0.0;
+    if (p.z != NO_CELL) {
+        ruu = rho_get(p.z);
+        tuu = temp_get(p.z);
+    }
+    let has = p.z != NO_CELL;
+    let rf = recon(rho_get(p.x), rho_get(p.y), ruu, has);
+    let tf = recon(temp_get(p.x), temp_get(p.y), tuu, has);
+    return vec2<f32>(uf * rf, uf * rf * tf);
 }
 
-fn mflux_y(i: u32) -> f32 {
-    let vf = velocity_y[i];
-    if (vf > 0.0) {
-        return vf * rho_get(i);
+// T de la face (hors low-Mach conservatif), pour l'advection non conservative
+fn temp_face(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> f32 {
+    let p = pick(k, stride, along, len, uf);
+    var tuu = 0.0;
+    if (p.z != NO_CELL) {
+        tuu = temp_get(p.z);
     }
-    return vf * rho_get(i + params.width);
-}
-
-// flux de ρT : même flux de masse × T de la cellule amont
-fn tflux_x(i: u32) -> f32 {
-    let uf = velocity_x[i];
-    if (uf > 0.0) {
-        return uf * rho_get(i) * temp_get(i);
-    }
-    return uf * rho_get(i + 1u) * temp_get(i + 1u);
-}
-
-fn tflux_y(i: u32) -> f32 {
-    let vf = velocity_y[i];
-    let j = i + params.width;
-    if (vf > 0.0) {
-        return vf * rho_get(i) * temp_get(i);
-    }
-    return vf * rho_get(j) * temp_get(j);
+    return recon(temp_get(p.x), temp_get(p.y), tuu, p.z != NO_CELL);
 }
 
 // Hors low-Mach : dT/dt = −u·∇T + (∇·(k∇T) + q + dP_th/dt)/(ρ·cp)
@@ -879,8 +1002,12 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (params.lowmach == 1u && !wall && cells[i] != CELL_SINK && cells[i] != CELL_EMITTER) {
         let rho_i = rho_get(i);
-        let dm = mflux_x(i) - mflux_x(i - 1u) + mflux_y(i) - mflux_y(i - w);
-        let dq = tflux_x(i) - tflux_x(i - 1u) + tflux_y(i) - tflux_y(i - w);
+        let fr = mt_flux(i, 1u, x, w, velocity_x[i]);
+        let fl = mt_flux(i - 1u, 1u, x - 1u, w, velocity_x[i - 1u]);
+        let fd = mt_flux(i, w, y, h, velocity_y[i]);
+        let fu = mt_flux(i - w, w, y - 1u, h, velocity_y[i - w]);
+        let dm = fr.x - fl.x + fd.x - fu.x;
+        let dq = fr.y - fl.y + fd.y - fu.y;
         // sous CFL (sorties <= 0,9/dts) rho_new >= 0,1·rho_i : positif
         let rho_new = max(rho_i - params.dts * dm, 1e-6);
         // partie advective de T : combinaison convexe des T amont (donc bornée)
@@ -896,15 +1023,23 @@ fn temperature_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // advection : Σ_faces u_sortant·(T_face − T_i) ; upwind : seules les faces entrantes ; MUSCL : T_face reconstruit
     var adv = 0.0;
     let fr = velocity_x[i];
     let fl = -velocity_x[i - 1u];
     let fd = velocity_y[i];
     let fu = -velocity_y[i - w];
-    if (fr < 0.0) { adv += fr * (temp_get(i + 1u) - ti); }
-    if (fl < 0.0) { adv += fl * (temp_get(i - 1u) - ti); }
-    if (fd < 0.0) { adv += fd * (temp_get(i + w) - ti); }
-    if (fu < 0.0) { adv += fu * (temp_get(i - w) - ti); }
+    if (params.muscl == 0u) {
+        if (fr < 0.0) { adv += fr * (temp_get(i + 1u) - ti); }
+        if (fl < 0.0) { adv += fl * (temp_get(i - 1u) - ti); }
+        if (fd < 0.0) { adv += fd * (temp_get(i + w) - ti); }
+        if (fu < 0.0) { adv += fu * (temp_get(i - w) - ti); }
+    } else {
+        if (fr != 0.0) { adv += fr * (temp_face(i, 1u, x, w, velocity_x[i]) - ti); }
+        if (fl != 0.0) { adv += fl * (temp_face(i - 1u, 1u, x - 1u, w, velocity_x[i - 1u]) - ti); }
+        if (fd != 0.0) { adv += fd * (temp_face(i, w, y, h, velocity_y[i]) - ti); }
+        if (fu != 0.0) { adv += fu * (temp_face(i - w, w, y - 1u, h, velocity_y[i - w]) - ti); }
+    }
 
     var cap = params.rho_amb * params.cp;
     if (wall) {

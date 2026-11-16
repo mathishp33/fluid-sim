@@ -562,6 +562,10 @@ impl FluidWindow {
                     ui.checkbox(&mut self.fluid.low_mach, "Low-Mach (compressible gas)");
                 }
                 ui.checkbox(&mut self.fluid.no_slip, "No-slip walls (adhérence)");
+                ui.checkbox(&mut self.fluid.high_order_scalars, "High order scalars");
+                ui.checkbox(&mut self.fluid.viscous_heating, "Viscous heating");
+                ui.checkbox(&mut self.fluid.maccormack, "MacCormak");
+
 
                 ui.separator();
                 ui.heading("Fluid (SI)");

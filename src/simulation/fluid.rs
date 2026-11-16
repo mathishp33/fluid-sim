@@ -174,6 +174,7 @@ pub struct FluidSim {
     pub dx: f32, // m/cellule
     pub gravity: f32, // m/s²
     pub p_th: f32, // pression thermodynamique (Pa)
+    pub(crate) p_th_acc: f64, // cumul de p_th en double précision (voir compute_source)
     pub dpdt: f32, // dP_th/dt (Pa/s), dernier pas (boîte fermée)
     pub last_dt: f32, // dernier dt utilisé (s), pour convertir la pression du solveur en Pa
     pub rho_min: f32, // kg/m³, cellules non solides
@@ -183,6 +184,14 @@ pub struct FluidSim {
     pub low_mach: bool,
     // Parois : true = adhérence (no-slip, physique) ; false = glissement libre.
     pub no_slip: bool,
+    // Advection de la vitesse : true = MacCormack limité (ordre 2, peu diffusif), false = semi-lagrangienne
+    // bilinéaire (ordre 1, robuste mais qui lisse fortement). CPU et GPU.
+    pub maccormack: bool,
+    // Advection des scalaires (tracer, T, ρ/ρT) : true = ordre 2 limité (MUSCL van Leer, peu diffusif, repli
+    // automatique en upwind si les vitesses sont extrêmes) ; false = upwind d'ordre 1 (très diffusif).
+    pub high_order_scalars: bool,
+    // Chauffage visqueux : l'énergie cinétique dissipée par ν∇² est rendue en chaleur (conservation de l'énergie).
+    pub viscous_heating: bool,
 
     pub tracer: Vec<f32>,
     pub rho: Vec<f32>, // kg/m³ (persistant en low-Mach, dérivé de T sinon)
@@ -208,6 +217,8 @@ pub struct FluidSim {
     pub(crate) velocity_y_temp: Vec<f32>,
     pub(crate) temperature_temp: Vec<f32>,
     pub(crate) rho_temp: Vec<f32>,
+    pub(crate) velocity_x_mc: Vec<f32>, // sortie du MacCormack (avant échange avec velocity_x)
+    pub(crate) velocity_y_mc: Vec<f32>,
 
     // true : `rho` doit être recalculé depuis l'EOS au prochain pas (état initial, reset de T,
     // changement de mode). Tant que c'est false, le low-Mach garde son ρ persistant.
@@ -255,11 +266,15 @@ impl FluidSim {
             dx,
             gravity: g,
             p_th: fm.p_ref,
+            p_th_acc: fm.p_ref as f64,
             dpdt: 0.0,
             last_dt: 0.016,
             rho_min: fm.rho_ambient(),
             low_mach: fm.kind == FluidKind::Gas,
             no_slip: true,
+            maccormack: true,
+            high_order_scalars: true,
+            viscous_heating: true,
 
             tracer: vec![0.0; size],
             velocity_x: vec![0.0; size],
@@ -284,6 +299,8 @@ impl FluidSim {
             velocity_y_temp: vec![0.0; size],
             temperature_temp: vec![0.0; size],
             rho_temp: vec![fm.rho_ambient(); size],
+            velocity_x_mc: vec![0.0; size],
+            velocity_y_mc: vec![0.0; size],
             rho_dirty: true,
 
             open_u: vec![0; size],
@@ -692,6 +709,9 @@ impl FluidSim {
 
     pub fn step(&mut self, dt: f32, pressure_iterations: usize) {
         self.apply_thermal_cells();
+        if self.viscous_heating {
+            self.add_viscous_heating(); // W/m³ dans heat_source, lu par compute_source et les scalaires
+        }
         if self.compute_method == ComputeMethod::GPU {
             if let Some(mut gpu) = self.gpu_context.take() {
                 self.refresh_rho(); // ρ persistant (low-Mach) ou ρ(T, P_th) : rho_min pour les sous-pas
@@ -742,6 +762,7 @@ impl FluidSim {
             kind: matches!(m.kind, FluidKind::Liquid) as u32, // 0 = gaz, 1 = liquide
             low_mach: self.low_mach_active(),
             no_slip: self.no_slip,
+            maccormack: self.maccormack,
             p_th,
             r_spec: m.r_spec,
             rho_amb: m.rho_ambient(),
@@ -770,7 +791,7 @@ impl FluidSim {
             heat_source: &self.heat_source,
         });
 
-        let substeps = self.scalar_substeps(dt);
-        gpu.step_scalars(&cfg, substeps, &mut self.tracer, &mut self.temperature, &mut self.rho);
+        let (substeps, high_order) = self.scalar_plan(dt);
+        gpu.step_scalars(&cfg, substeps, high_order, &mut self.tracer, &mut self.temperature, &mut self.rho);
     }
 }
