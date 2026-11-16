@@ -192,6 +192,19 @@ pub struct FluidSim {
     pub high_order_scalars: bool,
     // Chauffage visqueux : l'énergie cinétique dissipée par ν∇² est rendue en chaleur (conservation de l'énergie).
     pub viscous_heating: bool,
+    // Diagnostic de masse (low-Mach) : masse nette entrée par les bords depuis le début (kg par m de profondeur),
+    // intégrée avec les flux EXACTS du schéma. Pour un domaine intact, M(t) − M(0) = mass_boundary_flux(t) − mass_boundary_flux(0).
+    pub mass_boundary_flux: f64,
+    // Fraction de l'écart ρ − ρ_EOS rappelée à chaque pas (0 = aucun rappel, masse exactement conservée)
+    pub rho_relax: f32,
+    // Propriétés réelles : μ(T) (Sutherland pour l'air...), k(T), ν = μ/ρ(T, P_th). false = ν et k constants
+    // (valeurs de référence du matériau), comme avant.
+    pub variable_properties: bool,
+    pub(crate) mu_cell: Vec<f32>,   // Pa·s, par cellule (mis à jour au début de chaque pas)
+    pub(crate) k_cell: Vec<f32>,    // W/(m·K), fluide ou solide
+    pub(crate) rho_visc: Vec<f32>,  // kg/m³ utilisée pour ν = μ/ρ
+    pub(crate) nu_max_phys: f32,    // m²/s, pour les sous-pas de viscosité
+    pub(crate) alpha_max_phys: f32, // m²/s, pour les sous-pas thermiques
 
     pub tracer: Vec<f32>,
     pub rho: Vec<f32>, // kg/m³ (persistant en low-Mach, dérivé de T sinon)
@@ -275,6 +288,14 @@ impl FluidSim {
             maccormack: true,
             high_order_scalars: true,
             viscous_heating: true,
+            mass_boundary_flux: 0.0,
+            rho_relax: RHO_RELAX,
+            variable_properties: true,
+            mu_cell: vec![fm.viscosity * fm.rho_ambient(); size],
+            k_cell: vec![fm.conductivity; size],
+            rho_visc: vec![fm.rho_ambient(); size],
+            nu_max_phys: fm.viscosity,
+            alpha_max_phys: fm.alpha_fluid().max(fm.alpha_solid()),
 
             tracer: vec![0.0; size],
             velocity_x: vec![0.0; size],
@@ -319,7 +340,7 @@ impl FluidSim {
     }
 
     // conversions SI -> unités de grille
-    #[inline] fn inv_dx2(&self) -> f32 { 1.0 / (self.dx * self.dx) }
+    #[inline] pub(crate) fn inv_dx2(&self) -> f32 { 1.0 / (self.dx * self.dx) }
     pub(crate) fn nu_grid(&self) -> f32 { self.material.viscosity * self.inv_dx2() }
     pub(crate) fn tracer_diff_grid(&self) -> f32 { self.material.tracer_diffusion * self.inv_dx2() }
     pub(crate) fn gravity_grid(&self) -> f32 { self.gravity / self.dx }
@@ -404,16 +425,17 @@ impl FluidSim {
     /// Si le solveur de pression laisse un résidu (div u ≠ S, typiquement quand le pinceau injecte des
     /// vitesses de plusieurs centaines de cellules/s avec peu d'itérations), l'advection conservative
     /// comprime/dilate ρ à tort. Ici on résorbe une fraction RHO_RELAX de l'écart ρ − ρ_EOS à chaque pas,
-    /// en retirant la moyenne de la correction en boîte fermée : la masse totale ne bouge pas.
+    /// en retirant la moyenne de la correction (boîte fermée ou ouverte) : la masse totale ne bouge pas.
     /// En fonctionnement normal l'écart est ~1e-3 et la correction est négligeable.
     fn relax_rho_to_eos(&mut self) {
-        if RHO_RELAX <= 0.0 {
+        if self.rho_relax <= 0.0 {
             return;
         }
         let m = self.material;
         let p_th = self.p_th;
         let (w, h) = (self.width, self.height);
         let closed = self.is_closed();
+        let relax = self.rho_relax;
         let active = |i: usize, s: &[CellType]| {
             let (x, y) = (i % w, i / w);
             x > 0 && y > 0 && x < w - 1 && y < h - 1
@@ -434,7 +456,7 @@ impl FluidSim {
         self.rho.par_iter_mut().enumerate().for_each(|(i, r)| {
             if active(i, s) {
                 let err = m.density(t[i], p_th) - *r;
-                *r += RHO_RELAX * (err - mean);
+                *r += relax * (err - mean);
             }
         });
     }
@@ -709,6 +731,7 @@ impl FluidSim {
 
     pub fn step(&mut self, dt: f32, pressure_iterations: usize) {
         self.apply_thermal_cells();
+        self.refresh_properties(); // μ(T), k(T), ρ_visc, ν_max, α_max : une fois par pas
         if self.viscous_heating {
             self.add_viscous_heating(); // W/m³ dans heat_source, lu par compute_source et les scalaires
         }
@@ -767,7 +790,11 @@ impl FluidSim {
             r_spec: m.r_spec,
             rho_amb: m.rho_ambient(),
             dpdt: self.dpdt,
-            k_fluid: m.conductivity,
+            k_fluid: m.conductivity, // k_ref ; k(T) est recalculée dans le shader avec cond_law
+            cond_law: m.conductivity_law.gpu_params(),
+            visc_law: m.viscosity_law.gpu_params(),
+            variable_properties: self.variable_properties,
+            mu_ref: m.viscosity * m.rho_ambient(),
             k_solid: m.solid_conductivity,
             cp: m.cp,
             cap_solid: m.heat_capacity_solid(),

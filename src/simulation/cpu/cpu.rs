@@ -6,7 +6,7 @@ const CFL: f32 = 0.9;
 // sous CFL <= 1/2 (somme des flux sortants). En ordre 1 (upwind) on garde CFL.
 const CFL_SCALAR: f32 = 0.5;
 const MAX_SUBSTEPS: usize = 64;
-const MAX_VISC_SUBSTEPS: usize = 16;
+const MAX_VISC_SUBSTEPS: usize = 48; // μ(T)/ρ(T) peut être ×20 plus grande que la référence dans un gaz très chaud
 
 // Relaxation de ρ vers l'EOS (fraction de l'écart résorbée par pas, via la divergence cible S).
 // 0 = désactivé. 0,1–0,5 : les écarts locaux ρ ≠ P_th/(r·T) sont résorbés en quelques pas.
@@ -30,7 +30,7 @@ impl SharedMut {
 // (= forme harmonique de van Leer : 0 aux extrema, φ_face reste entre φ_U et φ_D, donc pas de
 // sur/sous-oscillation). Sans UU (bord, mur, ordre 1 demandé) : upwind, φ_face = φ_U.
 #[inline]
-fn recon(fu: f32, fd: f32, fuu: Option<f32>) -> f32 {
+pub(crate) fn recon(fu: f32, fd: f32, fuu: Option<f32>) -> f32 {
     match fuu {
         Some(fuu) => {
             let (a, b) = (fu - fuu, fd - fu);
@@ -45,7 +45,7 @@ fn recon(fu: f32, fd: f32, fuu: Option<f32>) -> f32 {
 /// coordonnée le long de l'axe (x pour les faces verticales), `len` la taille de l'axe, `uf` le flux de la face.
 /// Renvoie (amont U, aval D, amont-amont UU) : UU est omis au bord, contre un mur, ou si `hi` est faux.
 #[inline]
-fn pick(k: usize, stride: usize, along: usize, len: usize, uf: f32, hi: bool, s: &[CellType]) -> (usize, usize, Option<usize>) {
+pub(crate) fn pick(k: usize, stride: usize, along: usize, len: usize, uf: f32, hi: bool, s: &[CellType]) -> (usize, usize, Option<usize>) {
     if uf > 0.0 {
         (k, k + stride, if hi && along >= 1 && s[k - stride] != CellType::Wall { Some(k - stride) } else { None })
     } else {
@@ -107,8 +107,43 @@ impl TracerKernel<'_> {
 impl FluidSim {
     // ------------------------------------------------------------------ viscosité
 
+    // ν max = max(μ/ρ) sur les cellules fluides (voir refresh_properties) : stabilité de l'explicite, 4·ν·dt/dx² <= CFL
     pub(crate) fn viscosity_substeps(&self, dt: f32) -> usize {
-        ((4.0 * self.nu_grid() * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
+        ((4.0 * self.nu_max_phys * self.inv_dx2() * dt / CFL).ceil() as usize).clamp(1, MAX_VISC_SUBSTEPS)
+    }
+
+    // Propriétés dépendant de T, calculées UNE fois par pas (T du début de pas) :
+    //  - μ(T) (loi de Sutherland pour l'air, Vogel pour l'eau...), k(T), et ρ utilisée pour ν = μ/ρ ;
+    //  - ν_max et α_max pour les pas de temps explicites.
+    // `variable_properties = false` : μ, k constants et ρ_visc = ρ_ambient, donc ν constante (ancien comportement).
+    pub(crate) fn refresh_properties(&mut self) {
+        let m = self.material;
+        let var = self.variable_properties;
+        let rho_amb = m.rho_ambient();
+        let eos_rho = var && self.low_mach_active(); // ν = μ/ρ(T, P_th) : le gaz chaud est moins dense donc plus « visqueux »
+        let p_th = self.p_th;
+        let (mut nu_max, mut a_max) = (0.0f32, m.alpha_solid());
+        for i in 0..self.width * self.height {
+            if self.solids[i] == CellType::Wall {
+                self.mu_cell[i] = m.mu(m.t_ref, false);
+                self.k_cell[i] = m.solid_conductivity;
+                self.rho_visc[i] = rho_amb;
+                continue;
+            }
+            let t = self.temperature[i];
+            let mu = m.mu(t, var);
+            let k = m.k_fluid(t, var);
+            let rho = if eos_rho { m.density(t, p_th).max(1e-6) } else { rho_amb };
+            self.mu_cell[i] = mu;
+            self.k_cell[i] = k;
+            self.rho_visc[i] = rho;
+            nu_max = nu_max.max(mu / rho);
+            // diffusivité thermique k/(ρ·cp) : ρ de l'EOS en low-Mach (là où la capacité est la plus faible, le gaz chaud)
+            let rho_th = if self.low_mach_active() { m.density(t, p_th).max(1e-6) } else { rho_amb };
+            a_max = a_max.max(k / (rho_th * m.cp));
+        }
+        self.nu_max_phys = nu_max;
+        self.alpha_max_phys = a_max;
     }
 
     // Laplacien de la vitesse sur les faces. Contribution d'un voisin (face de même orientation) :
@@ -123,18 +158,22 @@ impl FluidSim {
         }
         let (w, h) = (self.width, self.height);
         let n = self.viscosity_substeps(dt);
-        let k = self.nu_grid() * dt / n as f32;
+        let kdt = dt / n as f32 * self.inv_dx2(); // dt_sous-pas / dx²
         let ns = self.no_slip;
-        let term = move |open: bool, val: f32, c: f32, normal: bool, ghost: bool| -> f32 {
-            if open { val - c } else if !ns { 0.0 } else if normal || ghost { val - c } else { -2.0 * c }
+        // contribution d'un lien : μ_lien·(valeur du voisin − c) ; μ_lien = moyenne des μ des deux faces
+        // (symétrique, donc l'énergie dissipée vaut exactement Σ μ_lien·(Δu)² : voir add_viscous_heating)
+        let term = move |open: bool, mu_l: f32, val: f32, c: f32, normal: bool, ghost: bool| -> f32 {
+            mu_l * if open { val - c } else if !ns { 0.0 } else if normal || ghost { val - c } else { -2.0 * c }
         };
 
         for _ in 0..n {
             self.velocity_x_temp.copy_from_slice(&self.velocity_x);
             self.velocity_y_temp.copy_from_slice(&self.velocity_y);
+            let (mu, rv) = (&self.mu_cell, &self.rho_visc);
 
             {
                 let (u, ou) = (&self.velocity_x, &self.open_u);
+                let mfu = |j: usize| 0.5 * (mu[j] + mu[j + 1]); // μ de la face u[j] (entre les cellules j et j+1)
                 self.velocity_x_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
                     if y == 0 || y >= h - 1 {
                         return;
@@ -145,16 +184,20 @@ impl FluidSim {
                             continue;
                         }
                         let c = u[i];
-                        let lap = term(ou[i + 1] != 0, u[i + 1], c, true, false)
-                            + term(ou[i - 1] != 0, u[i - 1], c, true, false)
-                            + term(ou[i + w] != 0, u[i + w], c, false, y + 1 == h - 1)
-                            + term(ou[i - w] != 0, u[i - w], c, false, y == 1);
-                        row[x] = c + k * lap;
+                        let m0 = mfu(i);
+                        let lk = |open: bool, j: usize| if open { 0.5 * (m0 + mfu(j)) } else { m0 };
+                        let (or, ol, od, oup) = (ou[i + 1] != 0, ou[i - 1] != 0, ou[i + w] != 0, ou[i - w] != 0);
+                        let lap = term(or, lk(or, i + 1), u[i + 1], c, true, false)
+                            + term(ol, lk(ol, i - 1), u[i - 1], c, true, false)
+                            + term(od, lk(od, i + w), u[i + w], c, false, y + 1 == h - 1)
+                            + term(oup, lk(oup, i - w), u[i - w], c, false, y == 1);
+                        row[x] = c + kdt * lap / (0.5 * (rv[i] + rv[i + 1]));
                     }
                 });
             }
             {
                 let (v, ov) = (&self.velocity_y, &self.open_v);
+                let mfv = |j: usize| 0.5 * (mu[j] + mu[j + w]); // μ de la face v[j] (entre les cellules j et j+w)
                 self.velocity_y_temp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
                     if y == 0 || y >= h - 2 {
                         return;
@@ -165,11 +208,14 @@ impl FluidSim {
                             continue;
                         }
                         let c = v[i];
-                        let lap = term(ov[i + 1] != 0, v[i + 1], c, false, x + 1 == w - 1)
-                            + term(ov[i - 1] != 0, v[i - 1], c, false, x == 1)
-                            + term(ov[i + w] != 0, v[i + w], c, true, false)
-                            + term(ov[i - w] != 0, v[i - w], c, true, false);
-                        row[x] = c + k * lap;
+                        let m0 = mfv(i);
+                        let lk = |open: bool, j: usize| if open { 0.5 * (m0 + mfv(j)) } else { m0 };
+                        let (or, ol, od, oup) = (ov[i + 1] != 0, ov[i - 1] != 0, ov[i + w] != 0, ov[i - w] != 0);
+                        let lap = term(or, lk(or, i + 1), v[i + 1], c, false, x + 1 == w - 1)
+                            + term(ol, lk(ol, i - 1), v[i - 1], c, false, x == 1)
+                            + term(od, lk(od, i + w), v[i + w], c, true, false)
+                            + term(oup, lk(oup, i - w), v[i - w], c, true, false);
+                        row[x] = c + kdt * lap / (0.5 * (rv[i] + rv[i + w]));
                     }
                 });
             }
@@ -181,64 +227,60 @@ impl FluidSim {
 
     // ------------------------------------------------------------------ chauffage visqueux
     //
-    // L'opérateur ν∇² de `diffuse_velocity` retire de l'énergie cinétique ; elle doit réapparaître en chaleur
-    // (sinon l'énergie totale n'est pas conservée et un fluide brassé ne s'échauffe jamais).
-    // Énergie cinétique par face E = ½u² ; dE/dt = −ν·Σ_liens (Δu)² (chaque lien compté une fois), plus,
-    // contre un solide en no-slip : 2ν·u² (tangentiel, paroi à mi-cellule) ou ν·u·(u − u_voisin) (normal/fantôme).
-    // C'est exactement le terme que `diffuse_velocity` applique, donc le bilan discret est fermé
-    // (au pas près : on évalue sur les vitesses du début de pas). Unités : u en cellules/s, ν physique en m²/s,
-    // le dx² du laplacien et de l'énergie se simplifient : D[W/kg] = ν·Σ(Δu_grille)².
-    // La puissance (W/m³ = ρ·D) est ajoutée à `heat_source`, moitié dans chacune des deux cellules qui
-    // encadrent la face ; les cellules solides ne reçoivent rien.
+    // L'opérateur (1/ρ)∇·(μ∇u) de `diffuse_velocity` retire de l'énergie cinétique ; elle doit réapparaître en
+    // chaleur (sinon l'énergie totale n'est pas conservée et un fluide brassé ne s'échauffe jamais).
+    // Énergie cinétique d'une face E = ½ρ_f·u² ; dE/dt = −Σ_liens μ_lien·(Δu)² (chaque lien compté une fois), plus,
+    // contre un solide en no-slip : 2μ·u² (tangentiel, paroi à mi-cellule) ou μ·u·(u − u_voisin) (normal/fantôme).
+    // C'est exactement le terme appliqué par `diffuse_velocity` (mêmes μ_lien), donc le bilan discret est fermé
+    // (au pas près : on évalue sur les vitesses du début de pas). Unités : u en cellules/s, μ en Pa·s :
+    // μ·(Δu_grille)² est directement une puissance volumique (W/m³), les dx² se simplifient.
+    // Ajoutée à `heat_source`, moitié dans chacune des deux cellules qui encadrent la face ; rien dans les solides.
     pub(crate) fn add_viscous_heating(&mut self) {
-        let nu = self.material.viscosity;
-        if nu <= 0.0 {
+        if self.nu_grid() <= 0.0 {
             return;
         }
         let (w, h) = (self.width, self.height);
         let ns = self.no_slip;
-        let low = self.low_mach_active();
-        let m = self.material;
-        let p_th = self.p_th;
-        let rho_amb = m.rho_ambient();
-        let mut d = vec![0.0f32; w * h]; // W/kg par cellule
-        let (u, v, ou, ov) = (&self.velocity_x, &self.velocity_y, &self.open_u, &self.open_v);
+        let mut d = vec![0.0f32; w * h]; // W/m³ par cellule
+        let (u, v, ou, ov, mu) = (&self.velocity_x, &self.velocity_y, &self.open_u, &self.open_v, &self.mu_cell);
+        let mfu = |j: usize| 0.5 * (mu[j] + mu[j + 1]);
+        let mfv = |j: usize| 0.5 * (mu[j] + mu[j + w]);
 
         // face u[i] : entre les cellules i et i+1 ; face v[i] : entre i et i+w
-        let mut put_u = |i: usize, e: f32| { d[i] += 0.5 * e; d[i + 1] += 0.5 * e; };
         for y in 1..h - 1 {
             for x in 1..w - 2 {
                 let i = x + y * w;
                 if ou[i] == 0 { continue; }
                 let c = u[i];
-                // normal (x) : voisin droit (un lien ouvert n'est compté que depuis sa face de gauche)
-                if ou[i + 1] != 0 { let dv = u[i + 1] - c; put_u(i, nu * dv * dv); }
-                else if ns { put_u(i, (nu * c * (c - u[i + 1])).max(0.0)); }
-                if ou[i - 1] == 0 && ns { put_u(i, (nu * c * (c - u[i - 1])).max(0.0)); }
-                // tangentiel (y)
-                if ou[i + w] != 0 { let dv = u[i + w] - c; put_u(i, nu * dv * dv); }
-                else if ns { put_u(i, if y + 1 == h - 1 { (nu * c * (c - u[i + w])).max(0.0) } else { 2.0 * nu * c * c }); }
-                if ou[i - w] == 0 && ns { put_u(i, if y == 1 { (nu * c * (c - u[i - w])).max(0.0) } else { 2.0 * nu * c * c }); }
+                let m0 = mfu(i);
+                let mut put = |e: f32| { d[i] += 0.5 * e; d[i + 1] += 0.5 * e; };
+                // un lien ouvert n'est compté que depuis sa face de gauche / du haut ; les liens fermés (no-slip) depuis la face ouverte
+                if ou[i + 1] != 0 { let dv = u[i + 1] - c; put(0.5 * (m0 + mfu(i + 1)) * dv * dv); }
+                else if ns { put((m0 * c * (c - u[i + 1])).max(0.0)); }
+                if ou[i - 1] == 0 && ns { put((m0 * c * (c - u[i - 1])).max(0.0)); }
+                if ou[i + w] != 0 { let dv = u[i + w] - c; put(0.5 * (m0 + mfu(i + w)) * dv * dv); }
+                else if ns { put(if y + 1 == h - 1 { (m0 * c * (c - u[i + w])).max(0.0) } else { 2.0 * m0 * c * c }); }
+                if ou[i - w] == 0 && ns { put(if y == 1 { (m0 * c * (c - u[i - w])).max(0.0) } else { 2.0 * m0 * c * c }); }
             }
         }
-        let mut put_v = |d: &mut Vec<f32>, i: usize, e: f32| { d[i] += 0.5 * e; d[i + w] += 0.5 * e; };
         for y in 1..h - 2 {
             for x in 1..w - 1 {
                 let i = x + y * w;
                 if ov[i] == 0 { continue; }
                 let c = v[i];
-                if ov[i + w] != 0 { let dv = v[i + w] - c; put_v(&mut d, i, nu * dv * dv); }
-                else if ns { put_v(&mut d, i, (nu * c * (c - v[i + w])).max(0.0)); }
-                if ov[i - w] == 0 && ns { put_v(&mut d, i, (nu * c * (c - v[i - w])).max(0.0)); }
-                if ov[i + 1] != 0 { let dv = v[i + 1] - c; put_v(&mut d, i, nu * dv * dv); }
-                else if ns { put_v(&mut d, i, if x + 1 == w - 1 { (nu * c * (c - v[i + 1])).max(0.0) } else { 2.0 * nu * c * c }); }
-                if ov[i - 1] == 0 && ns { put_v(&mut d, i, if x == 1 { (nu * c * (c - v[i - 1])).max(0.0) } else { 2.0 * nu * c * c }); }
+                let m0 = mfv(i);
+                let mut put = |e: f32| { d[i] += 0.5 * e; d[i + w] += 0.5 * e; };
+                if ov[i + w] != 0 { let dv = v[i + w] - c; put(0.5 * (m0 + mfv(i + w)) * dv * dv); }
+                else if ns { put((m0 * c * (c - v[i + w])).max(0.0)); }
+                if ov[i - w] == 0 && ns { put((m0 * c * (c - v[i - w])).max(0.0)); }
+                if ov[i + 1] != 0 { let dv = v[i + 1] - c; put(0.5 * (m0 + mfv(i + 1)) * dv * dv); }
+                else if ns { put(if x + 1 == w - 1 { (m0 * c * (c - v[i + 1])).max(0.0) } else { 2.0 * m0 * c * c }); }
+                if ov[i - 1] == 0 && ns { put(if x == 1 { (m0 * c * (c - v[i - 1])).max(0.0) } else { 2.0 * m0 * c * c }); }
             }
         }
         for i in 0..w * h {
             if d[i] > 0.0 && self.solids[i] != CellType::Wall {
-                let rho = if low { m.density(self.temperature[i], p_th) } else { rho_amb };
-                self.heat_source[i] += rho * d[i];
+                self.heat_source[i] += d[i];
             }
         }
     }
@@ -328,14 +370,15 @@ impl FluidSim {
         let inv_dx2 = 1.0 / (self.dx * self.dx);
         let low = self.low_mach_active();
         let dpdt = self.dpdt;
-        let (kf, ks, cp) = (m.conductivity, m.solid_conductivity, m.cp);
+        let cp = m.cp;
+        let kc = &self.k_cell;
         let (cap_ref, cap_solid) = (m.heat_capacity_ref(), m.heat_capacity_solid());
 
         self.temperature_temp.copy_from_slice(&self.temperature); // conserve les fantômes
 
         let (t, u, v, s, rho, q) = (&self.temperature, &self.velocity_x, &self.velocity_y,
                                     &self.solids, &self.rho, &self.heat_source);
-        let k_of = |i: usize| if s[i] == CellType::Wall { ks } else { kf };
+        let k_of = |i: usize| kc[i]; // k(T) du fluide, k du solide (voir refresh_properties)
         let k_face = |a: usize, b: usize| {
             let (ka, kb) = (k_of(a), k_of(b));
             let sum = ka + kb;
@@ -407,16 +450,18 @@ impl FluidSim {
         let dpdt = self.dpdt;
         let p_th = self.p_th;
         let r_spec = m.r_spec;
-        let (kf, ks, cp) = (m.conductivity, m.solid_conductivity, m.cp);
+        let cp = m.cp;
+        let kc = &self.k_cell;
         let cap_solid = m.heat_capacity_solid();
 
         self.temperature_temp.copy_from_slice(&self.temperature); // conserve les fantômes
         self.rho_temp.copy_from_slice(&self.rho);
+        let mut flux_net = 0.0f64;
 
         {
             let (t, u, v, s, rho, q) = (&self.temperature, &self.velocity_x, &self.velocity_y,
                                         &self.solids, &self.rho, &self.heat_source);
-            let k_of = |i: usize| if s[i] == CellType::Wall { ks } else { kf };
+            let k_of = |i: usize| kc[i]; // k(T) du fluide, k du solide (voir refresh_properties)
             let k_face = |a: usize, b: usize| {
                 let (ka, kb) = (k_of(a), k_of(b));
                 let sum = ka + kb;
@@ -425,19 +470,37 @@ impl FluidSim {
 
             // Flux (masse, ρT) à travers la face droite (x) / basse (y) de la cellule k, en cellules/s·kg/m³.
             // Un SEUL flux par face, partagé par les deux cellules voisines (les flux télescopent : la masse
-            // est conservée exactement). Le flux de ρT utilise le même flux de masse ρ_face·u que la masse.
-            // ρ_face et T_face sont reconstruits (MUSCL van Leer si `hi`, sinon upwind).
+            // est conservée exactement). ρ_face et (ρT)_face sont reconstruits (MUSCL van Leer si `hi`, sinon upwind).
             let flux = |k: usize, stride: usize, along: usize, len: usize, uf: f32| -> (f32, f32) {
                 if uf == 0.0 {
                     return (0.0, 0.0);
                 }
                 let (a, b, c) = pick(k, stride, along, len, uf, hi, s);
                 let rf = recon(rho[a], rho[b], c.map(|j| rho[j]));
-                let tf = recon(t[a], t[b], c.map(|j| t[j]));
-                (uf * rf, uf * rf * tf)
+                // Flux de ρT : ρT est reconstruit DIRECTEMENT (et non ρ_face·T_face). En low-Mach ρT = P_th/r est
+                // quasi uniforme, donc une interface chaud/froid ne crée aucune erreur sur ρT, alors que le produit
+                // de deux reconstructions limitées (ρ_f·T_f) s'écarte de l'EOS à chaque front et fait dériver
+                // (ρ, T) ; T = ρT/ρ reste alors cohérent avec l'EOS, sans rappel violent de ρ.
+                let rtf = recon(rho[a] * t[a], rho[b] * t[b], c.map(|j| rho[j] * t[j]));
+                (uf * rf, uf * rtf)
             };
             let fx = |k: usize| flux(k, 1, k % w, w, u[k]);
             let fy = |k: usize| flux(k, w, k / w, h, v[k]);
+
+            // Diagnostic : masse nette entrée par les bords pendant ce sous-pas (les MÊMES flux que ci-dessous),
+            // cumulée dans `mass_boundary_flux` : M(t) − M(0) doit en être égal (voir tests de bilan de masse).
+            let mut net = 0.0f64;
+            for y in 1..h - 1 {
+                let (l, r) = (y * w, y * w + w - 2);
+                if s[l + 1] != CellType::Wall { net += fx(l).0 as f64; }
+                if s[r] != CellType::Wall { net -= fx(r).0 as f64; }
+            }
+            for x in 1..w - 1 {
+                let (t0, b0) = (x, x + (h - 2) * w);
+                if s[t0 + w] != CellType::Wall { net += fy(t0).0 as f64; }
+                if s[b0] != CellType::Wall { net -= fy(b0).0 as f64; }
+            }
+            flux_net = net * dts as f64 * (self.dx as f64) * (self.dx as f64);
 
             self.temperature_temp.par_chunks_mut(w)
                 .zip(self.rho_temp.par_chunks_mut(w))
@@ -503,17 +566,14 @@ impl FluidSim {
                     }
                 });
         }
+        self.mass_boundary_flux += flux_net;
         std::mem::swap(&mut self.temperature, &mut self.temperature_temp);
         std::mem::swap(&mut self.rho, &mut self.rho_temp);
     }
 
     // diffusivité thermique max en cellules²/s (pour la stabilité des sous-pas)
     fn thermal_alpha_max_grid(&self) -> f32 {
-        let m = self.material;
-        let rho_f = if self.low_mach_active() { self.rho_min } else { m.rho_ambient() };
-        let a_f = m.conductivity / (rho_f.max(1e-6) * m.cp);
-        let a_s = m.alpha_solid();
-        a_f.max(a_s) / (self.dx * self.dx)
+        self.alpha_max_phys / (self.dx * self.dx) // max k(T)/(ρ·cp), fluide et solide (refresh_properties)
     }
 
     // ------------------------------------------------------------------ masques / conductances
@@ -1003,7 +1063,8 @@ impl FluidSim {
         let (w, h) = (self.width, self.height);
         let m = self.material;
         let inv_dx2 = 1.0 / (self.dx * self.dx);
-        let (kf, ks, cp) = (m.conductivity, m.solid_conductivity, m.cp);
+        let cp = m.cp;
+        let kc = &self.k_cell;
         let closed = self.is_closed();
         // pression de l'EOS : P_th en boîte fermée, P_ref en domaine ouvert
         let p_eos = if closed { self.p_th.max(1.0) } else { m.p_ref };
@@ -1013,7 +1074,7 @@ impl FluidSim {
 
         let (sum_a, sum_c, n_active) = {
             let (t, s, rho, q) = (&self.temperature, &self.solids, &self.rho, &self.heat_source);
-            let k_of = |i: usize| if s[i] == CellType::Wall { ks } else { kf };
+            let k_of = |i: usize| kc[i]; // k(T) du fluide, k du solide (voir refresh_properties)
             let k_face = |a: usize, b: usize| {
                 let (ka, kb) = (k_of(a), k_of(b));
                 let sum = ka + kb;

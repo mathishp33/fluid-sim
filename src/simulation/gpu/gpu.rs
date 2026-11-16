@@ -30,6 +30,14 @@ struct GpuParams {
     noslip: u32, // 1 = parois à adhérence
     maccormack: u32, // 1 = advection de la vitesse en MacCormack limité
     muscl: u32,      // 1 = advection des scalaires en MUSCL (van Leer), 0 = upwind
+    visc_law: u32,   // loi μ(T) : 0 constante, 1 Sutherland, 2 Vogel, 3 Arrhenius, 4 linéaire (voir PropertyLaw)
+    visc_a: f32,
+    visc_b: f32,
+    cond_law: u32,   // loi k(T), mêmes identifiants
+    cond_a: f32,
+    cond_b: f32,
+    mu_ref: f32,     // μ_ref = ν_ref·ρ_ambient, Pa·s
+    varprops: u32,   // 1 = μ(T), k(T), ν = μ/ρ ; 0 = ν et k constantes
     pad: [u32; 2],   // complète à 28 scalaires (112 octets) : les vec4 qui suivent exigent un alignement de 16
     boundary_type: [u32; 4], // gauche, droite, haut, bas
     boundary: [[f32; 4]; 4], // (vx, vy, tracer, offset) x 4
@@ -92,6 +100,10 @@ pub struct StepConfig<'a> {
     pub dpdt: f32,
     // énergie : conduction k (W/m/K), capacités thermiques (J/m³/K), 1/dx²
     pub k_fluid: f32,
+    pub cond_law: (u32, f32, f32), // (id, a, b) de PropertyLaw::gpu_params
+    pub visc_law: (u32, f32, f32),
+    pub variable_properties: bool,
+    pub mu_ref: f32,
     pub k_solid: f32,
     pub cp: f32,
     pub cap_solid: f32,
@@ -416,7 +428,7 @@ impl GpuContext {
             diffusion: cfg.tracer_diffusion,
             vmax: cfg.vmax,
             special_count: cfg.special_cells.len() as u32,
-            visc_k: cfg.viscosity * cfg.dt / cfg.viscosity_substeps.max(1) as f32,
+            visc_k: cfg.dt / cfg.viscosity_substeps.max(1) as f32 * cfg.inv_dx2, // dt_sous-pas/dx²
             gravity: cfg.gravity,
             t_ref: cfg.t_ref,
             beta: cfg.beta,
@@ -434,6 +446,14 @@ impl GpuContext {
             noslip: cfg.no_slip as u32,
             maccormack: cfg.maccormack as u32,
             muscl: muscl as u32,
+            visc_law: cfg.visc_law.0,
+            visc_a: cfg.visc_law.1,
+            visc_b: cfg.visc_law.2,
+            cond_law: cfg.cond_law.0,
+            cond_a: cfg.cond_law.1,
+            cond_b: cfg.cond_law.2,
+            mu_ref: cfg.mu_ref,
+            varprops: cfg.variable_properties as u32,
             pad: [0; 2],
             boundary_type: [ty(&b[0]), ty(&b[1]), ty(&b[2]), ty(&b[3])],
             boundary: [data(&b[0]), data(&b[1]), data(&b[2]), data(&b[3])],

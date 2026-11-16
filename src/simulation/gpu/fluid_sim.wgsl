@@ -36,7 +36,7 @@ struct Params {
     diffusion: f32,
     vmax: f32,
     special_count: u32,
-    visc_k: f32, // viscosity * dt / sous-pas
+    visc_k: f32, // dt_sous-pas / dx² (la viscosité dynamique μ(T) et ρ sont locales)
     gravity: f32, // g / dx (cellules/s²)
     t_ref: f32,
     beta: f32,
@@ -54,6 +54,14 @@ struct Params {
     noslip: u32, // 1 = parois à adhérence
     maccormack: u32, // 1 = advection de la vitesse en MacCormack limité (sinon semi-lagrangienne)
     muscl: u32, // 1 = advection des scalaires (tracer, T, rho) en MUSCL van Leer, 0 = upwind
+    visc_law: u32, // loi μ(T) : 0 constante, 1 Sutherland, 2 Vogel, 3 Arrhenius, 4 linéaire
+    visc_a: f32,
+    visc_b: f32,
+    cond_law: u32, // loi k(T)
+    cond_a: f32,
+    cond_b: f32,
+    mu_ref: f32, // μ_ref = ν_ref·ρ_ambient (Pa·s)
+    varprops: u32, // 1 = propriétés variables (μ(T), k(T), ν = μ/ρ) ; 0 = ν et k constantes
     pad1: u32,
     pad2: u32,
     // type de bordure : gauche, droite, haut, bas (0 = Wall, 1 = Inlet, 2 = Outlet)
@@ -787,20 +795,67 @@ fn tracer_commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     tracer[i] = scratch[2u * n + i];
 }
 
+// Facteur f(T) (f(T_ref) = 1) des lois de propriétés : mêmes formules que PropertyLaw::factor (materials.rs)
+fn law_factor(id: u32, a: f32, b: f32, t_in: f32) -> f32 {
+    let t = clamp(t_in, 100.0, 4000.0);
+    let tr = params.t_ref;
+    var f = 1.0;
+    if (id == 1u) { // Sutherland : (T/Tr)^1,5 (Tr + S)/(T + S)
+        let r = t / tr;
+        f = r * sqrt(r) * (tr + a) / (t + a);
+    } else if (id == 2u) { // Vogel : 10^{b (1/(T − c) − 1/(Tr − c))}
+        let d = max(t - b, 20.0);
+        let dr = max(tr - b, 20.0);
+        f = exp(2.302585093 * a * (1.0 / d - 1.0 / dr));
+    } else if (id == 3u) { // Arrhenius
+        f = exp(a * (1.0 / t - 1.0 / tr));
+    } else if (id == 4u) { // linéaire relatif
+        f = 1.0 + a * (t - tr);
+    }
+    return clamp(f, 0.01, 100.0);
+}
+
+// viscosité dynamique de la cellule i (Pa·s)
+fn mu_cell(i: u32) -> f32 {
+    if (params.varprops == 1u && !is_solid(i)) {
+        return params.mu_ref * law_factor(params.visc_law, params.visc_a, params.visc_b, temp_get(i));
+    }
+    return params.mu_ref;
+}
+
+// ρ utilisée pour ν = μ/ρ : EOS (T, P_th) en low-Mach avec propriétés variables, sinon ρ_ambient
+fn rho_visc(i: u32) -> f32 {
+    if (params.varprops == 1u && params.lowmach == 1u) {
+        return max(rho_of_t(temp_get(i)), 1e-6);
+    }
+    return params.rho_amb;
+}
+
+fn mu_fu(j: u32) -> f32 { return 0.5 * (mu_cell(j) + mu_cell(j + 1u)); }
+fn mu_fv(j: u32) -> f32 { return 0.5 * (mu_cell(j) + mu_cell(j + params.width)); }
+
 // Contribution d'un voisin au laplacien (même règles que le CPU) :
 //  face ouverte : val − c ; fermée : 0 (glissement libre) ; no-slip : normale ou fantôme -> val − c,
 //  tangentielle contre un solide -> −2c (paroi à mi-cellule)
-fn nb_term(open: bool, val: f32, c: f32, normal: bool, ghost: bool) -> f32 {
+fn nb_term(open: bool, mu_l: f32, val: f32, c: f32, normal: bool, ghost: bool) -> f32 {
     if (open) {
-        return val - c;
+        return mu_l * (val - c);
     }
     if (params.noslip == 0u) {
         return 0.0;
     }
     if (normal || ghost) {
-        return val - c;
+        return mu_l * (val - c);
     }
-    return -2.0 * c;
+    return -2.0 * mu_l * c;
+}
+
+// μ du lien : moyenne des μ des deux faces s'il est ouvert, μ de la face sinon (même règle que le CPU)
+fn link_mu(open: bool, m0: f32, mj: f32) -> f32 {
+    if (open) {
+        return 0.5 * (m0 + mj);
+    }
+    return m0;
 }
 
 @compute @workgroup_size(8, 8)
@@ -821,20 +876,30 @@ fn diffuse_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (x >= 1u && x + 2u < w && y >= 1u && y + 1u < h && open_u_at(x, y)) {
         let c = velocity_x[i];
-        let lap = nb_term(open_u_at(x + 1u, y), velocity_x[i + 1u], c, true, false)
-            + nb_term(open_u_at(x - 1u, y), velocity_x[i - 1u], c, true, false)
-            + nb_term(open_u_at(x, y + 1u), velocity_x[i + w], c, false, y + 1u == h - 1u)
-            + nb_term(open_u_at(x, y - 1u), velocity_x[i - w], c, false, y == 1u);
-        nu = c + k * lap;
+        let m0 = mu_fu(i);
+        let or = open_u_at(x + 1u, y);
+        let ol = open_u_at(x - 1u, y);
+        let od = open_u_at(x, y + 1u);
+        let oup = open_u_at(x, y - 1u);
+        let lap = nb_term(or, link_mu(or, m0, mu_fu(i + 1u)), velocity_x[i + 1u], c, true, false)
+            + nb_term(ol, link_mu(ol, m0, mu_fu(i - 1u)), velocity_x[i - 1u], c, true, false)
+            + nb_term(od, link_mu(od, m0, mu_fu(i + w)), velocity_x[i + w], c, false, y + 1u == h - 1u)
+            + nb_term(oup, link_mu(oup, m0, mu_fu(i - w)), velocity_x[i - w], c, false, y == 1u);
+        nu = c + k * lap / (0.5 * (rho_visc(i) + rho_visc(i + 1u)));
     }
 
     if (x >= 1u && x + 1u < w && y >= 1u && y + 2u < h && open_v_at(x, y)) {
         let c = velocity_y[i];
-        let lap = nb_term(open_v_at(x + 1u, y), velocity_y[i + 1u], c, false, x + 1u == w - 1u)
-            + nb_term(open_v_at(x - 1u, y), velocity_y[i - 1u], c, false, x == 1u)
-            + nb_term(open_v_at(x, y + 1u), velocity_y[i + w], c, true, false)
-            + nb_term(open_v_at(x, y - 1u), velocity_y[i - w], c, true, false);
-        nv = c + k * lap;
+        let m0 = mu_fv(i);
+        let or = open_v_at(x + 1u, y);
+        let ol = open_v_at(x - 1u, y);
+        let od = open_v_at(x, y + 1u);
+        let oup = open_v_at(x, y - 1u);
+        let lap = nb_term(or, link_mu(or, m0, mu_fv(i + 1u)), velocity_y[i + 1u], c, false, x + 1u == w - 1u)
+            + nb_term(ol, link_mu(ol, m0, mu_fv(i - 1u)), velocity_y[i - 1u], c, false, x == 1u)
+            + nb_term(od, link_mu(od, m0, mu_fv(i + w)), velocity_y[i + w], c, true, false)
+            + nb_term(oup, link_mu(oup, m0, mu_fv(i - w)), velocity_y[i - w], c, true, false);
+        nv = c + k * lap / (0.5 * (rho_visc(i) + rho_visc(i + w)));
     }
 
     scratch[i] = nu;
@@ -926,6 +991,9 @@ fn k_of(i: u32) -> f32 {
     if (is_solid(i)) {
         return params.k_solid;
     }
+    if (params.varprops == 1u) {
+        return params.k_fluid * law_factor(params.cond_law, params.cond_a, params.cond_b, temp_get(i));
+    }
     return params.k_fluid;
 }
 
@@ -941,8 +1009,8 @@ fn k_face(a: u32, b: u32) -> f32 {
 }
 
 // Flux (masse, ρT) à travers la face « droite » (stride 1) / « basse » (stride w) de la cellule k, en cellules/s·kg/m³.
-// Un seul flux par face, partagé par ses deux cellules voisines (masse conservée exactement) ; ρT utilise le même
-// flux de masse ρ_face·u. ρ_face et T_face : MUSCL van Leer (muscl = 1) ou upwind.
+// Un seul flux par face, partagé par ses deux cellules voisines (masse conservée exactement).
+// ρ_face et (ρT)_face : MUSCL van Leer (muscl = 1) ou upwind.
 fn mt_flux(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> vec2<f32> {
     if (uf == 0.0) {
         return vec2<f32>(0.0, 0.0);
@@ -956,8 +1024,10 @@ fn mt_flux(k: u32, stride: u32, along: u32, len: u32, uf: f32) -> vec2<f32> {
     }
     let has = p.z != NO_CELL;
     let rf = recon(rho_get(p.x), rho_get(p.y), ruu, has);
-    let tf = recon(temp_get(p.x), temp_get(p.y), tuu, has);
-    return vec2<f32>(uf * rf, uf * rf * tf);
+    // ρT reconstruit directement (et non ρ_face·T_face) : en low-Mach ρT = P_th/r est quasi uniforme, une interface
+    // chaud/froid ne crée donc pas d'écart à l'EOS (voir cpu.rs, thermo_substep_conservative)
+    let rtf = recon(rho_get(p.x) * temp_get(p.x), rho_get(p.y) * temp_get(p.y), ruu * tuu, has);
+    return vec2<f32>(uf * rf, uf * rtf);
 }
 
 // T de la face (hors low-Mach conservatif), pour l'advection non conservative

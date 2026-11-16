@@ -4,3 +4,5 @@ pub mod cpu;
 pub mod materials;
 #[cfg(test)]
 pub mod benchmarks;
+#[cfg(test)]
+pub mod lowmach_regression_tests;

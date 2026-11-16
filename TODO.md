@@ -10,20 +10,16 @@ Pression thermodynamique uniforme : l’effet de la stratification hydrostatique
 2D uniquement. La turbulence 2D (cascade inverse) diffère de la 3D, et il n’y a pas de modèle de sous-maille.
 
 L’énergie cinétique diminue : où part-elle ?
-Dans ton code, elle part dans cinq puits, dont aucun n’alimente la température :
-Dissipation numérique de l’advection semi-lagrangienne. C’est de loin le puits principal à cette résolution, et il n’a pas de contrepartie physique.
-Projection. Ton pinceau clic droit injecte une vitesse non solénoïdale, et la projection retire la partie compressible. Dans un vrai gaz, cette énergie deviendrait des ondes sonores, puis de la chaleur.
-Parois no-slip, avec le même mécanisme que la viscosité et la dissipation numérique.
 Limiteur vmax et mesure : ton KE est calculé avec la vitesse moyennée aux centres de cellules, ce qui sous-estime l’énergie des modes à petite échelle.
 
 ## Prioritaire
 
-Advection moins diffusive (MacCormack ou BFECC) : elle réduirait les +8 % de vitesse de la cavité à Ra = 1e5.
 GPU résident : ne plus recopier tout l’état à chaque pas.
 
-Viscosité variable : μ constant, ν = μ/ρ
-Propriétés dépendant de T : k(T), μ(T) avec une loi de Sutherland pour l’air.
-Advection moins diffusive : la semi-lagrangienne bilinéaire lisse beaucoup les panaches. MacCormack ou BFECC améliorent nettement le rendu visuel pour un coût modéré.
+Tenseur de contraintes. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. Les inclure demande de réécrire le traitement des parois, et je peux le faire si tu veux ce niveau de fidélité.
+cp et D. cp et la diffusion du traceur restent constants. Pour l’air, cp varie d’environ 3 % de 300 à 600 K.
+Retard d’un pas. Les propriétés sont évaluées sur la température du début de pas.
+Benchmarks. Je n’ai pas relancé ton benchmarks.rs. L’effet est négligeable dans la cavité à ΔT = 10 K, mais lance-le pour confirmer, en particulier le test de conduction à 600 K.
 
  - plus d'exemples de materiaux (miel)
  - créateur personnalisé de matériaux
