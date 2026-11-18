@@ -1,5 +1,5 @@
 Propriétés du fluide
-ν, k, cp sont constants. Pour un gaz, μ ∝ T^0,7 environ et k ∝ T^0,8, donc ν varie fortement avec T et P. Pour le miel, ν(T) est énorme.
+k, cp sont constants. Pour un gaz, μ ∝ T^0,7 environ et k ∝ T^0,8, donc ν varie fortement avec T et P. Pour le miel, ν(T) est énorme.
 Le liquide n’a ni compressibilité, ni ébullition, ni cavitation. L’eau est monophasique : pas de surface libre, de vagues ni d’éclaboussures.
 Le traceur est passif : il ne change ni la densité, ni la masse molaire, ni la chaleur spécifique. Un « panache de fumée chaude » ne se comporte donc pas comme un mélange réel.
 Il n’y a pas de rayonnement, alors qu’il domine à 1000 K ou plus. Pas de combustion, ni de changement de phase, ni d’humidité.
@@ -14,12 +14,20 @@ Limiteur vmax et mesure : ton KE est calculé avec la vitesse moyennée aux cent
 
 ## Prioritaire
 
+ - intégration egui (plusieurs solides, fluides (eau, miel, huile) en meme temps (miscibilité, ...))
+ - plusieurs matériaux de fluides en meme temps
+ - réactions chimiques (ajoutées par l'utilisateur)
+
+advection Rudman / Raessi–Pitsch
+
 GPU résident : ne plus recopier tout l’état à chaque pas.
 
-Tenseur de contraintes. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. Les inclure demande de réécrire le traitement des parois, et je peux le faire si tu veux ce niveau de fidélité.
+Tenseur de contraintes. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. 
+Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. 
+Les inclure demande de réécrire le traitement des parois, et je peux le faire si tu veux ce niveau de fidélité.
 cp et D. cp et la diffusion du traceur restent constants. Pour l’air, cp varie d’environ 3 % de 300 à 600 K.
 Retard d’un pas. Les propriétés sont évaluées sur la température du début de pas.
-Benchmarks. Je n’ai pas relancé ton benchmarks.rs. L’effet est négligeable dans la cavité à ΔT = 10 K, mais lance-le pour confirmer, en particulier le test de conduction à 600 K.
+Benchmarks. L’effet est négligeable dans la cavité à ΔT = 10 K, mais lance-le pour confirmer, en particulier le test de conduction à 600 K.
 
  - plus d'exemples de materiaux (miel)
  - créateur personnalisé de matériaux
@@ -27,7 +35,8 @@ Benchmarks. Je n’ai pas relancé ton benchmarks.rs. L’effet est négligeable
 
 1. encodeur de conditions initiales, fenetre séparé pour faire des experiences précises, pas à pas, en tout sauvegardant, exemple : 
    - je veux de la température là, puis j'accélère ici, puis je lance la simulation sur 5s puis j'arrête et je sauvegarde des statistiques.
-2. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
+   -> trouver une "interface" ou un moyen d'implémenter ça ?
+3. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
 3. PCG (Ax = b) ? pas sur
 5. Teleporter() kind of broken, destination size is not customizable.
 

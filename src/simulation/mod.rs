@@ -2,6 +2,17 @@ pub mod fluid;
 pub mod gpu;
 pub mod cpu;
 pub mod materials;
+pub mod mp_advect;
+pub mod mp_force;
+pub mod mp_pressure;
+pub mod mp_step;
+pub mod mp_thermo;
+pub mod multiphase;
+pub mod phases;
+pub mod vof;
+
+#[cfg(test)]
+pub mod mp_tests;
 #[cfg(test)]
 pub mod benchmarks;
 #[cfg(test)]
