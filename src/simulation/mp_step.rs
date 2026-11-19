@@ -46,10 +46,25 @@ impl MultiphaseSim {
         let dt = self.choose_dt();
         let (un, vn) = (self.u.clone(), self.v.clone());
         // 2. prédiction de vitesse
-        let (mut us, mut vs) = self.advect_velocity(dt);
-        self.add_forces(dt, &mut us, &mut vs);
-        // 3. masses, énergie (avec uⁿ)
-        self.advect_mass_energy(dt);
+        let (us, vs);
+        if self.conservative_momentum {
+            // forces évaluées sur l'état n, puis masses/énergie, puis quantité de mouvement avec les MÊMES flux de masse
+            let mut fx = vec![0.0; self.u.len()];
+            let mut fy = vec![0.0; self.v.len()];
+            self.add_forces(dt, &mut fx, &mut fy);
+            self.advect_mass_energy(dt);
+            let (mut ua, mut va) = self.advect_momentum();
+            for (a, f) in ua.iter_mut().zip(&fx) { *a += *f; }
+            for (a, f) in va.iter_mut().zip(&fy) { *a += *f; }
+            us = ua;
+            vs = va;
+        } else {
+            let (mut a, mut b) = self.advect_velocity(dt);
+            self.add_forces(dt, &mut a, &mut b);
+            self.advect_mass_energy(dt);
+            us = a;
+            vs = b;
+        }
         // 4. conduction + changement de phase sur l'état advecté
         self.refresh();
         self.conduct(dt);

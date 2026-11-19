@@ -64,6 +64,12 @@ pub struct MultiphaseSim {
     /// masse transformée liquide→vapeur cumulée par paire (kg/m), pour les bilans
     pub transferred: Vec<f64>,
     pub(crate) step_count: usize,
+    /// flux de masse total (toutes phases) à travers chaque face de cellule pendant le dernier advect_mass_energy (kg/m³ de cellule, + = vers +x / +y)
+    pub(crate) mfx: Vec<f64>,
+    pub(crate) mfy: Vec<f64>,
+    pub(crate) m_tot_old: Vec<f64>,
+    /// advection de la quantité de mouvement conservative, cohérente avec les flux de masse du VOF (défaut) ; false = semi-lagrangien
+    pub conservative_momentum: bool,
 }
 
 impl MultiphaseSim {
@@ -110,6 +116,10 @@ impl MultiphaseSim {
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
             step_count: 0,
+            mfx: vec![0.0; (nx + 1) * ny],
+            mfy: vec![0.0; nx * (ny + 1)],
+            m_tot_old: vec![0.0; n],
+            conservative_momentum: true,
         }
     }
 

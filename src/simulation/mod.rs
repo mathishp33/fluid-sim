@@ -10,6 +10,7 @@ pub mod mp_thermo;
 pub mod multiphase;
 pub mod phases;
 pub mod vof;
+pub mod mp_gpu_params;
 
 #[cfg(test)]
 pub mod mp_tests;
@@ -17,3 +18,5 @@ pub mod mp_tests;
 pub mod benchmarks;
 #[cfg(test)]
 pub mod lowmach_regression_tests;
+pub mod mp_view;
+pub mod gpu_multiphase;

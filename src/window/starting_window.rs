@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::simulation::fluid::{Boundary, BoundaryType};
 use crate::simulation::materials::{FluidKind, FluidMaterial};
+use crate::simulation::mp_view::MpScenario;
 
 const CELL_SIZES: [(f32, &str); 4] = [(1e-3, "1 mm"), (1e-2, "1 cm"), (1e-1, "10 cm"), (1.0, "1 m")];
 
@@ -22,6 +23,10 @@ pub struct SimulationSettings {
     pub right_boundary: Boundary,
     pub top_boundary: Boundary,
     pub bottom_boundary: Boundary,
+    /// true : solveur multiphasique (eau / air / vapeur / huile / solides) au lieu du solveur mono-fluide
+    pub multiphase: bool,
+    /// indice du scénario multiphasique (voir `MpScenario::ALL`)
+    pub mp_scenario: usize,
 }
 
 impl Default for SimulationSettings {
@@ -39,6 +44,8 @@ impl Default for SimulationSettings {
             right_boundary: Boundary::wall(),
             top_boundary: Boundary::wall(),
             bottom_boundary: Boundary::wall(),
+            multiphase: false,
+            mp_scenario: 0,
         }
     }
 }
@@ -67,22 +74,36 @@ impl StartingGui {
                 ui.heading("Fluid Simulation Settings");
                 ui.add_space(8.0);
 
+                ui.checkbox(&mut self.settings.multiphase, "Multiphase solver (water / air / steam / oil / solids, free surface)");
+                if self.settings.multiphase {
+                    let sc = MpScenario::from_index(self.settings.mp_scenario);
+                    ComboBox::from_label("Scenario").selected_text(sc.name()).show_ui(ui, |ui| {
+                        for (i, s) in MpScenario::ALL.iter().enumerate() {
+                            ui.selectable_value(&mut self.settings.mp_scenario, i, s.name());
+                        }
+                    });
+                    ui.weak("Uses width, height, precision, cell size and gravity below (gravity 0 → 9.81 m/s²). A boundary set to Outlet opens to 1 atm; Inlet is not supported in this mode. Typical: cell size 1 cm, precision 10.");
+                }
+                ui.add_space(4.0);
+
                 ui.add(egui::Slider::new(&mut self.settings.width, 100..=1920).text("Width"));
                 ui.add(egui::Slider::new(&mut self.settings.height, 100..=1080).text("Height"));
 
-                let kind_name = match self.settings.material.kind {
-                    FluidKind::Gas => "Air (gas, low-Mach)",
-                    FluidKind::Liquid => "Water (liquid)",
-                };
-                ComboBox::from_label("Fluid preset").selected_text(kind_name)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(false, "Air (gas, low-Mach)").clicked() { self.settings.material = FluidMaterial::air(); }
-                        if ui.selectable_label(false, "Water (liquid)").clicked() { self.settings.material = FluidMaterial::water(); }
-                    });
-                ui.add(egui::Slider::new(&mut self.settings.material.viscosity, 1e-7..=1e-3).logarithmic(true).text("ν (m²/s)"));
-                ui.add(egui::Slider::new(&mut self.settings.material.conductivity, 0.01..=400.0).logarithmic(true).text("k fluid (W/m/K)"));
-                ui.add(egui::Slider::new(&mut self.settings.material.solid_conductivity, 0.01..=400.0).logarithmic(true).text("k solid (W/m/K)"));
-                ui.add(egui::Slider::new(&mut self.settings.material.t_ref, 200.0..=500.0).text("T ambient (K)"));
+                if !self.settings.multiphase {
+                    let kind_name = match self.settings.material.kind {
+                        FluidKind::Gas => "Air (gas, low-Mach)",
+                        FluidKind::Liquid => "Water (liquid)",
+                    };
+                    ComboBox::from_label("Fluid preset").selected_text(kind_name)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(false, "Air (gas, low-Mach)").clicked() { self.settings.material = FluidMaterial::air(); }
+                            if ui.selectable_label(false, "Water (liquid)").clicked() { self.settings.material = FluidMaterial::water(); }
+                        });
+                    ui.add(egui::Slider::new(&mut self.settings.material.viscosity, 1e-7..=1e-3).logarithmic(true).text("ν (m²/s)"));
+                    ui.add(egui::Slider::new(&mut self.settings.material.conductivity, 0.01..=400.0).logarithmic(true).text("k fluid (W/m/K)"));
+                    ui.add(egui::Slider::new(&mut self.settings.material.solid_conductivity, 0.01..=400.0).logarithmic(true).text("k solid (W/m/K)"));
+                    ui.add(egui::Slider::new(&mut self.settings.material.t_ref, 200.0..=500.0).text("T ambient (K)"));
+                }
                 ui.add(egui::Slider::new(&mut self.settings.gravity, 0.0..=30.0).text("Gravity (m/s²)"));
 
                 let current = CELL_SIZES.iter()
@@ -100,7 +121,9 @@ impl StartingGui {
                                  self.settings.width as f32 / p * self.settings.dx,
                                  self.settings.height as f32 / p * self.settings.dx));
 
-                ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
+                if !self.settings.multiphase {
+                    ui.add(egui::Slider::new(&mut self.settings.pressure_iters, 0..=200).text("Pressure Iterations"));
+                }
 
                 ComboBox::from_label("Precision (pixels)")
                     .selected_text(format!("{}", self.settings.precision))
@@ -116,11 +139,13 @@ impl StartingGui {
                 boundary_ui(ui, "Top Boundary", &mut self.settings.top_boundary, dx);
                 boundary_ui(ui, "Bottom Boundary", &mut self.settings.bottom_boundary, dx);
 
-                ui.label("Max Tracer Color");
-                let c = self.settings.max_tracer_color;
-                let mut rgb = [c[0], c[1], c[2]];
-                ui.color_edit_button_srgb(&mut rgb);
-                self.settings.max_tracer_color = [rgb[0], rgb[1], rgb[2], 255];
+                if !self.settings.multiphase {
+                    ui.label("Max Tracer Color");
+                    let c = self.settings.max_tracer_color;
+                    let mut rgb = [c[0], c[1], c[2]];
+                    ui.color_edit_button_srgb(&mut rgb);
+                    self.settings.max_tracer_color = [rgb[0], rgb[1], rgb[2], 255];
+                }
 
                 ui.add_space(8.0);
                 if ui.button("Launch Simulation").clicked() {

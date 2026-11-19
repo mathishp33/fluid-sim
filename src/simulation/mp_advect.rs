@@ -241,6 +241,7 @@ impl MultiphaseSim {
             }
             let (d, r) = (donor[f], recv[f]);
             let mut ef = 0.0;
+            let mut mtot = 0.0;
             for k in 0..np {
                 let fk = ff[f * np + k];
                 if fk == 0.0 {
@@ -257,6 +258,7 @@ impl MultiphaseSim {
                 };
                 let _ = p_d;
                 let mf = fk * rho_d;
+                mtot += mf;
                 ef += mf * self.reg.phases[k].e_int(t_d);
                 if d != usize::MAX {
                     aw[k][d] -= fk;
@@ -270,6 +272,11 @@ impl MultiphaseSim {
                 } else {
                     self.boundary_flux[k] -= mf * a2;
                 }
+            }
+            {
+                let (fi_, fj_) = (f % fi, f / fi);
+                let sgn = if dir == 0 { self.u[self.uidx(fi_, fj_)] } else { self.v[self.vidx(fi_, fj_)] }.signum();
+                if dir == 0 { let q = self.uidx(fi_, fj_); self.mfx[q] += sgn * mtot; } else { let q = self.vidx(fi_, fj_); self.mfy[q] += sgn * mtot; }
             }
             if d != usize::MAX {
                 self.e[d] -= ef;
@@ -299,9 +306,99 @@ impl MultiphaseSim {
         let n = self.nx * self.ny;
         let mut aw: Vec<Vec<f64>> = (0..np).map(|k| self.alpha[k].clone()).collect();
         let _ = n;
+        self.mfx.iter_mut().for_each(|v| *v = 0.0);
+        self.mfy.iter_mut().for_each(|v| *v = 0.0);
+        self.m_tot_old = (0..n).map(|c| (0..np).map(|k| self.mass[k][c]).sum()).collect();
         let first = self.step_count % 2;
         for s in 0..2 {
             self.plic_sweep((first + s) % 2, dt, &mut aw);
         }
+    }
+}
+
+fn minmod(a: f64, b: f64) -> f64 {
+    if a * b <= 0.0 { 0.0 } else if a.abs() < b.abs() { a } else { b }
+}
+
+impl MultiphaseSim {
+    /// Advection CONSERVATIVE de la quantité de mouvement ρ_f·u sur les volumes de contrôle des faces, avec les flux de masse
+    /// du VOF (mfx, mfy) : ρ_f,nouveau = ρ_f − Σ flux de masse exactement, donc la vitesse d'une face d'air n'est jamais
+    /// « contaminée » par celle de l'eau voisine (Rudman 1998). Valeur transportée : reconstruction minmod d'ordre 2.
+    /// À appeler APRÈS advect_mass_energy (masses déjà mises à jour). Renvoie (u, v) advectés, sans forces.
+    pub(crate) fn advect_momentum(&self) -> (Vec<f64>, Vec<f64>) {
+        let (nx, ny) = (self.nx, self.ny);
+        let np = self.reg.phases.len();
+        let mnew = |c: usize| -> f64 { (0..np).map(|k| self.mass[k][c]).sum::<f64>() };
+        let mold = &self.m_tot_old;
+        let (u0, v0) = (&self.u, &self.v);
+        let mut un = u0.clone();
+        let mut vn = v0.clone();
+        let ux = |i: isize, j: isize| u0[(j.clamp(0, ny as isize - 1) as usize) * (nx + 1) + i.clamp(0, nx as isize) as usize];
+        let vy = |i: isize, j: isize| v0[(j.clamp(0, ny as isize) as usize) * nx + i.clamp(0, nx as isize - 1) as usize];
+        // composante u : faces intérieures 1..nx-1
+        for j in 0..ny {
+            for i in 1..nx {
+                let (a, b) = (j * nx + i - 1, j * nx + i);
+                if self.is_solid(a) || self.is_solid(b) { continue; }
+                let (ii, jj) = (i as isize, j as isize);
+                let rho_old = 0.5 * (mold[a] + mold[b]);
+                let rho_new = 0.5 * (mnew(a) + mnew(b));
+                // frontières en x : centres des cellules i-1 (gauche) et i (droite)
+                let fr = 0.5 * (self.mfx[j * (nx + 1) + i] + self.mfx[j * (nx + 1) + i + 1]);
+                let fl = 0.5 * (self.mfx[j * (nx + 1) + i - 1] + self.mfx[j * (nx + 1) + i]);
+                let edge = |lo: isize| -> f64 { // valeur transportée entre u(lo) et u(lo+1) ; flux défini par l'appelant
+                    let _ = lo; 0.0
+                };
+                let _ = edge;
+                let carry_x = |f: f64, lo: isize| -> f64 {
+                    if f >= 0.0 { ux(lo, jj) + 0.5 * minmod(ux(lo, jj) - ux(lo - 1, jj), ux(lo + 1, jj) - ux(lo, jj)) }
+                    else { ux(lo + 1, jj) - 0.5 * minmod(ux(lo + 1, jj) - ux(lo, jj), ux(lo + 2, jj) - ux(lo + 1, jj)) }
+                };
+                // frontières en y : coins (i, j) bas et (i, j+1) haut
+                let fb = 0.5 * (self.mfy[j * nx + i - 1] + self.mfy[j * nx + i]);
+                let ft = 0.5 * (self.mfy[(j + 1) * nx + i - 1] + self.mfy[(j + 1) * nx + i]);
+                let carry_y = |f: f64, lo: isize| -> f64 { // entre u(i,lo) et u(i,lo+1)
+                    if f >= 0.0 { ux(ii, lo) + 0.5 * minmod(ux(ii, lo) - ux(ii, lo - 1), ux(ii, lo + 1) - ux(ii, lo)) }
+                    else { ux(ii, lo + 1) - 0.5 * minmod(ux(ii, lo + 1) - ux(ii, lo), ux(ii, lo + 2) - ux(ii, lo + 1)) }
+                };
+                let (cr, cl) = (carry_x(fr, ii), carry_x(fl, ii - 1));
+                let (ct, cb) = (if j + 1 < ny { carry_y(ft, jj) } else { ux(ii, jj) }, if j > 0 { carry_y(fb, jj - 1) } else { ux(ii, jj) });
+                let (ft_, fb_) = (if j + 1 < ny { ft } else { 0.0 }, if j > 0 { fb } else { 0.0 });
+                let q = rho_old * u0[j * (nx + 1) + i] - (fr * cr - fl * cl) - (ft_ * ct - fb_ * cb);
+                let (lo, hi) = (ux(ii, jj).min(ux(ii - 1, jj)).min(ux(ii + 1, jj)).min(ux(ii, jj - 1)).min(ux(ii, jj + 1)),
+                                ux(ii, jj).max(ux(ii - 1, jj)).max(ux(ii + 1, jj)).max(ux(ii, jj - 1)).max(ux(ii, jj + 1)));
+                if rho_new > 1e-8 { un[j * (nx + 1) + i] = (q / rho_new).clamp(lo, hi); }
+            }
+        }
+        // composante v : faces intérieures 1..ny-1
+        for j in 1..ny {
+            for i in 0..nx {
+                let (a, b) = ((j - 1) * nx + i, j * nx + i);
+                if self.is_solid(a) || self.is_solid(b) { continue; }
+                let (ii, jj) = (i as isize, j as isize);
+                let rho_old = 0.5 * (mold[a] + mold[b]);
+                let rho_new = 0.5 * (mnew(a) + mnew(b));
+                let ft = 0.5 * (self.mfy[j * nx + i] + self.mfy[(j + 1) * nx + i]);
+                let fb = 0.5 * (self.mfy[(j - 1) * nx + i] + self.mfy[j * nx + i]);
+                let carry_y = |f: f64, lo: isize| -> f64 {
+                    if f >= 0.0 { vy(ii, lo) + 0.5 * minmod(vy(ii, lo) - vy(ii, lo - 1), vy(ii, lo + 1) - vy(ii, lo)) }
+                    else { vy(ii, lo + 1) - 0.5 * minmod(vy(ii, lo + 1) - vy(ii, lo), vy(ii, lo + 2) - vy(ii, lo + 1)) }
+                };
+                let fr = 0.5 * (self.mfx[j * (nx + 1) + i + 1] + self.mfx[(j - 1) * (nx + 1) + i + 1]);
+                let fl = 0.5 * (self.mfx[j * (nx + 1) + i] + self.mfx[(j - 1) * (nx + 1) + i]);
+                let carry_x = |f: f64, lo: isize| -> f64 { // entre v(lo,j) et v(lo+1,j)
+                    if f >= 0.0 { vy(lo, jj) + 0.5 * minmod(vy(lo, jj) - vy(lo - 1, jj), vy(lo + 1, jj) - vy(lo, jj)) }
+                    else { vy(lo + 1, jj) - 0.5 * minmod(vy(lo + 1, jj) - vy(lo, jj), vy(lo + 2, jj) - vy(lo + 1, jj)) }
+                };
+                let (ct, cb) = (carry_y(ft, jj), carry_y(fb, jj - 1));
+                let (cr, cl) = (if i + 1 < nx { carry_x(fr, ii) } else { vy(ii, jj) }, if i > 0 { carry_x(fl, ii - 1) } else { vy(ii, jj) });
+                let (fr_, fl_) = (if i + 1 < nx { fr } else { 0.0 }, if i > 0 { fl } else { 0.0 });
+                let q = rho_old * v0[j * nx + i] - (ft * ct - fb * cb) - (fr_ * cr - fl_ * cl);
+                let (lo, hi) = (vy(ii, jj).min(vy(ii, jj - 1)).min(vy(ii, jj + 1)).min(vy(ii - 1, jj)).min(vy(ii + 1, jj)),
+                                vy(ii, jj).max(vy(ii, jj - 1)).max(vy(ii, jj + 1)).max(vy(ii - 1, jj)).max(vy(ii + 1, jj)));
+                if rho_new > 1e-8 { vn[j * nx + i] = (q / rho_new).clamp(lo, hi); }
+            }
+        }
+        (un, vn)
     }
 }
