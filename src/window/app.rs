@@ -1,11 +1,11 @@
 use crate::window::main_window::{FluidWindow, WindowAction};
+use crate::window::multiphase_window::MultiphaseWindow;
 use crate::window::starting_window::{load_settings, StartingGui};
 
-/// Application racine : une seule fenêtre eframe (wgpu) qui affiche
-/// soit l'écran de configuration, soit la simulation.
+
 pub struct App {
     starting: StartingGui,
-    simulation: Option<FluidWindow>,
+    simulation: Option<MultiphaseWindow>,
     theme_set: bool,
 }
 
@@ -32,7 +32,9 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         } else if let Some(settings) = self.starting.ui(ctx) {
-            self.simulation = Some(FluidWindow::new(&settings));
+            if settings.multiphase {
+                self.simulation = Some(MultiphaseWindow::new(&settings));
+            }
             ctx.request_repaint();
         }
     }

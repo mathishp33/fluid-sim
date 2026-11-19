@@ -3,17 +3,58 @@ Le low-Mach filtre les ondes acoustiques et les chocs. C’est voulu, mais le so
 Pression thermodynamique uniforme : l’effet de la stratification hydrostatique sur ρ et sur le travail de pression est négligé. C’est acceptable pour quelques mètres.
 2D uniquement. La turbulence 2D (cascade inverse) diffère de la 3D, et il n’y a pas de modèle de sous-maille.
 
+
+POUR LE BUG :
+CONFIGURATION : 
+ - Rupture de barrage 
+ - CPU f64
+ - CFL : 0.40
+ - dt_max : 0.010
+ - gravité : 9.5 m²/s
+ - Tension de surface
+ - Viscosité
+ - Conduction thermique
+ - Changement de phase
+ - Quantité de mouvement conservative
+ - Cell size : 1cm
+ - Precision : 5
+ - Resolution : 800x600
+DESCRIPTION : 
+De la pression énorme se créée ce qui transforme l'eau en vapeur, 
+   la simulation ne veut pas se remettre en route grâce au garde-fou anti NaN.
+Ce bug arrive plus souvent avec le GPU en f32.
+MON AVIS:
+ - la precision de 5 met trop de stress sur la simulation. 
+ -> Il faut trouver le point faible qui cause ce crash et le fix.
+ -> Peut-être qu'il faut revoir l'architecture/la codebase entière.
+
 ## Prioritaire
 
- - intégration egui (plusieurs solides, fluides (eau, miel, huile) en meme temps (miscibilité, ...))
- - plusieurs matériaux de fluides en meme temps
+# PROCHAIN
+Fait la Cinétique chimique avec ce que tu as anoncé. 
+Puis ajoute la possibilité d'avoir des flammes/explosions.
+
+
+
+Faire dépendre la diffusivité de la paire de fluides, au lieu d’une valeur par fluide.
+Ajouter une enthalpie de mélange.
+Ajouter la dissolution d’un gaz dans un liquide (loi de Henry). 
+C’est l’usage naturel du cas gaz + liquide miscibles, aujourd’hui seulement signalé par un avertissement.
+
+METTRE GPU EN F64, TOUT EN F64
+
+ - Door / Valve CellEffect !!!!!!!!
+ - Compressor !!!!
+ - plus de CellEffect !!!!
+
  - réactions chimiques (ajoutées par l'utilisateur)
 
 advection Rudman / Raessi–Pitsch
 
+IMPLEMENTER TENSION LIQUIDE/LIQUIDE
 GPU résident : ne plus recopier tout l’état à chaque pas.
 
-Tenseur de contraintes. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. 
+TENSEUR DE CONTRAINTES. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. 
 Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. 
 Les inclure demande de réécrire le traitement des parois, et je peux le faire si tu veux ce niveau de fidélité.
 cp et D. cp et la diffusion du traceur restent constants. Pour l’air, cp varie d’environ 3 % de 300 à 600 K.

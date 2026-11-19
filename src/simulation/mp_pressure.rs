@@ -10,6 +10,9 @@
 
 use super::multiphase::{Bc, MultiphaseSim};
 
+/// pression absolue minimale d'une cellule fluide (Pa)
+pub(crate) const P_FLOOR: f64 = 10.0;
+
 struct Stencil {
     diag: Vec<f64>,
     ae: Vec<f64>,
@@ -80,12 +83,34 @@ impl MultiphaseSim {
                 };
             }
         }
+        for (f, p) in self.pf_u.iter().enumerate() {
+            if !p.is_nan() {
+                un[f] = *p;
+            }
+        }
+        for (f, p) in self.pf_v.iter().enumerate() {
+            if !p.is_nan() {
+                vn[f] = *p;
+            }
+        }
         (un, vn)
     }
 
     pub(crate) fn divergence_of(&self, u: &[f64], v: &[f64], i: usize, j: usize) -> f64 {
         let (nx, dx) = (self.nx, self.dx);
         (u[j * (nx + 1) + i + 1] - u[j * (nx + 1) + i] + v[(j + 1) * nx + i] - v[j * nx + i]) / dx
+    }
+
+    /// Couplage de pression entre deux cellules voisines a, b à travers une face : 0 = aucun (solide, face à vitesse imposée),
+    /// 1 = couplage complet, 2 = Dirichlet (une des deux est épinglée : δp = 0 de son côté, terme de diagonale seulement)
+    fn link(&self, a: usize, b: usize, fixed: bool) -> u8 {
+        if fixed || self.is_solid(a) || self.is_solid(b) {
+            0
+        } else if self.pinned(a) || self.pinned(b) {
+            2
+        } else {
+            1
+        }
     }
 
     fn build_stencil(&self, kappa: &[f64], dt: f64) -> Stencil {
@@ -95,15 +120,18 @@ impl MultiphaseSim {
         for j in 0..ny {
             for i in 0..nx {
                 let c = j * nx + i;
-                if self.is_solid(c) {
-                    continue;
+                if self.is_solid(c) || self.pinned(c) {
+                    continue; // ligne identité (δp = 0)
                 }
                 let mut d = kappa[c] / dt;
                 // est
                 if i + 1 < nx {
-                    if !self.is_solid(c + 1) {
+                    let k = self.link(c, c + 1, self.face_u_fixed(self.uidx(i + 1, j)));
+                    if k > 0 {
                         let t = dt / (self.face_rho_x(i + 1, j) * dx * dx);
-                        s.ae[c] = t;
+                        if k == 1 {
+                            s.ae[c] = t;
+                        }
                         d += t;
                     }
                 } else if let Bc::Open { .. } = self.bc[1] {
@@ -111,7 +139,7 @@ impl MultiphaseSim {
                 }
                 // ouest
                 if i > 0 {
-                    if !self.is_solid(c - 1) {
+                    if self.link(c - 1, c, self.face_u_fixed(self.uidx(i, j))) > 0 {
                         d += dt / (self.face_rho_x(i, j) * dx * dx);
                     }
                 } else if let Bc::Open { .. } = self.bc[0] {
@@ -119,9 +147,12 @@ impl MultiphaseSim {
                 }
                 // nord
                 if j + 1 < ny {
-                    if !self.is_solid(c + nx) {
+                    let k = self.link(c, c + nx, self.face_v_fixed(self.vidx(i, j + 1)));
+                    if k > 0 {
                         let t = dt / (self.face_rho_y(i, j + 1) * dx * dx);
-                        s.an[c] = t;
+                        if k == 1 {
+                            s.an[c] = t;
+                        }
                         d += t;
                     }
                 } else if let Bc::Open { .. } = self.bc[3] {
@@ -129,7 +160,7 @@ impl MultiphaseSim {
                 }
                 // sud
                 if j > 0 {
-                    if !self.is_solid(c - nx) {
+                    if self.link(c - nx, c, self.face_v_fixed(self.vidx(i, j))) > 0 {
                         d += dt / (self.face_rho_y(i, j) * dx * dx);
                     }
                 } else if let Bc::Open { .. } = self.bc[2] {
@@ -254,6 +285,10 @@ impl MultiphaseSim {
                 if self.is_solid(c) {
                     continue;
                 }
+                if self.pinned(c) {
+                    kappa[c] = 1.0;
+                    continue; // cellule épinglée : δp = 0
+                }
                 let (_, _, g0) = self.cell_closure(c, p_start[c], t_star[c]);
                 let tk = t_star[c] + g0 * (pk[c] - p_start[c]);
                 let (v, kap, _) = self.cell_closure(c, pk[c], tk);
@@ -266,7 +301,7 @@ impl MultiphaseSim {
             for j in 0..ny {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    if self.is_solid(c) {
+                    if self.is_solid(c) || self.pinned(c) {
                         continue;
                     }
                     let d_new = self.divergence_of(&ut, &vt, i, j);
@@ -278,12 +313,15 @@ impl MultiphaseSim {
             total_it += self.pcg(&st, &b, &mut dp);
             let mut dmax = 0.0f64;
             for c in 0..n {
-                if !self.is_solid(c) {
+                if !self.is_solid(c) && !self.pinned(c) {
                     pk[c] += dp[c];
-                    // un gaz ne peut pas être en tension : garde-fou de l'itération de Newton
-                    let gas: f64 = (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].is_gas()).map(|k| self.alpha[k][c]).sum();
-                    if gas > 1e-6 && pk[c] < 10.0 {
-                        pk[c] = 10.0;
+                    // Plancher de pression : aucun fluide ne descend sous P_FLOOR (vide / cavitation). Avant, seules les cellules contenant
+                    // du gaz étaient protégées : une cellule quasi vide d'eau seule pouvait atteindre −8e7 Pa, puis le travail de pression
+                    // −dt·p·∇·u sur sa capacité calorifique minuscule donnait T = −1.6e5 K → NaN.
+                    if !pk[c].is_finite() {
+                        pk[c] = p_start[c].max(P_FLOOR);
+                    } else if pk[c] < P_FLOOR {
+                        pk[c] = P_FLOOR;
                     }
                     dmax = dmax.max(dp[c].abs());
                 }

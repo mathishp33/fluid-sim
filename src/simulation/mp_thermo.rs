@@ -33,6 +33,7 @@ impl MultiphaseSim {
             .map(|c| if self.is_solid(c) { 0.0 } else { (0..self.reg.phases.len()).map(|k| self.mass[k][c] * self.reg.phases[k].e0).sum() })
             .collect();
         let mut t: Vec<f64> = (0..n).map(|c| (self.e[c] - off[c]) / cap[c].max(1e-30)).collect();
+        let iso: Vec<usize> = (0..n).filter(|&c| self.is_solid(c) && matches!(self.thermal[c], super::mp_cells::MpThermal::Isothermal(_))).collect();
         for _ in 0..nsub {
             let mut de = vec![0.0; n];
             for j in 0..ny {
@@ -56,6 +57,13 @@ impl MultiphaseSim {
                 self.e[c] += ds * de[c];
                 t[c] += ds * de[c] / cap[c].max(1e-30);
             }
+            // solides isothermes : température imposée à chaque sous-pas (ils sont des sources / puits de chaleur idéaux)
+            for c in iso.iter().copied() {
+                if let super::mp_cells::MpThermal::Isothermal(tc) = self.thermal[c] {
+                    t[c] = tc;
+                    self.e[c] = cap[c] * tc;
+                }
+            }
         }
         for c in 0..n {
             self.temp[c] = t[c];
@@ -77,7 +85,7 @@ impl MultiphaseSim {
             let (liq, vap) = (pc.liquid, pc.vapor);
             let (pl, pv) = (&self.reg.phases[liq].clone(), &self.reg.phases[vap].clone());
             for c in 0..n {
-                if self.is_solid(c) {
+                if self.is_solid(c) || self.pinned(c) {
                     continue;
                 }
                 let (ml, mv) = (self.mass[liq][c], self.mass[vap][c]);
@@ -153,11 +161,13 @@ impl MultiphaseSim {
         for j in 0..self.ny {
             for i in 0..self.nx {
                 let c = self.idx(i, j);
-                if self.is_solid(c) {
+                if self.is_solid(c) || self.pinned(c) {
                     continue;
                 }
-                let d = self.divergence_of(&self.u, &self.v, i, j);
-                self.e[c] -= dt * self.p[c] * d;
+                // dt·∇·u = variation relative de volume du pas : au-delà de ±50 % la cellule est quasi vide / en cavitation violente,
+                // où p·∇·u n'a plus de sens physique (et divise par une capacité calorifique qui tend vers 0)
+                let d = (dt * self.divergence_of(&self.u, &self.v, i, j)).clamp(-0.5, 0.5) / dt;
+                self.e[c] -= dt * self.p[c].max(0.0) * d;
             }
         }
     }

@@ -7,6 +7,7 @@
 //! Les fractions volumiques α_k sont DÉRIVÉES : α_k = (m_k/ρ_k(p,T)) / Σ_j (m_j/ρ_j(p,T)).
 //! Une seule pression et une seule température par cellule (équilibre mécanique et thermique des phases).
 
+use super::mp_cells::{MpEffect, MpInlet, MpThermal, PinInfo, TpMix};
 use super::phases::{PhaseKind, Registry};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,6 +71,26 @@ pub struct MultiphaseSim {
     pub(crate) m_tot_old: Vec<f64>,
     /// advection de la quantité de mouvement conservative, cohérente avec les flux de masse du VOF (défaut) ; false = semi-lagrangien
     pub conservative_momentum: bool,
+    /// vitesse au-delà de laquelle un pas est jugé aberrant (m/s) — déclenche le retour arrière avec sous-pas
+    pub speed_limit: f64,
+    /// nombre de pas annulés puis refaits avec un dt plus petit (état invalide : NaN, T hors plage, masse négative, vitesse aberrante)
+    pub rollbacks: usize,
+    /// true si même le plus petit sous-pas reste invalide : l'état n'avance plus (la fenêtre se met en pause au lieu de passer en NaN)
+    pub diverged: bool,
+
+    // ---- cellules spéciales, solides thermiques, entrées (voir mp_cells.rs)
+    /// effet de chaque cellule fluide (puits, émetteur, accélérateur, téléporteur)
+    pub special: Vec<Option<MpEffect>>,
+    /// comportement thermique de chaque cellule solide
+    pub thermal: Vec<MpThermal>,
+    /// entrée de bord par côté (gauche, droite, bas, haut) ; n'agit que si le bord est fermé (`Bc::Wall`)
+    pub inlet: [Option<MpInlet>; 4],
+    /// chaleur injectée par les solides chauffants depuis le début (J par m de profondeur)
+    pub energy_input: f64,
+    pub(crate) pin: Vec<Option<PinInfo>>,
+    pub(crate) pf_u: Vec<f64>,
+    pub(crate) pf_v: Vec<f64>,
+    pub(crate) tp_mix: TpMix,
 }
 
 impl MultiphaseSim {
@@ -120,6 +141,17 @@ impl MultiphaseSim {
             mfy: vec![0.0; nx * (ny + 1)],
             m_tot_old: vec![0.0; n],
             conservative_momentum: true,
+            speed_limit: 1000.0,
+            rollbacks: 0,
+            diverged: false,
+            special: vec![None; n],
+            thermal: vec![MpThermal::Passive; n],
+            inlet: [None; 4],
+            energy_input: 0.0,
+            pin: vec![None; n],
+            pf_u: vec![f64::NAN; (nx + 1) * ny],
+            pf_v: vec![f64::NAN; nx * (ny + 1)],
+            tp_mix: TpMix::new(),
         }
     }
 
@@ -278,6 +310,7 @@ impl MultiphaseSim {
     /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule.
     pub fn refresh(&mut self) {
         let np = self.reg.phases.len();
+        let mut vk = vec![0.0f64; np];
         for c in 0..self.nx * self.ny {
             if self.is_solid(c) {
                 let s = &self.reg.solids[self.solid[c] as usize];
@@ -291,7 +324,6 @@ impl MultiphaseSim {
             self.temp[c] = t;
             let p = self.p[c];
             let mut vol = 0.0;
-            let mut vk = [0.0f64; 8];
             for k in 0..np {
                 vk[k] = self.mass[k][c].max(0.0) / self.reg.phases[k].rho(p, t);
                 vol += vk[k];

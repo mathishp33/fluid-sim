@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::simulation::fluid::{Boundary, BoundaryType};
 use crate::simulation::materials::{FluidKind, FluidMaterial};
-use crate::simulation::mp_view::MpScenario;
+use crate::simulation::mp_materials::MaterialLibrary;
+use crate::simulation::mp_view::{build_scenario_with, MpScenario};
+use crate::window::material_editor::MaterialEditor;
 
 const CELL_SIZES: [(f32, &str); 4] = [(1e-3, "1 mm"), (1e-2, "1 cm"), (1e-1, "10 cm"), (1.0, "1 m")];
 
@@ -27,6 +29,10 @@ pub struct SimulationSettings {
     pub multiphase: bool,
     /// indice du scénario multiphasique (voir `MpScenario::ALL`)
     pub mp_scenario: usize,
+    /// matériaux du mode multiphasique (fluides, solides, miscibilité, changements de phase, réactions) : modifiables, persistés ici
+    pub materials: MaterialLibrary,
+    /// nom du fluide qui entre par un bord réglé sur « Inlet » en mode multiphasique
+    pub mp_inlet_fluid: String,
 }
 
 impl Default for SimulationSettings {
@@ -46,6 +52,8 @@ impl Default for SimulationSettings {
             bottom_boundary: Boundary::wall(),
             multiphase: false,
             mp_scenario: 0,
+            materials: MaterialLibrary::default(),
+            mp_inlet_fluid: "eau".into(),
         }
     }
 }
@@ -59,11 +67,12 @@ impl SimulationSettings {
 
 pub struct StartingGui {
     pub settings: SimulationSettings,
+    editor: MaterialEditor,
 }
 
 impl StartingGui {
     pub fn new(settings: SimulationSettings) -> Self {
-        Self { settings }
+        Self { settings, editor: MaterialEditor::default() }
     }
 
     pub fn ui(&mut self, ctx: &egui::Context) -> Option<SimulationSettings> {
@@ -82,7 +91,16 @@ impl StartingGui {
                             ui.selectable_value(&mut self.settings.mp_scenario, i, s.name());
                         }
                     });
-                    ui.weak("Uses width, height, precision, cell size and gravity below (gravity 0 → 9.81 m/s²). A boundary set to Outlet opens to 1 atm; Inlet is not supported in this mode. Typical: cell size 1 cm, precision 10.");
+                    ui.weak("Uses width, height, precision, cell size and gravity below (gravity 0 → 9.81 m/s²). A boundary set to Outlet opens to 1 atm; Inlet injects the fluid chosen below at the given velocity. Typical: cell size 1 cm, precision 10.");
+                    let names: Vec<String> = self.settings.materials.fluids.iter().map(|p| p.name.clone()).collect();
+                    ComboBox::from_label("Inlet fluid").selected_text(self.settings.mp_inlet_fluid.clone()).show_ui(ui, |ui| {
+                        for n in &names {
+                            ui.selectable_value(&mut self.settings.mp_inlet_fluid, n.clone(), n);
+                        }
+                    });
+                    ui.collapsing("Materials (fluids, solids, miscibility, phase change, reactions)", |ui| {
+                        self.editor.ui(ui, &mut self.settings.materials);
+                    });
                 }
                 ui.add_space(4.0);
 
@@ -148,7 +166,16 @@ impl StartingGui {
                 }
 
                 ui.add_space(8.0);
-                if ui.button("Launch Simulation").clicked() {
+                // le scénario choisi doit pouvoir être construit avec les matériaux courants (sinon on dit lequel manque)
+                let problem = if self.settings.multiphase {
+                    build_scenario_with(&self.settings.materials, MpScenario::from_index(self.settings.mp_scenario), 8, 8, 0.01, 9.81).err()
+                } else {
+                    None
+                };
+                if let Some(e) = &problem {
+                    ui.colored_label(egui::Color32::from_rgb(230, 80, 80), format!("✖ {e}"));
+                }
+                if ui.add_enabled(problem.is_none(), egui::Button::new("Launch Simulation")).clicked() {
                     save_settings(&self.settings);
                     launch = Some(self.settings.clone());
                 }
@@ -201,7 +228,7 @@ pub fn load_settings() -> SimulationSettings {
     }
 }
 
-fn save_settings(settings: &SimulationSettings) {
+pub fn save_settings(settings: &SimulationSettings) {
     let path = "config.json";
 
     match serde_json::to_string_pretty(settings) {

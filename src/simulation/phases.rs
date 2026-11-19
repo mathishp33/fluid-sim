@@ -12,15 +12,19 @@
 //!    (la chaleur latente restituée par le bilan d'énergie est donc celle utilisée par p_sat : cohérence thermodynamique).
 
 use super::materials::PropertyLaw;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Nombre maximal de phases fluides gérées par le solveur CPU (le GPU est limité à `NPMAX` = 4, voir `gpu_multiphase`).
+pub const MAX_PHASES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PhaseKind {
     Gas,
     Liquid,
 }
 
 /// Masse volumique d'un liquide à la pression de référence p0, en fonction de T.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Thermal {
     /// ρ = rho0 / (1 + β (T − t0))
     Beta { rho0: f64, t0: f64, beta: f64 },
@@ -53,13 +57,13 @@ impl Thermal {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Eos {
     IdealGas { r_spec: f64 },
     Tait { p0: f64, b: f64, n: f64, thermal: Thermal },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Phase {
     pub name: String,
     pub kind: PhaseKind,
@@ -72,6 +76,22 @@ pub struct Phase {
     pub t_ref: f64,
     pub e0: f64,           // décalage d'énergie interne (J/kg), fixé par `Registry::add_phase_change`
     pub sigma: f64,        // tension superficielle de CE liquide face aux gaz (N/m) ; 0 pour un gaz
+    /// couleur d'affichage (RGB 0..1)
+    #[serde(default = "default_color")]
+    pub color: [f32; 3],
+    /// masse molaire (kg/mol) : sert aux bilans stœchiométriques des réactions chimiques
+    #[serde(default = "default_molar_mass")]
+    pub molar_mass: f64,
+    /// coefficient de diffusion (m²/s) dans les mélanges miscibles (diffusion de Fick entre espèces d'un même groupe)
+    #[serde(default)]
+    pub diffusivity: f64,
+}
+
+fn default_color() -> [f32; 3] {
+    [0.6, 0.6, 0.6]
+}
+fn default_molar_mass() -> f64 {
+    0.018
 }
 
 impl Phase {
@@ -136,6 +156,9 @@ impl Phase {
             t_ref: 293.15,
             e0: 0.0,
             sigma: 0.0,
+            color: [0.05, 0.07, 0.11],
+            molar_mass: 0.02897,
+            diffusivity: 2.0e-5,
         }
     }
     pub fn water() -> Phase {
@@ -151,6 +174,9 @@ impl Phase {
             t_ref: 293.15,
             e0: 0.0,
             sigma: 0.0728,
+            color: [0.10, 0.42, 0.88],
+            molar_mass: 0.018015,
+            diffusivity: 1.0e-9,
         }
     }
     /// Vapeur d'eau (gaz parfait, R = 461.5 J/(kg·K))
@@ -167,6 +193,9 @@ impl Phase {
             t_ref: 373.15,
             e0: 0.0,
             sigma: 0.0,
+            color: [0.90, 0.93, 0.96],
+            molar_mass: 0.018015,
+            diffusivity: 2.5e-5,
         }
     }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
@@ -188,24 +217,33 @@ impl Phase {
             t_ref: 293.15,
             e0: 0.0,
             sigma: 0.032,
+            color: [0.85, 0.62, 0.10],
+            molar_mass: 0.885,
+            diffusivity: 1.0e-10,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Solid {
     pub name: String,
     pub rho: f64,
     pub cp: f64,
     pub conductivity: f64,
+    #[serde(default = "default_solid_color")]
+    pub color: [f32; 3],
+}
+
+fn default_solid_color() -> [f32; 3] {
+    [0.6, 0.6, 0.6]
 }
 
 impl Solid {
     pub fn steel() -> Solid {
-        Solid { name: "acier".into(), rho: 7850.0, cp: 490.0, conductivity: 45.0 }
+        Solid { name: "acier".into(), rho: 7850.0, cp: 490.0, conductivity: 45.0, color: [0.55, 0.57, 0.60] }
     }
     pub fn glass() -> Solid {
-        Solid { name: "verre".into(), rho: 2500.0, cp: 840.0, conductivity: 1.0 }
+        Solid { name: "verre".into(), rho: 2500.0, cp: 840.0, conductivity: 1.0, color: [0.62, 0.82, 0.80] }
     }
     pub fn rho_cp(&self) -> f64 {
         self.rho * self.cp
@@ -250,11 +288,52 @@ impl PhaseChange {
     }
 }
 
+/// Réaction chimique entre phases du registre (STRUCTURE seulement : le moteur cinétique n'est pas encore implémenté,
+/// `MultiphaseSim::react_step` est un point d'accroche vide). Le changement de phase liquide ↔ vapeur est le cas particulier
+/// « A → B » dont la cinétique est gérée à part (`PhaseChange`) ; il pourra être ré-exprimé comme une `Reaction`.
+///
+/// Conventions prévues pour la cinétique : vitesse molaire r = A·exp(−Ea/(R T))·Π_i c_i^{ordre_i} (c = m_i/M_i, mol/m³),
+/// dm_i = −ν_i M_i r dt (réactifs), +ν_j M_j r dt (produits), chaleur : Δh_r = Σ_prod ν M e0 − Σ_réact ν M e0 (J/mol de réaction)
+/// — l'énergie interne `e` est donc conservée EXACTEMENT par la seule bascule de masse (les décalages e0 jouent le rôle des
+/// enthalpies de formation, exactement comme pour la chaleur latente).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub name: String,
+    /// (indice de phase, coefficient stœchiométrique ν > 0)
+    pub reactants: Vec<(usize, f64)>,
+    pub products: Vec<(usize, f64)>,
+    /// facteur pré-exponentiel A (unités selon l'ordre global)
+    pub pre_exp: f64,
+    /// énergie d'activation Ea (J/mol)
+    pub activation_energy: f64,
+    /// ordre partiel par réactif (même longueur que `reactants` ; vide = ordre = ν)
+    #[serde(default)]
+    pub orders: Vec<f64>,
+}
+
+impl Reaction {
+    /// bilan de masse stœchiométrique : (Σ ν M réactifs, Σ ν M produits) en kg
+    pub fn mass_balance(&self, phases: &[Phase]) -> (f64, f64) {
+        let sum = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass)).sum::<f64>();
+        (sum(&self.reactants), sum(&self.products))
+    }
+    /// chaleur de réaction (J/mol, > 0 = endothermique) déduite des décalages d'énergie e0 : Σ ν M e0 (produits) − Σ ν M e0 (réactifs)
+    pub fn heat_of_reaction(&self, phases: &[Phase]) -> f64 {
+        let sum = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass * p.e0)).sum::<f64>();
+        sum(&self.products) - sum(&self.reactants)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     pub phases: Vec<Phase>,
     pub solids: Vec<Solid>,
     pub changes: Vec<PhaseChange>,
+    /// paires (a < b) de phases MISCIBLES (se mélangent à l'échelle moléculaire : pas d'interface entre elles). La relation est
+    /// utilisée par fermeture transitive : voir `miscible_groups`.
+    pub miscible: Vec<(usize, usize)>,
+    /// réactions chimiques (non simulées pour l'instant)
+    pub reactions: Vec<Reaction>,
 }
 
 impl Registry {
@@ -291,6 +370,115 @@ impl Registry {
     }
     pub fn change_for_liquid(&self, liquid: usize) -> Option<&PhaseChange> {
         self.changes.iter().find(|c| c.liquid == liquid)
+    }
+
+    // ---------------------------------------------------------------- miscibilité
+    pub fn is_miscible(&self, a: usize, b: usize) -> bool {
+        a != b && self.miscible.contains(&(a.min(b), a.max(b)))
+    }
+    pub fn set_miscible(&mut self, a: usize, b: usize, on: bool) {
+        if a == b {
+            return;
+        }
+        let pair = (a.min(b), a.max(b));
+        self.miscible.retain(|&q| q != pair);
+        if on {
+            self.miscible.push(pair);
+        }
+    }
+    /// Groupes de phases mutuellement miscibles (fermeture transitive des paires déclarées). Chaque phase appartient à exactement un
+    /// groupe (les non-miscibles sont des singletons). Ordre : par plus petit indice de membre ; membres triés.
+    pub fn miscible_groups(&self) -> Vec<Vec<usize>> {
+        let n = self.phases.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            let mut r = x;
+            while p[r] != r {
+                r = p[r];
+            }
+            let mut y = x;
+            while p[y] != r {
+                let nx = p[y];
+                p[y] = r;
+                y = nx;
+            }
+            r
+        }
+        for &(a, b) in &self.miscible {
+            if a < n && b < n {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = vec![];
+        let mut idx = vec![usize::MAX; n];
+        for k in 0..n {
+            let r = find(&mut parent, k);
+            if idx[r] == usize::MAX {
+                idx[r] = groups.len();
+                groups.push(vec![]);
+            }
+            groups[idx[r]].push(k);
+        }
+        groups
+    }
+
+    /// Cohérence du registre : liste de messages (vide = OK). Ne modifie rien.
+    pub fn validate(&self) -> Vec<String> {
+        let mut w = vec![];
+        let n = self.phases.len();
+        if n == 0 {
+            w.push("aucun fluide défini".to_string());
+        }
+        if n > MAX_PHASES {
+            w.push(format!("{n} fluides : maximum {MAX_PHASES}"));
+        }
+        for (i, a) in self.phases.iter().enumerate() {
+            if self.phases[..i].iter().any(|b| b.name == a.name) {
+                w.push(format!("nom de fluide en double : « {} »", a.name));
+            }
+        }
+        for (i, a) in self.solids.iter().enumerate() {
+            if self.solids[..i].iter().any(|b| b.name == a.name) {
+                w.push(format!("nom de solide en double : « {} »", a.name));
+            }
+        }
+        for g in self.miscible_groups().iter().filter(|g| g.len() > 1) {
+            let names: Vec<&str> = g.iter().map(|&k| self.phases[k].name.as_str()).collect();
+            let gas = g.iter().filter(|&&k| self.phases[k].is_gas()).count();
+            if gas != 0 && gas != g.len() {
+                w.push(format!("groupe miscible {names:?} mélange gaz et liquides : un gaz n'est pas miscible à un liquide (utiliser le changement de phase / la dissolution)"));
+            }
+            for (x, &a) in g.iter().enumerate() {
+                for &b in &g[x + 1..] {
+                    if !self.is_miscible(a, b) {
+                        w.push(format!("« {} » et « {} » sont déclarés miscibles indirectement (transitivité) : traités comme miscibles", self.phases[a].name, self.phases[b].name));
+                    }
+                }
+            }
+        }
+        for c in &self.changes {
+            if c.liquid >= n || c.vapor >= n {
+                w.push("changement de phase : indice de fluide invalide".to_string());
+            }
+        }
+        for r in &self.reactions {
+            if r.reactants.is_empty() || r.products.is_empty() {
+                w.push(format!("réaction « {} » : réactifs ou produits vides", r.name));
+                continue;
+            }
+            if r.reactants.iter().chain(r.products.iter()).any(|&(k, nu)| k >= n || !(nu > 0.0)) {
+                w.push(format!("réaction « {} » : fluide inexistant ou coefficient ≤ 0", r.name));
+                continue;
+            }
+            let (m_in, m_out) = r.mass_balance(&self.phases);
+            if (m_in - m_out).abs() > 1e-3 * m_in.max(m_out) {
+                w.push(format!("réaction « {} » : masse non conservée ({:.4} kg → {:.4} kg par mole de réaction)", r.name, m_in, m_out));
+            }
+        }
+        w
     }
 }
 

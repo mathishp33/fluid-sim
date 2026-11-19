@@ -123,8 +123,11 @@ impl MultiphaseSim {
     fn plic_sweep(&mut self, dir: usize, dt: f64, aw: &mut Vec<Vec<f64>>) {
         let (nx, ny) = (self.nx, self.ny);
         let np = self.reg.phases.len();
-        let order = self.phase_order();
-        // 1. PLIC des phases mixtes (sur α normalisé)
+        // groupes de phases miscibles : un groupe se comporte comme UNE phase pour l'interface (pas d'interface entre membres miscibles)
+        let groups = self.reg.miscible_groups();
+        let ng = groups.len();
+        let gorder = self.group_order(&groups);
+        // 1. PLIC des groupes mixtes (sur α normalisé)
         let n = nx * ny;
         let mut an = aw.clone();
         for c in 0..n {
@@ -133,15 +136,16 @@ impl MultiphaseSim {
                 an[k][c] = an[k][c].clamp(0.0, 1.0) / s;
             }
         }
-        let mut plic: Vec<Vec<Option<Plic>>> = vec![vec![None; n]; np];
-        for k in 0..np {
+        let ag: Vec<Vec<f64>> = groups.iter().map(|g| (0..n).map(|c| g.iter().map(|&k| an[k][c]).sum::<f64>().min(1.0)).collect()).collect();
+        let mut plic: Vec<Vec<Option<Plic>>> = vec![vec![None; n]; ng];
+        for g in 0..ng {
             for j in 0..ny {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    let a = an[k][c];
+                    let a = ag[g][c];
                     if a > 1e-10 && a < 1.0 - 1e-10 && !self.is_solid(c) {
-                        let (gx, gy) = self.youngs_grad(&an[k], i, j);
-                        plic[k][c] = Some(Plic::new(a, gx, gy));
+                        let (gx, gy) = self.youngs_grad(&ag[g], i, j);
+                        plic[g][c] = Some(Plic::new(a, gx, gy));
                     }
                 }
             }
@@ -153,6 +157,7 @@ impl MultiphaseSim {
         let mut donor = vec![usize::MAX; nf];
         let mut recv = vec![usize::MAX; nf];
         let mut inflow_ghost = vec![false; nf];
+        let mut ghost_t = vec![self.t_ambient; nf];
         for fj_ in 0..fj {
             for fi_ in 0..fi {
                 let f = fj_ * fi + fi_;
@@ -173,38 +178,50 @@ impl MultiphaseSim {
                 recv[f] = r.unwrap_or(usize::MAX);
                 match d {
                     None => {
-                        inflow_ghost[f] = true; // air ambiant entrant
-                        ff[f * np + self.ambient_phase] = xi;
+                        inflow_ghost[f] = true; // fluide entrant : ambiant, ou celui de l'entrée de bord si le bord en a une
+                        let (gp, gt) = self.ghost_source(dir, fi_, fj_);
+                        ff[f * np + gp] = xi;
+                        ghost_t[f] = gt;
                     }
                     Some(dc) => {
                         // bande balayée dans la cellule donneuse (coordonnées unité)
                         let (s0, s1) = if uf > 0.0 { (1.0 - xi, 1.0) } else { (0.0, xi) };
                         let mut rem = xi;
-                        let mut spare = vec![0.0; np];
-                        let pure = (0..np).find(|&k| an[k][dc] >= 1.0 - 1e-10);
-                        if let Some(kp) = pure {
-                            ff[f * np + kp] = xi;
+                        let mut spare = vec![0.0; ng];
+                        let mut fg = vec![0.0; ng];
+                        let pure = (0..ng).find(|&g| ag[g][dc] >= 1.0 - 1e-10);
+                        if let Some(gp) = pure {
+                            fg[gp] = xi;
                         } else {
-                            for (pos, &k) in order.iter().enumerate() {
-                                let a = an[k][dc];
-                                let want = if pos == np - 1 {
+                            for (pos, &g) in gorder.iter().enumerate() {
+                                let a = ag[g][dc];
+                                let want = if pos == ng - 1 {
                                     rem
-                                } else if let Some(pl) = plic[k][dc] {
+                                } else if let Some(pl) = plic[g][dc] {
                                     if dir == 0 { pl.area(s0, s1, 0.0, 1.0) } else { pl.area(0.0, 1.0, s0, s1) }
                                 } else {
                                     0.0
                                 };
                                 let fk = want.min(rem).min(a).max(0.0);
-                                ff[f * np + k] = fk;
+                                fg[g] = fk;
                                 rem -= fk;
-                                spare[k] = a - fk;
+                                spare[g] = a - fk;
                             }
                             if rem > 1e-14 {
                                 let tot: f64 = spare.iter().map(|s| s.max(0.0)).sum();
                                 if tot > 0.0 {
-                                    for k in 0..np {
-                                        ff[f * np + k] += rem * spare[k].max(0.0) / tot;
+                                    for g in 0..ng {
+                                        fg[g] += rem * spare[g].max(0.0) / tot;
                                     }
+                                }
+                            }
+                        }
+                        // flux du groupe → membres, au prorata de leur composition dans la cellule donneuse
+                        for g in 0..ng {
+                            if fg[g] > 0.0 {
+                                let tot = ag[g][dc].max(1e-300);
+                                for &k in &groups[g] {
+                                    ff[f * np + k] = fg[g] * an[k][dc] / tot;
                                 }
                             }
                         }
@@ -249,7 +266,7 @@ impl MultiphaseSim {
                 }
                 let (rho_d, t_d, p_d) = if d == usize::MAX {
                     let pr = if r != usize::MAX { self.p[r] } else { 101325.0 };
-                    (self.reg.phases[k].rho(pr, self.t_ambient), self.t_ambient, pr)
+                    (self.reg.phases[k].rho(pr, ghost_t[f]), ghost_t[f], pr)
                 } else {
                     // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0
                     let rho_eos = self.reg.phases[k].rho(self.p[d], t_old[d]);
@@ -293,10 +310,11 @@ impl MultiphaseSim {
         let _ = Bc::Wall;
     }
 
-    /// Ordre de priorité des phases pour l'allocation des flux : liquides d'abord, gaz ensuite (le dernier prend le reste).
-    pub(crate) fn phase_order(&self) -> Vec<usize> {
-        let mut o: Vec<usize> = (0..self.reg.phases.len()).collect();
-        o.sort_by_key(|&k| if self.reg.phases[k].is_gas() { 1 } else { 0 });
+    /// Ordre de priorité des GROUPES miscibles pour l'allocation des flux : groupes liquides d'abord, gazeux ensuite (le dernier prend le reste).
+    /// Sans miscibilité chaque groupe est une phase : ordre identique à l'ancien `phase_order`.
+    pub(crate) fn group_order(&self, groups: &[Vec<usize>]) -> Vec<usize> {
+        let mut o: Vec<usize> = (0..groups.len()).collect();
+        o.sort_by_key(|&g| if self.reg.phases[groups[g][0]].is_gas() { 1 } else { 0 });
         o
     }
 

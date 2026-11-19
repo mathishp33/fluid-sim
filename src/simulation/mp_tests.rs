@@ -422,3 +422,260 @@ fn export_gpu_case() {
     };
     export_case(&mut s, steps, 3, 400, &out);
 }
+
+/// Un état invalide ne doit JAMAIS se propager : le pas est annulé, refait avec dt/4, dt/16… puis, si rien ne passe, l'état sain
+/// précédent est restauré et `diverged` passe à true (la fenêtre se met alors en pause au lieu de planter sur des NaN).
+#[test]
+fn invalid_step_is_rolled_back_not_propagated() {
+    use super::mp_view::{build_scenario, MpScenario};
+    let mut s = build_scenario(MpScenario::DamBreak, 24, 18, 0.01, 9.81);
+    s.speed_limit = 1e-4; // tout écoulement non nul est jugé « aberrant »
+    let (u0, v0, p0, t0) = (s.u.clone(), s.v.clone(), s.p.clone(), s.time);
+    let dt = s.step();
+    assert_eq!(dt, 0.0);
+    assert!(s.diverged && s.rollbacks >= 5, "rollbacks = {}", s.rollbacks);
+    assert!(s.u.iter().chain(&s.v).chain(&s.p).all(|x| x.is_finite()));
+    assert_eq!((s.time, &s.u, &s.v, &s.p), (t0, &u0, &v0, &p0), "l'état doit être restauré tel quel");
+    assert_eq!(s.step(), 0.0, "une simulation divergée n'avance plus");
+    // et un sim sain ne déclenche aucun retour arrière
+    let mut ok = build_scenario(MpScenario::DamBreak, 24, 18, 0.01, 9.81);
+    for _ in 0..30 {
+        assert!(ok.step() > 0.0);
+    }
+    assert_eq!(ok.rollbacks, 0);
+    assert!(ok.state_is_sane());
+}
+
+// ------------------------------------------------------------------------------------------------ miscibilité
+fn alcohol() -> Phase {
+    let mut a = Phase::water();
+    a.name = "alcool".into();
+    a.eos = super::phases::Eos::Tait { p0: 101325.0, b: 1.0e8, n: 8.0, thermal: super::phases::Thermal::Beta { rho0: 800.0, t0: 293.15, beta: 1.1e-3 } };
+    a.cp = 2400.0;
+    a.sigma = 0.022;
+    a.conductivity = 0.17;
+    a.diffusivity = 1e-5; // artificiellement grand : le test doit voir le mélange en quelques secondes simulées
+    a
+}
+
+/// eau en bas, alcool au-dessus (stable), air tout en haut, boîte fermée
+fn two_liquid_box(miscible: bool) -> (MultiphaseSim, usize, usize, usize) {
+    let mut r = Registry::new();
+    let air = r.add_phase(Phase::air());
+    let eau = r.add_phase(Phase::water());
+    let alc = r.add_phase(alcohol());
+    r.set_miscible(eau, alc, miscible);
+    let mut s = MultiphaseSim::new(8, 24, 0.01, r, air);
+    s.paint_phase(move |_, y| if y < 0.08 { Some(eau) } else if y < 0.18 { Some(alc) } else { Some(air) });
+    s.finalize_init(|_, _| 293.15);
+    (s, air, eau, alc)
+}
+
+#[test]
+fn miscible_liquids_mix_by_diffusion_and_conserve_everything() {
+    let (mut m, _air, eau, alc) = two_liquid_box(true);
+    let (mut n, _, _, _) = two_liquid_box(false);
+    let masses0: Vec<f64> = (0..3).map(|k| m.total_mass(k)).collect();
+    let e0 = m.total_internal_energy();
+    while m.time < 6.0 {
+        m.step();
+    }
+    while n.time < 6.0 {
+        n.step();
+    }
+    assert!(!m.diverged && m.rollbacks == 0, "rollbacks {}", m.rollbacks);
+    // masse de chaque espèce conservée (boîte fermée, pas de changement de phase)
+    for k in 0..3 {
+        assert!((m.total_mass(k) / masses0[k] - 1.0).abs() < 1e-9, "masse {k} : {}", m.total_mass(k) / masses0[k] - 1.0);
+    }
+    assert!((m.total_internal_energy() / e0 - 1.0).abs() < 1e-3, "énergie interne");
+    // alcool dans la tranche j = 0..7 (initialement de l'eau pure) : apparaît par diffusion si miscible, pas sinon
+    let band = |s: &MultiphaseSim, k: usize| -> f64 { (0..8).flat_map(|j| (0..8).map(move |i| (i, j))).map(|(i, j)| s.mass[k][s.idx(i, j)]).sum::<f64>() };
+    let (a_m, a_n) = (band(&m, alc), band(&n, alc));
+    assert!(a_m > 1e-3 * 800.0 * 64.0 * 0.5, "l'alcool n'a pas diffusé vers le bas : {a_m}");
+    assert!(a_n < 1e-3 * a_m.max(1e-30) || a_n < 1e-6, "sans miscibilité l'interface doit rester nette : {a_n} vs {a_m}");
+    // l'eau, elle, monte dans l'ancienne couche d'alcool
+    let w_top = |s: &MultiphaseSim| -> f64 { (8..18).flat_map(|j| (0..8).map(move |i| (i, j))).map(|(i, j)| s.mass[eau][s.idx(i, j)]).sum::<f64>() };
+    assert!(w_top(&m) > 50.0 * w_top(&n).max(1e-9), "{} vs {}", w_top(&m), w_top(&n));
+}
+
+#[test]
+fn miscible_dam_break_conserves_each_species() {
+    let mut r = Registry::new();
+    let air = r.add_phase(Phase::air());
+    let eau = r.add_phase(Phase::water());
+    let alc = r.add_phase(alcohol());
+    r.set_miscible(eau, alc, true);
+    let mut s = MultiphaseSim::new(40, 24, 0.01, r, air);
+    s.paint_phase(move |x, y| if y < 0.10 && x < 0.10 { Some(eau) } else if y < 0.10 && x < 0.20 { Some(alc) } else { Some(air) });
+    s.finalize_init(|_, _| 293.15);
+    let m0: Vec<f64> = (0..3).map(|k| s.total_mass(k)).collect();
+    for _ in 0..200 {
+        s.step();
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    for k in 0..3 {
+        assert!((s.total_mass(k) / m0[k] - 1.0).abs() < 1e-9, "masse {k}");
+    }
+    // l'interface eau/alcool a disparu (mélange) : il existe des cellules contenant les deux
+    let both = (0..40 * 24).filter(|&c| s.alpha[eau][c] > 0.05 && s.alpha[alc][c] > 0.05).count();
+    assert!(both > 0, "aucune cellule mélangée");
+}
+
+// ------------------------------------------------------------------------------------------------ cellules spéciales
+use super::mp_cells::{MpEffect, MpInlet, MpThermal};
+
+fn open_tank(nx: usize, ny: usize, h: f64) -> (MultiphaseSim, usize, usize) {
+    let (mut s, air, eau) = tank(nx, ny, 0.01, h);
+    s.bc[3] = Bc::Open { p: P_ATM };
+    s.finalize_init(|_, _| 293.15);
+    (s, air, eau)
+}
+
+fn run_for(s: &mut MultiphaseSim, t: f64) {
+    while s.time < t {
+        s.step();
+    }
+    assert!(!s.diverged && s.rollbacks == 0, "divergence / retours arrière : {}", s.rollbacks);
+}
+
+#[test]
+fn sink_removes_water_at_the_prescribed_rate_and_balances_mass() {
+    let (mut s, _air, eau) = open_tank(16, 24, 0.12);
+    let c = s.idx(8, 0);
+    let rate = 0.2;
+    s.set_effect(c, Some(MpEffect::Sink { rate }));
+    let m0 = s.total_mass(eau);
+    run_for(&mut s, 0.4);
+    let dm = s.total_mass(eau) - m0;
+    // bilan exact : toute la masse retirée est inscrite dans boundary_flux
+    assert!((dm - s.boundary_flux[eau]).abs() < 1e-9 * m0.abs(), "bilan : Δm = {dm}, flux = {}", s.boundary_flux[eau]);
+    // débit attendu : 3 faces ouvertes (le sud est la paroi) × rate × dx × ρ × t
+    let expect = -998.2 * 3.0 * rate * 0.01 * s.time;
+    assert!(dm < 0.0 && (dm / expect - 1.0).abs() < 0.25, "Δm = {dm}, attendu ≈ {expect}");
+    assert!(s.state_is_sane());
+}
+
+#[test]
+fn emitter_creates_the_chosen_phase_with_exact_bookkeeping() {
+    let (mut s, air, eau) = open_tank(16, 24, 0.0);
+    // aucun liquide au départ : l'émetteur (eau, 1 m/s vers le haut) au fond du réservoir ouvert
+    let c = s.idx(8, 1);
+    s.set_effect(c, Some(MpEffect::Emitter { vx: 0.0, vy: 1.0, phase: eau, temp: 300.0 }));
+    run_for(&mut s, 0.15);
+    let w = s.total_mass(eau);
+    assert!(w > 0.0, "l'émetteur n'a rien créé");
+    assert!((w - s.boundary_flux[eau]).abs() < 1e-9 * w, "bilan eau");
+    let expect = 998.2 * 1.0 * 0.01 * s.time; // ρ · v · dx · t (par m de profondeur)
+    assert!((w / expect - 1.0).abs() < 0.5, "masse émise {w}, attendue ≈ {expect}");
+    // l'eau émise est à la bonne température dans le jet
+    let jet = (2..8).map(|j| s.idx(8, j)).filter(|&c| s.alpha[eau][c] > 0.5).map(|c| s.temp[c]).collect::<Vec<_>>();
+    assert!(!jet.is_empty() && jet.iter().all(|&t| (t - 300.0).abs() < 2.0), "T du jet {jet:?}");
+    let _ = air;
+}
+
+#[test]
+fn accelerator_drives_a_tube_with_the_force_balance_a_times_length_ratio() {
+    // tube d'air (3 cellules de haut, parois haut / bas), extrémités ouvertes à 1 atm : la force de volume ρ·a sur L_acc accélère
+    // toute la colonne (longueur L) : a_eff = a·L_acc/L (incompressible, p identique aux deux bouts)
+    let (mut s, _air, _eau) = tank(40, 3, 0.01, 0.0);
+    s.bc = [Bc::Open { p: P_ATM }, Bc::Open { p: P_ATM }, Bc::Wall, Bc::Wall];
+    s.gravity = [0.0, 0.0];
+    s.finalize_init(|_, _| 293.15);
+    for i in 10..30 {
+        for j in 0..3 {
+            let c = s.idx(i, j);
+            s.set_effect(c, Some(MpEffect::Accelerator { ax: 3.0, ay: 0.0 }));
+        }
+    }
+    run_for(&mut s, 0.05);
+    let expect = 3.0 * 0.5 * s.time;
+    let u_mid = s.u[s.uidx(20, 1)];
+    assert!((u_mid / expect - 1.0).abs() < 0.2, "u = {u_mid}, attendu ≈ {expect}");
+    // hors de la zone accélérée la vitesse est la même (incompressible) : continuité
+    let u_out = s.u[s.uidx(35, 1)];
+    assert!((u_out / u_mid - 1.0).abs() < 0.2, "u_out = {u_out}");
+}
+
+#[test]
+fn teleporter_moves_the_absorbed_fluid_to_its_destination() {
+    let (mut s, _air, eau) = open_tank(24, 24, 0.12);
+    let (src, dst) = (s.idx(5, 4), s.idx(18, 18)); // source dans l'eau, destination dans l'air
+    s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3 }));
+    let m0 = s.total_mass(eau);
+    run_for(&mut s, 0.4);
+    // de l'eau est apparue autour de la destination (dans l'air au départ)
+    let around: f64 = (14..23).flat_map(|j| (14..23).map(move |i| (i, j))).map(|(i, j)| s.mass[eau][s.idx(i, j)]).sum();
+    assert!(around > 1e-3, "rien n'est arrivé à destination : {around}");
+    // bilan : la masse d'eau totale n'a pas été détruite sans compte
+    let dm = s.total_mass(eau) - m0;
+    assert!((dm - s.boundary_flux[eau]).abs() < 1e-9 * m0, "bilan : {dm} vs {}", s.boundary_flux[eau]);
+    // le débit volumique émis est proche du débit aspiré : la masse d'eau nette change peu devant la masse aspirée
+    let sucked = 998.2 * 4.0 * 0.3 * 0.01 * s.time;
+    assert!(dm.abs() < 0.6 * sucked, "Δm = {dm} (aspiré ≈ {sucked})");
+}
+
+#[test]
+fn heater_and_isothermal_solids_follow_their_thermal_mode() {
+    use super::mp_view::{ACIER, VERRE};
+    let reg = super::mp_view::registry();
+    let air = 0;
+    let mut s = MultiphaseSim::new(20, 12, 0.01, reg, air);
+    s.paint_phase(|_, _| Some(air));
+    s.paint_solid(|x, y| if y < 0.03 && x > 0.05 && x < 0.10 { Some(ACIER) } else if y < 0.03 && x > 0.12 && x < 0.17 { Some(VERRE) } else { None });
+    s.finalize_init(|_, _| 293.15);
+    let heater = s.idx(6, 1);
+    let iso = s.idx(14, 1);
+    for c in 0..s.nx * s.ny {
+        if s.solid[c] == ACIER as i32 {
+            s.set_thermal_cell(c, MpThermal::Heater(2e8));
+        }
+        if s.solid[c] == VERRE as i32 {
+            s.set_thermal_cell(c, MpThermal::Isothermal(350.0));
+        }
+    }
+    let e0 = s.total_internal_energy();
+    run_for(&mut s, 0.1);
+    assert!(s.energy_input > 0.0);
+    // ΔT d'un bloc chauffant ≈ P t / (ρ c) (conduction vers l'air négligeable à cette échelle de temps)
+    let expect = 2e8 * s.time / (7850.0 * 490.0);
+    let dt_heater = s.temp[heater] - 293.15;
+    assert!(dt_heater > 0.5 * expect && dt_heater < 1.1 * expect, "ΔT = {dt_heater}, attendu ≈ {expect}");
+    assert!((s.temp[iso] - 350.0).abs() < 1e-6, "T isotherme = {}", s.temp[iso]);
+    // l'air au-dessus du bloc isotherme se réchauffe (puits / source idéale de chaleur)
+    assert!(s.temp[s.idx(14, 3)] > 293.2, "{}", s.temp[s.idx(14, 3)]);
+    // bilan d'énergie : ΔE_interne = chaleur injectée par le chauffage + apport des solides isothermes (positif) ; au moins la première
+    let de = s.total_internal_energy() - e0;
+    assert!(de >= 0.95 * s.energy_input, "ΔE = {de}, chauffage = {}", s.energy_input);
+}
+
+#[test]
+fn inlet_boundary_injects_the_chosen_phase_with_exact_bookkeeping() {
+    let (mut s, _air, eau) = open_tank(24, 16, 0.0);
+    s.bc[0] = Bc::Wall;
+    s.bc[1] = Bc::Open { p: P_ATM };
+    s.inlet[0] = Some(MpInlet { vx: 0.4, vy: 0.0, phase: eau, temp: 310.0, offset: 0 });
+    run_for(&mut s, 0.3);
+    let w = s.total_mass(eau);
+    assert!((w - s.boundary_flux[eau]).abs() < 1e-9 * w.max(1.0), "bilan");
+    let expect = 998.2 * 0.4 * (16.0 * 0.01) * s.time;
+    assert!((w / expect - 1.0).abs() < 0.25, "masse injectée {w}, attendue ≈ {expect}");
+    // l'eau entrante est à 310 K
+    let t = s.temp[s.idx(0, 8)];
+    assert!((t - 310.0).abs() < 3.0, "T d'entrée {t}");
+}
+
+#[test]
+fn extras_survive_a_dam_break_without_nan() {
+    use super::mp_view::{build_scenario, MpScenario};
+    let mut s = build_scenario(MpScenario::DamBreak, 48, 30, 0.01, 9.81);
+    let c = s.idx(40, 3);
+    s.set_effect(c, Some(MpEffect::Sink { rate: 0.5 }));
+    let c = s.idx(2, 25);
+    s.set_effect(c, Some(MpEffect::Emitter { vx: 0.5, vy: 0.0, phase: 1, temp: 293.15 }));
+    s.bc[3] = Bc::Open { p: P_ATM };
+    for _ in 0..150 {
+        s.step();
+    }
+    assert!(!s.diverged && s.state_is_sane());
+}

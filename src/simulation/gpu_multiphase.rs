@@ -30,8 +30,29 @@ pub struct MultiphaseGpu {
     pub newton_iter: u32,
 }
 
+/// Nombre maximal de fluides du solveur GPU (tableau `ph: array<PhaseP, 4>` des shaders).
+pub const GPU_MAX_PHASES: usize = 4;
+
+/// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut). Le GPU ne gère ni les cellules spéciales / entrées de bord /
+/// solides thermiques, ni la miscibilité (groupes de fluides), ni plus de `GPU_MAX_PHASES` fluides : le CPU f64 les gère tous.
+pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
+    if sim.reg.phases.len() > GPU_MAX_PHASES {
+        return Some(format!("{} fluides (le GPU en gère {GPU_MAX_PHASES} au maximum)", sim.reg.phases.len()));
+    }
+    if sim.has_extras() {
+        return Some("cellules spéciales, solides thermiques ou entrées de bord (CPU uniquement)".into());
+    }
+    if !sim.reg.miscible.is_empty() {
+        return Some("fluides miscibles (CPU uniquement)".into());
+    }
+    None
+}
+
 impl MultiphaseGpu {
     pub fn try_new(sim: &MultiphaseSim) -> Option<Self> {
+        if gpu_unsupported_reason(sim).is_some() {
+            return None;
+        }
         let (nx, ny, np) = (sim.nx, sim.ny, sim.reg.phases.len());
         let (header, total, offsets) = gpu_layout_header(nx, ny, np);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });

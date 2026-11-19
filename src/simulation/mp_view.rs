@@ -4,8 +4,12 @@
 //!
 //! Registre commun à tous les scénarios : phases 0 = air, 1 = eau, 2 = vapeur d'eau, 3 = huile ; solides 0 = acier, 1 = verre.
 
+use serde::{Deserialize, Serialize};
+
+use super::mp_cells::{MpEffect, MpThermal};
+use super::mp_materials::{MaterialLibrary, Roles};
 use super::multiphase::{Bc, MultiphaseSim};
-use super::phases::{Phase, PhaseKind, Registry, Solid};
+use super::phases::{Phase, Registry};
 
 pub const AIR: usize = 0;
 pub const EAU: usize = 1;
@@ -15,14 +19,10 @@ pub const ACIER: usize = 0;
 pub const VERRE: usize = 1;
 const P_ATM: f64 = 101325.0;
 
+/// Registre des matériaux PAR DÉFAUT (air, eau, vapeur, huile / acier, verre) : les constantes AIR, EAU… ci-dessus en sont les indices.
+/// Les matériaux de l'utilisateur viennent de `MaterialLibrary` (voir `build_scenario_with`).
 pub fn registry() -> Registry {
-    let (mut r, air, eau, vap) = Registry::water_air_steam();
-    debug_assert_eq!((air, eau, vap), (AIR, EAU, VAPEUR));
-    let huile = r.add_phase(Phase::oil());
-    debug_assert_eq!(huile, HUILE);
-    r.add_solid(Solid::steel());
-    r.add_solid(Solid::glass());
-    r
+    MaterialLibrary::default().build().expect("bibliothèque par défaut valide").registry
 }
 
 // ------------------------------------------------------------------------------------------------ scénarios
@@ -62,47 +62,65 @@ impl MpScenario {
     }
 }
 
-/// Construit un scénario sur une grille nx×ny de maille dx. Les formes sont exprimées en fractions du domaine (valable à toute résolution).
+/// Construit un scénario avec les matériaux PAR DÉFAUT (voir `build_scenario_with` pour une bibliothèque personnalisée).
 pub fn build_scenario(sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f64) -> MultiphaseSim {
+    build_scenario_with(&MaterialLibrary::default(), sc, nx, ny, dx, gravity).expect("scénario avec les matériaux par défaut")
+}
+
+/// Construit un scénario sur une grille nx×ny de maille dx avec la bibliothèque de matériaux de l'utilisateur. Les formes sont exprimées en
+/// fractions du domaine (valable à toute résolution). Les rôles (eau, huile, plaque…) sont retrouvés par nom puis par propriété ; si un
+/// matériau nécessaire manque, l'erreur dit lequel.
+pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f64) -> Result<MultiphaseSim, String> {
+    let built = lib.build()?;
+    let roles = Roles::resolve(&built.registry, built.ambient);
+    let need = |o: Option<usize>, what: &str| -> Result<usize, String> { o.ok_or_else(|| format!("le scénario « {} » nécessite {what} (ajoutez-le dans les matériaux)", sc.name())) };
+    let air = built.ambient;
     let (lx, ly) = (nx as f64 * dx, ny as f64 * dx);
-    let mut s = MultiphaseSim::new(nx, ny, dx, registry(), AIR);
+    let mut s = MultiphaseSim::new(nx, ny, dx, built.registry, air);
     s.gravity = [0.0, -gravity];
     let mut t_fn: Box<dyn Fn(f64, f64) -> f64> = Box::new(|_, _| 293.15);
     match sc {
         MpScenario::DamBreak => {
-            s.paint_phase(move |x, y| if x < 0.25 * lx && y < 0.5 * ly { Some(EAU) } else { Some(AIR) });
+            let eau = need(roles.water, "un liquide")?;
+            s.paint_phase(move |x, y| if x < 0.25 * lx && y < 0.5 * ly { Some(eau) } else { Some(air) });
         }
         MpScenario::DropSplash => {
+            let eau = need(roles.water, "un liquide")?;
             let (cx, cy, r) = (0.5 * lx, 0.62 * ly, 0.09 * lx.min(ly));
             s.paint_phase(move |x, y| {
-                if y < 0.22 * ly || (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(EAU) } else { Some(AIR) }
+                if y < 0.22 * ly || (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(eau) } else { Some(air) }
             });
         }
         MpScenario::Sloshing => {
-            s.paint_phase(move |x, y| if y < 0.4 * ly + 0.04 * ly * (std::f64::consts::PI * x / lx).cos() { Some(EAU) } else { Some(AIR) });
+            let eau = need(roles.water, "un liquide")?;
+            s.paint_phase(move |x, y| if y < 0.4 * ly + 0.04 * ly * (std::f64::consts::PI * x / lx).cos() { Some(eau) } else { Some(air) });
         }
         MpScenario::Boiling => {
             // plaque d'acier chaude (2 cellules) sous 40 % d'eau à 90 °C ; haut ouvert (atmosphère)
+            let eau = need(roles.water, "un liquide")?;
+            let plate = need(roles.plate, "un solide")?;
             let h_plate = 2.0 * dx;
-            s.paint_phase(move |_, y| if y < 0.45 * ly { Some(EAU) } else { Some(AIR) });
-            s.paint_solid(move |x, y| if y < h_plate && x > 0.1 * lx && x < 0.9 * lx { Some(ACIER) } else { None });
+            s.paint_phase(move |_, y| if y < 0.45 * ly { Some(eau) } else { Some(air) });
+            s.paint_solid(move |x, y| if y < h_plate && x > 0.1 * lx && x < 0.9 * lx { Some(plate) } else { None });
             s.bc[3] = Bc::Open { p: P_ATM };
             s.dt_max = 5e-4;
             t_fn = Box::new(move |x, y| if y < h_plate && x > 0.1 * lx && x < 0.9 * lx { 600.0 } else if y < 0.45 * ly { 363.15 } else { 293.15 });
         }
         MpScenario::OilWaterAir => {
+            let eau = need(roles.water, "un premier liquide (eau)")?;
+            let huile = need(roles.oil, "un second liquide (huile)")?;
             let (cx, cy, r) = (0.5 * lx, 0.15 * ly, 0.07 * lx.min(ly));
             s.paint_phase(move |x, y| {
-                if (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(HUILE) } else if y < 0.4 * ly { Some(EAU) } else { Some(AIR) }
+                if (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(huile) } else if y < 0.4 * ly { Some(eau) } else { Some(air) }
             });
         }
         MpScenario::Empty => {
             s.bc[3] = Bc::Open { p: P_ATM };
-            s.paint_phase(|_, _| Some(AIR));
+            s.paint_phase(move |_, _| Some(air));
         }
     }
     s.finalize_init(&*t_fn);
-    s
+    Ok(s)
 }
 
 // ------------------------------------------------------------------------------------------------ pinceaux
@@ -113,6 +131,10 @@ pub enum MpTool {
     EraseSolid,
     Heat,
     Push,
+    /// pose une cellule spéciale (puits, émetteur, accélérateur, téléporteur)
+    Effect(MpEffect),
+    /// efface solide, effet spécial et comportement thermique (la cellule redevient du fluide ambiant)
+    ClearCell,
 }
 
 pub fn tool_name(reg: &Registry, t: MpTool) -> String {
@@ -122,6 +144,8 @@ pub fn tool_name(reg: &Registry, t: MpTool) -> String {
         MpTool::EraseSolid => "Effacer le solide".into(),
         MpTool::Heat => "Chauffer / refroidir".into(),
         MpTool::Push => "Pousser le fluide".into(),
+        MpTool::Effect(e) => format!("Cellule spéciale : {}", e.kind_name()),
+        MpTool::ClearCell => "Effacer solide + effet".into(),
     }
 }
 
@@ -148,9 +172,27 @@ fn set_pure(sim: &mut MultiphaseSim, c: usize, k: usize, t: f64) {
     sim.temp[c] = t;
 }
 
+/// Paramètres d'un coup de pinceau.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolOpts {
+    /// température de pinceau (K) : phases ajoutées, solides, cible du chauffage
+    pub temp: f64,
+    /// vitesse du curseur (m/s, y vers le haut) pour la poussée
+    pub cursor: (f64, f64),
+    /// durée de la trame (s) pour les outils à taux (chauffage, poussée)
+    pub dt: f64,
+    /// comportement thermique donné aux solides posés
+    pub thermal: MpThermal,
+}
+
 /// Applique l'outil sur les cellules `cells` (i, j) ; `temp` = température de pinceau (K) ; `cursor` = vitesse du curseur (m/s, y vers le haut) ;
-/// `dt` = durée de la trame (s) pour les outils à taux (chauffage, poussée).
+/// `dt` = durée de la trame (s) pour les outils à taux (chauffage, poussée). Solides posés : passifs (voir `apply_tool_with`).
 pub fn apply_tool(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, usize)], temp: f64, cursor: (f64, f64), dt: f64) {
+    apply_tool_with(sim, tool, cells, &ToolOpts { temp, cursor, dt, thermal: MpThermal::Passive });
+}
+
+pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, usize)], o: &ToolOpts) {
+    let (temp, cursor, dt) = (o.temp, o.cursor, o.dt);
     let (nx, ny) = (sim.nx, sim.ny);
     for &(i, j) in cells {
         if i >= nx || j >= ny {
@@ -165,12 +207,14 @@ pub fn apply_tool(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, usize)
             }
             MpTool::Solid(s) => {
                 sim.solid[c] = s as i32;
+                sim.special[c] = None;
                 for k in 0..sim.reg.phases.len() {
                     sim.mass[k][c] = 0.0;
                     sim.alpha[k][c] = 0.0;
                 }
                 sim.e[c] = sim.reg.solids[s].rho_cp() * temp;
                 sim.temp[c] = temp;
+                sim.set_thermal_cell(c, o.thermal);
                 let (a, b, cc, d) = (sim.uidx(i, j), sim.uidx(i + 1, j), sim.vidx(i, j), sim.vidx(i, j + 1));
                 sim.u[a] = 0.0;
                 sim.u[b] = 0.0;
@@ -179,9 +223,19 @@ pub fn apply_tool(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, usize)
             }
             MpTool::EraseSolid => {
                 if sim.is_solid(c) {
+                    sim.thermal[c] = MpThermal::Passive;
                     let t = sim.t_ambient;
                     set_pure(sim, c, sim.ambient_phase, t);
                 }
+            }
+            MpTool::ClearCell => sim.clear_cell(c),
+            MpTool::Effect(e) => {
+                if let MpEffect::Teleporter { dest, .. } = e {
+                    if dest == c {
+                        continue;
+                    }
+                }
+                sim.set_effect(c, Some(e));
             }
             MpTool::Heat => {
                 let rate = 1.0 - (-5.0 * dt).exp();
@@ -238,10 +292,11 @@ pub enum MpDisplay {
     Velocity,
     Density,
     Vapor,
+    Divergence,
 }
 
 impl MpDisplay {
-    pub const ALL: [MpDisplay; 6] = [Self::Phases, Self::Pressure, Self::Temperature, Self::Velocity, Self::Density, Self::Vapor];
+    pub const ALL: [MpDisplay; 7] = [Self::Phases, Self::Pressure, Self::Temperature, Self::Velocity, Self::Density, Self::Vapor, Self::Divergence];
     pub fn name(self) -> &'static str {
         match self {
             Self::Phases => "PHASES",
@@ -250,6 +305,7 @@ impl MpDisplay {
             Self::Velocity => "VITESSE",
             Self::Density => "MASSE VOLUMIQUE",
             Self::Vapor => "VAPEUR (fraction)",
+            Self::Divergence => "DIVERGENCE (∇·u)",
         }
     }
     pub fn next(self) -> Self {
@@ -265,28 +321,21 @@ pub struct RenderOpts {
     pub t_scale: f64,
     /// échelle de pression (Pa), 0 = automatique (max |p − 1 atm|)
     pub p_scale: f64,
+    /// surcouche des cellules spéciales (puits rouge, émetteur vert, accélérateur violet, téléporteur bleu / destination cyan) et des
+    /// solides thermiques (isotherme bleu, chauffage orange). Sans elle, les cellules spéciales s'affichent comme du fluide.
+    pub show_effects: bool,
+    /// solides tous blancs au lieu de la couleur de leur matériau (touche I)
+    pub solids_white: bool,
 }
 
-fn phase_rgb(ph: &Phase, k: usize) -> [f32; 3] {
-    match ph.name.as_str() {
-        "air" => [0.05, 0.07, 0.11],
-        "eau" => [0.10, 0.42, 0.88],
-        "vapeur" => [0.90, 0.93, 0.96],
-        "huile" => [0.85, 0.62, 0.10],
-        _ => {
-            let h = (k as f32 * 67.0) % 360.0;
-            let c = hsv(h, 0.7, if ph.kind == PhaseKind::Gas { 0.5 } else { 0.9 });
-            [c[0], c[1], c[2]]
-        }
+impl RenderOpts {
+    pub fn new(display: MpDisplay, t_scale: f64, p_scale: f64) -> Self {
+        RenderOpts { display, t_scale, p_scale, show_effects: false, solids_white: false }
     }
 }
 
-fn solid_rgb(name: &str) -> [f32; 3] {
-    match name {
-        "acier" => [0.55, 0.57, 0.60],
-        "verre" => [0.62, 0.82, 0.80],
-        _ => [0.6, 0.6, 0.6],
-    }
+fn phase_rgb(ph: &Phase) -> [f32; 3] {
+    ph.color
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
@@ -341,10 +390,14 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
             rmax = rmax.max(sim.rho_mix[c]);
         }
     }
+    let mut dmax = 1e-9f64;
     for j in 0..ny {
         for i in 0..nx {
             let (vx, vy) = cell_velocity(sim, i, j);
             smax = smax.max((vx * vx + vy * vy).sqrt());
+            if !sim.is_solid(sim.idx(i, j)) {
+                dmax = dmax.max(sim.divergence_of(&sim.u, &sim.v, i, j).abs());
+            }
         }
     }
     for j in 0..ny {
@@ -353,8 +406,14 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
             let rgb: [f32; 3] = if sim.is_solid(c) {
                 if o.display == MpDisplay::Temperature {
                     temp_rgb((sim.temp[c] - sim.t_ambient) / o.t_scale.max(1e-3))
+                } else if o.solids_white {
+                    [1.0, 1.0, 1.0]
                 } else {
-                    solid_rgb(&sim.reg.solids[sim.solid[c] as usize].name)
+                    match (o.show_effects, sim.thermal[c]) {
+                        (true, MpThermal::Isothermal(_)) => [0x20 as f32 / 255.0, 0x60 as f32 / 255.0, 0xd0 as f32 / 255.0],
+                        (true, MpThermal::Heater(_)) => [0xd0 as f32 / 255.0, 0x80 as f32 / 255.0, 0x20 as f32 / 255.0],
+                        _ => sim.reg.solids[sim.solid[c] as usize].color,
+                    }
                 }
             } else {
                 match o.display {
@@ -362,7 +421,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                         let mut col = [0.0f32; 3];
                         for k in 0..sim.reg.phases.len() {
                             let a = sim.alpha[k][c].clamp(0.0, 1.0) as f32;
-                            let pc = phase_rgb(&sim.reg.phases[k], k);
+                            let pc = phase_rgb(&sim.reg.phases[k]);
                             for q in 0..3 {
                                 col[q] += a * pc[q];
                             }
@@ -380,6 +439,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                         let x = if rmax > rmin { ((sim.rho_mix[c].ln() - rmin.ln()) / (rmax.ln() - rmin.ln())).clamp(0.0, 1.0) as f32 } else { 0.0 };
                         [x, x, x]
                     }
+                    MpDisplay::Divergence => signed_rgb(sim.divergence_of(&sim.u, &sim.v, i, j), dmax),
                     MpDisplay::Vapor => {
                         let a: f64 = vapor_ids.iter().map(|&k| sim.alpha[k][c]).sum::<f64>().clamp(0.0, 1.0);
                         let a = a as f32;
@@ -393,6 +453,29 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
             out[p + 1] = (rgb[1].clamp(0.0, 1.0) * 255.0) as u8;
             out[p + 2] = (rgb[2].clamp(0.0, 1.0) * 255.0) as u8;
             out[p + 3] = 255;
+        }
+    }
+    if o.show_effects {
+        let mut put = |c: usize, rgb: [u8; 3]| {
+            let (i, j) = (c % nx, c / nx);
+            let p = ((ny - 1 - j) * nx + i) * 4;
+            out[p] = rgb[0];
+            out[p + 1] = rgb[1];
+            out[p + 2] = rgb[2];
+        };
+        for c in 0..nx * ny {
+            match sim.special[c] {
+                Some(MpEffect::Sink { .. }) => put(c, [0xff, 0x00, 0x00]),
+                Some(MpEffect::Emitter { .. }) => put(c, [0x00, 0xff, 0x00]),
+                Some(MpEffect::Accelerator { .. }) => put(c, [0xff, 0x00, 0xff]),
+                Some(MpEffect::Teleporter { dest, .. }) => {
+                    put(c, [0x00, 0x00, 0xff]);
+                    if dest < nx * ny && !sim.is_solid(dest) && sim.special[dest].is_none() {
+                        put(dest, [0x00, 0xff, 0xff]);
+                    }
+                }
+                None => {}
+            }
         }
     }
 }
@@ -421,6 +504,12 @@ pub struct MpStats {
     pub p_max: f64,
     pub speed_max: f64,
     pub finite: bool,
+    /// chaleur injectée par les solides chauffants (J/m)
+    pub heat_input: f64,
+    /// nombre de cellules spéciales
+    pub effects: usize,
+    /// pas annulés puis refaits (filet de sécurité numérique)
+    pub rollbacks: usize,
 }
 
 pub fn compute_stats(sim: &MultiphaseSim) -> MpStats {
@@ -449,6 +538,9 @@ pub fn compute_stats(sim: &MultiphaseSim) -> MpStats {
         }
     }
     st.speed_max = sim.max_speed();
+    st.heat_input = sim.energy_input;
+    st.effects = sim.special_count();
+    st.rollbacks = sim.rollbacks;
     st.finite = st.speed_max.is_finite() && st.p_min.is_finite() && st.p_max.is_finite() && st.t_max.is_finite() && st.kinetic.is_finite();
     st
 }
@@ -459,7 +551,24 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
     let mut v = vec![("Position".to_string(), format!("{i}, {j}")), ("Température (K)".into(), format!("{:.2}", sim.temp[c]))];
     if sim.is_solid(c) {
         v.push(("Solide".into(), sim.reg.solids[sim.solid[c] as usize].name.clone()));
+        match sim.thermal[c] {
+            MpThermal::Passive => {}
+            MpThermal::Isothermal(t) => v.push(("Thermique".into(), format!("isotherme {t:.1} K"))),
+            MpThermal::Heater(w) => v.push(("Thermique".into(), format!("chauffage {w:.3e} W/m³"))),
+        }
         return v;
+    }
+    match sim.special[c] {
+        Some(MpEffect::Sink { rate }) => v.push(("Cellule spéciale".into(), format!("puits, aspiration {rate:.3} m/s"))),
+        Some(MpEffect::Emitter { vx, vy, phase, temp }) => v.push((
+            "Cellule spéciale".into(),
+            format!("émetteur {} à {temp:.1} K, v = ({vx:.2}, {vy:.2}) m/s", sim.reg.phases.get(phase).map_or("?", |p| p.name.as_str())),
+        )),
+        Some(MpEffect::Accelerator { ax, ay }) => v.push(("Cellule spéciale".into(), format!("accélérateur ({ax:.2}, {ay:.2}) m/s²"))),
+        Some(MpEffect::Teleporter { dest, speed }) => {
+            v.push(("Cellule spéciale".into(), format!("téléporteur → ({}, {}), {speed:.2} m/s", dest % sim.nx, dest / sim.nx)))
+        }
+        None => {}
     }
     let (vx, vy) = cell_velocity(sim, i, j);
     v.push(("Pression (Pa)".into(), format!("{:.1}", sim.p[c])));
@@ -474,6 +583,123 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
         v.push((format!("T_sat à p ({})", sim.reg.phases[pc.liquid].name), format!("{:.2} K", pc.t_sat(sim.p[c]))));
     }
     v
+}
+
+/// « Reset flow » : annule toutes les vitesses (les faces imposées par les puits / émetteurs / entrées sont rétablies au pas suivant)
+/// et lève le drapeau de divergence (l'état restauré par le filet de sécurité est sain).
+pub fn reset_flow(sim: &mut MultiphaseSim) {
+    sim.u.iter_mut().for_each(|x| *x = 0.0);
+    sim.v.iter_mut().for_each(|x| *x = 0.0);
+    sim.diverged = false;
+}
+
+/// « Reset temperature » : toutes les cellules (fluide et solide) à `t` K, masses inchangées ; les solides isothermes gardent leur T imposée.
+pub fn reset_temperature(sim: &mut MultiphaseSim, t: f64) {
+    for c in 0..sim.nx * sim.ny {
+        if sim.is_solid(c) {
+            let tc = if let MpThermal::Isothermal(ti) = sim.thermal[c] { ti } else { t };
+            sim.e[c] = sim.reg.solids[sim.solid[c] as usize].rho_cp() * tc;
+            sim.temp[c] = tc;
+        } else {
+            sim.e[c] = (0..sim.reg.phases.len()).map(|k| sim.mass[k][c] * sim.reg.phases[k].e_int(t)).sum();
+            sim.temp[c] = t;
+        }
+    }
+    sim.refresh();
+}
+
+// ------------------------------------------------------------------------------------------------ sauvegarde de scène
+/// Effet de cellule tel qu'enregistré dans un fichier : la phase est désignée par son NOM (les indices changent si on modifie les matériaux).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EffectFile {
+    Sink { rate: f64 },
+    Emitter { vx: f64, vy: f64, phase: String, temp: f64 },
+    Accelerator { ax: f64, ay: f64 },
+    Teleporter { dest: usize, speed: f64 },
+}
+
+/// Scène = solides (par nom de matériau) + comportements thermiques + cellules spéciales. Équivalent du fichier `.fsf` du mono-fluide
+/// (qui ne contient que les cellules, pas l'état du fluide).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneFile {
+    pub version: u32,
+    pub nx: usize,
+    pub ny: usize,
+    pub solids: Vec<(usize, String)>,
+    pub thermal: Vec<(usize, MpThermal)>,
+    pub effects: Vec<(usize, EffectFile)>,
+}
+
+pub fn scene_to_json(sim: &MultiphaseSim) -> Result<String, String> {
+    let mut f = SceneFile { version: 1, nx: sim.nx, ny: sim.ny, solids: vec![], thermal: vec![], effects: vec![] };
+    for c in 0..sim.nx * sim.ny {
+        if sim.is_solid(c) {
+            f.solids.push((c, sim.reg.solids[sim.solid[c] as usize].name.clone()));
+            if sim.thermal[c] != MpThermal::Passive {
+                f.thermal.push((c, sim.thermal[c]));
+            }
+        }
+        let name = |k: usize| sim.reg.phases.get(k).map(|p| p.name.clone()).unwrap_or_default();
+        match sim.special[c] {
+            Some(MpEffect::Sink { rate }) => f.effects.push((c, EffectFile::Sink { rate })),
+            Some(MpEffect::Emitter { vx, vy, phase, temp }) => f.effects.push((c, EffectFile::Emitter { vx, vy, phase: name(phase), temp })),
+            Some(MpEffect::Accelerator { ax, ay }) => f.effects.push((c, EffectFile::Accelerator { ax, ay })),
+            Some(MpEffect::Teleporter { dest, speed }) => f.effects.push((c, EffectFile::Teleporter { dest, speed })),
+            None => {}
+        }
+    }
+    serde_json::to_string(&f).map_err(|e| e.to_string())
+}
+
+/// Charge une scène : remplace TOUS les solides / effets / comportements thermiques (comme le chargement des solides du mono-fluide).
+/// Retourne les avertissements (matériau inconnu ignoré, …). Erreur si la grille a une autre taille.
+pub fn scene_from_json(sim: &mut MultiphaseSim, json: &str) -> Result<Vec<String>, String> {
+    let f: SceneFile = serde_json::from_str(json).map_err(|e| format!("fichier illisible : {e}"))?;
+    if f.nx != sim.nx || f.ny != sim.ny {
+        return Err(format!("grille différente : le fichier fait {}×{}, la simulation {}×{}", f.nx, f.ny, sim.nx, sim.ny));
+    }
+    let n = sim.nx * sim.ny;
+    let mut warn = vec![];
+    for c in 0..n {
+        sim.clear_cell(c);
+    }
+    for (c, name) in &f.solids {
+        match (sim.reg.solids.iter().position(|s| &s.name == name), *c < n) {
+            (Some(s), true) => {
+                let (i, j) = (c % sim.nx, c / sim.nx);
+                apply_tool(sim, MpTool::Solid(s), &[(i, j)], sim.t_ambient, (0.0, 0.0), 0.0);
+            }
+            (None, _) => warn.push(format!("solide « {name} » inconnu : cellule {c} ignorée")),
+            _ => {}
+        }
+    }
+    for (c, t) in &f.thermal {
+        if *c < n {
+            sim.set_thermal_cell(*c, *t);
+        }
+    }
+    for (c, e) in &f.effects {
+        if *c >= n {
+            continue;
+        }
+        let eff = match e {
+            EffectFile::Sink { rate } => Some(MpEffect::Sink { rate: *rate }),
+            EffectFile::Accelerator { ax, ay } => Some(MpEffect::Accelerator { ax: *ax, ay: *ay }),
+            EffectFile::Teleporter { dest, speed } => Some(MpEffect::Teleporter { dest: *dest, speed: *speed }),
+            EffectFile::Emitter { vx, vy, phase, temp } => match sim.reg.phases.iter().position(|p| &p.name == phase) {
+                Some(k) => Some(MpEffect::Emitter { vx: *vx, vy: *vy, phase: k, temp: *temp }),
+                None => {
+                    warn.push(format!("fluide « {phase} » inconnu : émetteur de la cellule {c} ignoré"));
+                    None
+                }
+            },
+        };
+        if let Some(eff) = eff {
+            sim.set_effect(*c, Some(eff));
+        }
+    }
+    sim.refresh();
+    Ok(warn)
 }
 
 impl MultiphaseSim {
@@ -511,7 +737,7 @@ mod tests {
             }
             let st = compute_stats(&s);
             assert!(st.finite, "{sc:?} non fini");
-            let o = RenderOpts { display: MpDisplay::Phases, t_scale: 100.0, p_scale: 0.0 };
+            let o = RenderOpts::new(MpDisplay::Phases, 100.0, 0.0);
             png(&s, o, &format!("{sc:?}"));
             let mut buf = vec![];
             for d in MpDisplay::ALL {
@@ -542,5 +768,99 @@ mod tests {
             s.step();
         }
         assert!(compute_stats(&s).finite);
+    }
+
+    #[test]
+    fn scene_roundtrip_keeps_solids_effects_and_thermal_and_rejects_other_grid() {
+        let mut s = build_scenario(MpScenario::Empty, 30, 20, 0.01, 9.81);
+        apply_tool_with(&mut s, MpTool::Solid(ACIER), &brush_cells(30, 20, 5, 5, 2, false), &ToolOpts { temp: 293.15, cursor: (0.0, 0.0), dt: 0.0, thermal: MpThermal::Heater(1e6) });
+        apply_tool(&mut s, MpTool::Effect(MpEffect::Emitter { vx: 0.0, vy: 1.0, phase: EAU, temp: 300.0 }), &[(20, 3)], 293.15, (0.0, 0.0), 0.0);
+        let dest = s.idx(25, 15);
+        apply_tool(&mut s, MpTool::Effect(MpEffect::Teleporter { dest, speed: 0.4 }), &[(10, 10)], 293.15, (0.0, 0.0), 0.0);
+        let json = scene_to_json(&s).unwrap();
+        let mut t = build_scenario(MpScenario::Empty, 30, 20, 0.01, 9.81);
+        let w = scene_from_json(&mut t, &json).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.solid, t.solid);
+        assert_eq!(s.special, t.special);
+        assert_eq!(s.thermal, t.thermal);
+        // grille différente : refusée sans rien modifier
+        let mut other = build_scenario(MpScenario::Empty, 31, 20, 0.01, 9.81);
+        assert!(scene_from_json(&mut other, &json).is_err());
+        assert!(other.solid.iter().all(|&x| x < 0));
+        // un matériau supprimé entre-temps : avertissement, pas de plantage
+        let mut lib = MaterialLibrary::default();
+        let acier = lib.solid_index("acier").unwrap();
+        lib.remove_solid(acier);
+        let mut u = build_scenario_with(&lib, MpScenario::Empty, 30, 20, 0.01, 9.81).unwrap();
+        let w = scene_from_json(&mut u, &json).unwrap();
+        assert!(w.iter().any(|m| m.contains("acier")), "{w:?}");
+    }
+
+    #[test]
+    fn scenarios_use_the_user_library_and_report_missing_materials() {
+        // renommer : les rôles sont retrouvés par propriété
+        let mut lib = MaterialLibrary::default();
+        lib.rename_fluid(1, "H2O");
+        lib.rename_fluid(0, "azote");
+        let mut s = build_scenario_with(&lib, MpScenario::DamBreak, 32, 24, 0.01, 9.81).unwrap();
+        assert!(s.total_mass(1) > 0.0);
+        for _ in 0..10 {
+            s.step();
+        }
+        assert!(compute_stats(&s).finite);
+        // plus de liquide : message clair
+        let mut lib = MaterialLibrary::default();
+        lib.remove_fluid(3);
+        lib.remove_fluid(1);
+        let e = build_scenario_with(&lib, MpScenario::DamBreak, 32, 24, 0.01, 9.81).err().unwrap();
+        assert!(e.contains("liquide"), "{e}");
+        // pas d'huile : l'huile / eau / air échoue, le barrage fonctionne
+        let mut lib = MaterialLibrary::default();
+        lib.remove_fluid(3);
+        assert!(build_scenario_with(&lib, MpScenario::OilWaterAir, 32, 24, 0.01, 9.81).is_err());
+        assert!(build_scenario_with(&lib, MpScenario::DamBreak, 32, 24, 0.01, 9.81).is_ok());
+        // un fluide en plus (3 liquides) : l'huile / eau / air tourne toujours
+        let mut lib = MaterialLibrary::default();
+        let mut extra = lib.template_fluid(crate::simulation::phases::PhaseKind::Liquid);
+        extra.name = "glycérine".into();
+        lib.fluids.push(extra);
+        let mut s = build_scenario_with(&lib, MpScenario::OilWaterAir, 32, 24, 0.01, 9.81).unwrap();
+        for _ in 0..10 {
+            s.step();
+        }
+        assert!(compute_stats(&s).finite && s.reg.phases.len() == 5);
+    }
+
+    #[test]
+    fn reset_helpers_and_effect_overlay() {
+        let mut s = build_scenario(MpScenario::Boiling, 40, 30, 0.01, 9.81);
+        for _ in 0..5 {
+            s.step();
+        }
+        assert!(s.max_speed() > 0.0 || s.temp.iter().any(|&t| t > 400.0));
+        reset_flow(&mut s);
+        assert_eq!(s.max_speed(), 0.0);
+        reset_temperature(&mut s, 293.15);
+        assert!(s.temp.iter().all(|&t| (t - 293.15).abs() < 1e-6));
+        // surcouche : un puits rouge, un émetteur vert ; sans surcouche rien ne change
+        apply_tool(&mut s, MpTool::Effect(MpEffect::Sink { rate: 0.1 }), &[(5, 20)], 293.15, (0.0, 0.0), 0.0);
+        apply_tool(&mut s, MpTool::Effect(MpEffect::Emitter { vx: 0.0, vy: 0.5, phase: EAU, temp: 293.15 }), &[(7, 20)], 293.15, (0.0, 0.0), 0.0);
+        let (mut a, mut b) = (vec![], vec![]);
+        let base = RenderOpts::new(MpDisplay::Phases, 100.0, 0.0);
+        render_rgba(&s, base, &mut a);
+        render_rgba(&s, RenderOpts { show_effects: true, ..base }, &mut b);
+        let px = |buf: &Vec<u8>, i: usize, j: usize| -> [u8; 3] {
+            let p = ((30 - 1 - j) * 40 + i) * 4;
+            [buf[p], buf[p + 1], buf[p + 2]]
+        };
+        assert_ne!(px(&a, 5, 20), [255, 0, 0]);
+        assert_eq!(px(&b, 5, 20), [255, 0, 0]);
+        assert_eq!(px(&b, 7, 20), [0, 255, 0]);
+        // le mode divergence rend sans erreur
+        render_rgba(&s, RenderOpts { display: MpDisplay::Divergence, ..base }, &mut a);
+        assert_eq!(a.len(), 40 * 30 * 4);
+        // le GPU refuse les extras (et le dit)
+        assert!(crate::simulation::gpu_multiphase::gpu_unsupported_reason(&s).is_some());
     }
 }
