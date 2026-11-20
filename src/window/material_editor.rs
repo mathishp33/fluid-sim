@@ -5,8 +5,8 @@
 use egui::{ComboBox, DragValue, Ui};
 
 use crate::simulation::materials::PropertyLaw;
-use crate::simulation::mp_materials::{ChangeDef, MaterialLibrary, ReactionDef};
-use crate::simulation::phases::{Eos, Phase, PhaseKind, Thermal};
+use crate::simulation::mp_materials::{ChangeDef, MaterialLibrary, MixtureDef, ReactionDef};
+use crate::simulation::phases::{Eos, Phase, PhaseKind, Radiator, Reaction, Registry, Thermal};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum EditorTab {
@@ -16,6 +16,7 @@ pub enum EditorTab {
     Miscibility,
     PhaseChange,
     Reactions,
+    Mixtures,
 }
 
 #[derive(Default)]
@@ -24,6 +25,7 @@ pub struct MaterialEditor {
     sel_fluid: usize,
     sel_solid: usize,
     sel_reaction: usize,
+    sel_mixture: usize,
     name_buf: String,
     name_for: Option<(EditorTab, usize)>,
     status: String,
@@ -40,6 +42,7 @@ impl MaterialEditor {
                 (EditorTab::Miscibility, "Miscibilité"),
                 (EditorTab::PhaseChange, "Changement de phase"),
                 (EditorTab::Reactions, "Réactions"),
+                (EditorTab::Mixtures, "Mélanges"),
             ] {
                 ui.selectable_value(&mut self.tab, t, n);
             }
@@ -51,6 +54,7 @@ impl MaterialEditor {
             EditorTab::Miscibility => changed |= self.miscibility_ui(ui, lib),
             EditorTab::PhaseChange => changed |= self.phase_change_ui(ui, lib),
             EditorTab::Reactions => changed |= self.reactions_ui(ui, lib),
+            EditorTab::Mixtures => changed |= self.mixtures_ui(ui, lib),
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -59,6 +63,14 @@ impl MaterialEditor {
                 self.sel_fluid = 0;
                 self.sel_solid = 0;
                 self.name_for = None;
+                changed = true;
+            }
+            if ui
+                .button("+ Préréglage combustion")
+                .on_hover_text("Ajoute O2, N2, CH4, H2, CO, CO2, la thermochimie de la vapeur d'eau, les réactions (méthane, hydrogène, dissociation) et les mélanges (air sec, prémélanges stœchiométriques). Ne supprime rien.")
+                .clicked()
+            {
+                lib.add_combustion_preset();
                 changed = true;
             }
             let (mf, ms) = lib.missing_defaults();
@@ -377,7 +389,9 @@ impl MaterialEditor {
     // ------------------------------------------------------------------ réactions
     fn reactions_ui(&mut self, ui: &mut Ui, lib: &mut MaterialLibrary) -> bool {
         let mut changed = false;
-        ui.colored_label(egui::Color32::from_rgb(230, 170, 40), "Les réactions sont enregistrées et vérifiées (bilan de masse) mais le moteur cinétique n'est pas encore implémenté : elles n'ont AUCUN effet sur la simulation pour l'instant.");
+        ui.label("Vitesse r = A·T^b·exp(−Ea/RT)·Π c_i^ordre (mol/m³/s, c = mol/m³). La chaleur dégagée vient des Δh_f° des fluides ; une \
+                  réaction réversible tend vers l'équilibre thermodynamique (Δh_f°, s°). Une épaisseur de flamme > 0 active le modèle de flamme \
+                  épaissie (vitesse de flamme correcte sur une grille grossière).");
         let names: Vec<String> = lib.fluids.iter().map(|p| p.name.clone()).collect();
         if ui.add_enabled(!names.is_empty(), egui::Button::new("+ Réaction")).clicked() {
             lib.reactions.push(ReactionDef {
@@ -386,7 +400,7 @@ impl MaterialEditor {
                 products: vec![(names[0].clone(), 1.0)],
                 pre_exp: 1.0e6,
                 activation_energy: 5.0e4,
-                orders: vec![],
+                ..Default::default()
             });
             self.sel_reaction = lib.reactions.len() - 1;
             changed = true;
@@ -400,6 +414,11 @@ impl MaterialEditor {
                 ui.selectable_value(&mut self.sel_reaction, i, &r.name);
             }
         });
+        // chaleur de réaction (aperçu, avec la thermochimie actuelle)
+        let preview = lib.build().ok().and_then(|b| {
+            let name = lib.reactions[self.sel_reaction].name.clone();
+            b.registry.reactions.iter().find(|r| r.name == name).cloned().map(|r| (r, b.registry))
+        });
         let mut remove = false;
         let r = &mut lib.reactions[self.sel_reaction];
         ui.horizontal(|ui| {
@@ -409,44 +428,220 @@ impl MaterialEditor {
                 remove = true;
             }
         });
-        for (title, list) in [("Réactifs", &mut r.reactants), ("Produits", &mut r.products)] {
+        if r.orders.len() != r.reactants.len() {
+            let nus: Vec<f64> = r.reactants.iter().map(|x| x.1).collect();
+            r.orders = (0..r.reactants.len()).map(|k| r.orders.get(k).copied().unwrap_or(nus[k])).collect();
+        }
+        for (title, which) in [("Réactifs (ν, fluide, ordre)", 0), ("Produits (ν, fluide)", 1), ("Modulateurs de vitesse (ordre, fluide) — non consommés", 2)] {
             ui.strong(title);
             let mut del = None;
-            for (k, (n, nu)) in list.iter_mut().enumerate() {
+            let len = match which {
+                0 => r.reactants.len(),
+                1 => r.products.len(),
+                _ => r.modifiers.len(),
+            };
+            for k in 0..len {
                 ui.horizontal(|ui| {
-                    changed |= ui.add(DragValue::new(nu).speed(0.1).clamp_range(0.001..=100.0)).changed();
+                    let (n, nu) = match which {
+                        0 => {
+                            let e = &mut r.reactants[k];
+                            (&mut e.0, &mut e.1)
+                        }
+                        1 => {
+                            let e = &mut r.products[k];
+                            (&mut e.0, &mut e.1)
+                        }
+                        _ => {
+                            let e = &mut r.modifiers[k];
+                            (&mut e.0, &mut e.1)
+                        }
+                    };
+                    let range = if which == 2 { -3.0..=3.0 } else { 0.001..=100.0 };
+                    changed |= ui.add(DragValue::new(nu).speed(0.05).clamp_range(range)).changed();
                     ComboBox::from_id_source((title, k)).selected_text(n.as_str()).show_ui(ui, |ui| {
                         for m in &names {
                             changed |= ui.selectable_value(n, m.clone(), m).changed();
                         }
                     });
+                    if which == 0 {
+                        ui.label("ordre");
+                        changed |= ui.add(DragValue::new(&mut r.orders[k]).speed(0.05).clamp_range(-3.0..=5.0)).changed();
+                    }
                     if ui.small_button("✖").clicked() {
                         del = Some(k);
                     }
                 });
             }
             if let Some(k) = del {
-                list.remove(k);
+                match which {
+                    0 => {
+                        r.reactants.remove(k);
+                        if k < r.orders.len() {
+                            r.orders.remove(k);
+                        }
+                    }
+                    1 => {
+                        r.products.remove(k);
+                    }
+                    _ => {
+                        r.modifiers.remove(k);
+                    }
+                }
                 changed = true;
             }
-            if ui.small_button(format!("+ {title}")).clicked() && !names.is_empty() {
-                list.push((names[0].clone(), 1.0));
+            if ui.small_button("+ ajouter").clicked() && !names.is_empty() {
+                match which {
+                    0 => {
+                        r.reactants.push((names[0].clone(), 1.0));
+                        r.orders.push(1.0);
+                    }
+                    1 => r.products.push((names[0].clone(), 1.0)),
+                    _ => r.modifiers.push((names[0].clone(), 0.5)),
+                }
                 changed = true;
             }
         }
         egui::Grid::new("react_grid").num_columns(2).show(ui, |ui| {
-            ui.label("Facteur pré-exponentiel A");
-            changed |= ui.add(DragValue::new(&mut r.pre_exp).speed(1e3).clamp_range(0.0..=1e20)).changed();
+            ui.label("Facteur pré-exponentiel A (SI)");
+            changed |= ui.add(DragValue::new(&mut r.pre_exp).speed(1e3).clamp_range(0.0..=1e25)).changed();
             ui.end_row();
-            ui.label("Énergie d'activation Ea (J/mol)");
-            changed |= ui.add(DragValue::new(&mut r.activation_energy).speed(500.0).clamp_range(0.0..=1e7)).changed();
+            ui.label("Exposant de température b");
+            changed |= ui.add(DragValue::new(&mut r.temp_exponent).speed(0.05).clamp_range(-5.0..=5.0)).changed();
+            ui.end_row();
+            ui.label("Énergie d'activation Ea (kJ/mol)");
+            let mut ea = r.activation_energy / 1e3;
+            if ui.add(DragValue::new(&mut ea).speed(0.5).clamp_range(0.0..=2000.0)).changed() {
+                r.activation_energy = ea * 1e3;
+                changed = true;
+            }
+            ui.end_row();
+            ui.label("Réversible (équilibre thermodynamique)");
+            changed |= ui.checkbox(&mut r.reversible, "").changed();
+            ui.end_row();
+            ui.label("Épaisseur de flamme δ_L (mm), 0 = aucune");
+            let mut d = r.flame_thickness * 1e3;
+            if ui.add(DragValue::new(&mut d).speed(0.01).clamp_range(0.0..=20.0)).changed() {
+                r.flame_thickness = d * 1e-3;
+                changed = true;
+            }
             ui.end_row();
         });
+        if let Some((rr, reg)) = preview {
+            reaction_preview(ui, &rr, &reg);
+        }
         if remove {
             lib.reactions.remove(self.sel_reaction);
             changed = true;
         }
         changed
+    }
+
+    // ------------------------------------------------------------------ mélanges
+    fn mixtures_ui(&mut self, ui: &mut Ui, lib: &mut MaterialLibrary) -> bool {
+        let mut changed = false;
+        ui.label("Mélanges nommés (fractions volumiques = molaires pour des gaz) : pinceaux « Mélange » et fluide ambiant possible (ex. air sec \
+                  O2 + N2 pour que les bords ouverts apportent de l'oxygène).");
+        let names: Vec<String> = lib.fluids.iter().map(|p| p.name.clone()).collect();
+        if ui.add_enabled(!names.is_empty(), egui::Button::new("+ Mélange")).clicked() {
+            let n = format!("mélange {}", lib.mixtures.len() + 1);
+            lib.mixtures.push(MixtureDef { name: n, parts: vec![(names[0].clone(), 1.0)] });
+            self.sel_mixture = lib.mixtures.len() - 1;
+            changed = true;
+        }
+        if lib.mixtures.is_empty() {
+            return changed;
+        }
+        self.sel_mixture = self.sel_mixture.min(lib.mixtures.len() - 1);
+        ui.horizontal_wrapped(|ui| {
+            for (i, m) in lib.mixtures.iter().enumerate() {
+                ui.selectable_value(&mut self.sel_mixture, i, &m.name);
+            }
+        });
+        let i = self.sel_mixture;
+        let mut remove = false;
+        let amb = lib.ambient.clone();
+        let m = &mut lib.mixtures[i];
+        let mut make_ambient = false;
+        ui.horizontal(|ui| {
+            ui.label("Nom");
+            let old = m.name.clone();
+            if ui.text_edit_singleline(&mut m.name).changed() {
+                changed = true;
+                if amb == old {
+                    make_ambient = true;
+                }
+            }
+            if ui.button("Supprimer").clicked() {
+                remove = true;
+            }
+        });
+        let mut is_amb = amb == m.name;
+        if ui.checkbox(&mut is_amb, "Fluide ambiant (bords ouverts, cellules vidées) — gaz uniquement").changed() && is_amb {
+            make_ambient = true;
+        }
+        let mut del = None;
+        for (k, (n, x)) in m.parts.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let mut pct = *x * 100.0;
+                if ui.add(DragValue::new(&mut pct).speed(0.1).clamp_range(0.0..=100.0).suffix(" %")).changed() {
+                    *x = pct / 100.0;
+                    changed = true;
+                }
+                ComboBox::from_id_source(("mix", k)).selected_text(n.as_str()).show_ui(ui, |ui| {
+                    for f in &names {
+                        changed |= ui.selectable_value(n, f.clone(), f).changed();
+                    }
+                });
+                if ui.small_button("✖").clicked() {
+                    del = Some(k);
+                }
+            });
+        }
+        if let Some(k) = del {
+            m.parts.remove(k);
+            changed = true;
+        }
+        if ui.small_button("+ composant").clicked() {
+            m.parts.push((names[0].clone(), 0.0));
+            changed = true;
+        }
+        let tot: f64 = m.parts.iter().map(|x| x.1).sum();
+        if (tot - 1.0).abs() > 1e-3 {
+            ui.weak(format!("Somme = {:.1} % (normalisée à 100 % à l'utilisation)", tot * 100.0));
+        }
+        let name = m.name.clone();
+        if make_ambient {
+            lib.ambient = name;
+            changed = true;
+        }
+        if remove {
+            lib.mixtures.remove(i);
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// Bilan d'une réaction : chaleur dégagée, constante de vitesse et d'équilibre à quelques températures.
+fn reaction_preview(ui: &mut Ui, r: &Reaction, reg: &Registry) {
+    let dh = r.delta_h(&reg.phases, 298.15) / 1e3;
+    let (m_in, _) = r.mass_balance(&reg.phases);
+    ui.weak(format!(
+        "Δh_r(298 K) = {dh:.1} kJ/mol ({}) ; {:.2} MJ par kg de réactifs",
+        if dh < 0.0 { "exothermique" } else { "endothermique" },
+        -dh / 1e3 / m_in.max(1e-12)
+    ));
+    let mut line = String::from("k(T) :");
+    for t in [300.0, 1000.0, 1500.0, 2000.0] {
+        line += &format!("  {t:.0} K → {:.2e}", r.k_forward(t));
+    }
+    ui.weak(line);
+    if r.reversible {
+        let mut line = String::from("ln Kc :");
+        for t in [300.0, 1000.0, 2000.0, 3000.0] {
+            line += &format!("  {t:.0} K → {:.1}", r.ln_kc(&reg.phases, t));
+        }
+        ui.weak(line);
     }
 }
 
@@ -527,7 +722,40 @@ fn fluid_props_ui(ui: &mut Ui, p: &mut Phase) -> bool {
     });
     ch |= law_ui(ui, "Loi μ(T)", "mu_law", &mut p.mu_law);
     ch |= law_ui(ui, "Loi k(T)", "k_law", &mut p.k_law);
-    ui.weak("L'énergie interne de référence (e0) d'une paire liquide↔vapeur est calculée automatiquement à partir de la chaleur latente.");
+    ui.collapsing("Thermochimie (réactions, combustion)", |ui| {
+        egui::Grid::new("fluid_thermo").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Δh_f° (kJ/mol) à 298 K");
+            let mut hf = p.h_formation / 1e3;
+            if ui.add(DragValue::new(&mut hf).speed(0.5).clamp_range(-5000.0..=5000.0)).changed() {
+                p.h_formation = hf * 1e3;
+                ch = true;
+            }
+            ui.end_row();
+            ui.label("s° (J/(mol·K)) à 298 K, 1 bar");
+            ch |= ui.add(DragValue::new(&mut p.s_standard).speed(0.5).clamp_range(0.0..=2000.0)).changed();
+            ui.end_row();
+            ui.label("Pente dcp/dT (J/(kg·K²))");
+            ch |= ui.add(DragValue::new(&mut p.cp_slope).speed(0.01).clamp_range(-5.0..=20.0)).changed();
+            ui.end_row();
+            if p.is_gas() {
+                ui.label("Rayonnement");
+                ComboBox::from_id_source("radiator")
+                    .selected_text(match p.radiator {
+                        Radiator::None => "transparent",
+                        Radiator::Water => "comme H2O",
+                        Radiator::CarbonDioxide => "comme CO2",
+                    })
+                    .show_ui(ui, |ui| {
+                        ch |= ui.selectable_value(&mut p.radiator, Radiator::None, "transparent").changed();
+                        ch |= ui.selectable_value(&mut p.radiator, Radiator::Water, "comme H2O").changed();
+                        ch |= ui.selectable_value(&mut p.radiator, Radiator::CarbonDioxide, "comme CO2").changed();
+                    });
+                ui.end_row();
+            }
+        });
+        ui.weak("cp(T) = cp + pente·(T − 298 K). Δh_f° et s° fixent la chaleur et l'équilibre des réactions (tables NIST-JANAF). Sans réaction, \
+                 seule la chaleur latente des paires liquide↔vapeur compte (e0 calculé automatiquement).");
+    });
     ch
 }
 

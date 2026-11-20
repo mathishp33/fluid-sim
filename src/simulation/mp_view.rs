@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::mp_cells::{MpEffect, MpThermal};
-use super::mp_materials::{MaterialLibrary, Roles};
+use super::mp_materials::{MaterialLibrary, Roles, CH4, MIX_CH4_AIR, MIX_H2_AIR};
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Phase, Registry};
 
@@ -18,6 +18,11 @@ pub const HUILE: usize = 3;
 pub const ACIER: usize = 0;
 pub const VERRE: usize = 1;
 const P_ATM: f64 = 101325.0;
+/// température conseillée pour l'outil « Allumer » (K) : celle d'un noyau de gaz brûlés, proche de la température de flamme
+pub const T_IGNITION: f64 = 2200.0;
+/// noyau d'allumage des scénarios : gaz BRÛLÉS (combustion complète) à cette température, proche de la température de flamme —
+/// la flamme démarre sans l'explosion parasite d'un noyau de gaz frais surchauffé
+pub const T_KERNEL: f64 = 2200.0;
 
 /// Registre des matériaux PAR DÉFAUT (air, eau, vapeur, huile / acier, verre) : les constantes AIR, EAU… ci-dessus en sont les indices.
 /// Les matériaux de l'utilisateur viennent de `MaterialLibrary` (voir `build_scenario_with`).
@@ -34,6 +39,10 @@ pub enum MpScenario {
     Boiling,
     OilWaterAir,
     Empty,
+    PremixedFlame,
+    ConfinedExplosion,
+    VentedExplosion,
+    DiffusionFlame,
 }
 
 impl Default for MpScenario {
@@ -43,7 +52,22 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 6] = [Self::DamBreak, Self::DropSplash, Self::Sloshing, Self::Boiling, Self::OilWaterAir, Self::Empty];
+    pub const ALL: [MpScenario; 10] = [
+        Self::DamBreak,
+        Self::DropSplash,
+        Self::Sloshing,
+        Self::Boiling,
+        Self::OilWaterAir,
+        Self::Empty,
+        Self::PremixedFlame,
+        Self::ConfinedExplosion,
+        Self::VentedExplosion,
+        Self::DiffusionFlame,
+    ];
+    /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
+    pub fn is_combustion(self) -> bool {
+        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame)
+    }
     pub fn from_index(i: usize) -> Self {
         Self::ALL[i.min(Self::ALL.len() - 1)]
     }
@@ -58,6 +82,10 @@ impl MpScenario {
             Self::Boiling => "Ébullition sur plaque chauffante",
             Self::OilWaterAir => "Huile / eau / air (goutte d'huile qui monte)",
             Self::Empty => "Cuve vide (à peindre)",
+            Self::PremixedFlame => "Flamme de prémélange dans un tube (méthane–air)",
+            Self::ConfinedExplosion => "Explosion confinée (hydrogène–air)",
+            Self::VentedExplosion => "Explosion de gaz avec évent (méthane–air)",
+            Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
         }
     }
 }
@@ -71,36 +99,52 @@ pub fn build_scenario(sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f6
 /// fractions du domaine (valable à toute résolution). Les rôles (eau, huile, plaque…) sont retrouvés par nom puis par propriété ; si un
 /// matériau nécessaire manque, l'erreur dit lequel.
 pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f64) -> Result<MultiphaseSim, String> {
+    let lib_c;
+    let lib = if sc.is_combustion() {
+        lib_c = lib.with_combustion();
+        &lib_c
+    } else {
+        lib
+    };
     let built = lib.build()?;
     let roles = Roles::resolve(&built.registry, built.ambient);
     let need = |o: Option<usize>, what: &str| -> Result<usize, String> { o.ok_or_else(|| format!("le scénario « {} » nécessite {what} (ajoutez-le dans les matériaux)", sc.name())) };
-    let air = built.ambient;
+    let mix = |name: &str| -> Result<Vec<f64>, String> {
+        built.mixtures.iter().find(|(n, _)| n == name).map(|(_, a)| a.clone()).ok_or_else(|| format!("le scénario « {} » nécessite le mélange « {name} »", sc.name()))
+    };
     let (lx, ly) = (nx as f64 * dx, ny as f64 * dx);
-    let mut s = MultiphaseSim::new(nx, ny, dx, built.registry, air);
+    let mixtures = built.mixtures.clone();
+    let ambient_mix = built.ambient_mix.clone();
+    let mut s = MultiphaseSim::new(nx, ny, dx, built.registry, built.ambient);
+    s.ambient_mix = ambient_mix;
+    s.mixtures = mixtures;
     s.gravity = [0.0, -gravity];
+    // noyau d'allumage (gaz brûlés à T_KERNEL) : ≈ 2 épaisseurs de flamme épaissie, sinon la diffusion l'éteint
+    let r_kernel = (2.0 * (s.flame_resolution + 2.0) * dx).min(0.12 * lx.min(ly)).max((s.flame_resolution + 2.0) * dx);
+    let burnt = |a: &Vec<f64>| super::mp_species::complete_combustion(&s.reg, a);
     let mut t_fn: Box<dyn Fn(f64, f64) -> f64> = Box::new(|_, _| 293.15);
     match sc {
         MpScenario::DamBreak => {
             let eau = need(roles.water, "un liquide")?;
-            s.paint_phase(move |x, y| if x < 0.25 * lx && y < 0.5 * ly { Some(eau) } else { Some(air) });
+            s.paint_phase(move |x, y| if x < 0.25 * lx && y < 0.5 * ly { Some(eau) } else { None });
         }
         MpScenario::DropSplash => {
             let eau = need(roles.water, "un liquide")?;
             let (cx, cy, r) = (0.5 * lx, 0.62 * ly, 0.09 * lx.min(ly));
             s.paint_phase(move |x, y| {
-                if y < 0.22 * ly || (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(eau) } else { Some(air) }
+                if y < 0.22 * ly || (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(eau) } else { None }
             });
         }
         MpScenario::Sloshing => {
             let eau = need(roles.water, "un liquide")?;
-            s.paint_phase(move |x, y| if y < 0.4 * ly + 0.04 * ly * (std::f64::consts::PI * x / lx).cos() { Some(eau) } else { Some(air) });
+            s.paint_phase(move |x, y| if y < 0.4 * ly + 0.04 * ly * (std::f64::consts::PI * x / lx).cos() { Some(eau) } else { None });
         }
         MpScenario::Boiling => {
             // plaque d'acier chaude (2 cellules) sous 40 % d'eau à 90 °C ; haut ouvert (atmosphère)
             let eau = need(roles.water, "un liquide")?;
             let plate = need(roles.plate, "un solide")?;
             let h_plate = 2.0 * dx;
-            s.paint_phase(move |_, y| if y < 0.45 * ly { Some(eau) } else { Some(air) });
+            s.paint_phase(move |_, y| if y < 0.45 * ly { Some(eau) } else { None });
             s.paint_solid(move |x, y| if y < h_plate && x > 0.1 * lx && x < 0.9 * lx { Some(plate) } else { None });
             s.bc[3] = Bc::Open { p: P_ATM };
             s.dt_max = 5e-4;
@@ -111,16 +155,85 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let huile = need(roles.oil, "un second liquide (huile)")?;
             let (cx, cy, r) = (0.5 * lx, 0.15 * ly, 0.07 * lx.min(ly));
             s.paint_phase(move |x, y| {
-                if (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(huile) } else if y < 0.4 * ly { Some(eau) } else { Some(air) }
+                if (x - cx).powi(2) + (y - cy).powi(2) < r * r { Some(huile) } else if y < 0.4 * ly { Some(eau) } else { None }
             });
         }
         MpScenario::Empty => {
             s.bc[3] = Bc::Open { p: P_ATM };
-            s.paint_phase(move |_, _| Some(air));
+        }
+        MpScenario::PremixedFlame => {
+            // tube rempli de méthane–air stœchiométrique, fermé à gauche, ouvert à droite ; allumage plan contre le fond fermé.
+            // La flamme avance à σ·S_L ≈ 7.5 × 0.38 m/s ; les gaz brûlés, bloqués par le fond, chassent les gaz frais vers l'ouverture.
+            let m = mix(MIX_CH4_AIR)?;
+            let b = burnt(&m);
+            let xk = r_kernel.max(0.03 * lx);
+            s.paint_mixture(move |x, _| Some(if x < xk { b.clone() } else { m.clone() }));
+            s.bc[1] = Bc::Open { p: P_ATM };
+            s.dt_max = 2e-3;
+            t_fn = Box::new(move |x, _| if x < xk { T_KERNEL } else { 293.15 });
+        }
+        MpScenario::ConfinedExplosion => {
+            // boîte fermée d'hydrogène–air stœchiométrique, étincelle au centre : la pression monte vers ≈ 8 bar (combustion isochore)
+            let m = mix(MIX_H2_AIR)?;
+            let b = burnt(&m);
+            let (cx, cy, r) = (0.5 * lx, 0.5 * ly, r_kernel.max(0.04 * lx.min(ly)));
+            let ink = move |x: f64, y: f64| (x - cx).powi(2) + (y - cy).powi(2) < r * r;
+            s.paint_mixture(move |x, y| Some(if ink(x, y) { b.clone() } else { m.clone() }));
+            s.dt_max = 1e-3;
+            t_fn = Box::new(move |x, y| if ink(x, y) { T_KERNEL } else { 293.15 });
+        }
+        MpScenario::VentedExplosion => {
+            // pièce aux murs d'acier remplie de méthane–air, évent (ouverture) sur le mur de droite, allumage contre le mur du fond :
+            // jet de gaz frais puis boule de feu à la sortie de l'évent. Domaine ouvert en haut et à droite (atmosphère).
+            let plate = need(roles.plate, "un solide (murs de la pièce)")?;
+            let m = mix(MIX_CH4_AIR)?;
+            let w = 2.0 * dx;
+            let (x0, x1, y0, y1) = (0.04 * lx, 0.55 * lx, 0.04 * ly, 0.55 * ly);
+            let (v0, v1) = (y0 + 0.30 * (y1 - y0), y0 + 0.70 * (y1 - y0));
+            let inside = move |x: f64, y: f64| x > x0 + w && x < x1 - w && y > y0 + w && y < y1 - w;
+            let wall = move |x: f64, y: f64| {
+                let in_box = x >= x0 && x <= x1 && y >= y0 && y <= y1;
+                in_box && !inside(x, y) && !(x > x1 - w && y > v0 && y < v1)
+            };
+            let b = burnt(&m);
+            let (cx, cy, r) = (x0 + w + r_kernel, 0.5 * (y0 + y1), r_kernel.max(0.03 * lx.min(ly)));
+            let ink = move |x: f64, y: f64| (x - cx).powi(2) + (y - cy).powi(2) < r * r && inside(x, y);
+            s.paint_mixture(move |x, y| if ink(x, y) { Some(b.clone()) } else if inside(x, y) { Some(m.clone()) } else { None });
+            s.paint_solid(move |x, y| if wall(x, y) { Some(plate) } else { None });
+            s.bc[1] = Bc::Open { p: P_ATM };
+            s.bc[3] = Bc::Open { p: P_ATM };
+            s.dt_max = 2e-3;
+            t_fn = Box::new(move |x, y| if ink(x, y) { T_KERNEL } else { 293.15 });
+        }
+        MpScenario::DiffusionFlame => {
+            // buse de méthane au centre du fond (émetteurs, 0.25 m/s), air au repos, haut ouvert ; un noyau chaud de prémélange au-dessus
+            // de la buse allume le jet : flamme de diffusion laminaire, panache de fumées chaudes porté par la flottabilité.
+            let ch4 = built_index(&s, CH4).ok_or("le scénario nécessite le méthane")?;
+            let m = mix(MIX_CH4_AIR)?;
+            s.bc[3] = Bc::Open { p: P_ATM };
+            s.dt_max = 2e-3;
+            let half = ((0.025 * nx as f64).round() as usize).max(2);
+            let ic = nx / 2;
+            // flamme pilote : gaz brûlés chauds au-dessus de la buse
+            let b = burnt(&m);
+            let (cx, cy, r) = ((ic as f64) * dx, 2.0 * dx + r_kernel, r_kernel);
+            let ink = move |x: f64, y: f64| (x - cx).powi(2) + (y - cy).powi(2) < r * r;
+            s.paint_mixture(move |x, y| if ink(x, y) { Some(b.clone()) } else { None });
+            t_fn = Box::new(move |x, y| if ink(x, y) { T_KERNEL } else { 293.15 });
+            s.finalize_init(&*t_fn);
+            for i in ic.saturating_sub(half)..(ic + half).min(nx) {
+                let c = s.idx(i, 0);
+                s.set_effect(c, Some(MpEffect::Emitter { vx: 0.0, vy: 0.25, phase: ch4, temp: 293.15 }));
+            }
+            return Ok(s);
         }
     }
     s.finalize_init(&*t_fn);
     Ok(s)
+}
+
+fn built_index(s: &MultiphaseSim, name: &str) -> Option<usize> {
+    s.reg.phases.iter().position(|p| p.name == name)
 }
 
 // ------------------------------------------------------------------------------------------------ pinceaux
@@ -135,6 +248,10 @@ pub enum MpTool {
     Effect(MpEffect),
     /// efface solide, effet spécial et comportement thermique (la cellule redevient du fluide ambiant)
     ClearCell,
+    /// remplit d'un mélange nommé (`sim.mixtures[i]`), ex. méthane–air stœchiométrique
+    Mixture(usize),
+    /// allumage : crée un noyau de flamme (produits de combustion complète du mélange local à la T du pinceau, à pression constante)
+    Ignite,
 }
 
 pub fn tool_name(reg: &Registry, t: MpTool) -> String {
@@ -146,7 +263,35 @@ pub fn tool_name(reg: &Registry, t: MpTool) -> String {
         MpTool::Push => "Pousser le fluide".into(),
         MpTool::Effect(e) => format!("Cellule spéciale : {}", e.kind_name()),
         MpTool::ClearCell => "Effacer solide + effet".into(),
+        MpTool::Mixture(i) => format!("Mélange : {}", mixtures_name(reg, i)),
+        MpTool::Ignite => "Allumer (étincelle)".into(),
     }
+}
+
+fn mixtures_name(_reg: &Registry, i: usize) -> String {
+    format!("n° {}", i + 1)
+}
+
+/// Nom affichable d'un outil, mélanges nommés compris (préférer à `tool_name` quand la simulation est disponible).
+pub fn tool_label(sim: &MultiphaseSim, t: MpTool) -> String {
+    match t {
+        MpTool::Mixture(i) => format!("Mélange : {}", sim.mixtures.get(i).map_or("?", |m| m.0.as_str())),
+        _ => tool_name(&sim.reg, t),
+    }
+}
+
+/// Outils de pinceau d'une simulation : phases pures, mélanges nommés, solides, effacement, chauffage, poussée, allumage si réactions.
+pub fn sim_tools(sim: &MultiphaseSim) -> Vec<MpTool> {
+    let mut v: Vec<MpTool> = (0..sim.reg.phases.len()).map(MpTool::Phase).collect();
+    v.extend((0..sim.mixtures.len()).map(MpTool::Mixture));
+    v.extend((0..sim.reg.solids.len()).map(MpTool::Solid));
+    v.push(MpTool::EraseSolid);
+    v.push(MpTool::Heat);
+    v.push(MpTool::Push);
+    if !sim.reg.reactions.is_empty() {
+        v.push(MpTool::Ignite);
+    }
+    v
 }
 
 pub fn all_tools(reg: &Registry) -> Vec<MpTool> {
@@ -225,7 +370,8 @@ pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, u
                 if sim.is_solid(c) {
                     sim.thermal[c] = MpThermal::Passive;
                     let t = sim.t_ambient;
-                    set_pure(sim, c, sim.ambient_phase, t);
+                    sim.solid[c] = -1;
+                    sim.fill_ambient(c, t);
                 }
             }
             MpTool::ClearCell => sim.clear_cell(c),
@@ -236,6 +382,26 @@ pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, u
                     }
                 }
                 sim.set_effect(c, Some(e));
+            }
+            MpTool::Mixture(m) => {
+                if !sim.is_solid(c) {
+                    if let Some((_, a)) = sim.mixtures.get(m).cloned() {
+                        sim.fill_mixture(c, &a, temp);
+                    }
+                }
+            }
+            MpTool::Ignite => {
+                // noyau de flamme : le mélange de la cellule est remplacé par ses produits de combustion complète à `temp`, À LA PRESSION
+                // de la cellule (un chauffage à volume constant d'une boule de plusieurs cm se comporterait comme une charge explosive).
+                // L'énergie apportée est comptée dans `energy_input`.
+                if !sim.is_solid(c) && sim.temp[c] < temp {
+                    let np = sim.reg.phases.len();
+                    let a: Vec<f64> = (0..np).map(|k| sim.alpha[k][c]).collect();
+                    let burnt = super::mp_species::complete_combustion(&sim.reg, &a);
+                    let e_old = sim.e[c];
+                    sim.fill_mixture(c, &burnt, temp);
+                    sim.energy_input += (sim.e[c] - e_old) * sim.dx * sim.dx;
+                }
             }
             MpTool::Heat => {
                 let rate = 1.0 - (-5.0 * dt).exp();
@@ -293,10 +459,13 @@ pub enum MpDisplay {
     Density,
     Vapor,
     Divergence,
+    Flame,
+    HeatRelease,
 }
 
 impl MpDisplay {
-    pub const ALL: [MpDisplay; 7] = [Self::Phases, Self::Pressure, Self::Temperature, Self::Velocity, Self::Density, Self::Vapor, Self::Divergence];
+    pub const ALL: [MpDisplay; 9] =
+        [Self::Phases, Self::Pressure, Self::Temperature, Self::Velocity, Self::Density, Self::Vapor, Self::Divergence, Self::Flame, Self::HeatRelease];
     pub fn name(self) -> &'static str {
         match self {
             Self::Phases => "PHASES",
@@ -306,6 +475,8 @@ impl MpDisplay {
             Self::Density => "MASSE VOLUMIQUE",
             Self::Vapor => "VAPEUR (fraction)",
             Self::Divergence => "DIVERGENCE (∇·u)",
+            Self::Flame => "FLAMME (rayonnement des gaz chauds + front de réaction)",
+            Self::HeatRelease => "DÉGAGEMENT DE CHALEUR (échelle log)",
         }
     }
     pub fn next(self) -> Self {
@@ -354,6 +525,12 @@ fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
     [r + m, g + m, b + m]
 }
 
+/// lueur d'un gaz chaud : noir sous 800 K, rouge sombre → orange → jaune pâle vers 2400 K (intensité et teinte approchées du corps noir)
+fn blackbody_rgb(t: f64) -> [f32; 3] {
+    let x = ((t - 800.0) / 1600.0).clamp(0.0, 1.0) as f32;
+    [(1.6 * x).min(1.0), (1.6 * x - 0.45).clamp(0.0, 0.9), (1.6 * x - 1.0).clamp(0.0, 0.6)]
+}
+
 /// bleu/cyan (froid) → noir → rouge → jaune (chaud)
 fn temp_rgb(x: f64) -> [f32; 3] {
     let x = x.clamp(-1.0, 1.0) as f32;
@@ -390,6 +567,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
             rmax = rmax.max(sim.rho_mix[c]);
         }
     }
+    let qmax = sim.heat_release.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
     let mut dmax = 1e-9f64;
     for j in 0..ny {
         for i in 0..nx {
@@ -440,6 +618,28 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                         [x, x, x]
                     }
                     MpDisplay::Divergence => signed_rgb(sim.divergence_of(&sim.u, &sim.v, i, j), dmax),
+                    MpDisplay::HeatRelease => {
+                        // 6 décades sous le maximum ; exothermique jaune→blanc, endothermique (dissociation) bleu
+                        let q = sim.heat_release[c];
+                        let x = if qmax > 0.0 && q.abs() > 0.0 { ((q.abs() / qmax).log10() / 6.0 + 1.0).clamp(0.0, 1.0) as f32 } else { 0.0 };
+                        if q >= 0.0 { [x, x * x, x * x * x * 0.5] } else { [0.0, 0.3 * x, x] }
+                    }
+                    MpDisplay::Flame => {
+                        // fond : couleur des espèces assombrie ; gaz chauds : incandescence (corps noir approché) ∝ (T − 800 K) ;
+                        // zone de réaction : lueur bleue (chimiluminescence CH*, C2*) ∝ log du dégagement de chaleur
+                        let mut col = [0.0f32; 3];
+                        for k in 0..sim.reg.phases.len() {
+                            let a = sim.alpha[k][c].clamp(0.0, 1.0) as f32;
+                            let pc = phase_rgb(&sim.reg.phases[k]);
+                            for q in 0..3 {
+                                col[q] += 0.35 * a * pc[q];
+                            }
+                        }
+                        let b = blackbody_rgb(sim.temp[c]);
+                        let q = sim.heat_release[c];
+                        let blue = if qmax > 0.0 && q > 0.0 { ((q / qmax).log10() / 4.0 + 1.0).clamp(0.0, 1.0) as f32 } else { 0.0 };
+                        [col[0] + b[0] + 0.25 * blue, col[1] + b[1] + 0.45 * blue, col[2] + b[2] + 1.0 * blue]
+                    }
                     MpDisplay::Vapor => {
                         let a: f64 = vapor_ids.iter().map(|&k| sim.alpha[k][c]).sum::<f64>().clamp(0.0, 1.0);
                         let a = a as f32;
@@ -510,6 +710,14 @@ pub struct MpStats {
     pub effects: usize,
     /// pas annulés puis refaits (filet de sécurité numérique)
     pub rollbacks: usize,
+    /// chaleur de réaction dégagée (J/m), énergie rayonnée (J/m), puissance chimique instantanée (W/m)
+    pub chem_heat: f64,
+    pub radiated: f64,
+    pub chem_power: f64,
+    /// facteur d'épaississement maximal des flammes (TFM)
+    pub flame_factor: f64,
+    /// (nom, avancement cumulé mol/m) par réaction
+    pub reactions: Vec<(String, f64)>,
 }
 
 pub fn compute_stats(sim: &MultiphaseSim) -> MpStats {
@@ -541,6 +749,11 @@ pub fn compute_stats(sim: &MultiphaseSim) -> MpStats {
     st.heat_input = sim.energy_input;
     st.effects = sim.special_count();
     st.rollbacks = sim.rollbacks;
+    st.chem_heat = sim.chem_heat;
+    st.radiated = sim.radiated;
+    st.chem_power = sim.heat_release.iter().sum::<f64>() * sim.dx * sim.dx;
+    st.flame_factor = sim.flame_factor.iter().fold(1.0f64, |a, &b| a.max(b));
+    st.reactions = sim.reg.reactions.iter().zip(sim.reacted.iter().chain(std::iter::repeat(&0.0))).map(|(r, &x)| (r.name.clone(), x)).collect();
     st.finite = st.speed_max.is_finite() && st.p_min.is_finite() && st.p_max.is_finite() && st.t_max.is_finite() && st.kinetic.is_finite();
     st
 }
@@ -581,6 +794,23 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
     }
     for pc in &sim.reg.changes {
         v.push((format!("T_sat à p ({})", sim.reg.phases[pc.liquid].name), format!("{:.2} K", pc.t_sat(sim.p[c]))));
+    }
+    if !sim.reg.reactions.is_empty() {
+        v.push(("Dégagement de chaleur (W/m³)".into(), format!("{:.3e}", sim.heat_release[c])));
+        if sim.flame_factor[c] > 1.0 {
+            v.push(("Épaississement de flamme F".into(), format!("{:.1}", sim.flame_factor[c])));
+        }
+        // fractions molaires des gaz
+        let np = sim.reg.phases.len();
+        let n: Vec<f64> = (0..np).map(|k| if sim.reg.phases[k].is_gas() { sim.mass[k][c].max(0.0) / sim.reg.phases[k].molar_mass } else { 0.0 }).collect();
+        let tot: f64 = n.iter().sum();
+        if tot > 0.0 {
+            for k in 0..np {
+                if n[k] / tot > 1e-4 {
+                    v.push((format!("x {}", sim.reg.phases[k].name), format!("{:.4}", n[k] / tot)));
+                }
+            }
+        }
     }
     v
 }
@@ -744,8 +974,8 @@ mod tests {
                 render_rgba(&s, RenderOpts { display: d, ..o }, &mut buf);
                 assert_eq!(buf.len(), 48 * 36 * 4);
             }
-            // masse conservée (bords fermés ; Boiling/Empty ont le haut ouvert : on ne teste que les fermés)
-            if !matches!(sc, MpScenario::Boiling | MpScenario::Empty) {
+            // masse conservée (scénarios entièrement fermés, sans émetteur : les autres échangent de la masse avec l'extérieur)
+            if s.bc.iter().all(|b| *b == Bc::Wall) && s.special_count() == 0 {
                 assert!(((s.total_mass_all() - m0) / m0).abs() < 1e-9, "{sc:?}: masse");
             }
         }

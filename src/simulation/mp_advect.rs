@@ -158,6 +158,12 @@ impl MultiphaseSim {
         let mut recv = vec![usize::MAX; nf];
         let mut inflow_ghost = vec![false; nf];
         let mut ghost_t = vec![self.t_ambient; nf];
+        // température reconstruite à la face (MUSCL, limiteur de van Leer) ; NaN = celle de la cellule donneuse
+        let mut face_t = vec![f64::NAN; nf];
+        let t_old = self.temp.clone();
+        let van_leer = |a: f64, b: f64| if a * b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
+        // cellule fluide sans interface (un seul groupe présent à 99 %) : la reconstruction d'ordre 2 y est sûre
+        let single = |c: usize| -> Option<usize> { (0..ng).find(|&g| ag[g][c] > 0.99) };
         for fj_ in 0..fj {
             for fi_ in 0..fi {
                 let f = fj_ * fi + fi_;
@@ -179,8 +185,10 @@ impl MultiphaseSim {
                 match d {
                     None => {
                         inflow_ghost[f] = true; // fluide entrant : ambiant, ou celui de l'entrée de bord si le bord en a une
-                        let (gp, gt) = self.ghost_source(dir, fi_, fj_);
-                        ff[f * np + gp] = xi;
+                        let (ga, gt) = self.ghost_source(dir, fi_, fj_);
+                        for k in 0..np {
+                            ff[f * np + k] = xi * ga[k];
+                        }
                         ghost_t[f] = gt;
                     }
                     Some(dc) => {
@@ -216,12 +224,54 @@ impl MultiphaseSim {
                                 }
                             }
                         }
-                        // flux du groupe → membres, au prorata de leur composition dans la cellule donneuse
+                        // cellule en amont de la donneuse (pour la pente) et receveuse, si fluides
+                        let up = if dir == 0 {
+                            if uf > 0.0 { (fi_ >= 2).then(|| self.idx(fi_ - 2, fj_)) } else { (fi_ + 1 < nx).then(|| self.idx(fi_ + 1, fj_)) }
+                        } else if uf > 0.0 {
+                            (fj_ >= 2).then(|| self.idx(fi_, fj_ - 2))
+                        } else {
+                            (fj_ + 1 < ny).then(|| self.idx(fi_, fj_ + 1))
+                        };
+                        let up = up.filter(|&c| !self.is_solid(c));
+                        let rc = r.filter(|&c| !self.is_solid(c));
+                        // reconstruction MUSCL (ordre 2, TVD) de la composition d'un groupe miscible et de la température, hors interfaces :
+                        // sans elle la diffusion numérique du schéma décentré (≈ u·dx/2) dépasse la diffusion moléculaire des mélanges
+                        let smooth = match (up, rc) {
+                            (Some(uc), Some(rcv)) => {
+                                let gd = single(dc);
+                                if gd.is_some() && single(uc) == gd && single(rcv) == gd { Some((uc, rcv, gd.unwrap())) } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some((uc, rcv, _)) = smooth {
+                            let (tu, td, tr) = (t_old[uc], t_old[dc], t_old[rcv]);
+                            face_t[f] = td + 0.5 * (1.0 - xi) * van_leer(td - tu, tr - td);
+                        }
+                        // flux du groupe → membres, au prorata de leur composition (reconstruite à la face si possible)
                         for g in 0..ng {
                             if fg[g] > 0.0 {
                                 let tot = ag[g][dc].max(1e-300);
-                                for &k in &groups[g] {
-                                    ff[f * np + k] = fg[g] * an[k][dc] / tot;
+                                match smooth {
+                                    Some((uc, rcv, gs)) if gs == g && groups[g].len() > 1 => {
+                                        let (tu, tr) = (ag[g][uc].max(1e-300), ag[g][rcv].max(1e-300));
+                                        let mut phi: Vec<f64> = groups[g]
+                                            .iter()
+                                            .map(|&k| {
+                                                let (pu, pd, pr) = (an[k][uc] / tu, an[k][dc] / tot, an[k][rcv] / tr);
+                                                (pd + 0.5 * (1.0 - xi) * van_leer(pd - pu, pr - pd)).max(0.0)
+                                            })
+                                            .collect();
+                                        let sphi: f64 = phi.iter().sum::<f64>().max(1e-300);
+                                        phi.iter_mut().for_each(|x| *x /= sphi);
+                                        for (q, &k) in groups[g].iter().enumerate() {
+                                            ff[f * np + k] = fg[g] * phi[q];
+                                        }
+                                    }
+                                    _ => {
+                                        for &k in &groups[g] {
+                                            ff[f * np + k] = fg[g] * an[k][dc] / tot;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -250,7 +300,6 @@ impl MultiphaseSim {
             }
         }
         // 4. mise à jour conservative : α, m_k, e
-        let t_old = self.temp.clone();
         let a2 = self.dx * self.dx;
         for f in 0..nf {
             if donor[f] == usize::MAX && !inflow_ghost[f] {
@@ -271,7 +320,8 @@ impl MultiphaseSim {
                     // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0
                     let rho_eos = self.reg.phases[k].rho(self.p[d], t_old[d]);
                     let rho = if aw[k][d] > 1e-8 { self.mass[k][d] / aw[k][d] } else { rho_eos };
-                    (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, t_old[d], self.p[d])
+                    let tf = if face_t[f].is_nan() { t_old[d] } else { face_t[f] };
+                    (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, tf, self.p[d])
                 };
                 let _ = p_d;
                 let mf = fk * rho_d;

@@ -45,6 +45,12 @@ pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
     if !sim.reg.miscible.is_empty() {
         return Some("fluides miscibles (CPU uniquement)".into());
     }
+    if !sim.reg.reactions.is_empty() {
+        return Some("réactions chimiques / combustion (CPU uniquement)".into());
+    }
+    if !sim.ambient_mix.is_empty() || sim.reg.phases.iter().any(|p| p.cp_slope != 0.0) {
+        return Some("ambiant mélangé ou cp variable avec T (CPU uniquement)".into());
+    }
     None
 }
 

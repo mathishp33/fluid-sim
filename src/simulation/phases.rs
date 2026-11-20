@@ -14,6 +14,39 @@
 use super::materials::PropertyLaw;
 use serde::{Deserialize, Serialize};
 
+/// Température et pression de l'état standard thermochimique (enthalpies de formation, entropies standard).
+pub const T_STD: f64 = 298.15;
+pub const P_STD: f64 = 1.0e5;
+/// Constante des gaz parfaits (J/(mol·K))
+pub const R_GAS: f64 = 8.314462618;
+
+/// Rayonnement thermique d'un gaz (modèle optiquement mince, coefficients d'absorption moyens de Planck du TNF Workshop / RADCAL).
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub enum Radiator {
+    /// transparent (N2, O2, air, liquides…)
+    #[default]
+    None,
+    /// vapeur d'eau H2O
+    Water,
+    /// dioxyde de carbone CO2
+    CarbonDioxide,
+}
+
+impl Radiator {
+    /// coefficient d'absorption moyen de Planck a_p (1/(m·atm)) ; polynômes en 1000/T valides 300–2500 K (T borné à [500 ; 2500] K)
+    pub fn planck_mean(self, t: f64) -> f64 {
+        let t = t.clamp(500.0, 2500.0);
+        let x = 1000.0 / t;
+        let poly = |c: &[f64]| c.iter().rev().fold(0.0, |acc, &ci| acc * x + ci);
+        match self {
+            Radiator::None => 0.0,
+            // TNF : a = c0 + c1 (1000/T) + … + c5 (1000/T)^5
+            Radiator::Water => poly(&[-0.23093, -1.12390, 9.41530, -2.99880, 0.51382, -1.86840e-5]).max(0.0),
+            Radiator::CarbonDioxide => poly(&[18.741, -121.310, 273.500, -194.050, 56.310, -5.8169]).max(0.0),
+        }
+    }
+}
+
 /// Nombre maximal de phases fluides gérées par le solveur CPU (le GPU est limité à `NPMAX` = 4, voir `gpu_multiphase`).
 pub const MAX_PHASES: usize = 32;
 
@@ -85,6 +118,19 @@ pub struct Phase {
     /// coefficient de diffusion (m²/s) dans les mélanges miscibles (diffusion de Fick entre espèces d'un même groupe)
     #[serde(default)]
     pub diffusivity: f64,
+    /// enthalpie standard de formation Δh_f° (J/mol) à 298.15 K, DANS L'ÉTAT DE CE FLUIDE (H2O liquide : −285.83 kJ/mol, vapeur : −241.83) ;
+    /// fixe la référence d'énergie chimique quand des réactions sont définies (voir `Registry::apply_thermochemistry`)
+    #[serde(default)]
+    pub h_formation: f64,
+    /// entropie standard s° (J/(mol·K)) à 298.15 K et 1 bar : constante d'équilibre des réactions réversibles
+    #[serde(default)]
+    pub s_standard: f64,
+    /// variation linéaire de la chaleur massique : cp(T) = cp + cp_slope·(T − 298.15) (J/(kg·K²)) ; 0 = cp constant
+    #[serde(default)]
+    pub cp_slope: f64,
+    /// rayonnement thermique (gaz de combustion)
+    #[serde(default)]
+    pub radiator: Radiator,
 }
 
 fn default_color() -> [f32; 3] {
@@ -105,8 +151,51 @@ impl Phase {
             Eos::Tait { .. } => self.cp,
         }
     }
+    /// gaz parfait : constante spécifique R/M (J/(kg·K)) ; liquide : 0
+    pub fn r_spec(&self) -> f64 {
+        match self.eos {
+            Eos::IdealGas { r_spec } => r_spec,
+            Eos::Tait { .. } => 0.0,
+        }
+    }
+    /// chaleur massique de l'énergie interne à T : de/dT = c_e + cp_slope·(T − 298.15)
+    pub fn c_e_at(&self, t: f64) -> f64 {
+        self.c_e() + self.cp_slope * (t - T_STD)
+    }
+    pub fn cp_at(&self, t: f64) -> f64 {
+        self.cp + self.cp_slope * (t - T_STD)
+    }
+    /// énergie interne massique e(T) = c_e·T + ½·cp_slope·(T − 298.15)² + e0
     pub fn e_int(&self, t: f64) -> f64 {
-        self.c_e() * t + self.e0
+        let d = t - T_STD;
+        self.c_e() * t + 0.5 * self.cp_slope * d * d + self.e0
+    }
+    /// enthalpie massique h = e + p/ρ (gaz parfait : + r T ; liquide : p/ρ ≈ 100 J/kg négligé, cohérent avec e0)
+    pub fn h_mass(&self, t: f64) -> f64 {
+        self.e_int(t) + self.r_spec() * t
+    }
+    /// coefficient de diffusion moléculaire à (T, p) : gaz D ∝ T^1.75 / p (Fuller / Chapman–Enskog), liquide D ∝ T / μ(T) (Stokes–Einstein)
+    pub fn diffusivity_at(&self, t: f64, p: f64) -> f64 {
+        let tr = self.t_ref.max(1.0);
+        if self.is_gas() {
+            self.diffusivity * (t.max(50.0) / tr).powf(1.75) * (101325.0 / p.max(1e3))
+        } else {
+            self.diffusivity * (t.max(50.0) / tr) * (self.mu_ref / self.mu(t).max(1e-12))
+        }
+    }
+    /// enthalpie molaire (J/mol)
+    pub fn h_molar(&self, t: f64) -> f64 {
+        self.molar_mass * self.h_mass(t)
+    }
+    /// entropie molaire standard (1 bar) s°(T) = s°(298.15) + M ∫ cp(T)/T dT  (J/(mol·K))
+    pub fn s_molar(&self, t: f64) -> f64 {
+        let t = t.max(1.0);
+        let a = self.cp - self.cp_slope * T_STD;
+        self.s_standard + self.molar_mass * (a * (t / T_STD).ln() + self.cp_slope * (t - T_STD))
+    }
+    /// enthalpie libre molaire standard g°(T) = h − T s° (J/mol)
+    pub fn g_molar(&self, t: f64) -> f64 {
+        self.h_molar(t) - t * self.s_molar(t)
     }
     pub fn rho(&self, p: f64, t: f64) -> f64 {
         match self.eos {
@@ -159,6 +248,10 @@ impl Phase {
             color: [0.05, 0.07, 0.11],
             molar_mass: 0.02897,
             diffusivity: 2.0e-5,
+            h_formation: 0.0,
+            s_standard: 0.0,
+            cp_slope: 0.0,
+            radiator: Radiator::None,
         }
     }
     pub fn water() -> Phase {
@@ -177,6 +270,10 @@ impl Phase {
             color: [0.10, 0.42, 0.88],
             molar_mass: 0.018015,
             diffusivity: 1.0e-9,
+            h_formation: -285.83e3,
+            s_standard: 69.95,
+            cp_slope: 0.0,
+            radiator: Radiator::None,
         }
     }
     /// Vapeur d'eau (gaz parfait, R = 461.5 J/(kg·K))
@@ -196,6 +293,10 @@ impl Phase {
             color: [0.90, 0.93, 0.96],
             molar_mass: 0.018015,
             diffusivity: 2.5e-5,
+            h_formation: -241.826e3,
+            s_standard: 188.84,
+            cp_slope: 0.0,
+            radiator: Radiator::Water,
         }
     }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
@@ -220,6 +321,10 @@ impl Phase {
             color: [0.85, 0.62, 0.10],
             molar_mass: 0.885,
             diffusivity: 1.0e-10,
+            h_formation: 0.0,
+            s_standard: 0.0,
+            cp_slope: 0.0,
+            radiator: Radiator::None,
         }
     }
 }
@@ -288,27 +393,40 @@ impl PhaseChange {
     }
 }
 
-/// Réaction chimique entre phases du registre (STRUCTURE seulement : le moteur cinétique n'est pas encore implémenté,
-/// `MultiphaseSim::react_step` est un point d'accroche vide). Le changement de phase liquide ↔ vapeur est le cas particulier
-/// « A → B » dont la cinétique est gérée à part (`PhaseChange`) ; il pourra être ré-exprimé comme une `Reaction`.
+/// Réaction chimique entre fluides du registre (moteur cinétique : `mp_species::react_step`).
 ///
-/// Conventions prévues pour la cinétique : vitesse molaire r = A·exp(−Ea/(R T))·Π_i c_i^{ordre_i} (c = m_i/M_i, mol/m³),
-/// dm_i = −ν_i M_i r dt (réactifs), +ν_j M_j r dt (produits), chaleur : Δh_r = Σ_prod ν M e0 − Σ_réact ν M e0 (J/mol de réaction)
-/// — l'énergie interne `e` est donc conservée EXACTEMENT par la seule bascule de masse (les décalages e0 jouent le rôle des
-/// enthalpies de formation, exactement comme pour la chaleur latente).
+/// Vitesse (mol de réaction par m³ de cellule et par s), loi d'Arrhenius modifiée et loi d'action de masse :
+///   k(T) = A · T^b · exp(−Ea / (R T)),   r = k(T) · Π_réactifs c_i^{o_i} · Π_modulateurs c_j^{o_j} · (1 − Q/Kc si réversible)
+/// avec c = m/M (mol/m³), o_i = ordre partiel (défaut : ν_i), Q = Π c_prod^ν / Π c_réac^ν, Kc(T) = exp(−ΔG°/(R T)) · (P°/(R T))^Δn
+/// (ΔG° calculé avec les h_f°, s° et cp(T) des fluides : l'équilibre — dissociation de CO2 et H2O dans les flammes — est
+/// thermodynamiquement cohérent). Masse : −ν_i M_i ξ pour les réactifs, +ν_j M_j ξ pour les produits (bilan exact imposé).
+/// Énergie : l'énergie interne e de la cellule est INCHANGÉE ; les décalages e0 (fixés par les enthalpies de formation, voir
+/// `Registry::apply_thermochemistry`) portent la chaleur de réaction, comme pour la chaleur latente.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Reaction {
     pub name: String,
     /// (indice de phase, coefficient stœchiométrique ν > 0)
     pub reactants: Vec<(usize, f64)>,
     pub products: Vec<(usize, f64)>,
-    /// facteur pré-exponentiel A (unités selon l'ordre global)
+    /// facteur pré-exponentiel A (unités SI : (m³/mol)^(ordre global − 1) / s / K^b)
     pub pre_exp: f64,
     /// énergie d'activation Ea (J/mol)
     pub activation_energy: f64,
     /// ordre partiel par réactif (même longueur que `reactants` ; vide = ordre = ν)
     #[serde(default)]
     pub orders: Vec<f64>,
+    /// exposant de température b de la loi d'Arrhenius modifiée
+    #[serde(default)]
+    pub temp_exponent: f64,
+    /// réaction réversible (vitesse inverse déduite de l'équilibre thermodynamique)
+    #[serde(default)]
+    pub reversible: bool,
+    /// espèces qui modulent la vitesse sans être consommées (ex. H2O dans l'oxydation de CO) : (indice, ordre)
+    #[serde(default)]
+    pub modifiers: Vec<(usize, f64)>,
+    /// épaisseur de flamme laminaire δ_L (m) pour le modèle de flamme épaissie (TFM) ; 0 = pas de modèle de flamme
+    #[serde(default)]
+    pub flame_thickness: f64,
 }
 
 impl Reaction {
@@ -317,10 +435,40 @@ impl Reaction {
         let sum = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass)).sum::<f64>();
         (sum(&self.reactants), sum(&self.products))
     }
-    /// chaleur de réaction (J/mol, > 0 = endothermique) déduite des décalages d'énergie e0 : Σ ν M e0 (produits) − Σ ν M e0 (réactifs)
+    /// énergie interne de réaction à 0 K de la convention e0 (J/mol, > 0 = endothermique) : Σ ν M e0 (produits) − Σ ν M e0 (réactifs)
     pub fn heat_of_reaction(&self, phases: &[Phase]) -> f64 {
         let sum = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass * p.e0)).sum::<f64>();
         sum(&self.products) - sum(&self.reactants)
+    }
+    fn sum_over(&self, phases: &[Phase], f: impl Fn(&Phase) -> f64) -> f64 {
+        let s = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * f(p))).sum::<f64>();
+        s(&self.products) - s(&self.reactants)
+    }
+    /// enthalpie de réaction Δh_r(T) (J/mol, < 0 = exothermique)
+    pub fn delta_h(&self, phases: &[Phase], t: f64) -> f64 {
+        self.sum_over(phases, |p| p.h_molar(t))
+    }
+    /// énergie interne de réaction Δu_r(T) (J/mol) : chaleur dégagée à volume constant = −Δu_r
+    pub fn delta_u(&self, phases: &[Phase], t: f64) -> f64 {
+        self.sum_over(phases, |p| p.molar_mass * p.e_int(t))
+    }
+    /// Δn (mol) = Σ ν produits − Σ ν réactifs
+    pub fn delta_n(&self) -> f64 {
+        self.products.iter().map(|x| x.1).sum::<f64>() - self.reactants.iter().map(|x| x.1).sum::<f64>()
+    }
+    /// ln Kc(T), Kc en (mol/m³)^Δn : ln Kc = −ΔG°/(R T) + Δn ln(P°/(R T))
+    pub fn ln_kc(&self, phases: &[Phase], t: f64) -> f64 {
+        let dg = self.sum_over(phases, |p| p.g_molar(t));
+        -dg / (R_GAS * t) + self.delta_n() * (P_STD / (R_GAS * t)).ln()
+    }
+    /// constante de vitesse directe k(T)
+    pub fn k_forward(&self, t: f64) -> f64 {
+        let t = t.max(1.0);
+        self.pre_exp * if self.temp_exponent != 0.0 { t.powf(self.temp_exponent) } else { 1.0 } * (-self.activation_energy / (R_GAS * t)).exp()
+    }
+    /// ordre partiel du i-ème réactif
+    pub fn order(&self, i: usize) -> f64 {
+        self.orders.get(i).copied().unwrap_or(self.reactants[i].1)
     }
 }
 
@@ -332,7 +480,7 @@ pub struct Registry {
     /// paires (a < b) de phases MISCIBLES (se mélangent à l'échelle moléculaire : pas d'interface entre elles). La relation est
     /// utilisée par fermeture transitive : voir `miscible_groups`.
     pub miscible: Vec<(usize, usize)>,
-    /// réactions chimiques (non simulées pour l'instant)
+    /// réactions chimiques (cinétique : `mp_species::react_step`)
     pub reactions: Vec<Reaction>,
 }
 
@@ -349,15 +497,47 @@ impl Registry {
         self.solids.len() - 1
     }
     /// Déclare que `liquid` et `vapor` sont les deux états d'une même substance.
-    /// Fixe e0_vapeur − e0_liquide = L_ref − (cp_v − cp_l) T_ref  ⇒  h_v − h_l = L(T) pour tout T.
+    /// Fixe e0_vapeur (à partir du liquide) pour que h_v(T_ref) − h_l(T_ref) = L_ref ; à cp constants : e0_v − e0_l = L_ref − (cp_v − cp_l) T_ref
+    /// ⇒ h_v − h_l = L(T) pour tout T.
     pub fn add_phase_change(&mut self, liquid: usize, vapor: usize, l_ref: f64, t_ref: f64, p_ref: f64) {
+        self.add_phase_change_anchored(liquid, vapor, l_ref, t_ref, p_ref, false);
+    }
+    /// Comme `add_phase_change` ; `anchor_vapor` = true : la vapeur garde son e0 (fixé par sa thermochimie) et c'est celui du liquide qui
+    /// est ajusté (cas d'une vapeur produite par une réaction, ex. H2O de combustion).
+    pub fn add_phase_change_anchored(&mut self, liquid: usize, vapor: usize, l_ref: f64, t_ref: f64, p_ref: f64, anchor_vapor: bool) {
         let r_v = match self.phases[vapor].eos {
             Eos::IdealGas { r_spec } => r_spec,
             _ => panic!("la vapeur doit être un gaz parfait"),
         };
         let dcp = self.phases[vapor].cp - self.phases[liquid].cp;
-        self.phases[vapor].e0 = self.phases[liquid].e0 + l_ref - dcp * t_ref;
+        if anchor_vapor {
+            let h_v = self.phases[vapor].h_mass(t_ref);
+            let l = &mut self.phases[liquid];
+            l.e0 = 0.0;
+            l.e0 = h_v - l_ref - l.h_mass(t_ref);
+        } else {
+            let h_l = self.phases[liquid].h_mass(t_ref);
+            let v = &mut self.phases[vapor];
+            v.e0 = 0.0;
+            v.e0 = h_l + l_ref - v.h_mass(t_ref);
+        }
         self.changes.push(PhaseChange { liquid, vapor, l_ref, t_ref, p_ref, r_v, dcp });
+    }
+    /// Références d'énergie chimique : e0 = Δh_f°/M − cp·298.15  ⇒  h(298.15 K) = Δh_f°/M pour chaque fluide (gaz : h = e + rT ;
+    /// liquide : h ≈ e). Appelé quand des réactions sont définies, AVANT les changements de phase.
+    pub fn apply_thermochemistry(&mut self) {
+        for p in self.phases.iter_mut() {
+            p.e0 = 0.0;
+            p.e0 = p.h_formation / p.molar_mass.max(1e-9) - p.h_mass(T_STD);
+        }
+    }
+    /// chaleur latente h_v(T) − h_l(T) d'une paire (J/kg), cohérente avec les énergies internes du solveur (cp(T) compris)
+    pub fn latent_heat(&self, pc: &PhaseChange, t: f64) -> f64 {
+        self.phases[pc.vapor].h_mass(t) - self.phases[pc.liquid].h_mass(t)
+    }
+    /// fluide k impliqué dans au moins une réaction (réactif, produit ou modulateur) ?
+    pub fn is_reactive(&self, k: usize) -> bool {
+        self.reactions.iter().any(|r| r.reactants.iter().chain(r.products.iter()).chain(r.modifiers.iter()).any(|x| x.0 == k))
     }
     /// eau + vapeur d'eau + air (valeurs réelles à 100 °C / 1 atm). Retourne (registre, id_air, id_eau, id_vapeur).
     pub fn water_air_steam() -> (Registry, usize, usize, usize) {
@@ -473,9 +653,29 @@ impl Registry {
                 w.push(format!("réaction « {} » : fluide inexistant ou coefficient ≤ 0", r.name));
                 continue;
             }
+            if r.modifiers.iter().any(|&(k, _)| k >= n) {
+                w.push(format!("réaction « {} » : modulateur de vitesse inexistant", r.name));
+                continue;
+            }
             let (m_in, m_out) = r.mass_balance(&self.phases);
             if (m_in - m_out).abs() > 1e-3 * m_in.max(m_out) {
                 w.push(format!("réaction « {} » : masse non conservée ({:.4} kg → {:.4} kg par mole de réaction)", r.name, m_in, m_out));
+            }
+            if !r.orders.is_empty() && r.orders.len() != r.reactants.len() {
+                w.push(format!("réaction « {} » : {} ordres pour {} réactifs (les ordres manquants valent ν)", r.name, r.orders.len(), r.reactants.len()));
+            }
+            if r.reversible && r.reactants.iter().chain(r.products.iter()).any(|&(k, _)| self.phases[k].s_standard == 0.0) {
+                w.push(format!("réaction réversible « {} » : entropie standard s° non renseignée pour un des fluides (équilibre faux)", r.name));
+            }
+            // réactifs dans des groupes non miscibles : la réaction n'a lieu que dans les cellules d'interface (taux volumique)
+            let groups = self.miscible_groups();
+            let gid = |k: usize| groups.iter().position(|g| g.contains(&k)).unwrap_or(usize::MAX);
+            let g0 = gid(r.reactants[0].0);
+            if r.reactants.iter().any(|&(k, _)| gid(k) != g0) {
+                w.push(format!("réaction « {} » : réactifs non miscibles entre eux — elle n'aura lieu que dans les cellules où ils se touchent", r.name));
+            }
+            if r.reactants.iter().chain(r.products.iter()).all(|&(k, _)| self.phases[k].h_formation == 0.0) {
+                w.push(format!("réaction « {} » : enthalpies de formation toutes nulles — aucune chaleur de réaction", r.name));
             }
         }
         w

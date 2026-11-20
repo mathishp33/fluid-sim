@@ -13,6 +13,7 @@ struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
     rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
+    flame_factor: Vec<f64>, heat_release: Vec<f64>, chem_heat: f64, radiated: f64, reacted: Vec<f64>, dt_chem: f64,
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
 }
@@ -22,7 +23,7 @@ impl MultiphaseSim {
         let n = self.nx * self.ny;
         let dx = self.dx;
         let umax = self.max_speed();
-        let mut dt = self.dt_max;
+        let mut dt = self.dt_max.min(self.dt_chem);
         dt = dt.min(self.cfl * dx / umax.max(1e-9));
         let g = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
         if g > 0.0 {
@@ -39,8 +40,11 @@ impl MultiphaseSim {
                 dt = dt.min(0.2 * self.rho_mix[c] * dx * dx / self.mu_cell[c]);
             }
         }
-        for ph in &self.reg.phases {
-            sig = sig.max(ph.sigma);
+        // tension de surface : seulement des liquides effectivement présents (un liquide absent n'impose pas de pas capillaire)
+        for (k, ph) in self.reg.phases.iter().enumerate() {
+            if ph.sigma > sig && self.mass[k].iter().any(|&m| m > 1e-9) {
+                sig = ph.sigma;
+            }
         }
         if self.surface_tension && sig > 0.0 {
             dt = dt.min(self.cap_safety * ((rmin + rmax) * dx.powi(3) / (4.0 * std::f64::consts::PI * sig)).sqrt());
@@ -80,6 +84,8 @@ impl MultiphaseSim {
             u: self.u.clone(), v: self.v.clone(), rho_mix: self.rho_mix.clone(), mu_cell: self.mu_cell.clone(), k_cell: self.k_cell.clone(),
             boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(),
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
+            flame_factor: self.flame_factor.clone(), heat_release: self.heat_release.clone(), chem_heat: self.chem_heat,
+            radiated: self.radiated, reacted: self.reacted.clone(), dt_chem: self.dt_chem,
             mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(),
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
         }
@@ -91,6 +97,8 @@ impl MultiphaseSim {
         self.mu_cell.clone_from(&s.mu_cell); self.k_cell.clone_from(&s.k_cell);
         self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred);
         self.energy_input = s.energy_input; self.tp_mix.clone_from(&s.tp_mix);
+        self.flame_factor.clone_from(&s.flame_factor); self.heat_release.clone_from(&s.heat_release); self.chem_heat = s.chem_heat;
+        self.radiated = s.radiated; self.reacted.clone_from(&s.reacted); self.dt_chem = s.dt_chem;
         self.mfx.clone_from(&s.mfx); self.mfy.clone_from(&s.mfy); self.m_tot_old.clone_from(&s.m_tot_old);
         self.time = s.time; self.last_dt = s.last_dt; self.last_pressure_iters = s.last_pressure_iters; self.step_count = s.step_count;
     }
@@ -127,6 +135,10 @@ impl MultiphaseSim {
     }
 
     /// Un pas de temps sans protection. Retourne dt.
+    /// Un pas SANS le filet de sécurité (diagnostic, sondes).
+    pub fn step_raw_pub(&mut self) -> f64 {
+        self.step_raw()
+    }
     pub(crate) fn step_raw(&mut self) -> f64 {
         self.refresh();
         // cellules spéciales / entrées : faces à vitesse imposée, cellules épinglées remises à leur composition cible
@@ -166,9 +178,11 @@ impl MultiphaseSim {
         // 4. conduction + changement de phase sur l'état advecté
         self.refresh();
         self.apply_thermal_sources(dt);
+        self.update_flame_factor(dt);
         self.conduct(dt);
         self.diffuse_species(dt);
         self.react_step(dt);
+        self.radiate(dt);
         self.phase_change_step(dt);
         // 5-6. pression
         self.refresh_after_thermo();

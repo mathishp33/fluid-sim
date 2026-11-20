@@ -91,6 +91,53 @@ pub struct MultiphaseSim {
     pub(crate) pf_u: Vec<f64>,
     pub(crate) pf_v: Vec<f64>,
     pub(crate) tp_mix: TpMix,
+
+    // ---- réactions chimiques, flammes, rayonnement (voir mp_species.rs)
+    /// composition du fluide ambiant (fractions VOLUMIQUES par phase, somme 1) ; vide = phase `ambient_phase` pure. Ex. air = 21 % O2 + 79 % N2
+    pub ambient_mix: Vec<f64>,
+    /// mélanges nommés (fractions volumiques) utilisables au pinceau (ex. « méthane–air stœchiométrique »)
+    pub mixtures: Vec<(String, Vec<f64>)>,
+    /// cinétique chimique active
+    pub chemistry: bool,
+    /// rayonnement des gaz chauds (H2O, CO2), modèle optiquement mince
+    pub radiation: bool,
+    /// épaisseur visée des flammes épaissies (cellules) : facteur F = flame_resolution·dx/δ_L
+    pub flame_resolution: f64,
+    /// variation relative de volume (à p, T de la cellule) que la chimie peut produire en un pas ; au-delà, l'intégration s'arrête et dt diminue
+    pub chem_volume_limit: f64,
+    /// facteur d'épaississement local F_eff (1 hors des flammes) : multiplie diffusion thermique et des espèces, divise la vitesse de réaction
+    pub flame_factor: Vec<f64>,
+    /// puissance chimique dégagée au dernier pas (W/m³, > 0 = exothermique)
+    pub heat_release: Vec<f64>,
+    /// chaleur de réaction dégagée depuis le début (J par m de profondeur) et énergie rayonnée (J/m)
+    pub chem_heat: f64,
+    pub radiated: f64,
+    /// avancement cumulé de chaque réaction (mol par m de profondeur)
+    pub reacted: Vec<f64>,
+    /// pas de temps maximal imposé par la chimie au pas suivant (s)
+    pub dt_chem: f64,
+}
+
+/// Température d'un mélange de masses `m` (kg/m³) d'énergie interne totale `e` (J/m³) : résout Σ m_k e_k(T) = e.
+/// e_k(T) = c_k T + ½ s_k (T − 298.15)² + e0_k ⇒ trinôme du second degré en τ = T − 298.15 (forme stable sans annulation).
+pub fn temp_from_masses(phases: &[super::phases::Phase], m: impl Iterator<Item = f64>, e: f64) -> f64 {
+    let (mut cap, mut slope, mut off) = (0.0, 0.0, 0.0);
+    for (k, mk) in m.enumerate() {
+        let p = &phases[k];
+        cap += mk * p.c_e();
+        slope += mk * p.cp_slope;
+        off += mk * p.e0;
+    }
+    let t0 = super::phases::T_STD;
+    let rhs = e - off - cap * t0; // = C τ + ½ S τ²
+    if slope.abs() <= 1e-12 * cap.abs().max(1e-300) {
+        return t0 + rhs / cap.max(1e-30);
+    }
+    let disc = cap * cap + 2.0 * slope * rhs;
+    if disc <= 0.0 {
+        return t0 - cap / slope; // minimum de e(T) : énergie hors du domaine du modèle (ne se produit pas en pratique)
+    }
+    t0 + 2.0 * rhs / (cap + disc.sqrt()).max(1e-30)
 }
 
 impl MultiphaseSim {
@@ -98,6 +145,7 @@ impl MultiphaseSim {
         let n = nx * ny;
         let np = reg.phases.len();
         let nch = reg.changes.len();
+        let nre = reg.reactions.len();
         MultiphaseSim {
             nx,
             ny,
@@ -152,6 +200,18 @@ impl MultiphaseSim {
             pf_u: vec![f64::NAN; (nx + 1) * ny],
             pf_v: vec![f64::NAN; nx * (ny + 1)],
             tp_mix: TpMix::new(),
+            ambient_mix: vec![],
+            mixtures: vec![],
+            chemistry: true,
+            radiation: nre > 0,
+            flame_resolution: 6.0,
+            chem_volume_limit: 0.5,
+            flame_factor: vec![1.0; n],
+            heat_release: vec![0.0; n],
+            chem_heat: 0.0,
+            radiated: 0.0,
+            reacted: vec![0.0; nre],
+            dt_chem: f64::INFINITY,
         }
     }
 
@@ -203,6 +263,36 @@ impl MultiphaseSim {
             }
         }
     }
+    /// Comme `paint_phase` avec un MÉLANGE : `f(x,y)` donne des fractions volumiques (somme 1) ou None.
+    pub fn paint_mixture(&mut self, f: impl Fn(f64, f64) -> Option<Vec<f64>>) {
+        let s = 8usize;
+        let np = self.reg.phases.len();
+        for j in 0..self.ny {
+            for i in 0..self.nx {
+                let c = self.idx(i, j);
+                let mut cnt = vec![0.0; np];
+                let mut tot = 0.0;
+                for b in 0..s {
+                    for a in 0..s {
+                        let x = (i as f64 + (a as f64 + 0.5) / s as f64) * self.dx;
+                        let y = (j as f64 + (b as f64 + 0.5) / s as f64) * self.dx;
+                        if let Some(m) = f(x, y) {
+                            for k in 0..np.min(m.len()) {
+                                cnt[k] += m[k];
+                            }
+                            tot += 1.0;
+                        }
+                    }
+                }
+                if tot > 0.0 {
+                    let keep = 1.0 - tot / (s * s) as f64;
+                    for k in 0..np {
+                        self.alpha[k][c] = self.alpha[k][c] * keep + cnt[k] / (s * s) as f64;
+                    }
+                }
+            }
+        }
+    }
     /// Marque des cellules solides : `f(x,y)` → Some(indice solide). Les cellules solides sont étanches (u·n = 0).
     pub fn paint_solid(&mut self, f: impl Fn(f64, f64) -> Option<usize>) {
         for j in 0..self.ny {
@@ -228,8 +318,10 @@ impl MultiphaseSim {
                 if !self.is_solid(c) {
                     let s: f64 = (0..self.reg.phases.len()).map(|k| self.alpha[k][c]).sum();
                     if s < 1.0 - 1e-12 {
-                        let a = self.ambient_phase;
-                        self.alpha[a][c] += 1.0 - s;
+                        let amb = self.ambient_alpha();
+                        for k in 0..self.reg.phases.len() {
+                            self.alpha[k][c] += (1.0 - s) * amb[k];
+                        }
                     } else if s > 1.0 + 1e-12 {
                         for k in 0..self.reg.phases.len() {
                             self.alpha[k][c] /= s;
@@ -294,18 +386,20 @@ impl MultiphaseSim {
 
     // ---------------------------------------------------------------- propriétés dérivées
     /// Σ m_k c_k (J/(m³·K)) d'une cellule (solide : ρ_s c_s)
+    /// ∂e/∂T à la température courante de la cellule (J/(m³·K)) (solide : ρ_s c_s)
     pub fn heat_capacity(&self, c: usize) -> f64 {
         if self.is_solid(c) {
             return self.reg.solids[self.solid[c] as usize].rho_cp();
         }
-        (0..self.reg.phases.len()).map(|k| self.mass[k][c] * self.reg.phases[k].c_e()).sum()
+        let t = self.temp[c];
+        (0..self.reg.phases.len()).map(|k| self.mass[k][c] * self.reg.phases[k].c_e_at(t)).sum()
     }
     pub fn temp_from_energy(&self, c: usize) -> f64 {
         if self.is_solid(c) {
             return self.e[c] / self.reg.solids[self.solid[c] as usize].rho_cp();
         }
-        let off: f64 = (0..self.reg.phases.len()).map(|k| self.mass[k][c] * self.reg.phases[k].e0).sum();
-        (self.e[c] - off) / self.heat_capacity(c).max(1e-30)
+        let np = self.reg.phases.len();
+        temp_from_masses(&self.reg.phases, (0..np).map(|k| self.mass[k][c]), self.e[c])
     }
     /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule.
     pub fn refresh(&mut self) {
@@ -397,6 +491,16 @@ impl MultiphaseSim {
         let mu = self.u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         let mv = self.v.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         mu.max(mv)
+    }
+    /// fractions volumiques du fluide ambiant (une seule phase si `ambient_mix` est vide)
+    pub fn ambient_alpha(&self) -> Vec<f64> {
+        let np = self.reg.phases.len();
+        if self.ambient_mix.len() == np && self.ambient_mix.iter().sum::<f64>() > 0.0 {
+            let s: f64 = self.ambient_mix.iter().sum();
+            self.ambient_mix.iter().map(|a| a / s).collect()
+        } else {
+            (0..np).map(|k| if k == self.ambient_phase { 1.0 } else { 0.0 }).collect()
+        }
     }
     pub fn liquid_phases(&self) -> Vec<usize> {
         (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].kind == PhaseKind::Liquid).collect()

@@ -94,8 +94,8 @@ impl MultiphaseSim {
         if effect.is_some() && self.is_solid(c) {
             self.solid[c] = -1;
             self.thermal[c] = MpThermal::Passive;
-            let (k, t) = (self.ambient_phase, self.t_ambient);
-            self.fill_pure(c, k, t);
+            let t = self.t_ambient;
+            self.fill_ambient(c, t);
         }
         self.special[c] = effect;
     }
@@ -118,8 +118,8 @@ impl MultiphaseSim {
     pub fn clear_cell(&mut self, c: usize) {
         if self.is_solid(c) {
             self.solid[c] = -1;
-            let (k, t) = (self.ambient_phase, self.t_ambient);
-            self.fill_pure(c, k, t);
+            let t = self.t_ambient;
+            self.fill_ambient(c, t);
         }
         self.special[c] = None;
         self.thermal[c] = MpThermal::Passive;
@@ -138,8 +138,14 @@ impl MultiphaseSim {
         self.temp[c] = t;
     }
 
+    /// Remplit la cellule du fluide ambiant (pur ou mélange, ex. air O2/N2) à (p courant, T).
+    pub fn fill_ambient(&mut self, c: usize, t: f64) {
+        let a = self.ambient_alpha();
+        self.fill_mixture(c, &a, t);
+    }
+
     /// Remplit la cellule d'un mélange (fractions volumiques `alpha`, somme 1) à (p courant, T).
-    fn fill_mixture(&mut self, c: usize, alpha: &[f64], t: f64) {
+    pub fn fill_mixture(&mut self, c: usize, alpha: &[f64], t: f64) {
         let p = self.p[c];
         let mut e = 0.0;
         for j in 0..self.reg.phases.len() {
@@ -354,6 +360,7 @@ impl MultiphaseSim {
                     let (alpha, t) = (alpha.clone(), *t);
                     self.fill_mixture(c, &alpha, t);
                 }
+                _ if pin.phase == self.ambient_phase => self.fill_ambient(c, pin.temp),
                 _ => self.fill_pure(c, pin.phase, pin.temp),
             }
             for k in 0..np {
@@ -367,19 +374,18 @@ impl MultiphaseSim {
         let np = self.reg.phases.len();
         for c in 0..self.nx * self.ny {
             let Some(PinInfo { kind: 1, tp_dest: Some(dest), .. }) = self.pin[c] else { continue };
-            let (p, amb, ta) = (self.p[c], self.ambient_phase, self.t_ambient);
-            // contenu de remplissage (air ambiant) à soustraire
-            let base: Vec<f64> = (0..np).map(|k| if k == amb { self.reg.phases[k].rho(p, ta) } else { 0.0 }).collect();
+            let (p, ta) = (self.p[c], self.t_ambient);
+            // contenu de remplissage (fluide ambiant) à soustraire
+            let amb = self.ambient_alpha();
+            let base: Vec<f64> = (0..np).map(|k| amb[k] * self.reg.phases[k].rho(p, ta)).collect();
             let e_base: f64 = (0..np).map(|k| base[k] * self.reg.phases[k].e_int(ta)).sum();
             let ma: Vec<f64> = (0..np).map(|k| (self.mass[k][c] - base[k]).max(0.0)).collect();
             let tot: f64 = ma.iter().sum();
             if tot < 1e-9 {
                 continue;
             }
-            let e_abs = (self.e[c] - e_base).max(0.0);
-            let off: f64 = (0..np).map(|k| ma[k] * self.reg.phases[k].e0).sum();
-            let cap: f64 = (0..np).map(|k| ma[k] * self.reg.phases[k].c_e()).sum();
-            let t = ((e_abs - off) / cap.max(1e-30)).clamp(100.0, 3000.0);
+            let e_abs = self.e[c] - e_base;
+            let t = super::multiphase::temp_from_masses(&self.reg.phases, ma.iter().copied(), e_abs).clamp(100.0, 3000.0);
             let vols: Vec<f64> = (0..np).map(|k| ma[k] / self.reg.phases[k].rho(p, t)).collect();
             let vsum: f64 = vols.iter().sum();
             if vsum > 0.0 {
@@ -388,8 +394,8 @@ impl MultiphaseSim {
         }
     }
 
-    /// (phase, T) du fluide qui ENTRE par la face de bord (dir, fi, fj) : celui de l'entrée du côté concerné, sinon le fluide ambiant.
-    pub(crate) fn ghost_source(&self, dir: usize, fi: usize, fj: usize) -> (usize, f64) {
+    /// (fractions volumiques, T) du fluide qui ENTRE par la face de bord (dir, fi, fj) : celui de l'entrée du côté concerné, sinon l'ambiant.
+    pub(crate) fn ghost_source(&self, dir: usize, fi: usize, fj: usize) -> (Vec<f64>, f64) {
         let side = if dir == 0 {
             if fi == 0 { 0 } else { 1 }
         } else if fj == 0 {
@@ -398,8 +404,15 @@ impl MultiphaseSim {
             3
         };
         match self.inlet[side] {
-            Some(inl) if self.bc[side] == Bc::Wall => (inl.phase.min(self.reg.phases.len() - 1), inl.temp),
-            _ => (self.ambient_phase, self.t_ambient),
+            Some(inl) if self.bc[side] == Bc::Wall => {
+                let k = inl.phase.min(self.reg.phases.len() - 1);
+                if k == self.ambient_phase {
+                    (self.ambient_alpha(), inl.temp)
+                } else {
+                    ((0..self.reg.phases.len()).map(|j| if j == k { 1.0 } else { 0.0 }).collect(), inl.temp)
+                }
+            }
+            _ => (self.ambient_alpha(), self.t_ambient),
         }
     }
 

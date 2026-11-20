@@ -16,8 +16,8 @@ use crate::simulation::gpu_multiphase::{gpu_unsupported_reason, MultiphaseGpu};
 use crate::simulation::mp_cells::{MpEffect, MpInlet, MpThermal};
 use crate::simulation::mp_materials::{MaterialLibrary, Roles};
 use crate::simulation::mp_view::{
-    all_tools, apply_tool_with, brush_cells, build_scenario_with, cell_info, compute_stats, render_rgba, reset_flow, reset_temperature, scene_from_json,
-    scene_to_json, tool_name, MpDisplay, MpScenario, MpStats, MpTool, RenderOpts, ToolOpts,
+    apply_tool_with, brush_cells, build_scenario_with, cell_info, compute_stats, render_rgba, reset_flow, reset_temperature, scene_from_json,
+    scene_to_json, sim_tools, tool_label, tool_name, MpDisplay, MpScenario, MpStats, MpTool, RenderOpts, ToolOpts, T_IGNITION,
 };
 use crate::simulation::multiphase::{Bc, MultiphaseSim};
 use crate::window::main_window::WindowAction;
@@ -107,6 +107,8 @@ pub struct MultiphaseWindow {
     circle: bool,
     radius: usize,
     brush_temp: f64,
+    /// température du noyau de flamme créé par l'outil « Allumer »
+    ignite_temp: f64,
 
     // cellules spéciales / solides thermiques (Ctrl + clic gauche)
     cell_kind: CellKind,
@@ -186,6 +188,7 @@ impl MultiphaseWindow {
             circle: true,
             radius: 3,
             brush_temp: 293.15,
+            ignite_temp: T_IGNITION,
             cell_kind: CellKind::Wall,
             sel_solid: roles.plate.unwrap_or(0),
             thermal_mode: ThermalMode::Passive,
@@ -305,6 +308,8 @@ impl MultiphaseWindow {
         let ok = match self.tool {
             MpTool::Phase(k) => k < np,
             MpTool::Solid(s) => s < ns,
+            MpTool::Mixture(m) => m < self.sim.mixtures.len(),
+            MpTool::Ignite => !self.sim.reg.reactions.is_empty(),
             _ => true,
         };
         if !ok {
@@ -520,8 +525,8 @@ impl MultiphaseWindow {
 
                 ui.separator();
                 ui.heading("Pinceau");
-                for t in all_tools(&self.sim.reg) {
-                    let name = tool_name(&self.sim.reg, t);
+                for t in sim_tools(&self.sim) {
+                    let name = tool_label(&self.sim, t);
                     ui.selectable_value(&mut self.tool, t, name);
                 }
                 ui.selectable_value(&mut self.tool, MpTool::ClearCell, tool_name(&self.sim.reg, MpTool::ClearCell));
@@ -531,8 +536,13 @@ impl MultiphaseWindow {
                     ui.selectable_value(&mut self.circle, false, "Carré");
                 });
                 ui.add(egui::Slider::new(&mut self.radius, 1..=60).text("Rayon (C)"));
-                ui.add(egui::Slider::new(&mut self.brush_temp, 100.0..=2000.0).text("T pinceau (K)"));
-                ui.weak("T pinceau : température des phases ajoutées, des solides, et cible du chauffage");
+                ui.add(egui::Slider::new(&mut self.brush_temp, 100.0..=3000.0).text("T pinceau (K)"));
+                ui.weak("T pinceau : température des phases et mélanges ajoutés, des solides, et cible du chauffage");
+                if self.tool == MpTool::Ignite {
+                    ui.add(egui::Slider::new(&mut self.ignite_temp, 1200.0..=3000.0).text("T du noyau de flamme (K)"));
+                    ui.weak("Allumer : le mélange local est remplacé par ses gaz brûlés chauds (à pression constante) ; un noyau trop petit \
+                             (< ~10 mailles de diamètre) peut s'éteindre, comme une étincelle trop faible.");
+                }
 
                 ui.separator();
                 self.cell_effects_ui(ui);
@@ -572,7 +582,13 @@ impl MultiphaseWindow {
                 ui.checkbox(&mut self.sim.surface_tension, "Tension de surface");
                 ui.checkbox(&mut self.sim.viscous, "Viscosité");
                 ui.checkbox(&mut self.sim.conduction, "Conduction thermique");
-                ui.checkbox(&mut self.sim.phase_change, "Changement de phase (ébullition / cavitation)");
+                ui.checkbox(&mut self.sim.phase_change, "Changement de phase (ébullition / cavitation / évaporation)");
+                if !self.sim.reg.reactions.is_empty() {
+                    ui.checkbox(&mut self.sim.chemistry, "Réactions chimiques");
+                    ui.checkbox(&mut self.sim.radiation, "Rayonnement des gaz chauds (H2O, CO2)");
+                    ui.add(egui::Slider::new(&mut self.sim.flame_resolution, 4.0..=12.0).text("Épaisseur des flammes (mailles)"));
+                    ui.weak("Flamme épaissie : la vitesse de flamme est conservée quelle que soit la maille ; plus de mailles = plus précis, plus lent.");
+                }
                 ui.add_enabled(self.backend == Backend::Cpu, egui::Checkbox::new(&mut self.sim.conservative_momentum, "Quantité de mouvement conservative (CPU)"));
                 ui.weak("GPU : l'advection est toujours conservative.");
                 if ui.button("Reset temperature").clicked() {
@@ -758,7 +774,24 @@ impl MultiphaseWindow {
                     row("Chaleur injectée (J/m)", format!("{:.4e}", st.heat_input));
                     row("Cellules spéciales", format!("{}", st.effects));
                     row("Pas annulés (filet)", format!("{}", st.rollbacks));
+                    if !st.reactions.is_empty() {
+                        row("Puissance chimique (W/m)", format!("{:.4e}", st.chem_power));
+                        row("Chaleur de réaction (J/m)", format!("{:.4e}", st.chem_heat));
+                        row("Énergie rayonnée (J/m)", format!("{:.4e}", st.radiated));
+                        row("Épaississement des flammes F", format!("{:.0}", st.flame_factor));
+                    }
                 });
+                if !st.reactions.is_empty() {
+                    ui.separator();
+                    ui.label("Avancement des réactions (mol/m)");
+                    egui::Grid::new("mp_rx_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                        for (n, x) in &st.reactions {
+                            ui.label(n);
+                            ui.label(format!("{:.4e}", x));
+                            ui.end_row();
+                        }
+                    });
+                }
                 ui.separator();
                 ui.label("Masse (kg/m) · aire (m²)");
                 egui::Grid::new("mp_mass_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -809,7 +842,7 @@ impl MultiphaseWindow {
                     ("R", "Reset flow (vitesses à zéro)"),
                     ("Maj + R", "Recommencer le scénario"),
                     ("Échap", "Retour aux réglages"),
-                    ("Clic gauche", "Applique l'outil (phase, solide, chauffage, poussée…)"),
+                    ("Clic gauche", "Applique l'outil (phase, mélange, solide, chauffage, poussée, allumage…)"),
                     ("Ctrl + clic gauche", "Pose le type de cellule choisi (solide + thermique, puits, émetteur, accélérateur, téléporteur)"),
                     ("Clic droit", "Pousse le fluide avec le curseur"),
                     ("Clic milieu / Ctrl + milieu", "Efface solide, effet et comportement thermique"),
@@ -938,11 +971,12 @@ impl MultiphaseWindow {
             return;
         }
         let cells = brush_cells(nx, ny, ci, cj, self.radius, self.circle);
-        let base = ToolOpts { temp: self.brush_temp, cursor, dt, thermal: self.thermal_for_tool() };
+        let t_tool = if self.tool == MpTool::Ignite { self.ignite_temp } else { self.brush_temp };
+        let base = ToolOpts { temp: t_tool, cursor, dt, thermal: self.thermal_for_tool() };
         let mut edited = false;
         if left {
             if shift && !ctrl {
-                apply_tool_with(&mut self.sim, MpTool::Heat, &cells, &base);
+                apply_tool_with(&mut self.sim, MpTool::Heat, &cells, &ToolOpts { temp: self.brush_temp, ..base });
             } else if ctrl {
                 if let Some((tool, th)) = self.ctrl_tool() {
                     let temp = if matches!(self.cell_kind, CellKind::Wall) && self.thermal_mode == ThermalMode::Isothermal { self.thermal_temp } else { self.brush_temp };
@@ -959,7 +993,7 @@ impl MultiphaseWindow {
         }
         if middle {
             if shift && !ctrl {
-                apply_tool_with(&mut self.sim, MpTool::Heat, &cells, &base);
+                apply_tool_with(&mut self.sim, MpTool::Heat, &cells, &ToolOpts { temp: self.brush_temp, ..base });
             } else {
                 apply_tool_with(&mut self.sim, MpTool::ClearCell, &cells, &base);
             }
@@ -1179,6 +1213,33 @@ mod tests {
             w.display = d;
             frame(&ctx, &mut w, vec![], Modifiers::default());
         }
+    }
+
+    #[test]
+    fn combustion_scenario_ignites_from_the_ui_and_renders_flames() {
+        let ctx = egui::Context::default();
+        let mut st = settings();
+        st.mp_scenario = MpScenario::ConfinedExplosion.index();
+        let mut w = MultiphaseWindow::new(&st);
+        assert!(w.sim.reg.reactions.len() >= 3 && w.status.starts_with("Scénario"), "{}", w.status);
+        // GPU refusé (chimie)
+        w.set_backend(Backend::Gpu);
+        assert!(w.backend == Backend::Cpu);
+        // allumage supplémentaire au pinceau, dans un coin
+        w.tool = MpTool::Ignite;
+        w.radius = 4;
+        w.paused = true;
+        click_at(&ctx, &mut w, pos2(500.0, 200.0), Modifiers::default(), egui::PointerButton::Primary);
+        w.paused = false;
+        for _ in 0..25 {
+            frame(&ctx, &mut w, vec![], Modifiers::default());
+        }
+        assert!(w.sim.state_is_sane() && w.sim.chem_heat > 0.0, "rien n'a brûlé");
+        for d in [MpDisplay::Flame, MpDisplay::HeatRelease, MpDisplay::Temperature] {
+            w.display = d;
+            frame(&ctx, &mut w, vec![], Modifiers::default());
+        }
+        assert!(sim_tools(&w.sim).iter().any(|t| matches!(t, MpTool::Mixture(_))));
     }
 
     #[test]

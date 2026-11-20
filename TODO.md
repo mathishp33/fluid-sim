@@ -1,10 +1,10 @@
-Il n’y a pas de rayonnement, alors qu’il domine à 1000 K ou plus. Pas de combustion, ni d’humidité.
+pas d’humidité ?
 Le low-Mach filtre les ondes acoustiques et les chocs. C’est voulu, mais le son n’existe pas.
 Pression thermodynamique uniforme : l’effet de la stratification hydrostatique sur ρ et sur le travail de pression est négligé. C’est acceptable pour quelques mètres.
 2D uniquement. La turbulence 2D (cascade inverse) diffère de la 3D, et il n’y a pas de modèle de sous-maille.
 
 
-POUR LE BUG :
+(POUR LE BUG (réglé) :
 CONFIGURATION : 
  - Rupture de barrage 
  - CPU f64
@@ -24,35 +24,43 @@ De la pression énorme se créée ce qui transforme l'eau en vapeur,
    la simulation ne veut pas se remettre en route grâce au garde-fou anti NaN.
 Ce bug arrive plus souvent avec le GPU en f32.
 MON AVIS:
- - la precision de 5 met trop de stress sur la simulation. 
- -> Il faut trouver le point faible qui cause ce crash et le fix.
- -> Peut-être qu'il faut revoir l'architecture/la codebase entière.
+ - la precision de 5 met trop de stress sur la simulation.
+   -> Il faut trouver le point faible qui cause ce crash et le fix.
+   -> Peut-être qu'il faut revoir l'architecture/la codebase entière.)
 
 ## Prioritaire
 
-# PROCHAIN
-Fait la Cinétique chimique avec ce que tu as anoncé. 
-Puis ajoute la possibilité d'avoir des flammes/explosions.
+Facteur A recalé : les valeurs publiées (Westbrook–Dryer pour le méthane, Marinov pour l’hydrogène) donnaient des vitesses de flamme fausses avec ce solveur. Je les ai recalées sur les vitesses mesurées, ce qui est la façon normale de construire ces mécanismes à une étape. L’allumage spontané d’un mélange chaud, en revanche, n’est qu’approximatif.
+Pas de détonation : le solveur de pression ne gère pas les ondes de choc, donc les explosions restent des déflagrations (le cas des explosions de gaz accidentelles).
+Énergie pendant une explosion : l’énergie totale dérive jusqu’à 5 % de la chaleur dégagée pendant les fortes oscillations de pression.
+Flamme du tube : elle oscille avec l’acoustique du tube, comme dans les expériences. Sa vitesse instantanée varie donc, et seule la moyenne est juste.
+Pas de radicaux ni de suie : sans OH, H, O, les flammes sont environ 50–90 K trop chaudes, et les flammes de diffusion n’ont pas leur couleur jaune.
+GPU : le calcul repasse sur CPU dès qu’il y a de la chimie.
+Changements d’anciens comportements :
+une scène sans liquide n’est plus ralentie par la tension de surface d’un liquide absent ;
+le transport de la température est un peu moins diffusif.
 
 
+ - Faire dépendre la diffusivité de la paire de fluides, au lieu d’une valeur par fluide.
+ - Ajouter une enthalpie de mélange.
+ - Ajouter la dissolution d’un gaz dans un liquide (loi de Henry). 
+ - C’est l’usage naturel du cas gaz + liquide miscibles, aujourd’hui seulement signalé par un avertissement.
 
-Faire dépendre la diffusivité de la paire de fluides, au lieu d’une valeur par fluide.
-Ajouter une enthalpie de mélange.
-Ajouter la dissolution d’un gaz dans un liquide (loi de Henry). 
-C’est l’usage naturel du cas gaz + liquide miscibles, aujourd’hui seulement signalé par un avertissement.
+ - METTRE GPU EN F64 & GPU résident : ne plus recopier tout l’état à chaque pas
+Il faut faire une décision d'architecture : 
+ - Es ce qu'on supporte seulement sur le GPU ?
+ - Es ce qu'on continue à supporter CPU et GPU ?
+ - Il faut surement revoir l'architecture du coté GPU ?
+On a des performances horribles (5 fps) en CPU (et même CPU je crois) alors que le CPU est à 11%
 
-METTRE GPU EN F64, TOUT EN F64
-
- - Door / Valve CellEffect !!!!!!!!
- - Compressor !!!!
- - plus de CellEffect !!!!
-
- - réactions chimiques (ajoutées par l'utilisateur)
+Plus de CellEffts: 
+ - Door / Valve CellEffect !
+ - Compressor ?
+ - d'autres ...
 
 advection Rudman / Raessi–Pitsch
 
 IMPLEMENTER TENSION LIQUIDE/LIQUIDE
-GPU résident : ne plus recopier tout l’état à chaque pas.
 
 TENSEUR DE CONTRAINTES. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. 
 Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. 
@@ -80,14 +88,13 @@ CHANGEMENT D ETATS, REACTIONS CHIMIQUES ?
 
 ## Ancien / Autre (Quand même à faire)
 
-1. Optimiser la simulation de fluide (Conjugate Gradient ?, PCG ?, Multi-grid ?)
-2. Meilleures conditions aux limites (Periodic, Open, PressureOutlet, VelocityOutlet)
+1. Optimiser la simulation de fluide
+2. Meilleures conditions aux limites (bordures) (Periodic, Open, PressureOutlet, VelocityOutlet)
 3. Forces externes (archimède, frottements/pas frottements)
-4. solides mobiles Solid(position, accéleration, masse, angle, vitesse angulaire, inertie, dynamique, forme)
+4. solides mobiles
 
 FLIP/PIC ?
 Indicateur vorticité
-Écoulement compressible
 
 
 # Fait (Fonctionnalités)
