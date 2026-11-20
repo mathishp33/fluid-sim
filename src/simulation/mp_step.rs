@@ -7,7 +7,51 @@
 //!  4. conduction, diffusion des espèces miscibles, réactions (accroche), changement de phase (source de volume)
 //! dt est limité par l'advection (CFL), la gravité, la tension de surface (Brackbill) et la viscosité — PAS par l'acoustique.
 
+use std::time::Instant;
+
 use super::multiphase::MultiphaseSim;
+
+pub const P_REFRESH: usize = 0;
+pub const P_FORCES: usize = 1;
+pub const P_ADVECT_MASS: usize = 2;
+pub const P_ADVECT_MOM: usize = 3;
+pub const P_CONDUCT: usize = 4;
+pub const P_SPECIES: usize = 5;
+pub const P_CHEM: usize = 6;
+pub const P_PHASE: usize = 7;
+pub const P_PRESSURE: usize = 8;
+pub const P_OTHER: usize = 9;
+pub const PROFILE_NAMES: [&str; 10] = [
+    "propriétés (refresh)",
+    "forces (gravité, tension, viscosité)",
+    "advection masse / énergie (PLIC)",
+    "advection quantité de mouvement",
+    "conduction thermique",
+    "diffusion des espèces",
+    "chimie + rayonnement",
+    "changement de phase",
+    "pression (Newton + PCG)",
+    "divers (cellules spéciales, dt)",
+];
+
+/// Temps passé dans chaque partie du pas (secondes cumulées depuis la dernière remise à zéro).
+#[derive(Clone, Debug, Default)]
+pub struct StepProfile {
+    pub secs: [f64; 10],
+    pub steps: usize,
+}
+
+impl StepProfile {
+    pub fn total(&self) -> f64 {
+        self.secs.iter().sum()
+    }
+    /// (nom, ms par pas, part du total)
+    pub fn report(&self) -> Vec<(&'static str, f64, f64)> {
+        let tot = self.total().max(1e-30);
+        let n = self.steps.max(1) as f64;
+        (0..10).map(|k| (PROFILE_NAMES[k], 1e3 * self.secs[k] / n, self.secs[k] / tot)).collect()
+    }
+}
 
 struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
@@ -140,7 +184,15 @@ impl MultiphaseSim {
         self.step_raw()
     }
     pub(crate) fn step_raw(&mut self) -> f64 {
+        let mut clk = Instant::now();
+        let mut lap = |prof: &mut StepProfile, k: usize| {
+            let now = Instant::now();
+            prof.secs[k] += (now - clk).as_secs_f64();
+            clk = now;
+        };
+        let mut prof = std::mem::take(&mut self.profile);
         self.refresh();
+        lap(&mut prof, P_REFRESH);
         // cellules spéciales / entrées : faces à vitesse imposée, cellules épinglées remises à leur composition cible
         self.prepare_special();
         if self.has_extras() {
@@ -149,6 +201,7 @@ impl MultiphaseSim {
             self.refresh();
         }
         let dt = self.choose_dt();
+        lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());
         // 2. prédiction de vitesse
         let (us, vs);
@@ -157,16 +210,22 @@ impl MultiphaseSim {
             let mut fx = vec![0.0; self.u.len()];
             let mut fy = vec![0.0; self.v.len()];
             self.add_forces(dt, &mut fx, &mut fy);
+            lap(&mut prof, P_FORCES);
             self.advect_mass_energy(dt);
+            lap(&mut prof, P_ADVECT_MASS);
             let (mut ua, mut va) = self.advect_momentum();
             for (a, f) in ua.iter_mut().zip(&fx) { *a += *f; }
             for (a, f) in va.iter_mut().zip(&fy) { *a += *f; }
             us = ua;
             vs = va;
+            lap(&mut prof, P_ADVECT_MOM);
         } else {
             let (mut a, mut b) = self.advect_velocity(dt);
+            lap(&mut prof, P_ADVECT_MOM);
             self.add_forces(dt, &mut a, &mut b);
+            lap(&mut prof, P_FORCES);
             self.advect_mass_energy(dt);
+            lap(&mut prof, P_ADVECT_MASS);
             us = a;
             vs = b;
         }
@@ -178,18 +237,28 @@ impl MultiphaseSim {
         // 4. conduction + changement de phase sur l'état advecté
         self.refresh();
         self.apply_thermal_sources(dt);
+        lap(&mut prof, P_REFRESH);
         self.update_flame_factor(dt);
         self.conduct(dt);
+        lap(&mut prof, P_CONDUCT);
         self.diffuse_species(dt);
+        lap(&mut prof, P_SPECIES);
         self.react_step(dt);
         self.radiate(dt);
+        lap(&mut prof, P_CHEM);
         self.phase_change_step(dt);
+        lap(&mut prof, P_PHASE);
         // 5-6. pression
         self.refresh_after_thermo();
+        lap(&mut prof, P_REFRESH);
         self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &un, &vn);
+        lap(&mut prof, P_PRESSURE);
         // 7. travail de pression et état final
         self.pressure_work(dt);
         self.refresh();
+        lap(&mut prof, P_REFRESH);
+        prof.steps += 1;
+        self.profile = prof;
         self.time += dt;
         self.last_dt = dt;
         self.step_count += 1;

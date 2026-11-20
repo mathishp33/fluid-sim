@@ -53,6 +53,8 @@ pub struct MultiphaseSim {
     pub phase_change: bool,
     pub pressure_tol: f64,
     pub pressure_max_iter: usize,
+    /// préconditionneur de la pression : multigrille (défaut, parallèle) ou Cholesky incomplet IC(0) (historique)
+    pub multigrid: bool,
     // changement de phase
     pub nucleation_superheat: f64, // K de surchauffe pour amorcer l'ébullition en volume
     pub nucleation_alpha: f64,     // fraction de vapeur créée à l'amorçage (germes)
@@ -60,6 +62,8 @@ pub struct MultiphaseSim {
     pub time: f64,
     pub last_dt: f64,
     pub last_pressure_iters: usize,
+    /// itérations de Newton de la fermeture volumique au dernier pas
+    pub last_newton_iters: usize,
     /// masse (kg par m de profondeur) entrée par les bords ouverts, par phase : M_k(t) − M_k(0) = flux_k − (changements de phase)
     pub boundary_flux: Vec<f64>,
     /// masse transformée liquide→vapeur cumulée par paire (kg/m), pour les bilans
@@ -116,6 +120,21 @@ pub struct MultiphaseSim {
     pub reacted: Vec<f64>,
     /// pas de temps maximal imposé par la chimie au pas suivant (s)
     pub dt_chem: f64,
+    /// profil de temps de calcul par partie du pas (voir `mp_step::StepProfile`)
+    pub profile: super::mp_step::StepProfile,
+}
+
+/// Pointeur partagé entre fils pour des écritures à des indices DISJOINTS (une cellule = un seul fil).
+#[derive(Clone, Copy)]
+pub(crate) struct SyncPtr<T>(pub *mut T);
+unsafe impl<T> Send for SyncPtr<T> {}
+unsafe impl<T> Sync for SyncPtr<T> {}
+impl<T> SyncPtr<T> {
+    /// (méthode : force la capture du wrapper entier par les fermetures, pas du seul pointeur brut)
+    #[inline(always)]
+    pub fn at(&self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
+    }
 }
 
 /// Température d'un mélange de masses `m` (kg/m³) d'énergie interne totale `e` (J/m³) : résout Σ m_k e_k(T) = e.
@@ -176,12 +195,14 @@ impl MultiphaseSim {
             phase_change: true,
             pressure_tol: 1e-10,
             pressure_max_iter: 600,
+            multigrid: true,
             nucleation_superheat: 4.0,
             nucleation_alpha: 1e-3,
             nuclei_density: 1e13,
             time: 0.0,
             last_dt: 0.0,
             last_pressure_iters: 0,
+            last_newton_iters: 0,
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
             step_count: 0,
@@ -212,6 +233,7 @@ impl MultiphaseSim {
             radiated: 0.0,
             reacted: vec![0.0; nre],
             dt_chem: f64::INFINITY,
+            profile: Default::default(),
         }
     }
 
@@ -401,38 +423,63 @@ impl MultiphaseSim {
         let np = self.reg.phases.len();
         temp_from_masses(&self.reg.phases, (0..np).map(|k| self.mass[k][c]), self.e[c])
     }
-    /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule.
+    /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule. Parallèle par lignes sur les grandes grilles ;
+    /// les phases absentes d'une cellule (cas le plus fréquent) ne coûtent rien.
     pub fn refresh(&mut self) {
         let np = self.reg.phases.len();
-        let mut vk = vec![0.0f64; np];
-        for c in 0..self.nx * self.ny {
-            if self.is_solid(c) {
-                let s = &self.reg.solids[self.solid[c] as usize];
-                self.temp[c] = self.e[c] / s.rho_cp();
-                self.rho_mix[c] = s.rho;
-                self.k_cell[c] = s.conductivity;
-                self.mu_cell[c] = 0.0;
-                continue;
+        let (nx, ny) = (self.nx, self.ny);
+        let n = nx * ny;
+        let temp = SyncPtr(self.temp.as_mut_ptr());
+        let rho_mix = SyncPtr(self.rho_mix.as_mut_ptr());
+        let mu_cell = SyncPtr(self.mu_cell.as_mut_ptr());
+        let k_cell = SyncPtr(self.k_cell.as_mut_ptr());
+        let alpha: Vec<SyncPtr<f64>> = self.alpha.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect();
+        let this = &*self;
+        let row = |j: usize| {
+            let mut vk = [0.0f64; super::phases::MAX_PHASES];
+            for i in 0..nx {
+                let c = j * nx + i;
+                // SAFETY : chaque cellule c n'est écrite que par la ligne j qui la contient (lignes réparties entre les fils)
+                unsafe {
+                    if this.solid[c] >= 0 {
+                        let s = &this.reg.solids[this.solid[c] as usize];
+                        *temp.at(c) = this.e[c] / s.rho_cp();
+                        *rho_mix.at(c) = s.rho;
+                        *k_cell.at(c) = s.conductivity;
+                        *mu_cell.at(c) = 0.0;
+                        continue;
+                    }
+                    let t = temp_from_masses(&this.reg.phases, (0..np).map(|k| this.mass[k][c]), this.e[c]);
+                    *temp.at(c) = t;
+                    let p = this.p[c];
+                    let mut vol = 0.0;
+                    for k in 0..np {
+                        let m = this.mass[k][c];
+                        vk[k] = if m > 0.0 { m / this.reg.phases[k].rho(p, t) } else { 0.0 };
+                        vol += vk[k];
+                    }
+                    let (mut rho, mut mu, mut kc) = (0.0, 0.0, 0.0);
+                    let inv = 1.0 / vol.max(1e-300);
+                    for k in 0..np {
+                        let a = vk[k] * inv;
+                        *alpha[k].at(c) = a;
+                        rho += this.mass[k][c];
+                        if a > 0.0 {
+                            mu += a * this.reg.phases[k].mu(t);
+                            kc += a * this.reg.phases[k].k(t);
+                        }
+                    }
+                    *rho_mix.at(c) = rho * inv;
+                    *mu_cell.at(c) = mu;
+                    *k_cell.at(c) = kc;
+                }
             }
-            let t = self.temp_from_energy(c);
-            self.temp[c] = t;
-            let p = self.p[c];
-            let mut vol = 0.0;
-            for k in 0..np {
-                vk[k] = self.mass[k][c].max(0.0) / self.reg.phases[k].rho(p, t);
-                vol += vk[k];
-            }
-            let (mut rho, mut mu, mut kc) = (0.0, 0.0, 0.0);
-            for k in 0..np {
-                let a = vk[k] / vol.max(1e-300);
-                self.alpha[k][c] = a;
-                rho += self.mass[k][c];
-                mu += a * self.reg.phases[k].mu(t);
-                kc += a * self.reg.phases[k].k(t);
-            }
-            self.rho_mix[c] = rho / vol.max(1e-300);
-            self.mu_cell[c] = mu;
-            self.k_cell[c] = kc;
+        };
+        if n >= 4096 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            (0..ny).into_par_iter().for_each(row);
+        } else {
+            (0..ny).for_each(row);
         }
     }
 

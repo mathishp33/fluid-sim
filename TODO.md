@@ -56,7 +56,7 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 ### Bugs / manques des cellules spéciales
 - [M] Téléporteur partiellement cassé : la taille de la destination n'est pas réglable (une seule cellule de destination).
 - [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), Compresseur, Sensor (pression, température, ...), autres…
-- [M] Montée en température : en ajoutant une grosse montée en température très rapide sur un liquide, ça se met sur pause (filet de sécurité ?)
+- [M] Montée en température : en ajoutant une grosse montée en température très rapide sur un liquide, ça se met sur pause (filet de sécurité ?).
 ### Simulation monophasique et multiphasique
 - **[M + 1] Séparer la simulation monophasique et multiphasique**, avec des dossiers ?
 

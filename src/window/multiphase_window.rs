@@ -573,6 +573,7 @@ impl MultiphaseWindow {
                         g.pcg_iter = it as u32;
                     }
                 }
+                ui.checkbox(&mut self.sim.multigrid, "Pression : préconditionneur multigrille (sinon IC(0), ~10× plus d'itérations)");
                 ui.add(egui::Slider::new(&mut self.sim.cfl, 0.1..=0.9).text("CFL"));
                 ui.add(egui::Slider::new(&mut self.sim.dt_max, 1e-5..=2e-2).logarithmic(true).text("dt max (s)"));
                 let mut g = -self.sim.gravity[1];
@@ -807,6 +808,31 @@ impl MultiphaseWindow {
                     for w in &self.build_warnings {
                         ui.colored_label(Color32::from_rgb(230, 170, 40), format!("⚠ {w}"));
                     }
+                }
+                ui.separator();
+                let mut reset_prof = false;
+                egui::CollapsingHeader::new(format!(
+                    "Profil du calcul : {:.1} ms par pas, {} fil(s)",
+                    1e3 * self.sim.profile.total() / self.sim.profile.steps.max(1) as f64,
+                    rayon::current_num_threads()
+                ))
+                .id_source("mp_prof")
+                .show(ui, |ui| {
+                    egui::Grid::new("mp_prof_grid").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
+                        for (name, ms, frac) in self.sim.profile.report() {
+                            ui.label(name);
+                            ui.label(format!("{ms:.2} ms"));
+                            ui.label(format!("{:.0} %", 100.0 * frac));
+                            ui.end_row();
+                        }
+                    });
+                    ui.label(format!("Itérations : {} PCG, {} Newton (dernier pas)", self.sim.last_pressure_iters, self.sim.last_newton_iters));
+                    if ui.button("Remettre le profil à zéro").clicked() {
+                        reset_prof = true;
+                    }
+                });
+                if reset_prof {
+                    self.sim.profile = Default::default();
                 }
                 ui.separator();
                 ui.heading("Cellule sous le curseur");

@@ -6,7 +6,8 @@
 //! bulle dans l'eau → quasi isotherme).
 //! Équation : −∇·(dt/ρ_f ∇δp) + (κ_eff/dt) δp = (V−1)/dt − ∇·(Ũ − uⁿ),   Ũ = u* − dt/ρ_f ∇p_k,
 //! uⁿ⁺¹ = Ũ − dt/ρ_f ∇δp. Le terme acoustique κ/dt est implicite : le pas de temps n'est PAS limité par c ≈ 1480 m/s.
-//! Matrice SPD résolue par gradients conjugués préconditionnés par Cholesky incomplet IC(0).
+//! Matrice SPD résolue par gradients conjugués préconditionnés par un V-cycle multigrille (`mp_mg`, défaut) ou par Cholesky incomplet
+//! IC(0) (`multigrid = false`, séquentiel, ~10× plus d'itérations).
 
 use super::multiphase::{Bc, MultiphaseSim};
 
@@ -174,6 +175,70 @@ impl MultiphaseSim {
 
     /// Résout A x = b (PCG + IC(0)). Retourne le nombre d'itérations.
     fn pcg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
+        if self.multigrid {
+            self.pcg_mg(st, b, x)
+        } else {
+            self.pcg_ic0(st, b, x)
+        }
+    }
+
+    /// Gradient conjugué préconditionné par multigrille (vecteurs et opérateur parallèles).
+    fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
+        use super::mp_mg::{dot, Level, Multigrid, PAR_MIN};
+        use rayon::prelude::*;
+        let n = b.len();
+        let active: Vec<bool> = (0..n).map(|c| !(self.is_solid(c) || self.pinned(c))).collect();
+        let fine = Level { nx: self.nx, ny: self.ny, diag: st.diag.clone(), ae: st.ae.clone(), an: st.an.clone(), active };
+        let mut mg = Multigrid::new(fine);
+        let mut r = vec![0.0; n];
+        let mut ax = vec![0.0; n];
+        mg.levels[0].apply(x, &mut ax);
+        for c in 0..n {
+            r[c] = b[c] - ax[c];
+        }
+        let bn = dot(b, b).sqrt().max(1e-300);
+        let mut z = vec![0.0; n];
+        mg.precondition(&r, &mut z);
+        let mut pdir = z.clone();
+        let mut rz = dot(&r, &z);
+        let mut it = 0;
+        let par = n >= PAR_MIN;
+        while it < self.pressure_max_iter {
+            if dot(&r, &r).sqrt() <= self.pressure_tol * bn {
+                break;
+            }
+            mg.levels[0].apply(&pdir, &mut ax);
+            let pap = dot(&pdir, &ax);
+            if pap.abs() < 1e-300 {
+                break;
+            }
+            let al = rz / pap;
+            let upd = |((xc, rc), (pc, ac)): ((&mut f64, &mut f64), (&f64, &f64))| {
+                *xc += al * pc;
+                *rc -= al * ac;
+            };
+            if par {
+                x.par_iter_mut().zip(r.par_iter_mut()).zip(pdir.par_iter().zip(ax.par_iter())).for_each(upd);
+            } else {
+                x.iter_mut().zip(r.iter_mut()).zip(pdir.iter().zip(ax.iter())).for_each(upd);
+            }
+            mg.precondition(&r, &mut z);
+            let rz2 = dot(&r, &z);
+            let be = rz2 / rz.max(1e-300);
+            rz = rz2;
+            let dir = |(pc, zc): (&mut f64, &f64)| *pc = zc + be * *pc;
+            if par {
+                pdir.par_iter_mut().zip(z.par_iter()).for_each(dir);
+            } else {
+                pdir.iter_mut().zip(z.iter()).for_each(dir);
+            }
+            it += 1;
+        }
+        it
+    }
+
+    /// Gradient conjugué préconditionné par Cholesky incomplet IC(0) (historique, séquentiel).
+    fn pcg_ic0(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
         let nx = self.nx;
         let n = b.len();
         let mut l = vec![1.0; n];
@@ -279,7 +344,9 @@ impl MultiphaseSim {
         let mut pk = self.p.clone();
         let mut total_it = 0;
         let mut kappa = vec![0.0; n];
+        let mut newton = 0;
         for _newton in 0..4 {
+            newton += 1;
             let mut vol = vec![1.0; n];
             for c in 0..n {
                 if self.is_solid(c) {
@@ -330,6 +397,7 @@ impl MultiphaseSim {
                 break;
             }
         }
+        self.last_newton_iters = newton;
         let (uf, vf) = self.face_velocities(us, vs, &pk, dt);
         self.u = uf;
         self.v = vf;

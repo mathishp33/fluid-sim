@@ -98,6 +98,11 @@ impl MultiphaseSim {
                 let (t, p) = (self.temp[c], self.p[c]);
                 let al = self.alpha[liq][c];
                 let av = self.alpha[vap][c];
+                // tri rapide (T_sat(p) se calcule par dichotomie, p_sat(T) par une exponentielle) : sans vapeur et sous la saturation,
+                // ni ébullition, ni nucléation, ni condensation ne sont possibles (sauf évaporation dans un gaz mélangé : voir plus bas)
+                if others.is_empty() && mv <= 1e-12 && pc.p_sat(t) <= p {
+                    continue;
+                }
                 if !others.is_empty() {
                     let n_o: f64 = others.iter().map(|&k| self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass).sum();
                     if n_o > 1e-9 && pc.p_sat(t) < 0.98 * p && (ml > 1e-12 || mv > 1e-12) {

@@ -6,9 +6,9 @@
 //!   D_k(T, p) : gaz ∝ T^1.75/p, liquides ∝ T/μ. L'énergie interne accompagne chaque espèce : l'énergie totale est conservée exactement.
 //!
 //! * Cinétique (`react_step`) : loi d'Arrhenius modifiée + action de masse, réactions réversibles par l'équilibre thermodynamique
-//!   (voir `phases::Reaction`). Intégration cellule par cellule à volume et énergie interne constants (découplage d'opérateurs :
-//!   l'expansion est ensuite produite par la projection de pression) avec sous-pas adaptatifs — limite d'échauffement de 25 K et de
-//!   consommation de 30 % par sous-pas pour les réactions irréversibles, Euler IMPLICITE (Newton) pour les réactions réversibles,
+//!   (voir `phases::Reaction`). Intégration cellule par cellule (en parallèle) à volume et énergie interne constants (découplage
+//!   d'opérateurs : l'expansion est ensuite produite par la projection de pression) avec sous-pas adaptatifs — point milieu (ordre 2),
+//!   échauffement ≤ 60 K et consommation ≤ 40 % par sous-pas pour les réactions irréversibles, Euler IMPLICITE (Newton) pour les réactions réversibles,
 //!   raides près de l'équilibre (dissociation de CO2 / H2O). Masse exactement conservée réaction par réaction, énergie interne inchangée :
 //!   la chaleur de réaction vient des enthalpies de formation portées par les décalages e0.
 //!   Couplage avec l'écoulement : la chimie d'un pas ne peut pas augmenter le volume d'une cellule (à p, T) de plus de `chem_volume_limit` ;
@@ -32,6 +32,16 @@ const SIGMA_SB: f64 = 5.670374419e-8;
 const C_FLOOR: f64 = 1e-3;
 /// nombre maximal de sous-pas chimiques par cellule et par pas
 const MAX_CHEM_SUBSTEPS: usize = 4000;
+
+/// résultat de l'intégration chimique d'une cellule
+struct ChemOut {
+    c: usize,
+    m: Vec<f64>,
+    temp: f64,
+    q: f64,
+    xi: Vec<f64>,
+    dt_cell: f64,
+}
 
 /// état local d'une cellule pendant l'intégration chimique
 struct CellChem<'a> {
@@ -186,65 +196,116 @@ impl MultiphaseSim {
             let nsub = ((dt * dmax / (0.2 * dx * dx)).ceil() as usize).clamp(1, 500);
             let ds = dt / nsub as f64;
             let ng = g.len();
-            let mut jf = vec![0.0; ng];
+            let par = n >= 2048 && rayon::current_num_threads() > 2;
+            let mut mg = vec![0.0; n];
+            let mut y: Vec<Vec<f64>> = vec![vec![0.0; n]; ng];
+            let mut new_m: Vec<Vec<f64>> = vec![vec![0.0; n]; ng];
+            let mut new_e = vec![0.0; n];
             for _ in 0..nsub {
-                let mg: Vec<f64> = (0..n).map(|c| if self.is_solid(c) { 0.0 } else { g.iter().map(|&k| self.mass[k][c].max(0.0)).sum() }).collect();
-                let mut dm: Vec<Vec<f64>> = vec![vec![0.0; n]; ng];
-                let mut de = vec![0.0; n];
-                for j in 0..ny {
+                // masse du groupe et fractions massiques
+                for c in 0..n {
+                    mg[c] = if self.is_solid(c) { 0.0 } else { g.iter().map(|&k| self.mass[k][c].max(0.0)).sum() };
+                    for (q, &k) in g.iter().enumerate() {
+                        y[q][c] = if mg[c] > 0.0 { self.mass[k][c].max(0.0) / mg[c] } else { 0.0 };
+                    }
+                }
+                // flux à travers la face (a, b), a < b, de a vers b : même calcul vu des deux cellules ⇒ conservation exacte
+                let this = &*self;
+                let (mg_, y_, dl_) = (&mg, &y, &dloc);
+                let face = |a: usize, b: usize, out: &mut [f64; super::phases::MAX_PHASES], ef: &mut f64| -> bool {
+                    if this.is_solid(a) || this.is_solid(b) || mg_[a] <= 1e-12 || mg_[b] <= 1e-12 {
+                        return false;
+                    }
+                    let mbar = 0.5 * (mg_[a] + mg_[b]);
+                    let mut jsum = 0.0;
+                    for q in 0..ng {
+                        let (da, db) = (dl_[q][a], dl_[q][b]);
+                        let dk = 2.0 * da * db / (da + db).max(1e-300);
+                        out[q] = dk * mbar * (y_[q][a] - y_[q][b]) / (dx * dx) * ds;
+                        jsum += out[q];
+                    }
+                    let mut scale = 1.0f64;
+                    for (q, &k) in g.iter().enumerate() {
+                        out[q] -= 0.5 * (y_[q][a] + y_[q][b]) * jsum;
+                        let avail = 0.25 * if out[q] > 0.0 { this.mass[k][a].max(0.0) } else { this.mass[k][b].max(0.0) };
+                        if out[q].abs() > avail {
+                            scale = scale.min(avail / out[q].abs());
+                        }
+                    }
+                    *ef = 0.0;
+                    for (q, &k) in g.iter().enumerate() {
+                        out[q] *= scale;
+                        let t_don = if out[q] > 0.0 { this.temp[a] } else { this.temp[b] };
+                        *ef += out[q] * this.reg.phases[k].e_int(t_don);
+                    }
+                    true
+                };
+                let nm: Vec<super::multiphase::SyncPtr<f64>> = new_m.iter_mut().map(|v| super::multiphase::SyncPtr(v.as_mut_ptr())).collect();
+                let ne = super::multiphase::SyncPtr(new_e.as_mut_ptr());
+                let row = |j: usize| {
+                    let mut out = [0.0f64; super::phases::MAX_PHASES];
+                    let mut ef = 0.0;
                     for i in 0..nx {
-                        let a = j * nx + i;
-                        for (di, dj) in [(1usize, 0usize), (0, 1)] {
-                            let (ii, jj) = (i + di, j + dj);
-                            if ii >= nx || jj >= ny {
-                                continue;
+                        let c = j * nx + i;
+                        let mut dm = [0.0f64; super::phases::MAX_PHASES];
+                        let mut de = 0.0;
+                        let nbs = [(i > 0).then(|| c - 1), (i + 1 < nx).then(|| c + 1), (j > 0).then(|| c - nx), (j + 1 < ny).then(|| c + nx)];
+                        for b in nbs.into_iter().flatten() {
+                            let (lo, hi) = if c < b { (c, b) } else { (b, c) };
+                            if face(lo, hi, &mut out, &mut ef) {
+                                let sgn = if c == lo { -1.0 } else { 1.0 };
+                                for q in 0..ng {
+                                    dm[q] += sgn * out[q];
+                                }
+                                de += sgn * ef;
                             }
-                            let b = jj * nx + ii;
-                            if self.is_solid(a) || self.is_solid(b) || mg[a] <= 1e-12 || mg[b] <= 1e-12 {
-                                continue;
-                            }
-                            let mbar = 0.5 * (mg[a] + mg[b]);
-                            // flux bruts −ρ D_k ∇Y_k puis correction : J_k −= Ȳ_k Σ J
-                            let mut jsum = 0.0;
+                        }
+                        // SAFETY : la cellule c n'est écrite que par sa ligne
+                        unsafe {
                             for (q, &k) in g.iter().enumerate() {
-                                let (ya, yb) = (self.mass[k][a].max(0.0) / mg[a], self.mass[k][b].max(0.0) / mg[b]);
-                                let dk = 2.0 * dloc[q][a] * dloc[q][b] / (dloc[q][a] + dloc[q][b]).max(1e-300);
-                                jf[q] = dk * mbar * (ya - yb) / (dx * dx) * ds;
-                                jsum += jf[q];
+                                *nm[q].at(c) = (this.mass[k][c] + dm[q]).max(0.0);
                             }
-                            let mut scale = 1.0f64;
-                            for (q, &k) in g.iter().enumerate() {
-                                let ybar = 0.5 * (self.mass[k][a].max(0.0) / mg[a] + self.mass[k][b].max(0.0) / mg[b]);
-                                jf[q] -= ybar * jsum;
-                                // jamais plus que le quart de la masse de l'espèce dans la cellule donneuse (facteur commun : Σ J = 0 conservé)
-                                let avail = 0.25 * if jf[q] > 0.0 { self.mass[k][a].max(0.0) } else { self.mass[k][b].max(0.0) };
-                                if jf[q].abs() > avail {
-                                    scale = scale.min(avail / jf[q].abs());
+                            *ne.at(c) = this.e[c] + de;
+                        }
+                    }
+                };
+                if par {
+                    // parallèle : chaque cellule rassemble les flux de ses 4 faces (chaque face calculée deux fois, identiquement)
+                    use rayon::prelude::*;
+                    (0..ny).into_par_iter().for_each(row);
+                } else {
+                    // séquentiel : chaque face une seule fois, répartie sur ses deux cellules
+                    for (q, &k) in g.iter().enumerate() {
+                        new_m[q].copy_from_slice(&self.mass[k]);
+                    }
+                    new_e.copy_from_slice(&self.e);
+                    let mut out = [0.0f64; super::phases::MAX_PHASES];
+                    let mut ef = 0.0;
+                    for j in 0..ny {
+                        for i in 0..nx {
+                            let a = j * nx + i;
+                            for b in [(i + 1 < nx).then(|| a + 1), (j + 1 < ny).then(|| a + nx)].into_iter().flatten() {
+                                if face(a, b, &mut out, &mut ef) {
+                                    for q in 0..ng {
+                                        new_m[q][a] -= out[q];
+                                        new_m[q][b] += out[q];
+                                    }
+                                    new_e[a] -= ef;
+                                    new_e[b] += ef;
                                 }
                             }
-                            for (q, &k) in g.iter().enumerate() {
-                                let flux = jf[q] * scale;
-                                if flux == 0.0 {
-                                    continue;
-                                }
-                                let t_don = if flux > 0.0 { self.temp[a] } else { self.temp[b] };
-                                let ef = flux * self.reg.phases[k].e_int(t_don);
-                                dm[q][a] -= flux;
-                                dm[q][b] += flux;
-                                de[a] -= ef;
-                                de[b] += ef;
-                            }
+                        }
+                    }
+                    for q in 0..ng {
+                        for v in new_m[q].iter_mut() {
+                            *v = v.max(0.0);
                         }
                     }
                 }
                 for (q, &k) in g.iter().enumerate() {
-                    for c in 0..n {
-                        self.mass[k][c] = (self.mass[k][c] + dm[q][c]).max(0.0);
-                    }
+                    std::mem::swap(&mut self.mass[k], &mut new_m[q]);
                 }
-                for c in 0..n {
-                    self.e[c] += de[c];
-                }
+                std::mem::swap(&mut self.e, &mut new_e);
                 for c in 0..n {
                     if !self.is_solid(c) {
                         self.temp[c] = self.temp_from_energy(c);
@@ -338,29 +399,61 @@ impl MultiphaseSim {
             self.reacted = vec![0.0; nre];
         }
         let target = 0.5 * self.chem_volume_limit;
+        for h in self.heat_release.iter_mut() {
+            *h = 0.0;
+        }
+        // intégration indépendante cellule par cellule : en parallèle, puis application séquentielle des résultats
+        let this = &*self;
+        let cell = |c: usize| this.integrate_cell(c, dt, target, &phases, &rx, &scale);
+        let out: Vec<ChemOut> = if n >= super::mp_mg::PAR_MIN_CELLS / 4 {
+            use rayon::prelude::*;
+            (0..n).into_par_iter().filter_map(cell).collect()
+        } else {
+            (0..n).filter_map(cell).collect()
+        };
         let mut dt_next = f64::INFINITY;
-        for c in 0..n {
-            self.heat_release[c] = 0.0;
+        for o in out {
+            let c = o.c;
+            for k in 0..np {
+                self.mass[k][c] = o.m[k];
+            }
+            self.temp[c] = o.temp;
+            self.heat_release[c] = o.q / dt;
+            self.chem_heat += o.q * a2;
+            for j in 0..nre {
+                self.reacted[j] += o.xi[j] * a2;
+            }
+            dt_next = dt_next.min(o.dt_cell);
+        }
+        self.dt_chem = if dt_next.is_finite() { dt_next.max(1e-8) } else { f64::INFINITY };
+    }
+
+    /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir.
+    fn integrate_cell(&self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64]) -> Option<ChemOut> {
+        let np = phases.len();
+        let nre = rx.len();
+        {
+
             if self.is_solid(c) || self.pinned(c) {
-                continue;
+                return None;
             }
             // tri rapide : une réaction peut-elle avoir lieu ?
             let possible = rx.iter().any(|r| {
                 r.reactants.iter().all(|&(s, _)| self.mass[s][c] > 1e-12) || (r.reversible && r.products.iter().all(|&(s, _)| self.mass[s][c] > 1e-12))
             });
             if !possible {
-                continue;
+                return None;
             }
-            let mut cc = CellChem { phases: &phases, rx: &rx, m: (0..np).map(|k| self.mass[k][c]).collect(), e: self.e[c], f_eff: self.flame_factor[c].max(1.0), scale: scale.clone() };
+            let mut cc = CellChem { phases, rx, m: (0..np).map(|k| self.mass[k][c]).collect(), e: self.e[c], f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec() };
             let t0 = cc.temp();
-            // cellule « gelée » ? (aucune réaction n'avancerait de 1e-9 de sa masse disponible pendant dt)
+            // cellule « gelée » ou déjà à l'équilibre ? (aucune réaction n'avancerait de 1e-7 de sa masse disponible pendant dt)
             let active = (0..nre).any(|j| {
                 let (lo, hi) = cc.bounds(j);
                 let r = cc.rate(j, t0);
-                (r > 0.0 && r * dt > 1e-9 * hi) || (r < 0.0 && -r * dt > 1e-9 * (-lo))
+                (r > 0.0 && r * dt > 1e-7 * hi) || (r < 0.0 && -r * dt > 1e-7 * (-lo))
             });
             if !active {
-                continue;
+                return None;
             }
             let p = self.p[c];
             let v0 = cc.volume(p, t0);
@@ -389,11 +482,11 @@ impl MultiphaseSim {
                     }
                 }
                 if dtdt.abs() > 0.0 {
-                    h = h.min(25.0 / dtdt.abs());
+                    h = h.min(60.0 / dtdt.abs());
                 }
                 for s in 0..np {
                     if cons[s] > 0.0 && cc.m[s] > 1e-12 {
-                        h = h.min(0.3 * cc.m[s] / cons[s]);
+                        h = h.min(0.4 * cc.m[s] / cons[s]);
                     }
                 }
                 h = h.max(dt * 1e-9);
@@ -433,20 +526,32 @@ impl MultiphaseSim {
                         cc.m.copy_from_slice(&base);
                         x
                     } else {
+                        // point milieu (Runge–Kutta 2) : vitesse évaluée à mi-pas (composition et T) → erreur O(h³) par sous-pas
                         let tt = cc.temp();
-                        (h * cc.rate(j, tt)).clamp(0.0, 0.999 * hi)
+                        let r1 = cc.rate(j, tt);
+                        let half = (0.5 * h * r1).clamp(0.0, 0.999 * hi);
+                        if half > 0.0 {
+                            let base = cc.m.clone();
+                            cc.apply(j, half);
+                            let th = cc.temp();
+                            let rh = cc.rate(j, th);
+                            cc.m.copy_from_slice(&base);
+                            (h * rh).clamp(0.0, 0.999 * hi)
+                        } else {
+                            0.0
+                        }
                     };
                     if xi != 0.0 {
                         cc.apply(j, xi);
                         xi_tot[j] += xi;
                     }
                 }
-                // sous-pas rejeté s'il échauffe de plus de 60 K (réactions réversibles implicites très exothermiques loin de l'équilibre)
+                // sous-pas rejeté s'il échauffe de plus de 120 K (réactions réversibles implicites très exothermiques loin de l'équilibre)
                 let dtemp = (cc.temp() - t).abs();
-                if dtemp > 60.0 && h > dt * 1e-7 && nsub < MAX_CHEM_SUBSTEPS {
+                if dtemp > 120.0 && h > dt * 1e-7 && nsub < MAX_CHEM_SUBSTEPS {
                     cc.m.copy_from_slice(&m_sub);
                     xi_tot.copy_from_slice(&xi_sub);
-                    let h2 = h * (0.5 * 60.0 / dtemp).min(0.5);
+                    let h2 = h * (0.5 * 120.0 / dtemp).min(0.5);
                     // refait le sous-pas avec h2 : on borne la durée restante par h2 au prochain tour
                     max_h = h2;
                     continue;
@@ -460,26 +565,14 @@ impl MultiphaseSim {
                     break;
                 }
             }
-            // bilan : masses, chaleur dégagée (= baisse de l'énergie chimique Σ m e0, e inchangée), avancements
-            let mut q = 0.0;
-            for k in 0..np {
-                q -= (cc.m[k] - m_old[k]) * phases[k].e0;
-                self.mass[k][c] = cc.m[k];
-            }
-            self.temp[c] = cc.temp();
-            self.heat_release[c] = q / dt;
-            self.chem_heat += q * a2;
-            for j in 0..nre {
-                self.reacted[j] += xi_tot[j] * a2;
-            }
+            // bilan : chaleur dégagée (= baisse de l'énergie chimique Σ m e0, e inchangée)
+            let q: f64 = (0..np).map(|k| -(cc.m[k] - m_old[k]) * phases[k].e0).sum();
+            let t_new = cc.temp();
             // pas de temps suivant : expansion visée `target` par pas
-            let dv = (cc.volume(p, self.temp[c]) - v0).abs() / v0.max(1e-300);
-            if dv > 1e-3 {
-                let tau = if stopped { tl } else { dt };
-                dt_next = dt_next.min(target * tau / dv);
-            }
+            let dv = (cc.volume(p, t_new) - v0).abs() / v0.max(1e-300);
+            let dt_cell = if dv > 1e-3 { target * if stopped { tl } else { dt } / dv } else { f64::INFINITY };
+            Some(ChemOut { c, m: cc.m, temp: t_new, q, xi: xi_tot, dt_cell })
         }
-        self.dt_chem = if dt_next.is_finite() { dt_next.max(1e-8) } else { f64::INFINITY };
     }
 
     // ================================================================ rayonnement
