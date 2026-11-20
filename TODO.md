@@ -4,37 +4,11 @@ Pression thermodynamique uniforme : l’effet de la stratification hydrostatique
 2D uniquement. La turbulence 2D (cascade inverse) diffère de la 3D, et il n’y a pas de modèle de sous-maille.
 
 
-(POUR LE BUG (réglé) :
-CONFIGURATION : 
- - Rupture de barrage 
- - CPU f64
- - CFL : 0.40
- - dt_max : 0.010
- - gravité : 9.5 m²/s
- - Tension de surface
- - Viscosité
- - Conduction thermique
- - Changement de phase
- - Quantité de mouvement conservative
- - Cell size : 1cm
- - Precision : 5
- - Resolution : 800x600
-DESCRIPTION : 
-De la pression énorme se créée ce qui transforme l'eau en vapeur, 
-   la simulation ne veut pas se remettre en route grâce au garde-fou anti NaN.
-Ce bug arrive plus souvent avec le GPU en f32.
-MON AVIS:
- - la precision de 5 met trop de stress sur la simulation.
-   -> Il faut trouver le point faible qui cause ce crash et le fix.
-   -> Peut-être qu'il faut revoir l'architecture/la codebase entière.)
-
-
-
 REACTION AVEC SOLIDES & POUDRES (carbones, bois)
 POUDRES (poudre a canon, carbone)
 
-
-
+En scénario combustion confinée hydrogène : 
+lorsque la combustion est fine/presque finie, lorsque je passe en vue PHASE, ça crash.
 # TODO — Simulation de fluide en Rust
 
 Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
@@ -44,24 +18,19 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 ## 1. Prioritaire
 
 ### Performances et architecture GPU
-- **[M+1] Performances : ~5 fps alors que le CPU n'est utilisé qu'à 11 %.** Le calcul tourne sur un seul cœur : paralléliser (rayon) les boucles par cellule (pression/PCG, advection, conduction, chimie), profiler `step()`.
-- **[M] GPU en f64 et résident** : ne plus recopier tout l'état à chaque pas.
-- **[M] Décision d'architecture à prendre avant d'écrire du code GPU :**
-    - GPU seul, ou CPU **et** GPU maintenus en parallèle ?
-    - Revoir l'architecture côté GPU ?
-    - Aujourd'hui, le GPU (f32, 4 fluides max) est refusé dès qu'il y a cellules spéciales, entrées de bord, miscibilité, chimie ou cp(T) : tout ce qui est récent tourne uniquement sur CPU.
-- [M] PCG (Ax = b) : à revoir ? (préconditionneur, convergence) — pas sûr que ce soit le goulot.
+- **[M] Mesurer le GPU résident sur une vraie carte graphique** (NVIDIA / AMD / Intel) : il n'a pu être validé que sur lavapipe (pilote Vulkan logiciel, qui exécute les noyaux sur le CPU : aucune mesure de vitesse n'y a de sens). Regarder le nombre de noyaux par pas affiché dans le panneau (≈ 300–500) et le temps « GPU : pas complet » du profil.
+- [M] GPU : profil par partie du pas (requêtes d'horodatage wgpu) au lieu d'un seul temps « pas complet ».
+- [P] GPU : contournements de bogues de lavapipe à revérifier sur une vraie carte — dans la chimie, chaque fil fait au moins une itération de boucle (seulement sur adaptateur logiciel) ; partout, une série de pas est soumise en tampons de commandes de ≤ 1200 lancements (lavapipe plantait au-delà de ~2500). Coût attendu nul, à confirmer.
+- [M] GPU f32 : limites de précision connues — la fermeture volumique 1 − Σ m/ρ n'est connue qu'à ~1e-7 près (masses stockées en f32) : dans une cellule presque pleine de liquide, la vapeur produite par pas est bruitée de ~1 % et la pression du liquide de quelques Pa. Piste : stocker les masses des liquides en écart à une référence (m − ρ₀α).
+- [M] Advection PLIC : les flux sont appliqués face par face dans l'ordre des indices (la donneuse est lue après ses flux entrants pour un écoulement vers +x, avant pour −x). La forme « flux pure » (tout évalué sur l'état d'avant le balayage, indépendante de l'ordre) a été essayée : elle diverge sur un jet d'eau entrant dans l'air (écarts de remplissage m/α ≠ ρ transportés sans amortissement). À creuser, puis à reporter sur le GPU (qui reproduit aujourd'hui exactement l'ordre du CPU).
 
 ### Expériences reproductibles
 - **[M] Sauvegarder tout le contexte**, pas seulement les solides : masses, énergie, pression, vitesses, cellules spéciales, bords, matériaux utilisés. Aujourd'hui une scène `.mps` contient solides + thermique + cellules spéciales.
 - **[M] Encodeur de conditions initiales / fenêtre d'expérience séparée** pour des expériences précises pas à pas, avec sauvegarde. Exemple : « de la température ici, puis j'accélère là, puis je simule 5 s, j'arrête et je sauvegarde des statistiques ». → trouver l'interface (script d'actions ? timeline ?).
-- **[M] Simulation pré-calculée** : on lance une simulation avec la fenêtre d'expérience séparée (pas encore implémentée), puis on fait une sorte de "vidéo" (un peu comme blender ?) mais avec beaucoup d'informations
+
 ### Bugs / manques des cellules spéciales
 - [M] Téléporteur partiellement cassé : la taille de la destination n'est pas réglable (une seule cellule de destination).
-- [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), Compresseur, Sensor (pression, température, ...), autres…
-- [M] Montée en température : en ajoutant une grosse montée en température très rapide sur un liquide, ça se met sur pause (filet de sécurité ?).
-### Simulation monophasique et multiphasique
-- **[M + 1] Séparer la simulation monophasique et multiphasique**, avec des dossiers ?
+- [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), compresseur, autres…
 
 ---
 
@@ -133,3 +102,9 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - Thermochimie : enthalpies de formation, entropies, cp(T) calé sur JANAF. [M]
 - Flammes et explosions : modèle de flamme épaissie (vitesse de flamme juste quelle que soit la maille), rayonnement des gaz chauds, outil « Allumer », 4 scénarios (tube, explosion confinée, explosion avec évent, flamme de diffusion), préréglage combustion. [M]
 - Évaporation / condensation à la pression partielle (Dalton), diffusion propre à chaque espèce. [M]
+
+### Performances, robustesse, GPU
+- Performances CPU : préconditionneur multigrille du gradient conjugué (≈ 20 itérations au lieu de ≈ 270 avec IC(0)), boucles par cellule parallélisées (rayon), profil de `step()` par partie. [M]
+- Montée en température brutale (2000 °C au pinceau sur un liquide) sans mise en pause : chauffage progressif en temps simulé (puissance plafonnée), ébullition en volume au-delà de 15 K de surchauffe, cavité de vapeur (DVCM) au plancher de pression. [M]
+- Filet de sécurité : un NaN né pendant un pas n'arrête plus le programme (bornes « clamp » tolérantes aux NaN) ; il est détecté en fin de pas et le pas est refait avec dt/4. [M]
+- **GPU résident (f32)** : l'état reste sur le GPU ; ~256 octets relus par série de pas (dt, itérations, drapeaux), l'image rendue sur le GPU, l'état complet relu seulement pour les statistiques (~2 fois/s), les outils et la sauvegarde. Gère TOUT ce que gère le CPU : jusqu'à 32 fluides, miscibilité et diffusion des espèces, cp(T), chimie (réactions réversibles comprises), flammes épaissies, rayonnement, évaporation de Dalton, ébullition / cavitation, cellules spéciales, entrées de bord, solides isothermes / chauffants, chauffage au pinceau, QDM conservative ou semi-lagrangienne / MacCormack. Pas de temps, Newton + gradient conjugué multigrille, sous-pas de conduction / diffusion et filet de sécurité (retour arrière dt/4) décidés sur le GPU. Validé contre le CPU (16 tests : mêmes résultats à l'arrondi f32 près pas à pas). Décision : CPU f64 (référence) et GPU f32 maintenus en parallèle ; le GPU f64 ne vaut pas le coup (2 à 64× plus lent sur les cartes grand public). [M]

@@ -154,6 +154,13 @@ impl<T> SyncPtr<T> {
     }
 }
 
+/// `x` borné à [lo, hi] SANS paniquer si une borne est NaN (f64::clamp panique) : un NaN né pendant un pas doit aller jusqu'au
+/// contrôle de fin de pas (retour arrière du filet de sécurité), pas arrêter le programme.
+#[inline]
+pub(crate) fn clampf(x: f64, lo: f64, hi: f64) -> f64 {
+    x.max(lo).min(hi)
+}
+
 /// Température d'un mélange de masses `m` (kg/m³) d'énergie interne totale `e` (J/m³) : résout Σ m_k e_k(T) = e.
 /// e_k(T) = c_k T + ½ s_k (T − 298.15)² + e0_k ⇒ trinôme du second degré en τ = T − 298.15 (forme stable sans annulation).
 pub fn temp_from_masses(phases: &[super::phases::Phase], m: impl Iterator<Item = f64>, e: f64) -> f64 {
@@ -593,7 +600,7 @@ impl MultiphaseSim {
                 continue;
             }
             let lim = self.heat_power_max * dt;
-            let de = (self.heat_capacity(c) * (tt - self.temp[c]) * f).clamp(-lim, lim);
+            let de = clampf(self.heat_capacity(c) * (tt - self.temp[c]) * f, -lim, lim);
             self.e[c] += de;
             self.energy_input += de * a2;
             self.temp[c] = self.temp_from_energy(c);

@@ -1,0 +1,726 @@
+//! Validation du solveur GPU résident (f32) contre le solveur CPU (f64) : mêmes scènes, même temps simulé, grandeurs comparées.
+//! Ces tests ont besoin d'un adaptateur wgpu (lavapipe suffit) ; sans adaptateur ils sont ignorés (message).
+
+use super::gpu_multiphase::MultiphaseGpu;
+use super::mp_view::{build_scenario, MpScenario};
+use super::multiphase::MultiphaseSim;
+
+/// grandeurs globales d'une simulation
+#[derive(Debug, Clone)]
+pub(crate) struct Metrics {
+    pub time: f64,
+    pub steps: usize,
+    pub mass: Vec<f64>,
+    pub area: Vec<f64>,
+    /// centre de masse de chaque phase (x, y)
+    pub com: Vec<(f64, f64)>,
+    pub kinetic: f64,
+    pub internal: f64,
+    pub t_min: f64,
+    pub t_max: f64,
+    pub p_min: f64,
+    pub p_max: f64,
+    pub umax: f64,
+}
+
+pub(crate) fn metrics(s: &MultiphaseSim) -> Metrics {
+    let np = s.reg.phases.len();
+    let n = s.nx * s.ny;
+    let mut com = vec![(0.0, 0.0); np];
+    for k in 0..np {
+        let (mut mx, mut my, mut m) = (0.0, 0.0, 0.0);
+        for c in 0..n {
+            let (x, y) = s.center(c % s.nx, c / s.nx);
+            mx += s.mass[k][c] * x;
+            my += s.mass[k][c] * y;
+            m += s.mass[k][c];
+        }
+        com[k] = if m > 0.0 { (mx / m, my / m) } else { (0.0, 0.0) };
+    }
+    let fl: Vec<usize> = (0..n).filter(|&c| !s.is_solid(c)).collect();
+    Metrics {
+        time: s.time,
+        steps: s.step_count,
+        mass: (0..np).map(|k| s.total_mass(k)).collect(),
+        area: (0..np).map(|k| s.phase_area(k)).collect(),
+        com,
+        kinetic: s.kinetic_energy(),
+        internal: s.total_internal_energy(),
+        t_min: fl.iter().map(|&c| s.temp[c]).fold(f64::MAX, f64::min),
+        t_max: fl.iter().map(|&c| s.temp[c]).fold(f64::MIN, f64::max),
+        p_min: fl.iter().map(|&c| s.p[c]).fold(f64::MAX, f64::min),
+        p_max: fl.iter().map(|&c| s.p[c]).fold(f64::MIN, f64::max),
+        umax: s.max_speed(),
+    }
+}
+
+/// GPU disponible ? (lavapipe, pilote réel…)
+pub(crate) fn gpu_or_skip(sim: &MultiphaseSim) -> Option<MultiphaseGpu> {
+    match MultiphaseGpu::try_new(sim) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            if e.contains("compilation") || e.contains("initialisation") {
+                panic!("GPU : {e}");
+            }
+            eprintln!("test GPU ignoré : {e}");
+            None
+        }
+    }
+}
+
+/// avance `sim` jusqu'à t_end sur le GPU (relit l'état à la fin)
+pub(crate) fn run_gpu(g: &mut MultiphaseGpu, sim: &mut MultiphaseSim, t_end: f64, max_steps: usize) {
+    let mut k = 0;
+    while sim.time < t_end && !sim.diverged && k < max_steps {
+        g.step(sim);
+        k += 1;
+    }
+    g.download(sim);
+}
+
+
+/// Accord d'UN pas (répété `steps` fois depuis l'état CPU) après `warm` pas CPU : écarts max par champ bornés. Pour les phénomènes à
+/// seuil (nucléation, auto-allumage, panaches instables) la comparaison à long terme n'a pas de sens au-delà de quelques %, l'accord
+/// pas à pas valide la physique implémentée.
+/// `tol_m` : écart max des masses (rapporté au max de chaque phase) ; les VAPEURS d'un changement de phase ont `tol_vap` : leur production
+/// est bornée par la fermeture volumique 1 − Σ m/ρ, calculée en f32 avec une erreur absolue ~1e-7 (masses stockées en f32) — quand
+/// 1 − Σ m/ρ ~ 1e-5 (cellule presque pleine de liquide), c'est 1 % d'écart sur la vapeur produite dans la cellule.
+pub(crate) fn one_step_agreement(name: &str, mut cpu: MultiphaseSim, warm: usize, steps: usize, tol_m: f64, tol_t: f64) {
+    let tol_vap: f64 = 0.05;
+    for _ in 0..warm {
+        cpu.step();
+    }
+    let mut gs = clone_sim(&cpu);
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    for k in 0..steps {
+        cpu.step();
+        g.step(&mut gs);
+        g.download(&mut gs);
+        eprintln!("== {name} : pas {k} (dt {:.3e} / {:.3e})", cpu.last_dt, gs.last_dt);
+        for (n, v, at) in field_diff(&cpu, &gs) {
+            if v > 0.0 {
+                eprintln!("   {n:<28} {v:.3e} (case {at})");
+            }
+            if n.starts_with('m') {
+                let k: usize = n[1..].split(' ').next().unwrap().parse().unwrap();
+                let tol = if cpu.reg.changes.iter().any(|pc| pc.vapor == k) { tol_vap.max(tol_m) } else { tol_m };
+                assert!(v < tol, "{name} : {n} {v} (case {at})");
+            } else if n == "T" {
+                assert!(v < tol_t, "{name} : T {v} K (case {at})");
+            }
+        }
+        // repart du même état (celui du CPU)
+        g.upload(&cpu);
+        gs = clone_sim(&cpu);
+    }
+}
+
+/// copie d'une simulation (champs utiles ; MultiphaseSim n'est pas Clone)
+fn clone_sim(s: &MultiphaseSim) -> MultiphaseSim {
+    let mut c = MultiphaseSim::new(s.nx, s.ny, s.dx, s.reg.clone(), s.ambient_phase);
+    c.gravity = s.gravity;
+    c.bc = s.bc;
+    c.t_ambient = s.t_ambient;
+    c.mass = s.mass.clone();
+    c.alpha = s.alpha.clone();
+    c.e = s.e.clone();
+    c.temp = s.temp.clone();
+    c.p = s.p.clone();
+    c.u = s.u.clone();
+    c.v = s.v.clone();
+    c.solid = s.solid.clone();
+    c.rho_mix = s.rho_mix.clone();
+    c.mu_cell = s.mu_cell.clone();
+    c.k_cell = s.k_cell.clone();
+    c.special = s.special.clone();
+    c.thermal = s.thermal.clone();
+    c.inlet = s.inlet;
+    c.ambient_mix = s.ambient_mix.clone();
+    c.mixtures = s.mixtures.clone();
+    c.chemistry = s.chemistry;
+    c.radiation = s.radiation;
+    c.flame_factor = s.flame_factor.clone();
+    c.heat_release = s.heat_release.clone();
+    c.heat_target = s.heat_target.clone();
+    c.heat_active = s.heat_active;
+    c.heat_power_max = s.heat_power_max;
+    c.dt_max = s.dt_max;
+    c.dt_chem = s.dt_chem;
+    c.dt_phase = s.dt_phase;
+    c.pressure_clamped = s.pressure_clamped.clone();
+    c.boundary_flux = s.boundary_flux.clone();
+    c.transferred = s.transferred.clone();
+    c.reacted = s.reacted.clone();
+    c.step_count = s.step_count;
+    c.time = s.time;
+    c.conservative_momentum = s.conservative_momentum;
+    c.maccormack = s.maccormack;
+    c.tp_mix = s.tp_mix.clone();
+    c
+}
+
+fn rel(a: f64, b: f64) -> f64 {
+    (a - b).abs() / a.abs().max(b.abs()).max(1e-30)
+}
+
+#[test]
+fn gpu_compiles_and_runs_dam_break() {
+    let mk = || build_scenario(MpScenario::DamBreak, 64, 40, 0.01, 9.81);
+    let mut cpu = mk();
+    let mut gs = mk();
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    let t_end = 0.3;
+    let t0 = std::time::Instant::now();
+    run_gpu(&mut g, &mut gs, t_end, 20000);
+    let tg = t0.elapsed().as_secs_f64();
+    let t0 = std::time::Instant::now();
+    cpu.run(t_end);
+    let tc = t0.elapsed().as_secs_f64();
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!("CPU {:.2}s {a:?}\nGPU {:.2}s {b:?}\nGPU last {:?}", tc, tg, g.last);
+    assert!(!gs.diverged && gs.state_is_sane(), "GPU divergé");
+    for k in 0..a.mass.len() {
+        assert!(rel(a.mass[k], b.mass[k]) < 1e-3, "masse phase {k} : {} vs {}", a.mass[k], b.mass[k]);
+    }
+    let water = (0..cpu.reg.phases.len()).filter(|&k| !cpu.reg.phases[k].is_gas()).max_by(|&i, &j| a.mass[i].total_cmp(&a.mass[j])).unwrap();
+    let d = ((a.com[water].0 - b.com[water].0).powi(2) + (a.com[water].1 - b.com[water].1).powi(2)).sqrt();
+    assert!(d < 0.02 * 0.64, "centre de masse de l'eau : CPU {:?} GPU {:?}", a.com[water], b.com[water]);
+    assert!(rel(a.kinetic, b.kinetic) < 0.15, "énergie cinétique {} vs {}", a.kinetic, b.kinetic);
+}
+
+/// construit deux fois la même scène, avance le CPU et le GPU jusqu'à t_end, imprime les grandeurs ; renvoie (cpu, gpu, gpu solver)
+pub(crate) fn compare(name: &str, mk: &dyn Fn() -> MultiphaseSim, t_end: f64) -> Option<(MultiphaseSim, MultiphaseSim, MultiphaseGpu)> {
+    let mut cpu = mk();
+    let mut gs = mk();
+    let mut g = gpu_or_skip(&gs)?;
+    let t0 = std::time::Instant::now();
+    run_gpu(&mut g, &mut gs, t_end, 50000);
+    let tg = t0.elapsed().as_secs_f64();
+    let t0 = std::time::Instant::now();
+    cpu.run(t_end);
+    let tc = t0.elapsed().as_secs_f64();
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!("== {name}\n CPU {tc:.2}s {a:?}\n GPU {tg:.2}s {b:?}\n GPU dernier pas {:?}", g.last);
+    assert!(!gs.diverged && gs.state_is_sane(), "{name} : GPU divergé ou état invalide");
+    assert!(!cpu.diverged, "{name} : CPU divergé");
+    Some((cpu, gs, g))
+}
+
+fn liquid_with_most_mass(s: &MultiphaseSim) -> usize {
+    (0..s.reg.phases.len()).filter(|&k| !s.reg.phases[k].is_gas()).max_by(|&i, &j| s.total_mass(i).total_cmp(&s.total_mass(j))).unwrap()
+}
+
+fn com_dist(a: &Metrics, b: &Metrics, k: usize) -> f64 {
+    ((a.com[k].0 - b.com[k].0).powi(2) + (a.com[k].1 - b.com[k].1).powi(2)).sqrt()
+}
+
+#[test]
+fn gpu_matches_cpu_drop_splash_surface_tension() {
+    let mk = || build_scenario(MpScenario::DropSplash, 48, 40, 0.004, 9.81);
+    let Some((cpu, gs, _)) = compare("goutte", &mk, 0.12) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    let w = liquid_with_most_mass(&cpu);
+    assert!(rel(a.mass[w], b.mass[w]) < 1e-4);
+    assert!(com_dist(&a, &b, w) < 0.01 * 0.192, "centre de masse {:?} {:?}", a.com[w], b.com[w]);
+    assert!(rel(a.kinetic, b.kinetic) < 0.2, "énergie cinétique {} {}", a.kinetic, b.kinetic);
+}
+
+#[test]
+fn gpu_matches_cpu_oil_water_air() {
+    let mk = || build_scenario(MpScenario::OilWaterAir, 40, 40, 0.004, 9.81);
+    let Some((cpu, gs, _)) = compare("huile-eau-air", &mk, 0.15) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    for k in 0..a.mass.len() {
+        assert!(rel(a.mass[k], b.mass[k]) < 1e-4, "masse {k}");
+        if a.mass[k] > 0.0 {
+            assert!(com_dist(&a, &b, k) < 0.004, "phase {k} : {:?} {:?}", a.com[k], b.com[k]);
+        }
+    }
+}
+
+#[test]
+fn gpu_matches_cpu_boiling_on_hot_plate() {
+    // eau à 99 °C sur une plaque d'acier à 700 K : ébullition nucléée sur la plaque (conduction solide → fluide, changement de phase)
+    let mk = || {
+        let mut s = build_scenario(MpScenario::Boiling, 32, 32, 0.003, 9.81);
+        for c in 0..s.nx * s.ny {
+            let t = if s.is_solid(c) { 700.0 } else if s.temp[c] > 350.0 { 372.0 } else { continue };
+            if s.is_solid(c) {
+                let rc = s.reg.solids[s.solid[c] as usize].rho_cp();
+                s.e[c] = rc * t;
+            } else {
+                let e: f64 = (0..s.reg.phases.len()).map(|k| s.mass[k][c] * s.reg.phases[k].e_int(t)).sum();
+                s.e[c] = e;
+            }
+        }
+        s.refresh();
+        s
+    };
+    // pas à pas pendant l'ébullition (accord à l'arrondi f32 près)
+    one_step_agreement("ébullition", mk(), 120, 3, 1e-4, 2.0);
+    // à long terme : la nucléation est un phénomène à seuil (surchauffe) ; on vérifie bilans et ordre de grandeur
+    let Some((cpu, gs, _)) = compare("ébullition", &mk, 0.08) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!(" transféré CPU {:?} GPU {:?}", cpu.transferred, gs.transferred);
+    let m0 = mk();
+    for k in 0..a.mass.len() {
+        let d = gs.total_mass(k) - m0.total_mass(k) - gs.boundary_flux[k];
+        let tr: f64 = gs.reg.changes.iter().zip(&gs.transferred).map(|(pc, t)| if pc.vapor == k { *t } else if pc.liquid == k { -*t } else { 0.0 }).sum();
+        assert!((d - tr).abs() < 1e-4 * m0.total_mass_all(), "bilan phase {k} : {d} vs transféré {tr}");
+    }
+    // plaque à 700 K sous de l'eau à 99 °C : ébullition explosive (jets d'eau par le haut ouvert, ~20 m/s) — chaotique : seuls les
+    // bilans et l'existence de l'ébullition sont comparés à long terme
+    assert!(cpu.transferred[0] > 0.0 && gs.transferred[0] > 0.0, "pas d'ébullition");
+    assert!(b.umax < 200.0 && b.t_max < 800.0, "GPU : état non physique {:?}", b);
+    let _ = a;
+}
+
+#[test]
+fn gpu_matches_cpu_premixed_methane_flame() {
+    // chimie (Arrhenius, CH4 + CO réversible), flamme épaissie, diffusion des espèces, rayonnement, bord ouvert
+    let mk = || build_scenario(MpScenario::PremixedFlame, 64, 12, 0.001, 0.0);
+    let Some((cpu, gs, g)) = compare("flamme de prémélange", &mk, 0.02) else { return };
+    let fpos = |s: &MultiphaseSim| {
+        // position du front : abscisse moyenne où T dépasse 1200 K, ligne du milieu
+        let j = s.ny / 2;
+        (0..s.nx).filter(|&i| s.temp[s.idx(i, j)] > 1200.0).map(|i| i as f64 + 0.5).fold(0.0f64, f64::max) * s.dx
+    };
+    eprintln!(" chaleur CPU {:.4e} GPU {:.4e} ; front CPU {:.4} GPU {:.4} ; rayonné {:.3e} {:.3e} ; F max {:.2} {:.2} ; budgets {:?}",
+        cpu.chem_heat, gs.chem_heat, fpos(&cpu), fpos(&gs), cpu.radiated, gs.radiated,
+        cpu.flame_factor.iter().fold(0.0f64, |a, &b| a.max(b)), gs.flame_factor.iter().fold(0.0f64, |a, &b| a.max(b)), g.last);
+    assert!(cpu.chem_heat > 0.0 && gs.chem_heat > 0.0);
+    assert!(rel(cpu.chem_heat, gs.chem_heat) < 0.1, "chaleur dégagée {} {}", cpu.chem_heat, gs.chem_heat);
+    assert!((fpos(&cpu) - fpos(&gs)).abs() <= 3.0 * cpu.dx, "front {} {}", fpos(&cpu), fpos(&gs));
+    for j in 0..cpu.reacted.len() {
+        eprintln!("  réaction {j} : CPU {:.4e} GPU {:.4e}", cpu.reacted[j], gs.reacted[j]);
+    }
+}
+
+#[test]
+fn gpu_matches_cpu_confined_hydrogen_explosion() {
+    // réactions réversibles (dissociation), fermée : la pression finale se compare à l'équilibre
+    let mk = || build_scenario(MpScenario::ConfinedExplosion, 24, 24, 0.002, 0.0);
+    one_step_agreement("explosion confinée H2", mk(), 100, 3, 1e-2, 10.0);
+    let Some((cpu, gs, g)) = compare("explosion confinée H2", &mk, 0.006) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!(" chaleur CPU {:.4e} GPU {:.4e} ; p max {:.4e} {:.4e} ; T max {:.1} {:.1} ; {:?}", cpu.chem_heat, gs.chem_heat, a.p_max, b.p_max, a.t_max, b.t_max, g.last);
+    for j in 0..cpu.reacted.len() {
+        eprintln!("  réaction {j} : CPU {:.4e} GPU {:.4e}", cpu.reacted[j], gs.reacted[j]);
+    }
+    assert!(rel(cpu.chem_heat, gs.chem_heat) < 0.05, "chaleur {} {}", cpu.chem_heat, gs.chem_heat);
+    assert!(rel(a.p_max, b.p_max) < 0.05, "p max {} {}", a.p_max, b.p_max);
+    // T max = point chaud local (gaz brûlés comprimés au centre) : sensible au moment exact de l'auto-allumage → comparaison large ;
+    // la température moyenne (masse) est comparée finement
+    assert!(rel(a.t_max, b.t_max) < 0.12, "T max {} {}", a.t_max, b.t_max);
+    let tmean = |s: &MultiphaseSim| {
+        let n = s.nx * s.ny;
+        let m: Vec<f64> = (0..n).map(|c| (0..s.reg.phases.len()).map(|k| s.mass[k][c]).sum()).collect();
+        (0..n).map(|c| m[c] * s.temp[c]).sum::<f64>() / m.iter().sum::<f64>()
+    };
+    eprintln!(" T moyenne CPU {:.1} GPU {:.1}", tmean(&cpu), tmean(&gs));
+    assert!((tmean(&cpu) - tmean(&gs)).abs() < 30.0);
+    // énergie totale (cuve fermée : seules les pertes radiatives la font varier), rapportée à la chaleur de réaction
+    eprintln!(" énergie interne CPU {:.4e} GPU {:.4e} ; rayonné {:.4e} {:.4e}", a.internal, b.internal, cpu.radiated, gs.radiated);
+    assert!((a.internal - b.internal).abs() < 0.01 * cpu.chem_heat, "énergie interne {} {}", a.internal, b.internal);
+}
+
+/// écart maximal champ par champ entre deux états (diagnostic)
+pub(crate) fn field_diff(a: &MultiphaseSim, b: &MultiphaseSim) -> Vec<(String, f64, usize)> {
+    let n = a.nx * a.ny;
+    let mut out = vec![];
+    let mut push = |name: String, x: &[f64], y: &[f64], scale: f64| {
+        let mut m = 0.0f64;
+        let mut at = 0;
+        for i in 0..x.len().min(y.len()) {
+            let d = (x[i] - y[i]).abs() / scale.max(1e-300);
+            if d > m || d.is_nan() {
+                m = d;
+                at = i;
+            }
+        }
+        out.push((name, m, at));
+    };
+    for k in 0..a.reg.phases.len() {
+        let sc = a.mass[k].iter().fold(0.0f64, |s, &v| s.max(v.abs())).max(1e-12);
+        push(format!("m{k} ({})", a.reg.phases[k].name), &a.mass[k], &b.mass[k], sc);
+    }
+    push("T".into(), &a.temp, &b.temp, 1.0);
+    let pa: Vec<f64> = a.p.iter().map(|p| p - 101325.0).collect();
+    let pb: Vec<f64> = b.p.iter().map(|p| p - 101325.0).collect();
+    push("p−p0 (Pa)".into(), &pa, &pb, 1.0);
+    let us = a.max_speed().max(1e-9);
+    push("u".into(), &a.u, &b.u, us);
+    push("v".into(), &a.v, &b.v, us);
+    push("flamme".into(), &a.flame_factor, &b.flame_factor, 1.0);
+    let q = a.heat_release.iter().fold(0.0f64, |s, &v| s.max(v.abs())).max(1e-12);
+    push("dégagement".into(), &a.heat_release, &b.heat_release, q);
+    let _ = n;
+    out
+}
+
+/// un pas CPU et un pas GPU depuis le même état : écarts par champ (diagnostic, `cargo test -- --ignored --nocapture`)
+#[test]
+#[ignore]
+fn gpu_one_step_field_diffs() {
+    let sc = std::env::var("MP_SC").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(6);
+    let warm = std::env::var("MP_WARM").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+    let steps = std::env::var("MP_STEPS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(3);
+    let mk = || {
+        let sc = MpScenario::from_index(sc);
+        let (nx, ny, dx, g) = match sc {
+            MpScenario::PremixedFlame => (64, 12, 0.001, 0.0),
+            MpScenario::ConfinedExplosion => (24, 24, 0.002, 0.0),
+            _ => (40, 32, 0.004, 9.81),
+        };
+        let mut s = build_scenario(sc, nx, ny, dx, g);
+        for _ in 0..warm {
+            s.step();
+        }
+        let off = |v: &str| std::env::var(v).is_ok();
+        if off("MP_NOCHEM") { s.chemistry = false; }
+        if off("MP_NOCOND") { s.conduction = false; }
+        if off("MP_NORAD") { s.radiation = false; }
+        if off("MP_NOVISC") { s.viscous = false; }
+        if off("MP_NOST") { s.surface_tension = false; }
+        if off("MP_NODIFF") { for p in s.reg.phases.iter_mut() { p.diffusivity = 0.0; } }
+        s
+    };
+    let mut cpu = mk();
+    let mut gs = mk();
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    for k in 0..steps {
+        let dc = cpu.step();
+        let dg = g.step(&mut gs);
+        g.download(&mut gs);
+        eprintln!("pas {k} : dt CPU {dc:.6e} GPU {dg:.6e} ; Newton {} / {} ; PCG {} / {} ; dt_chem {:.3e} / {:.3e} ; dt_phase {:.3e} / {:.3e}",
+            cpu.last_newton_iters, gs.last_newton_iters, cpu.last_pressure_iters, gs.last_pressure_iters, cpu.dt_chem, gs.dt_chem, cpu.dt_phase, gs.dt_phase);
+        for (name, d, at) in field_diff(&cpu, &gs) {
+            eprintln!("   {name:<28} {d:.3e} (case {at})");
+        }
+        if std::env::var("MP_ROWS").is_ok() {
+            let k = 9.min(cpu.reg.phases.len() - 1);
+            let sc = cpu.mass[k].iter().fold(0.0f64, |a, &b| a.max(b));
+            for j in 0..cpu.ny {
+                let row: Vec<String> = (0..cpu.nx).map(|i| { let c = cpu.idx(i, j); format!("{:+.0}", 1e4 * (gs.mass[k][c] - cpu.mass[k][c]) / sc) }).collect();
+                eprintln!("   j={j:2} {}", row.join(" "));
+            }
+            for j in 0..cpu.ny {
+                let row: Vec<String> = (0..cpu.nx).map(|i| { let c = cpu.idx(i, j); format!("{:+.1}", gs.temp[c] - cpu.temp[c]) }).collect();
+                eprintln!("   T j={j:2} {}", row[..40].join(" "));
+            }
+        }
+        // repart du même état (CPU) pour isoler l'écart d'UN pas
+        g.upload(&cpu);
+        gs.time = cpu.time;
+        gs.step_count = cpu.step_count;
+        gs.dt_chem = cpu.dt_chem;
+        gs.dt_phase = cpu.dt_phase;
+        let t = cpu.time;
+        let _ = t;
+    }
+}
+
+/// avancement des masses seul (advection PLIC) : CPU vs GPU depuis le même état (diagnostic)
+#[test]
+#[ignore]
+fn gpu_advection_only_diffs() {
+    let sc = std::env::var("MP_SC").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(6);
+    let warm = std::env::var("MP_WARM").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(60);
+    let mk = || {
+        let sc = MpScenario::from_index(sc);
+        let (nx, ny, dx, g) = match sc {
+            MpScenario::PremixedFlame => (64, 12, 0.001, 0.0),
+            MpScenario::ConfinedExplosion => (24, 24, 0.002, 0.0),
+            _ => (40, 32, 0.004, 9.81),
+        };
+        let mut s = build_scenario(sc, nx, ny, dx, g);
+        for _ in 0..warm {
+            s.step();
+        }
+        s
+    };
+    let mut cpu = mk();
+    let mut gs = mk();
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    cpu.refresh();
+    let dt = cpu.choose_dt();
+    cpu.advect_mass_energy(dt);
+    g.debug_partial_step(&gs, "k_temp_update", 2);
+    g.download(&mut gs);
+    eprintln!("dt {dt:.6e}");
+    for (name, d, at) in field_diff(&cpu, &gs) {
+        eprintln!("   {name:<28} {d:.3e} (case {at})");
+    }
+    let k = 9.min(cpu.reg.phases.len() - 1);
+    let sc = cpu.mass[k].iter().fold(0.0f64, |a, &b| a.max(b));
+    let j = cpu.ny / 2;
+    let row: Vec<String> = (0..cpu.nx).map(|i| { let c = cpu.idx(i, j); format!("{:+.0}", 1e4 * (gs.mass[k][c] - cpu.mass[k][c]) / sc) }).collect();
+    eprintln!("   m{k} j={j} {}", row.join(" "));
+}
+
+/// scène de test des extras : cuve d'eau avec émetteur, puits, accélérateur, téléporteur, entrée de bord, solides isotherme et chauffant
+fn extras_scene() -> MultiphaseSim {
+    use super::mp_cells::{MpEffect, MpInlet, MpThermal};
+    use super::multiphase::Bc;
+    let mut s = build_scenario(MpScenario::DamBreak, 40, 30, 0.005, 9.81);
+    let (nx, ny) = (s.nx, s.ny);
+    let water = liquid_with_most_mass(&s);
+    let steel = 0;
+    let t_amb = s.t_ambient;
+    // plaque isotherme chaude et chauffage au fond à droite
+    for i in 26..32 {
+        let c = s.idx(i, 0);
+        s.solid[c] = steel as i32;
+        for k in 0..s.reg.phases.len() {
+            s.mass[k][c] = 0.0;
+        }
+        s.e[c] = s.reg.solids[steel].rho_cp() * 330.0;
+        s.temp[c] = 330.0;
+        s.set_thermal_cell(c, if i < 29 { MpThermal::Isothermal(360.0) } else { MpThermal::Heater(5e7) });
+    }
+    let e = s.idx(20, 20);
+    s.set_effect(e, Some(MpEffect::Emitter { vx: 0.0, vy: -0.4, phase: water, temp: 300.0 }));
+    let k = s.idx(35, 25);
+    s.set_effect(k, Some(MpEffect::Sink { rate: 0.2 }));
+    for j in 2..6 {
+        let c = s.idx(15, j);
+        s.set_effect(c, Some(MpEffect::Accelerator { ax: 30.0, ay: 0.0 }));
+    }
+    let src = s.idx(5, 2);
+    let dst = s.idx(30, 22);
+    s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3 }));
+    s.inlet[0] = Some(MpInlet { vx: 0.3, vy: 0.0, phase: s.ambient_phase, temp: t_amb + 20.0, offset: 0 });
+    s.bc[0] = Bc::Wall;
+    s.bc[3] = Bc::Open { p: 101325.0 };
+    let _ = (nx, ny);
+    s.refresh();
+    s
+}
+
+#[test]
+fn gpu_matches_cpu_special_cells_inlets_and_thermal_solids() {
+    let Some((cpu, gs, _)) = compare("cellules spéciales", &extras_scene, 0.08) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    let m0 = extras_scene();
+    for k in 0..a.mass.len() {
+        // bilan GPU : M(t) − M(0) = flux des bords + cellules épinglées
+        let d = gs.total_mass(k) - m0.total_mass(k) - gs.boundary_flux[k];
+        assert!(d.abs() < 1e-4 * m0.total_mass_all().max(1e-9), "bilan GPU phase {k} : {d}");
+        eprintln!(" phase {k} : masse CPU {:.6e} GPU {:.6e} ; flux CPU {:.4e} GPU {:.4e}", a.mass[k], b.mass[k], cpu.boundary_flux[k], gs.boundary_flux[k]);
+        if a.mass[k] > 1e-6 {
+            assert!(rel(a.mass[k], b.mass[k]) < 0.02, "masse {k} : {} {}", a.mass[k], b.mass[k]);
+        }
+    }
+    eprintln!(" chaleur des solides CPU {:.4e} GPU {:.4e}", cpu.energy_input, gs.energy_input);
+    assert!(rel(cpu.energy_input, gs.energy_input) < 0.02, "énergie injectée {} {}", cpu.energy_input, gs.energy_input);
+    assert!(rel(a.internal, b.internal) < 1e-3);
+    assert!(rel(a.kinetic, b.kinetic) < 0.3, "énergie cinétique {} {}", a.kinetic, b.kinetic);
+    assert_eq!(cpu.tp_mix.len(), gs.tp_mix.len());
+}
+
+#[test]
+fn gpu_heats_a_liquid_to_2000_c_without_pausing() {
+    // ancien bogue : montée de 2000 °C d'un coup au pinceau sur de l'eau → pause (filet de sécurité). Même scène sur les deux solveurs.
+    let mk = || {
+        let mut s = build_scenario(MpScenario::DamBreak, 32, 24, 0.005, 9.81);
+        for j in 2..8 {
+            for i in 2..6 {
+                let c = s.idx(i, j);
+                s.set_heat_target(c, 2273.15);
+            }
+        }
+        s.heat_power_max = 1e10; // maximum du curseur de la fenêtre : ébullition en quelques centièmes de seconde
+        s
+    };
+    let Some((cpu, gs, _)) = compare("chauffage 2000 °C", &mk, 0.05) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!(" énergie apportée CPU {:.4e} GPU {:.4e} ; transferts {:?} {:?} ; retours arrière {} {}", cpu.energy_input, gs.energy_input, cpu.transferred, gs.transferred, cpu.rollbacks, gs.rollbacks);
+    assert!(cpu.transferred[0] > 0.0, "le CPU n'a pas fait bouillir (scène de test à revoir)");
+    assert!(gs.energy_input > 0.0 && gs.transferred[0] > 0.0, "le GPU n'a ni chauffé ni fait bouillir");
+    let r = gs.transferred[0] / cpu.transferred[0];
+    assert!(r > 0.3 && r < 3.0, "vapeur produite {:?} {:?}", cpu.transferred, gs.transferred);
+    assert!(rel(cpu.energy_input, gs.energy_input) < 0.1, "énergie {} {}", cpu.energy_input, gs.energy_input);
+    assert!(rel(a.internal, b.internal) < 2e-3);
+    one_step_agreement("chauffage 2000 °C", mk(), 400, 3, 1e-4, 0.1);
+}
+
+#[test]
+fn gpu_matches_cpu_semi_lagrangian_and_maccormack_momentum() {
+    for mac in [false, true] {
+        let mk = || {
+            let mut s = build_scenario(MpScenario::DamBreak, 48, 32, 0.008, 9.81);
+            s.conservative_momentum = false;
+            s.maccormack = mac;
+            s
+        };
+        let Some((cpu, gs, _)) = compare(if mac { "MacCormack" } else { "semi-lagrangien" }, &mk, 0.2) else { return };
+        let (a, b) = (metrics(&cpu), metrics(&gs));
+        let w = liquid_with_most_mass(&cpu);
+        assert!(com_dist(&a, &b, w) < 0.01 * 0.384, "centre de masse {:?} {:?}", a.com[w], b.com[w]);
+        assert!(rel(a.kinetic, b.kinetic) < 0.1, "énergie cinétique {} {}", a.kinetic, b.kinetic);
+    }
+}
+
+#[test]
+fn gpu_upload_download_roundtrip_and_render_match_cpu() {
+    use super::mp_view::{render_rgba, MpDisplay, RenderOpts};
+    let mut s = build_scenario(MpScenario::PremixedFlame, 48, 12, 0.001, 0.0);
+    for _ in 0..30 {
+        s.step();
+    }
+    let Some(mut g) = gpu_or_skip(&s) else { return };
+    let mut back = build_scenario(MpScenario::PremixedFlame, 48, 12, 0.001, 0.0);
+    g.download(&mut back);
+    for (name, d, at) in field_diff(&s, &back) {
+        // arrondi f32 : T ~ 2000 K → 1e-4 K ; p − p0 ~ 1e3 Pa → 1e-4 Pa ; autres champs relatifs
+        let tol = if name == "T" { 1e-3 } else if name.starts_with("p") { 1e-2 } else { 1e-6 };
+        assert!(d < tol, "aller-retour {name} : {d} (case {at})");
+    }
+    let rel_e = s.e.iter().zip(&back.e).map(|(a, b)| (a - b).abs() / a.abs().max(1e3)).fold(0.0f64, f64::max);
+    assert!(rel_e < 1e-5, "énergie relue : {rel_e}");
+    // rendu GPU = rendu CPU (à l'arrondi des couleurs près)
+    for d in MpDisplay::ALL {
+        let o = RenderOpts { display: d, t_scale: 500.0, p_scale: 0.0, show_effects: true, solids_white: false };
+        let (mut a, mut b) = (vec![], vec![]);
+        render_rgba(&s, o, &mut a);
+        g.render(&s, &o, &mut b);
+        let worst = a.iter().zip(&b).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap();
+        let bad = a.iter().zip(&b).filter(|(x, y)| (**x as i32 - **y as i32).abs() > 3).count();
+        eprintln!(" rendu {:?} : écart max {worst}, {bad} composantes > 3", d);
+        assert!(bad <= a.len() / 200, "rendu {:?} : {bad} composantes différentes", d);
+    }
+}
+
+#[test]
+fn gpu_rollback_and_divergence_like_cpu() {
+    // vitesse limite absurde : chaque pas est jugé invalide → retours arrière (dt/4 …) puis arrêt, état d'avant conservé
+    let mk = || {
+        let mut s = build_scenario(MpScenario::DamBreak, 24, 16, 0.01, 9.81);
+        s.speed_limit = 1e-3;
+        s
+    };
+    let mut cpu = mk();
+    let mut gs = mk();
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    // quelques pas sans limite d'abord (l'eau doit se mettre en mouvement)
+    cpu.speed_limit = 1000.0;
+    gs.speed_limit = 1000.0;
+    for _ in 0..10 {
+        cpu.step();
+        g.step(&mut gs);
+    }
+    cpu.speed_limit = 1e-3;
+    gs.speed_limit = 1e-3;
+    let t_before = gs.time;
+    let dc = cpu.step();
+    let dg = g.step(&mut gs);
+    eprintln!(" CPU dt {dc} rollbacks {} diverged {} ; GPU dt {dg} rollbacks {} diverged {}", cpu.rollbacks, cpu.diverged, gs.rollbacks, gs.diverged);
+    assert!(cpu.diverged && gs.diverged && dg == 0.0);
+    assert_eq!(cpu.rollbacks, gs.rollbacks);
+    assert_eq!(gs.time, t_before);
+    g.download(&mut gs);
+    assert!(gs.state_is_sane() || gs.max_speed() > 1e-3, "état restauré invalide");
+}
+
+#[test]
+fn gpu_matches_cpu_evaporation_into_humid_air_dalton() {
+    // eau chaude sous de l'air sec O2/N2 miscible avec la vapeur : équilibre de pression partielle (Dalton) dans les cellules mixtes et
+    // échange à travers l'interface alignée sur la grille, diffusion de la vapeur dans l'air
+    use super::mp_materials::MaterialLibrary;
+    use super::mp_view::build_scenario_with;
+    let mk = || {
+        let lib = MaterialLibrary::default().with_combustion();
+        let mut s = build_scenario_with(&lib, MpScenario::Sloshing, 32, 24, 0.004, 9.81).unwrap();
+        let w = liquid_with_most_mass(&s);
+        for c in 0..s.nx * s.ny {
+            if s.alpha[w][c] > 0.5 {
+                let t = 345.0;
+                let e: f64 = (0..s.reg.phases.len()).map(|k| s.mass[k][c] * s.reg.phases[k].e_int(t)).sum();
+                s.e[c] = e;
+            }
+        }
+        s.refresh();
+        s
+    };
+    let Some((cpu, gs, g)) = compare("évaporation (Dalton)", &mk, 0.05) else { return };
+    eprintln!(" évaporé CPU {:?} GPU {:?} ; {:?}", cpu.transferred, gs.transferred, g.last);
+    let q = cpu.reg.changes.iter().position(|pc| pc.liquid == liquid_with_most_mass(&cpu)).unwrap();
+    assert!(cpu.transferred[q] > 0.0 && gs.transferred[q] > 0.0, "pas d'évaporation");
+    assert!(rel(cpu.transferred[q], gs.transferred[q]) < 0.05, "évaporation {:?} {:?}", cpu.transferred, gs.transferred);
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    assert!(rel(a.internal, b.internal) < 1e-3);
+}
+
+#[test]
+fn gpu_runs_diffusion_flame_and_vented_explosion() {
+    for (sc, t_end, nx, ny, dx) in [(MpScenario::DiffusionFlame, 0.02, 32, 32, 0.002), (MpScenario::VentedExplosion, 0.01, 40, 32, 0.003)] {
+        let mk = || build_scenario(sc, nx, ny, dx, 9.81);
+        one_step_agreement(sc.name(), mk(), 80, 2, 5e-3, 3.0);
+        let Some((cpu, gs, _)) = compare(sc.name(), &mk, t_end) else { return };
+        eprintln!(" chaleur CPU {:.4e} GPU {:.4e}", cpu.chem_heat, gs.chem_heat);
+        assert!(gs.chem_heat > 0.0);
+        // jet / panache instables : écart à long terme de quelques dizaines de % admis
+        assert!(rel(cpu.chem_heat, gs.chem_heat) < 0.25, "{} : chaleur {} {}", sc.name(), cpu.chem_heat, gs.chem_heat);
+    }
+}
+
+/// diagnostic : un pas noyau par noyau (MP_SC = scénario, combustion si MP_COMB)
+#[test]
+#[ignore]
+fn gpu_kernel_by_kernel() {
+    use super::mp_materials::MaterialLibrary;
+    use super::mp_view::build_scenario_with;
+    let sc = MpScenario::from_index(std::env::var("MP_SC").ok().and_then(|s| s.parse().ok()).unwrap_or(2));
+    let lib = if std::env::var("MP_COMB").is_ok() { MaterialLibrary::default().with_combustion() } else { MaterialLibrary::default() };
+    let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let mut s = build_scenario_with(&lib, sc, ev("MP_NX", 32.0) as usize, ev("MP_NY", 24.0) as usize, ev("MP_DX", 0.004), 9.81).unwrap();
+    let Some(mut g) = gpu_or_skip(&s) else { return };
+    let skip: usize = std::env::var("MP_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    for k in 0..skip {
+        eprintln!("pas {k}");
+        g.step(&mut s);
+        if std::env::var("MP_DL").is_ok() {
+            g.download(&mut s);
+            let bad = (0..s.nx * s.ny).filter(|&c| !s.temp[c].is_finite() || !s.e[c].is_finite()).count();
+            eprintln!("   dt {:.3e} T [{:.1}, {:.1}] invalides {bad}", s.last_dt, s.temp.iter().cloned().fold(f64::MAX, f64::min), s.temp.iter().cloned().fold(f64::MIN, f64::max));
+        }
+    }
+    g.debug_step_one_by_one(&s);
+}
+
+#[test]
+fn gpu_step_batch_equals_single_steps() {
+    let mk = || build_scenario(MpScenario::DropSplash, 32, 24, 0.004, 9.81);
+    let mut a = mk();
+    let mut b = mk();
+    let Some(mut ga) = gpu_or_skip(&a) else { return };
+    let Some(mut gb) = gpu_or_skip(&b) else { return };
+    for _ in 0..3 {
+        for _ in 0..4 {
+            ga.step(&mut a);
+        }
+        let t = gb.step_batch(&mut b, 4);
+        assert!(t > 0.0);
+    }
+    ga.download(&mut a);
+    gb.download(&mut b);
+    assert_eq!(a.step_count, b.step_count);
+    assert!((a.time - b.time).abs() < 1e-9 * a.time, "temps {} {}", a.time, b.time);
+    for (name, d, at) in field_diff(&a, &b) {
+        assert!(d < 1e-6, "série ≠ pas à pas : {name} {d} (case {at})");
+    }
+}
+
+#[test]
+fn gpu_matches_cpu_miscible_liquids_diffusion() {
+    // eau / alcool miscibles sous de l'air : groupe miscible d'indice 1 (emplacements de lancement propres au groupe), diffusion de Fick
+    let mk = || super::mp_tests::two_liquid_box(true).0;
+    one_step_agreement("liquides miscibles", mk(), 20, 2, 1e-5, 0.01);
+    let Some((cpu, gs, g)) = compare("liquides miscibles", &mk, 0.5) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    eprintln!(" sous-pas de diffusion GPU {}", g.last.species_sub);
+    for k in 0..3 {
+        assert!(rel(a.mass[k], b.mass[k]) < 1e-5, "masse {k}");
+        assert!(com_dist(&a, &b, k) < 1e-4, "phase {k} : {:?} {:?}", a.com[k], b.com[k]);
+    }
+}

@@ -21,7 +21,9 @@ pub const P_CHEM: usize = 6;
 pub const P_PHASE: usize = 7;
 pub const P_PRESSURE: usize = 8;
 pub const P_OTHER: usize = 9;
-pub const PROFILE_NAMES: [&str; 10] = [
+/// solveur GPU résident : pas complet (encodage, calcul GPU et relecture des scalaires de contrôle)
+pub const P_GPU: usize = 10;
+pub const PROFILE_NAMES: [&str; 11] = [
     "propriétés (refresh)",
     "forces (gravité, tension, viscosité)",
     "advection masse / énergie (PLIC)",
@@ -32,12 +34,13 @@ pub const PROFILE_NAMES: [&str; 10] = [
     "changement de phase",
     "pression (Newton + PCG)",
     "divers (cellules spéciales, dt)",
+    "GPU : pas complet (calcul + attente)",
 ];
 
 /// Temps passé dans chaque partie du pas (secondes cumulées depuis la dernière remise à zéro).
 #[derive(Clone, Debug, Default)]
 pub struct StepProfile {
-    pub secs: [f64; 10],
+    pub secs: [f64; 11],
     pub steps: usize,
 }
 
@@ -49,7 +52,7 @@ impl StepProfile {
     pub fn report(&self) -> Vec<(&'static str, f64, f64)> {
         let tot = self.total().max(1e-30);
         let n = self.steps.max(1) as f64;
-        (0..10).map(|k| (PROFILE_NAMES[k], 1e3 * self.secs[k] / n, self.secs[k] / tot)).collect()
+        (0..PROFILE_NAMES.len()).map(|k| (PROFILE_NAMES[k], 1e3 * self.secs[k] / n, self.secs[k] / tot)).collect()
     }
 }
 

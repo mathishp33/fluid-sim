@@ -294,6 +294,7 @@ impl GpuContext {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point,
+            compilation_options: Default::default(),
         });
 
         let pipelines = Pipelines {

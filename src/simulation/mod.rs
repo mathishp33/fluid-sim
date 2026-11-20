@@ -8,21 +8,16 @@ pub mod mp_pressure;
 pub mod mp_step;
 pub mod mp_thermo;
 pub mod mp_species;
+pub mod mp_mg;
+mod mp_chem_tests;
+mod mp_gpu_tests;
 pub mod mp_cells;
 pub mod multiphase;
 pub mod phases;
 pub mod vof;
-pub mod mp_gpu_params;
-pub mod mp_materials;
-pub mod mp_mg;
-
-#[cfg(test)]
 pub mod mp_tests;
-#[cfg(test)]
 pub mod benchmarks;
-#[cfg(test)]
 pub mod lowmach_regression_tests;
-pub mod mp_chem_tests;
-
 pub mod mp_view;
+pub mod mp_materials;
 pub mod gpu_multiphase;

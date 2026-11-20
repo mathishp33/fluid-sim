@@ -47,7 +47,7 @@ impl Radiator {
     }
 }
 
-/// Nombre maximal de phases fluides gérées par le solveur CPU (le GPU est limité à `NPMAX` = 4, voir `gpu_multiphase`).
+/// Nombre maximal de phases fluides gérées par les solveurs CPU et GPU (`gpu_multiphase::GPU_MAX_PHASES`).
 pub const MAX_PHASES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

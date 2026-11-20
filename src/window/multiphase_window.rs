@@ -283,6 +283,7 @@ impl MultiphaseWindow {
     fn reset(&mut self) {
         match Self::make(&self.settings, &self.settings.materials.clone(), self.scenario) {
             Ok(s) => {
+                let was_gpu = self.backend == Backend::Gpu;
                 self.sim = s;
                 self.gpu = None;
                 self.backend = Backend::Cpu;
@@ -291,6 +292,13 @@ impl MultiphaseWindow {
                 self.fix_selection();
                 self.stats = compute_stats(&self.sim);
                 self.status = format!("Scénario : {}", self.scenario.name());
+                if was_gpu {
+                    // la nouvelle scène reste sur le GPU (le message d'erreur éventuel remplace le statut)
+                    self.set_backend(Backend::Gpu);
+                    if self.backend == Backend::Gpu {
+                        self.status = format!("Scénario : {} (GPU)", self.scenario.name());
+                    }
+                }
                 self.paused = false;
                 self.step_frame = 0;
                 self.tp_dest = None;
@@ -403,6 +411,7 @@ impl MultiphaseWindow {
     }
 
     fn do_reset_flow(&mut self) {
+        self.sync_host();
         reset_flow(&mut self.sim);
         self.upload_if_gpu();
         self.status = "Écoulement remis à zéro".into();
@@ -410,11 +419,20 @@ impl MultiphaseWindow {
 
     fn upload_if_gpu(&mut self) {
         if let Some(g) = &mut self.gpu {
-            g.upload(&self.sim); // l'état CPU est relu à chaque pas : on renvoie l'état édité
+            g.upload(&self.sim); // l'état édité (relu au préalable par `sync_host`) remplace celui du GPU
         }
     }
 
-    /// Repasse sur le CPU si une modification (cellule spéciale, entrée, solide thermique, miscibilité) n'existe pas sur le GPU.
+    /// GPU résident : relit l'état complet dans `self.sim` s'il a avancé depuis la dernière relecture (avant une modification,
+    /// une sauvegarde, des statistiques). Sans effet en calcul CPU.
+    fn sync_host(&mut self) {
+        if let Some(g) = &mut self.gpu {
+            g.ensure_host(&mut self.sim);
+        }
+    }
+
+    /// Repasse sur le CPU si une modification dépasse les limites du GPU (plus de 32 fluides, réaction à plus de 6 réactifs / produits,
+    /// plus de 256 destinations de téléporteurs). L'état vient d'être envoyé : CPU et GPU sont identiques à ce moment.
     fn enforce_backend(&mut self) {
         if self.backend == Backend::Gpu {
             if let Some(why) = gpu_unsupported_reason(&self.sim) {
@@ -431,6 +449,7 @@ impl MultiphaseWindow {
     }
 
     fn save_scene(&mut self) {
+        self.sync_host();
         let path = rfd::FileDialog::new().add_filter("Scène multiphasique", &["mps"]).set_file_name("scene.mps").save_file();
         if let Some(path) = path {
             self.status = match scene_to_json(&self.sim).and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string())) {
@@ -444,6 +463,7 @@ impl MultiphaseWindow {
     fn load_scene(&mut self) {
         let path = rfd::FileDialog::new().add_filter("Scène multiphasique", &["mps"]).pick_file();
         if let Some(path) = path {
+            self.sync_host();
             self.status = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| scene_from_json(&mut self.sim, &s)) {
                 Ok(w) if w.is_empty() => "Scène chargée".into(),
                 Ok(w) => format!("Scène chargée ({} avertissement(s) : {})", w.len(), w[0]),
@@ -571,13 +591,27 @@ impl MultiphaseWindow {
                     ui.weak(format!("GPU indisponible pour cette scène : {why}"));
                 }
                 if self.backend == Backend::Gpu {
-                    if let Some(g) = &mut self.gpu {
-                        let mut it = g.pcg_iter as usize;
-                        ui.add(egui::Slider::new(&mut it, 20..=2000).text("Itérations PCG (GPU)"));
-                        g.pcg_iter = it as u32;
+                    if let Some(g) = &self.gpu {
+                        let l = g.last;
+                        ui.weak(format!(
+                            "GPU résident ({}) : dt {:.2e} s, {} Newton, {} PCG (max {} par résolution), sous-pas : {} conduction, {} espèces, {} noyaux par pas{}{}",
+                            g.adapter_name,
+                            l.dt,
+                            l.newton,
+                            l.pcg,
+                            l.pcg_max,
+                            l.cond_sub,
+                            l.species_sub,
+                            l.dispatches,
+                            if l.retries > 0 { format!(", {} retour(s) arrière", l.retries) } else { String::new() },
+                            if l.redo > 0 { format!(", {} pas refait(s) (budget)", l.redo) } else { String::new() }
+                        ));
                     }
                 }
-                ui.checkbox(&mut self.sim.multigrid, "Pression : préconditionneur multigrille (sinon IC(0), ~10× plus d'itérations)");
+                ui.add_enabled(
+                    self.backend == Backend::Cpu,
+                    egui::Checkbox::new(&mut self.sim.multigrid, "Pression : préconditionneur multigrille (sinon IC(0), ~10× plus d'itérations ; GPU : toujours multigrille)"),
+                );
                 ui.add(egui::Slider::new(&mut self.sim.cfl, 0.1..=0.9).text("CFL"));
                 ui.add(egui::Slider::new(&mut self.sim.dt_max, 1e-5..=2e-2).logarithmic(true).text("dt max (s)"));
                 let mut g = -self.sim.gravity[1];
@@ -594,9 +628,9 @@ impl MultiphaseWindow {
                     ui.add(egui::Slider::new(&mut self.sim.flame_resolution, 4.0..=12.0).text("Épaisseur des flammes (mailles)"));
                     ui.weak("Flamme épaissie : la vitesse de flamme est conservée quelle que soit la maille ; plus de mailles = plus précis, plus lent.");
                 }
-                ui.add_enabled(self.backend == Backend::Cpu, egui::Checkbox::new(&mut self.sim.conservative_momentum, "Quantité de mouvement conservative (CPU)"));
-                ui.weak("GPU : l'advection est toujours conservative.");
+                ui.checkbox(&mut self.sim.conservative_momentum, "Quantité de mouvement conservative (sinon semi-lagrangien)");
                 if ui.button("Reset temperature").clicked() {
+                    self.sync_host();
                     let t_amb = self.sim.t_ambient;
                     reset_temperature(&mut self.sim, t_amb);
                     self.upload_if_gpu();
@@ -612,6 +646,7 @@ impl MultiphaseWindow {
                 }
                 ui.weak("Inlet : vitesse imposée sur la face normale, fluide d'entrée choisi à l'écran de démarrage ; Outlet : ouvert à 1 atm.");
                 if self.apply_boundaries() {
+                    self.sync_host();
                     self.upload_if_gpu();
                     self.enforce_backend();
                 }
@@ -724,6 +759,7 @@ impl MultiphaseWindow {
     fn set_backend(&mut self, b: Backend) {
         match b {
             Backend::Cpu => {
+                self.sync_host(); // l'état le plus récent est sur le GPU
                 self.gpu = None;
                 self.backend = Backend::Cpu;
                 self.status = "Calcul CPU (f64)".into();
@@ -735,14 +771,15 @@ impl MultiphaseWindow {
                     return;
                 }
                 match MultiphaseGpu::try_new(&self.sim) {
-                    Some(g) => {
+                    Ok(g) => {
                         self.gpu = Some(g);
                         self.backend = Backend::Gpu;
-                        self.status = "Calcul GPU (f32)".into();
+                        self.status = "Calcul GPU (f32, état résident sur le GPU)".into();
                     }
-                    None => {
+                    Err(e) => {
+                        self.gpu = None;
                         self.backend = Backend::Cpu;
-                        self.status = "GPU indisponible (adaptateur absent ou grille trop grande pour un seul buffer)".into();
+                        self.status = format!("GPU indisponible : {e}");
                     }
                 }
             }
@@ -901,8 +938,14 @@ impl MultiphaseWindow {
             self.simulate(dt_wall);
             // les cibles du pinceau « Chauffer » ne valent que pour l'image en cours (elles sont reposées tant que le bouton est enfoncé)
             self.sim.clear_heat_targets();
+            if let Some(g) = &mut self.gpu {
+                g.sync_heat_targets(&self.sim);
+            }
             self.stats_age += 1;
-            if self.stats_age >= 5 || self.paused {
+            // GPU résident : l'état complet n'est relu que pour les statistiques (~2 fois par seconde) et les outils
+            let every = if self.backend == Backend::Gpu { 30 } else { 5 };
+            if self.stats_age >= every || self.paused {
+                self.sync_host();
                 self.stats = compute_stats(&self.sim);
                 self.stats_age = 0;
                 if !self.stats.finite && !self.paused {
@@ -1003,6 +1046,13 @@ impl MultiphaseWindow {
             return;
         }
         let cells = brush_cells(nx, ny, ci, cj, self.radius, self.circle);
+        // GPU résident : un pinceau « Chauffer » sur du fluide ne pose que des cibles (envoyées seules) ; tout autre outil modifie l'état :
+        // il est d'abord relu, puis renvoyé
+        let heat_only = !right && ((left && shift && !ctrl && !middle) || (middle && shift && !ctrl && !left));
+        let light = heat_only && cells.iter().all(|&(i, j)| i < nx && j < ny && !self.sim.is_solid(self.sim.idx(i, j)));
+        if !light {
+            self.sync_host();
+        }
         let t_tool = if self.tool == MpTool::Ignite { self.ignite_temp } else { self.brush_temp };
         let base = ToolOpts { temp: t_tool, cursor, dt, thermal: self.thermal_for_tool() };
         let mut edited = false;
@@ -1032,13 +1082,14 @@ impl MultiphaseWindow {
             edited = true;
         }
         if edited {
-            if self.backend == Backend::Gpu && !self.paused {
-                // le GPU n'applique pas les cibles de chauffage : apport de l'image appliqué ici, sur le temps simulé de l'image
-                self.sim.relax_heat_targets(dt * self.speed);
-                self.sim.clear_heat_targets();
+            if light {
+                if let Some(g) = &mut self.gpu {
+                    g.sync_heat_targets(&self.sim);
+                }
+            } else {
+                self.upload_if_gpu();
+                self.enforce_backend();
             }
-            self.upload_if_gpu();
-            self.enforce_backend();
         }
     }
 
@@ -1062,11 +1113,11 @@ impl MultiphaseWindow {
         loop {
             match (&mut self.gpu, self.backend) {
                 (Some(g), Backend::Gpu) => {
-                    g.step(&mut self.sim);
-                    // le GPU n'a pas de retour arrière : on valide l'état relu et on s'arrête avant que les NaN ne se propagent
-                    if !self.sim.state_is_sane() {
-                        self.sim.diverged = true;
-                    }
+                    // pas protégés sur le GPU (instantané, retour arrière + dt/4 comme le CPU) ; seuls quelques scalaires sont relus,
+                    // une fois par série de pas (jusqu'à 8 pas soumis d'un bloc, selon le temps simulé restant pour cette image)
+                    let remaining = target - (self.sim.time - t0);
+                    let k = if self.paused { 1 } else { ((remaining / self.sim.last_dt.max(1e-9)).floor() as usize).clamp(1, 8) };
+                    g.step_batch(&mut self.sim, k);
                 }
                 _ => {
                     self.sim.step(); // pas protégé : retour arrière + sous-pas si l'état devient invalide
@@ -1093,7 +1144,11 @@ impl MultiphaseWindow {
 
     fn update_texture(&mut self, ctx: &egui::Context) {
         let o = RenderOpts { display: self.display, t_scale: self.t_scale, p_scale: self.p_scale, show_effects: self.show_effects, solids_white: self.solids_white };
-        render_rgba(&self.sim, o, &mut self.rgba);
+        match (&mut self.gpu, self.backend) {
+            // GPU résident : image rendue sur le GPU, seuls nx·ny·4 octets sont relus
+            (Some(g), Backend::Gpu) => g.render(&self.sim, &o, &mut self.rgba),
+            _ => render_rgba(&self.sim, o, &mut self.rgba),
+        }
         // destination du téléporteur en cours de réglage
         if self.show_effects && self.cell_kind == CellKind::Teleporter {
             if let Some(d) = self.tp_dest {
@@ -1228,9 +1283,16 @@ mod tests {
         }
         assert!(w.sim.state_is_sane());
 
-        // GPU : refusé avec une raison dès qu'il y a des extras
+        // GPU résident : accepte les extras (cellules spéciales, entrées, solides thermiques) ; sans adaptateur, repli CPU expliqué
         w.set_backend(Backend::Gpu);
-        assert!(w.backend == Backend::Cpu && w.status.contains("GPU"), "{}", w.status);
+        assert!(w.status.contains("GPU"), "{}", w.status);
+        if w.backend == Backend::Gpu {
+            for _ in 0..20 {
+                frame(&ctx, &mut w, vec![], Modifiers::default());
+            }
+            w.sync_host();
+            assert!(w.sim.state_is_sane() && !w.sim.diverged, "GPU : état invalide avec émetteur et entrée de bord");
+        }
 
         // raccourcis : C change le rayon, I les solides, V l'affichage, R remet l'écoulement à zéro
         let r0 = w.radius;
@@ -1259,9 +1321,9 @@ mod tests {
         st.mp_scenario = MpScenario::ConfinedExplosion.index();
         let mut w = MultiphaseWindow::new(&st);
         assert!(w.sim.reg.reactions.len() >= 3 && w.status.starts_with("Scénario"), "{}", w.status);
-        // GPU refusé (chimie)
+        // chimie sur le GPU résident (si un adaptateur est disponible)
         w.set_backend(Backend::Gpu);
-        assert!(w.backend == Backend::Cpu);
+        assert!(w.status.contains("GPU"), "{}", w.status);
         // allumage supplémentaire au pinceau, dans un coin
         w.tool = MpTool::Ignite;
         w.radius = 4;
@@ -1271,7 +1333,8 @@ mod tests {
         for _ in 0..25 {
             frame(&ctx, &mut w, vec![], Modifiers::default());
         }
-        assert!(w.sim.state_is_sane() && w.sim.chem_heat > 0.0, "rien n'a brûlé");
+        w.sync_host(); // GPU résident : l'état n'est relu que sur demande
+        assert!(w.sim.state_is_sane() && w.sim.chem_heat > 0.0, "rien n'a brûlé ({})", w.status);
         for d in [MpDisplay::Flame, MpDisplay::HeatRelease, MpDisplay::Temperature] {
             w.display = d;
             frame(&ctx, &mut w, vec![], Modifiers::default());

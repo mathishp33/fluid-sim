@@ -1108,7 +1108,7 @@ mod tests {
         // le mode divergence rend sans erreur
         render_rgba(&s, RenderOpts { display: MpDisplay::Divergence, ..base }, &mut a);
         assert_eq!(a.len(), 40 * 30 * 4);
-        // le GPU refuse les extras (et le dit)
-        assert!(crate::simulation::gpu_multiphase::gpu_unsupported_reason(&s).is_some());
+        // le GPU résident gère les extras (cellules spéciales, solides thermiques, entrées)
+        assert!(crate::simulation::gpu_multiphase::gpu_unsupported_reason(&s).is_none());
     }
 }

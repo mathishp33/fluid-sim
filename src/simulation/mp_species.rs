@@ -23,7 +23,7 @@
 //! * Rayonnement (`radiate`) : modèle optiquement mince (TNF Workshop) q = 4σ Σ_k p_k a_P,k(T) (T⁴ − T_amb⁴), coefficients moyens de
 //!   Planck de H2O et CO2. Pertes des gaz brûlés (refroidissement des fumées) ; surestime les pertes des très grandes flammes (opaques).
 
-use super::multiphase::{temp_from_masses, MultiphaseSim};
+use super::multiphase::{clampf, temp_from_masses, MultiphaseSim};
 use super::phases::{Phase, Reaction, Radiator};
 
 /// constante de Stefan–Boltzmann (W/(m²·K⁴))
@@ -506,7 +506,7 @@ impl MultiphaseSim {
                             let tt = cc.temp();
                             cc.rate(j, tt)
                         };
-                        let mut x = (h * r0[j]).clamp(0.999 * lo, 0.999 * hi);
+                        let mut x = clampf(h * r0[j], 0.999 * lo, 0.999 * hi);
                         for _ in 0..6 {
                             let rx_ = eval(&mut cc, x);
                             let g = x - h * rx_;
@@ -516,7 +516,7 @@ impl MultiphaseSim {
                             let dr = (rd - rx_) / (xd - x);
                             let jac = 1.0 - h * dr;
                             let xn = if jac > 0.05 { x - g / jac } else { h * rx_ };
-                            let xn = xn.clamp(0.999 * lo, 0.999 * hi);
+                            let xn = clampf(xn, 0.999 * lo, 0.999 * hi);
                             let conv = (xn - x).abs() <= 1e-9 * (hi - lo).abs().max(1e-30);
                             x = xn;
                             if conv {
@@ -529,14 +529,14 @@ impl MultiphaseSim {
                         // point milieu (Runge–Kutta 2) : vitesse évaluée à mi-pas (composition et T) → erreur O(h³) par sous-pas
                         let tt = cc.temp();
                         let r1 = cc.rate(j, tt);
-                        let half = (0.5 * h * r1).clamp(0.0, 0.999 * hi);
+                        let half = clampf(0.5 * h * r1, 0.0, 0.999 * hi);
                         if half > 0.0 {
                             let base = cc.m.clone();
                             cc.apply(j, half);
                             let th = cc.temp();
                             let rh = cc.rate(j, th);
                             cc.m.copy_from_slice(&base);
-                            (h * rh).clamp(0.0, 0.999 * hi)
+                            clampf(h * rh, 0.0, 0.999 * hi)
                         } else {
                             0.0
                         }
@@ -609,7 +609,7 @@ impl MultiphaseSim {
             let q = 4.0 * SIGMA_SB * kappa * (t.powi(4) - ta.powi(4)) * a_gas;
             // jamais plus de la moitié de l'écart à l'ambiante en un pas (stabilité)
             let lim = 0.5 * self.heat_capacity(c) * (t - ta).abs();
-            let de = (q * dt).clamp(-lim, lim);
+            let de = clampf(q * dt, -lim, lim);
             self.e[c] -= de;
             self.radiated += de * a2;
             self.temp[c] = self.temp_from_energy(c);

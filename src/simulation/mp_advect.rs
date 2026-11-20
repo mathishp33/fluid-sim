@@ -1,7 +1,7 @@
 //! Advection : (1) masses partielles + énergie + fractions par balayages PLIC conservatifs (flux géométriques exacts),
 //! (2) vitesse par semi-lagrangien MacCormack limité.
 
-use super::multiphase::{Bc, MultiphaseSim};
+use super::multiphase::{clampf, Bc, MultiphaseSim};
 use super::vof::Plic;
 
 /// Interpolation bilinéaire d'un champ w×h aux indices (gx, gy) (bornés), renvoie (valeur, min, max) des 4 voisins.
@@ -32,7 +32,7 @@ fn bicubic_limited(f: &[f64], w: usize, h: usize, gx: f64, gy: f64) -> f64 {
         col[q] = cr(at(i0 - 1, j0 + dj), at(i0, j0 + dj), at(i0 + 1, j0 + dj), at(i0 + 2, j0 + dj), fx);
     }
     let v = cr(col[0], col[1], col[2], col[3], fy);
-    if v.is_finite() { v.clamp(lo, hi) } else { lin }
+    if v.is_finite() { clampf(v, lo, hi) } else { lin }
 }
 
 impl MultiphaseSim {
@@ -76,7 +76,7 @@ impl MultiphaseSim {
                 let (xf, yf) = self.trace(u0, v0, x, y, dt, -1.0);
                 let back = self.sample_u(&ustar, xf, yf).0;
                 let c = ustar[j * (nx + 1) + i] + 0.5 * (u0[j * (nx + 1) + i] - back);
-                un[j * (nx + 1) + i] = if self.maccormack { c.clamp(lo, hi) } else { ustar[j * (nx + 1) + i] };
+                un[j * (nx + 1) + i] = if self.maccormack { clampf(c, lo, hi) } else { ustar[j * (nx + 1) + i] };
             }
         }
         let mut vstar = v0.clone();
@@ -95,7 +95,7 @@ impl MultiphaseSim {
                 let (xf, yf) = self.trace(u0, v0, x, y, dt, -1.0);
                 let back = self.sample_v(&vstar, xf, yf).0;
                 let c = vstar[j * nx + i] + 0.5 * (v0[j * nx + i] - back);
-                vn[j * nx + i] = if self.maccormack { c.clamp(lo, hi) } else { vstar[j * nx + i] };
+                vn[j * nx + i] = if self.maccormack { clampf(c, lo, hi) } else { vstar[j * nx + i] };
             }
         }
         (un, vn)
@@ -299,7 +299,11 @@ impl MultiphaseSim {
                 }
             }
         }
-        // 4. mise à jour conservative : α, m_k, e
+        // 4. mise à jour conservative : α, m_k, e, face par face DANS L'ORDRE des indices (la masse volumique m/α de la donneuse est
+        //    lue sur l'état courant, flux entrants des faces précédentes compris). NB : une évaluation simultanée sur l'état d'avant le
+        //    balayage (forme flux « pure ») a été essayée : elle transporte sans les amortir les écarts de remplissage m/α ≠ ρ des
+        //    cellules d'eau et diverge sur un jet d'eau entrant dans l'air ; le GPU reproduit exactement cet ordre (une ligne, resp.
+        //    une colonne, par fil)
         let a2 = self.dx * self.dx;
         for f in 0..nf {
             if donor[f] == usize::MAX && !inflow_ghost[f] {
@@ -436,7 +440,7 @@ impl MultiphaseSim {
                 let q = rho_old * u0[j * (nx + 1) + i] - (fr * cr - fl * cl) - (ft_ * ct - fb_ * cb);
                 let (lo, hi) = (ux(ii, jj).min(ux(ii - 1, jj)).min(ux(ii + 1, jj)).min(ux(ii, jj - 1)).min(ux(ii, jj + 1)),
                                 ux(ii, jj).max(ux(ii - 1, jj)).max(ux(ii + 1, jj)).max(ux(ii, jj - 1)).max(ux(ii, jj + 1)));
-                if rho_new > 1e-8 { un[j * (nx + 1) + i] = (q / rho_new).clamp(lo, hi); }
+                if rho_new > 1e-8 { un[j * (nx + 1) + i] = clampf(q / rho_new, lo, hi); }
             }
         }
         // composante v : faces intérieures 1..ny-1
@@ -465,7 +469,7 @@ impl MultiphaseSim {
                 let q = rho_old * v0[j * nx + i] - (ft * ct - fb * cb) - (fr_ * cr - fl_ * cl);
                 let (lo, hi) = (vy(ii, jj).min(vy(ii, jj - 1)).min(vy(ii, jj + 1)).min(vy(ii - 1, jj)).min(vy(ii + 1, jj)),
                                 vy(ii, jj).max(vy(ii, jj - 1)).max(vy(ii, jj + 1)).max(vy(ii - 1, jj)).max(vy(ii + 1, jj)));
-                if rho_new > 1e-8 { vn[j * nx + i] = (q / rho_new).clamp(lo, hi); }
+                if rho_new > 1e-8 { vn[j * nx + i] = clampf(q / rho_new, lo, hi); }
             }
         }
         (un, vn)

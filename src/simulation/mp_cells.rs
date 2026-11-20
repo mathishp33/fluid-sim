@@ -185,13 +185,20 @@ impl MultiphaseSim {
     // ---------------------------------------------------------------- préparation d'un pas
     /// Reconstruit `pin`, `pf_u`, `pf_v` depuis les effets et les entrées de bord. Appelé au début de chaque pas.
     pub(crate) fn prepare_special(&mut self) {
+        let (pin, pf_u, pf_v) = self.special_tables();
+        self.pin = pin;
+        self.pf_u = pf_u;
+        self.pf_v = pf_v;
+    }
+
+    /// (`pin`, `pf_u`, `pf_v`) des effets et entrées de bord courants, sans modifier l'état (aussi utilisé par le solveur GPU).
+    pub(crate) fn special_tables(&self) -> (Vec<Option<PinInfo>>, Vec<f64>, Vec<f64>) {
         let (nx, ny) = (self.nx, self.ny);
         let n = nx * ny;
-        self.pin = vec![None; n];
-        self.pf_u = vec![f64::NAN; (nx + 1) * ny];
-        self.pf_v = vec![f64::NAN; nx * (ny + 1)];
+        let mut pin: Vec<Option<PinInfo>> = vec![None; n];
+        let mut fx = FixedFaces { nx, ny, solid: &self.solid, pf_u: vec![f64::NAN; (nx + 1) * ny], pf_v: vec![f64::NAN; nx * (ny + 1)] };
         if !self.has_extras() {
-            return;
+            return (pin, fx.pf_u, fx.pf_v);
         }
         // 1. cellules épinglées + vitesses de leurs faces
         let mut tp_dst: Vec<(usize, f64, usize)> = vec![]; // (dest, vitesse de sortie, source)
@@ -202,16 +209,16 @@ impl MultiphaseSim {
             let (i, j) = (c % nx, c / nx);
             match self.special[c] {
                 Some(MpEffect::Sink { rate }) => {
-                    self.pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: None });
-                    self.fix_faces(i, j, -rate.abs());
+                    pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: None });
+                    fx.fix_faces(i, j, -rate.abs());
                 }
                 Some(MpEffect::Emitter { vx, vy, phase, temp }) => {
-                    self.pin[c] = Some(PinInfo { kind: 2, phase: phase.min(self.reg.phases.len() - 1), temp, tp_dest: None });
-                    self.fix_nozzle(i, j, vx, vy);
+                    pin[c] = Some(PinInfo { kind: 2, phase: phase.min(self.reg.phases.len() - 1), temp, tp_dest: None });
+                    fx.fix_nozzle(i, j, vx, vy);
                 }
                 Some(MpEffect::Teleporter { dest, speed }) if self.tp_dest_ok(c, dest) => {
-                    self.pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
-                    self.fix_faces(i, j, -speed.abs());
+                    pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
+                    fx.fix_faces(i, j, -speed.abs());
                     let n_src = self.open_faces(i, j);
                     tp_dst.push((dest, speed.abs() * n_src as f64, c));
                 }
@@ -219,13 +226,13 @@ impl MultiphaseSim {
             }
         }
         for (dest, flux, _src) in tp_dst {
-            if self.pin[dest].is_some() {
+            if pin[dest].is_some() {
                 continue; // destination déjà prise par un autre téléporteur : ignorée
             }
             let (i, j) = (dest % nx, dest / nx);
             let n_dst = self.open_faces(i, j).max(1);
-            self.pin[dest] = Some(PinInfo { kind: 2, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: None });
-            self.fix_faces(i, j, flux / n_dst as f64);
+            pin[dest] = Some(PinInfo { kind: 2, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: None });
+            fx.fix_faces(i, j, flux / n_dst as f64);
         }
         // 2. entrées de bord (uniquement sur un bord fermé)
         for side in 0..4 {
@@ -240,7 +247,7 @@ impl MultiphaseSim {
                         let cell = if side == 0 { self.idx(0, j) } else { self.idx(nx - 1, j) };
                         if !self.is_solid(cell) {
                             let f = self.uidx(i, j);
-                            self.pf_u[f] = inl.vx * offset_factor(j, ny, inl.offset);
+                            fx.pf_u[f] = inl.vx * offset_factor(j, ny, inl.offset);
                         }
                     }
                 }
@@ -250,7 +257,7 @@ impl MultiphaseSim {
                         let cell = if side == 2 { self.idx(i, 0) } else { self.idx(i, ny - 1) };
                         if !self.is_solid(cell) {
                             let f = self.vidx(i, j);
-                            self.pf_v[f] = inl.vy * offset_factor(i, nx, inl.offset);
+                            fx.pf_v[f] = inl.vy * offset_factor(i, nx, inl.offset);
                         }
                     }
                 }
@@ -259,20 +266,21 @@ impl MultiphaseSim {
         // 3. faces entre deux cellules épinglées : fermées
         for j in 0..ny {
             for i in 1..nx {
-                if self.pinned(self.idx(i - 1, j)) && self.pinned(self.idx(i, j)) {
+                if pin[self.idx(i - 1, j)].is_some() && pin[self.idx(i, j)].is_some() {
                     let f = self.uidx(i, j);
-                    self.pf_u[f] = 0.0;
+                    fx.pf_u[f] = 0.0;
                 }
             }
         }
         for j in 1..ny {
             for i in 0..nx {
-                if self.pinned(self.idx(i, j - 1)) && self.pinned(self.idx(i, j)) {
+                if pin[self.idx(i, j - 1)].is_some() && pin[self.idx(i, j)].is_some() {
                     let f = self.vidx(i, j);
-                    self.pf_v[f] = 0.0;
+                    fx.pf_v[f] = 0.0;
                 }
             }
         }
+        (pin, fx.pf_u, fx.pf_v)
     }
 
     /// nombre de faces de la cellule (i, j) donnant sur du fluide intérieur (ni solide, ni bord)
@@ -281,57 +289,6 @@ impl MultiphaseSim {
         let ok = |a: isize, b: isize| a >= 0 && b >= 0 && (a as usize) < nx && (b as usize) < ny && !self.is_solid(self.idx(a as usize, b as usize));
         let (ii, jj) = (i as isize, j as isize);
         [(ii - 1, jj), (ii + 1, jj), (ii, jj - 1), (ii, jj + 1)].iter().filter(|&&(a, b)| ok(a, b)).count()
-    }
-
-    /// vitesse normale `s` ALGÉBRIQUE VERS L'EXTÉRIEUR de la cellule (s < 0 : aspiration) sur ses faces ouvertes
-    fn fix_faces(&mut self, i: usize, j: usize, s: f64) {
-        let (nx, ny) = (self.nx, self.ny);
-        let free = |sim: &Self, a: isize, b: isize| a >= 0 && b >= 0 && (a as usize) < nx && (b as usize) < ny && !sim.is_solid(sim.idx(a as usize, b as usize));
-        let (ii, jj) = (i as isize, j as isize);
-        if free(self, ii - 1, jj) {
-            let f = self.uidx(i, j);
-            self.pf_u[f] = -s;
-        }
-        if free(self, ii + 1, jj) {
-            let f = self.uidx(i + 1, j);
-            self.pf_u[f] = s;
-        }
-        if free(self, ii, jj - 1) {
-            let f = self.vidx(i, j);
-            self.pf_v[f] = -s;
-        }
-        if free(self, ii, jj + 1) {
-            let f = self.vidx(i, j + 1);
-            self.pf_v[f] = s;
-        }
-    }
-
-    /// Émetteur : buse. La composante sortante (vx, vy) est imposée sur les faces concernées et TOUTES les autres faces ouvertes sont
-    /// fermées (vitesse nulle) : le débit émis est exactement ρ·|v|·dx, sans fuite latérale ni aspiration par l'amont. Un émetteur de
-    /// vitesse nulle laisse ses faces libres (réservoir à la pression du voisinage).
-    fn fix_nozzle(&mut self, i: usize, j: usize, vx: f64, vy: f64) {
-        if vx == 0.0 && vy == 0.0 {
-            return;
-        }
-        let (nx, ny) = (self.nx, self.ny);
-        let free = |sim: &Self, a: isize, b: isize| a >= 0 && b >= 0 && (a as usize) < nx && (b as usize) < ny && !sim.is_solid(sim.idx(a as usize, b as usize));
-        let (ii, jj) = (i as isize, j as isize);
-        if free(self, ii - 1, jj) {
-            let f = self.uidx(i, j);
-            self.pf_u[f] = vx.min(0.0);
-        }
-        if free(self, ii + 1, jj) {
-            let f = self.uidx(i + 1, j);
-            self.pf_u[f] = vx.max(0.0);
-        }
-        if free(self, ii, jj - 1) {
-            let f = self.vidx(i, j);
-            self.pf_v[f] = vy.min(0.0);
-        }
-        if free(self, ii, jj + 1) {
-            let f = self.vidx(i, j + 1);
-            self.pf_v[f] = vy.max(0.0);
-        }
     }
 
     /// Ré-écrit les vitesses imposées dans u, v.
@@ -486,3 +443,55 @@ impl MultiphaseSim {
 }
 
 pub(crate) type TpMix = HashMap<usize, (Vec<f64>, f64)>;
+
+/// Faces à vitesse imposée en construction (voir `special_tables`).
+struct FixedFaces<'a> {
+    nx: usize,
+    ny: usize,
+    solid: &'a [i32],
+    pf_u: Vec<f64>,
+    pf_v: Vec<f64>,
+}
+
+impl FixedFaces<'_> {
+    fn free(&self, a: isize, b: isize) -> bool {
+        a >= 0 && b >= 0 && (a as usize) < self.nx && (b as usize) < self.ny && self.solid[b as usize * self.nx + a as usize] < 0
+    }
+    /// vitesse normale `s` ALGÉBRIQUE VERS L'EXTÉRIEUR de la cellule (s < 0 : aspiration) sur ses faces ouvertes
+    fn fix_faces(&mut self, i: usize, j: usize, s: f64) {
+        let (nx, ii, jj) = (self.nx, i as isize, j as isize);
+        if self.free(ii - 1, jj) {
+            self.pf_u[j * (nx + 1) + i] = -s;
+        }
+        if self.free(ii + 1, jj) {
+            self.pf_u[j * (nx + 1) + i + 1] = s;
+        }
+        if self.free(ii, jj - 1) {
+            self.pf_v[j * nx + i] = -s;
+        }
+        if self.free(ii, jj + 1) {
+            self.pf_v[(j + 1) * nx + i] = s;
+        }
+    }
+    /// Émetteur : buse. La composante sortante (vx, vy) est imposée sur les faces concernées et TOUTES les autres faces ouvertes sont
+    /// fermées (vitesse nulle) : le débit émis est exactement ρ·|v|·dx, sans fuite latérale ni aspiration par l'amont. Un émetteur de
+    /// vitesse nulle laisse ses faces libres (réservoir à la pression du voisinage).
+    fn fix_nozzle(&mut self, i: usize, j: usize, vx: f64, vy: f64) {
+        if vx == 0.0 && vy == 0.0 {
+            return;
+        }
+        let (nx, ii, jj) = (self.nx, i as isize, j as isize);
+        if self.free(ii - 1, jj) {
+            self.pf_u[j * (nx + 1) + i] = vx.min(0.0);
+        }
+        if self.free(ii + 1, jj) {
+            self.pf_u[j * (nx + 1) + i + 1] = vx.max(0.0);
+        }
+        if self.free(ii, jj - 1) {
+            self.pf_v[j * nx + i] = vy.min(0.0);
+        }
+        if self.free(ii, jj + 1) {
+            self.pf_v[(j + 1) * nx + i] = vy.max(0.0);
+        }
+    }
+}

@@ -376,52 +376,6 @@ fn free_fall_and_splash_energy_with_conservative_momentum() {
     assert!((dy / th - 1.0).abs() < 0.04 && ratio < 1.15 && ratio > 0.9, "Δy={dy} ratio={ratio}");
 }
 
-/// Exporte des cas pour le banc CPU/GPU (WebGPU headless) : `GPU_CASE=dam GPU_STEPS=40 GPU_OUT=/chemin.json cargo test export_gpu_case -- --ignored`
-#[test]
-#[ignore]
-fn export_gpu_case() {
-    use super::mp_gpu_params::export_case;
-    let case = std::env::var("GPU_CASE").unwrap_or("dam".into());
-    let steps: usize = std::env::var("GPU_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-    let out = std::env::var("GPU_OUT").unwrap_or("/tmp/gpu_case.json".into());
-    let mut s = match case.as_str() {
-        "hydro" => {
-            let (mut s, _, _) = tank(12, 24, 0.01, 0.12);
-            s.bc[3] = Bc::Open { p: P_ATM };
-            s.finalize_init(|_, _| 293.15);
-            s
-        }
-        "boil" => {
-            let (r, air, _eau, vap) = Registry::water_air_steam();
-            let eau = 1usize;
-            let mut s = MultiphaseSim::new(24, 24, 0.002, r, air);
-            s.gravity = [0.0, 0.0];
-            s.surface_tension = false;
-            s.dt_max = 5e-4;
-            s.paint_phase(move |x, y| if ((x - 0.024f64).powi(2) + (y - 0.024f64).powi(2)).sqrt() < 0.008 { Some(vap) } else { Some(eau) });
-            s.finalize_init(|_, _| 383.0);
-            s
-        }
-        "laplace" => {
-            let (n, dx) = (48usize, 0.1 / 48.0);
-            let mut r = Registry::new();
-            let air = r.add_phase(Phase::air());
-            let eau = r.add_phase(Phase::water());
-            let mut s = MultiphaseSim::new(n, n, dx, r, air);
-            s.gravity = [0.0, 0.0];
-            s.paint_phase(move |x, y| if ((x - 0.05f64).powi(2) + (y - 0.05f64).powi(2)).sqrt() < 0.02 { Some(eau) } else { Some(air) });
-            s.finalize_init(|_, _| 293.15);
-            s
-        }
-        _ => {
-            let (mut s, _, eau) = tank(40, 32, 0.01, 0.0);
-            s.paint_phase(move |x, y| if x < 0.1 && y < 0.2 { Some(eau) } else { Some(1 - eau) });
-            s.finalize_init(|_, _| 293.15);
-            s
-        }
-    };
-    export_case(&mut s, steps, 3, 400, &out);
-}
 
 /// Un état invalide ne doit JAMAIS se propager : le pas est annulé, refait avec dt/4, dt/16… puis, si rien ne passe, l'état sain
 /// précédent est restauré et `diverged` passe à true (la fenêtre se met alors en pause au lieu de planter sur des NaN).
@@ -459,7 +413,7 @@ fn alcohol() -> Phase {
 }
 
 /// eau en bas, alcool au-dessus (stable), air tout en haut, boîte fermée
-fn two_liquid_box(miscible: bool) -> (MultiphaseSim, usize, usize, usize) {
+pub(crate) fn two_liquid_box(miscible: bool) -> (MultiphaseSim, usize, usize, usize) {
     let mut r = Registry::new();
     let air = r.add_phase(Phase::air());
     let eau = r.add_phase(Phase::water());

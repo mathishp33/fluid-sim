@@ -1,261 +1,1634 @@
-//! Hôte wgpu du solveur multiphasique GPU. ATTENTION : ce fichier n'a PAS pu être compilé dans l'environnement de développement
-//! (pas de crate wgpu hors ligne) ; il reproduit ligne à ligne l'orchestration du banc WebGPU `gpu_run.js` qui, lui, a été exécuté
-//! et comparé au CPU. Style d'API wgpu identique à gpu.rs (wgpu 0.19/0.20, pollster, bytemuck).
+//! Solveur multiphasique GPU RÉSIDENT (wgpu, f32), miroir du solveur CPU f64 (`multiphase.rs`, `mp_*.rs`).
 //!
-//! Un seul buffer de stockage `S` (f32) + un uniforme `Params` (512 octets) : aucune limite de nombre de buffers.
-//! Taille de S ≈ (≈ 30·np + 40)·nx·ny·4 octets (≈ 40 Mo pour 256×256, 3 phases) ; limite par défaut 128 Mo (≈ 380×380).
+//! L'état (masses, énergie, pression, vitesses, propriétés dérivées, facteur de flamme, mélanges des téléporteurs, compteurs des bilans)
+//! RESTE sur le GPU d'un pas à l'autre. Par pas, seuls ~256 octets sont relus (dt, itérations, drapeaux de contrôle) : le pas de temps
+//! (CFL, gravité, capillarité, viscosité, chauffage, chimie, changement de phase), les itérations de Newton et du gradient conjugué
+//! (multigrille), les sous-pas de conduction et de diffusion sont décidés SUR LE GPU (réductions), le filet de sécurité aussi
+//! (instantané GPU → GPU, retour arrière avec dt/4 comme le CPU). L'image affichée est rendue sur le GPU (nx·ny·4 octets relus par
+//! image) ; l'état complet n'est relu que sur demande (statistiques, outils, sauvegarde : `ensure_host`).
+//!
+//! Conditionnement f32 : énergie SENSIBLE relative ε = e − Σ m_k e_k(T0) (T0 = 298.15 K), pression relative p − 101325 Pa. Les tables
+//! (fluides, solides, changements de phase, groupes miscibles, réactions, ln Kc(T) précalculé en f64) sont dans un buffer en lecture seule.
+//! Différences avec le CPU f64 : arrondis f32 (≈ 1e-7 relatif ; Newton de la pression arrêté à max(0.1 Pa, 2e-6 p) au lieu de 1e-3 Pa,
+//! gradient conjugué à 1e-6 relatif au lieu de 1e-10), préconditionneur toujours multigrille, échange de surface et ordre des cellules
+//! d'un même pas évalués en parallèle (le CPU les traite en séquence).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use super::mp_gpu_params::{gpu_layout_header, GpuState};
-use super::multiphase::MultiphaseSim;
+use super::mp_cells::{MpEffect, MpThermal, PinInfo};
+use super::mp_step::P_GPU;
+use super::multiphase::{Bc, MultiphaseSim};
+use super::phases::{Eos, Radiator, Thermal, T_STD};
 
-const WGSL_TEMPLATE: &str = include_str!("multiphase.template.wgsl");
+const SHADERS: [&str; 8] = [
+    include_str!("mp_gpu/common.wgsl"),
+    include_str!("mp_gpu/flow.wgsl"),
+    include_str!("mp_gpu/mg.wgsl"),
+    include_str!("mp_gpu/thermo.wgsl"),
+    include_str!("mp_gpu/species.wgsl"),
+    include_str!("mp_gpu/special.wgsl"),
+    include_str!("mp_gpu/sl.wgsl"),
+    include_str!("mp_gpu/render.wgsl"),
+];
+
+/// Nombre maximal de fluides du solveur GPU (= celui du CPU).
+pub const GPU_MAX_PHASES: usize = 32;
+/// nombre maximal de destinations de téléporteurs
+const TP_CAP: usize = 256;
+/// table ln Kc(T) : 200 K → 6000 K par pas de 5 K
+const KC_T0: f64 = 200.0;
+const KC_DT: f64 = 5.0;
+const KC_N: usize = 1161;
+/// niveaux multigrilles de moins de TAIL_CELLS cellules : traités par un seul groupe de travail
+const TAIL_CELLS: usize = 8192;
+const D_LEN: usize = 64;
+/// emplacements de paramètres de lancement (a, b) : a < SLOT_A pour b = 0, a < SLOT_A_SP pour b = groupe diffusant
+const SLOT_A: usize = 2048;
+const SLOT_A_SP: usize = 512;
+const SLOT_BYTES: u64 = 256;
+const PARAMS_WORDS: usize = 56;
+/// lancements de noyaux au plus par tampon de commandes d'une série de pas
+const MAX_BATCH_OPS: usize = 1200;
+
+// cases du buffer D (miroir de common.wgsl)
+const D_DT: usize = 0;
+const D_DTCHEM: usize = 1;
+const D_DTPHASE: usize = 2;
+const D_SUB_C: usize = 4;
+const D_NEWTON_IT: usize = 8;
+const D_PCG_IT: usize = 10;
+const D_BAD: usize = 19;
+const D_MAXPCG_N: usize = 28;
+const D_REDO: usize = 30;
+const D_NSUB_S_MAX: usize = 31;
+const D_PCG_UNCONV: usize = 48;
+const D_B_TSUM: usize = 50;
+const D_B_BAD: usize = 52;
+const D_B_REDO: usize = 53;
+const D_B_SUBC: usize = 54;
+const D_B_NSUBS: usize = 55;
+const D_B_MAXPCG: usize = 56;
+const D_B_NEWTON: usize = 57;
+const D_B_UNCONV: usize = 58;
+
+// drapeaux (Params.flags)
+const F_ST: u32 = 1;
+const F_VISC: u32 = 2;
+const F_COND: u32 = 4;
+const F_PC: u32 = 8;
+const F_CHEM: u32 = 16;
+const F_EXTRAS: u32 = 32;
+const F_CONS: u32 = 64;
+const F_HEAT: u32 = 128;
+const F_MISC: u32 = 256;
+const F_FLAME: u32 = 512;
+const F_MACC: u32 = 1024;
+
+const PH_STRIDE: usize = 32;
+const SOL_STRIDE: usize = 8;
+const PC_STRIDE: usize = 8;
+const LEV_STRIDE: usize = 8;
+const RX_STRIDE: usize = 48;
+
+/// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
+pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
+    if sim.reg.phases.len() > GPU_MAX_PHASES {
+        return Some(format!("{} fluides (le GPU en gère {GPU_MAX_PHASES} au maximum)", sim.reg.phases.len()));
+    }
+    for r in &sim.reg.reactions {
+        if r.reactants.len() > 6 || r.products.len() > 6 || r.modifiers.len() > 4 {
+            return Some(format!("réaction « {} » : plus de 6 réactifs / 6 produits / 4 modulateurs", r.name));
+        }
+    }
+    let dests: std::collections::HashSet<usize> = sim.special.iter().filter_map(|s| if let Some(MpEffect::Teleporter { dest, .. }) = s { Some(*dest) } else { None }).collect();
+    if dests.len() > TP_CAP {
+        return Some(format!("plus de {TP_CAP} destinations de téléporteurs"));
+    }
+    None
+}
+
+/// Disposition d'un buffer : (nom, début, longueur) en f32
+#[derive(Default)]
+struct Layout {
+    items: Vec<(String, usize, usize)>,
+    map: HashMap<String, (usize, usize)>,
+    total: usize,
+}
+impl Layout {
+    fn add(&mut self, name: &str, len: usize) {
+        let len = len.max(1);
+        self.items.push((name.to_string(), self.total, len));
+        self.map.insert(name.to_string(), (self.total, len));
+        self.total += len;
+    }
+    fn o(&self, name: &str) -> usize {
+        self.map.get(name).unwrap_or_else(|| panic!("tampon GPU inconnu : {name}")).0
+    }
+}
+
+/// une commande de calcul : noyau, groupes de travail, emplacement de paramètres de lancement (décalage dynamique)
+#[derive(Clone, Copy)]
+struct Op {
+    k: &'static str,
+    wg: u32,
+    slot: u32,
+}
+
+/// Informations de pas relues sur le GPU.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuStepInfo {
+    pub dt: f64,
+    pub newton: usize,
+    pub pcg: usize,
+    pub pcg_max: usize,
+    pub cond_sub: usize,
+    pub species_sub: usize,
+    pub retries: usize,
+    pub redo: usize,
+    /// lancements de noyaux du dernier essai
+    pub dispatches: usize,
+}
+
+/// compteurs des bilans au moment du dernier envoi / de la dernière relecture (les accumulateurs GPU repartent de zéro)
+#[derive(Clone, Default)]
+struct Baselines {
+    boundary_flux: Vec<f64>,
+    transferred: Vec<f64>,
+    energy_input: f64,
+    chem_heat: f64,
+    radiated: f64,
+    reacted: Vec<f64>,
+}
 
 pub struct MultiphaseGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     s_buf: wgpu::Buffer,
+    t_buf: wgpu::Buffer,
+    d_buf: wgpu::Buffer,
+    r_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
-    readback: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    pipelines: HashMap<String, wgpu::ComputePipeline>,
+    slot_buf: wgpu::Buffer,
+    snap_s: wgpu::Buffer,
+    snap_d: wgpu::Buffer,
+    d_read: wgpu::Buffer,
+    s_read: wgpu::Buffer,
+    r_read: wgpu::Buffer,
+    bg0: wgpu::BindGroup,
+    bg1: wgpu::BindGroup,
+    pl: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    sl: Layout,
+    tl: Layout,
+    pers: (usize, usize),
+    acc: (usize, usize),
+    // configuration
     nx: usize,
     ny: usize,
     np: usize,
-    total: usize,
-    offsets: Vec<(&'static str, usize, usize)>,
-    /// itérations PCG (préconditionneur de Jacobi) par itération de Newton : prendre ≳ 6·max(nx, ny)
-    pub pcg_iter: u32,
-    pub newton_iter: u32,
+    ng: usize,
+    npc: usize,
+    nre: usize,
+    levels: Vec<(usize, usize)>,
+    mg_tail: usize,
+    slot_base: Vec<usize>,
+    nwg: usize,
+    diff_groups: Vec<usize>,
+    surf_pairs: Vec<bool>,
+    has_flames: bool,
+    has_radiators: bool,
+    /// adaptateur logiciel (lavapipe / llvmpipe) : contournements de pilote activés
+    software: bool,
+    /// nom de l'adaptateur (affichage)
+    pub adapter_name: String,
+    // état statique (recalculé à chaque envoi)
+    has_extras: bool,
+    has_accel: bool,
+    has_thermal: bool,
+    ntp: usize,
+    slots_of_dest: Vec<usize>,
+    heat_on: bool,
+    // budgets adaptatifs (lancements préparés ; les noyaux en trop ne font rien)
+    newton_budget: usize,
+    pcg_budget: usize,
+    cond_budget: usize,
+    sp_budget: usize,
+    base: Baselines,
+    /// l'état CPU (`sim`) est en retard sur le GPU (pas effectués depuis la dernière relecture)
+    host_stale: bool,
+    pub last: GpuStepInfo,
 }
 
-/// Nombre maximal de fluides du solveur GPU (tableau `ph: array<PhaseP, 4>` des shaders).
-pub const GPU_MAX_PHASES: usize = 4;
-
-/// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut). Le GPU ne gère ni les cellules spéciales / entrées de bord /
-/// solides thermiques, ni la miscibilité (groupes de fluides), ni plus de `GPU_MAX_PHASES` fluides : le CPU f64 les gère tous.
-pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
-    if sim.reg.phases.len() > GPU_MAX_PHASES {
-        return Some(format!("{} fluides (le GPU en gère {GPU_MAX_PHASES} au maximum)", sim.reg.phases.len()));
-    }
-    if sim.has_extras() {
-        return Some("cellules spéciales, solides thermiques ou entrées de bord (CPU uniquement)".into());
-    }
-    if !sim.reg.miscible.is_empty() {
-        return Some("fluides miscibles (CPU uniquement)".into());
-    }
-    if !sim.reg.reactions.is_empty() {
-        return Some("réactions chimiques / combustion (CPU uniquement)".into());
-    }
-    if !sim.ambient_mix.is_empty() || sim.reg.phases.iter().any(|p| p.cp_slope != 0.0) {
-        return Some("ambiant mélangé ou cp variable avec T (CPU uniquement)".into());
-    }
-    None
+fn wg(count: usize) -> u32 {
+    count.div_ceil(64).max(1) as u32
 }
 
 impl MultiphaseGpu {
-    pub fn try_new(sim: &MultiphaseSim) -> Option<Self> {
-        if gpu_unsupported_reason(sim).is_some() {
-            return None;
+    pub fn try_new(sim: &MultiphaseSim) -> Result<Self, String> {
+        if let Some(why) = gpu_unsupported_reason(sim) {
+            return Err(why);
         }
-        let (nx, ny, np) = (sim.nx, sim.ny, sim.reg.phases.len());
-        let (header, total, offsets) = gpu_layout_header(nx, ny, np);
+        let (nx, ny) = (sim.nx, sim.ny);
+        let np = sim.reg.phases.len();
+        let n = nx * ny;
+        let (nfu, nfv) = ((nx + 1) * ny, nx * (ny + 1));
+        let nf = nfu.max(nfv);
+        let groups = sim.reg.miscible_groups();
+        let ng = groups.len();
+        let npc = sim.reg.changes.len();
+        let nre = sim.reg.reactions.len();
+        let npmax = np.max(1);
+        // hiérarchie multigrille (mêmes règles que mp_mg::Multigrid::new)
+        let mut levels = vec![(nx, ny)];
+        loop {
+            let &(a, b) = levels.last().unwrap();
+            if !(a > 3 && b > 3 && a * b > 32) {
+                break;
+            }
+            levels.push((a.div_ceil(2), b.div_ceil(2)));
+        }
+        let last = levels.len() - 1;
+        let mg_tail = levels.iter().position(|&(a, b)| a * b <= TAIL_CELLS).unwrap_or(last).min(last);
+        let nwg = n.max(nf).div_ceil(64).max(1);
+
+        // ---------------------------------------------------------------- disposition de S
+        let mut sl = Layout::default();
+        for name in ["solid", "pin_kind", "pin_phase", "pin_temp", "pin_tp"] {
+            sl.add(name, n);
+        }
+        sl.add("pfu_on", nfu);
+        sl.add("pfu", nfu);
+        sl.add("pfv_on", nfv);
+        sl.add("pfv", nfv);
+        for name in ["acc_on", "acc_x", "acc_y", "th_kind", "th_val", "heat_t", "ovl"] {
+            sl.add(name, n);
+        }
+        let pers_start = sl.total;
+        sl.add("mass", np * n);
+        sl.add("eps", n);
+        sl.add("prel", n);
+        sl.add("U", nfu);
+        sl.add("V", nfv);
+        sl.add("temp", n);
+        sl.add("alpha", np * n);
+        for name in ["rho_mix", "mu_cell", "k_cell", "clamped", "flame", "heat_rel"] {
+            sl.add(name, n);
+        }
+        sl.add("tpmix", TP_CAP * (np + 2));
+        let acc_start = sl.total;
+        sl.add("bflux", np * n);
+        sl.add("acc_ein", n);
+        sl.add("acc_tr", npc.max(1) * n);
+        sl.add("acc_rad", n);
+        sl.add("acc_chem", n);
+        sl.add("acc_xi", nre.max(1) * n);
+        let pers_end = sl.total;
+        for name in ["Un", "Us", "Fx", "ust"] {
+            sl.add(name, nfu);
+        }
+        for name in ["Vn", "Vs", "Fy", "vst"] {
+            sl.add(name, nfv);
+        }
+        for name in ["w1", "w2", "w3", "w4"] {
+            sl.add(name, n);
+        }
+        sl.add("w5", (nx + 1) * (ny + 1));
+        sl.add("aw", np * n);
+        sl.add("an", np * n);
+        sl.add("ag", ng * n);
+        sl.add("scale", np * n);
+        sl.add("fl_vol", nf * np);
+        for name in ["fdon", "frcv", "fghost", "ftf"] {
+            sl.add(name, nf);
+        }
+        sl.add("mfx", nfu);
+        sl.add("mfy", nfv);
+        for name in [
+            "mtot_old", "p_start", "tst", "floor", "vol", "kappa", "rhs", "sd", "sae", "san", "sact", "cx", "cr", "cz", "cp", "cap", "kc2", "capc",
+            "tc", "tn", "sx_dm", "sx_tgt", "sx_e", "mgs", "newe", "omega", "mask", "mtmp",
+        ] {
+            sl.add(name, n);
+        }
+        for name in ["ch_m", "ch_s", "ch_b", "ch_o", "ch_cons"] {
+            sl.add(name, npmax * n);
+        }
+        for name in ["ch_xi", "ch_xs", "ch_r0"] {
+            sl.add(name, nre.max(1) * n);
+        }
+        sl.add("dloc", npmax * n);
+        sl.add("ys", npmax * n);
+        sl.add("newm", npmax * n);
+        sl.add("part", 8 * nwg);
+        for (l, &(a, b)) in levels.iter().enumerate().skip(1) {
+            for q in ["d", "ae", "an", "act", "x", "b"] {
+                sl.add(&format!("mg{l}_{q}"), a * b);
+            }
+        }
+
+        // ---------------------------------------------------------------- disposition de T
+        let nrev = sim.reg.reactions.iter().filter(|r| r.reversible).count();
+        let mut tl = Layout::default();
+        tl.add("PH", np * PH_STRIDE);
+        tl.add("SOL", sim.reg.solids.len().max(1) * SOL_STRIDE);
+        tl.add("PC", npc.max(1) * PC_STRIDE);
+        tl.add("GRP", ng.max(1) * (1 + npmax));
+        tl.add("GORD", ng.max(1));
+        tl.add("AMB", np);
+        tl.add("INL", 16);
+        tl.add("LEV", levels.len() * LEV_STRIDE);
+        tl.add("RX", nre.max(1) * RX_STRIDE);
+        tl.add("KC", nrev.max(1) * KC_N);
+        tl.add("TP", TP_CAP * 2);
+
+        // ---------------------------------------------------------------- source WGSL
+        let mut header = String::from("// ---- constantes générées par gpu_multiphase.rs ----\n");
+        for (name, off, _) in &sl.items {
+            header += &format!("const O_{name}: u32 = {off}u;\n");
+        }
+        for (name, off, _) in &tl.items {
+            header += &format!("const T_{name}: u32 = {off}u;\n");
+        }
+        header += &format!(
+            "const NPMAX: u32 = {npmax}u;\nconst NREMAX: u32 = {}u;\nconst NWG: u32 = {nwg}u;\nconst PH_STRIDE: u32 = {PH_STRIDE}u;\nconst SOL_STRIDE: u32 = {SOL_STRIDE}u;\n\
+             const PC_STRIDE: u32 = {PC_STRIDE}u;\nconst GRP_STRIDE: u32 = {}u;\nconst LEV_STRIDE: u32 = {LEV_STRIDE}u;\nconst RX_STRIDE: u32 = {RX_STRIDE}u;\n\
+             const KC_N: u32 = {KC_N}u;\nconst KC_T0: f32 = {KC_T0:.1};\nconst KC_DT: f32 = {KC_DT:.1};\n",
+            nre.max(1),
+            1 + npmax
+        );
+        let mut source = format!("{header}{}", SHADERS.join("\n"));
+        // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
+        if let Ok(patch) = std::env::var("MP_WGSL_PATCH") {
+            for pair in patch.split("@@") {
+                if let Some((a, b)) = pair.split_once("=>") {
+                    source = source.replace(a, b);
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("MP_WGSL_DUMP") {
+            let _ = std::fs::write(path, &header);
+        }
+
+        // ---------------------------------------------------------------- périphérique
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+        }))
+        .ok_or("aucun adaptateur GPU (Vulkan / Metal / DX12)")?;
+        let info = adapter.get_info();
+        let software = info.device_type == wgpu::DeviceType::Cpu || info.name.to_lowercase().contains("llvmpipe");
+        let adapter_name = format!("{} ({:?})", info.name, info.backend);
+        let s_bytes = (sl.total * 4) as u64;
         let mut limits = wgpu::Limits::default();
-        let bytes = (total * 4) as u32;
-        if bytes > limits.max_storage_buffer_binding_size {
-            limits.max_storage_buffer_binding_size = bytes.min(adapter.limits().max_storage_buffer_binding_size);
-            limits.max_buffer_size = limits.max_storage_buffer_binding_size as u64;
+        let al = adapter.limits();
+        if s_bytes > limits.max_storage_buffer_binding_size as u64 {
+            limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
+            limits.max_buffer_size = al.max_buffer_size;
         }
-        if (total * 4) as u64 > limits.max_buffer_size {
-            return None; // grille trop grande pour un seul buffer : réduire nx·ny ou scinder le buffer
+        if s_bytes > limits.max_storage_buffer_binding_size as u64 || s_bytes > limits.max_buffer_size {
+            return Err(format!("grille trop grande pour le GPU ({:.0} Mo dans un seul buffer)", s_bytes as f64 / 1e6));
         }
         let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor { label: Some("multiphase device"), required_features: wgpu::Features::empty(), required_limits: limits },
+            &wgpu::DeviceDescriptor { label: Some("multiphase GPU"), required_features: wgpu::Features::empty(), required_limits: limits },
             None,
         ))
-        .ok()?;
+        .map_err(|e| format!("périphérique GPU : {e}"))?;
 
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let s_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("S"), size: (total * 4) as u64, usage, mapped_at_creation: false });
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (total * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: super::mp_gpu_params::PARAMS_BYTES as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("multiphase resident"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        if let Some(e) = pollster::block_on(device.pop_error_scope()) {
+            return Err(format!("compilation des shaders GPU : {e}"));
+        }
+        let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size.max(16), usage, mapped_at_creation: false });
+        let s_buf = mk("S", s_bytes, st);
+        let t_buf = mk("T", (tl.total * 4) as u64, st);
+        let d_buf = mk("D", (D_LEN * 4) as u64, st);
+        let r_buf = mk("R", (n * 4) as u64, st);
+        let params_buf = mk("params", (PARAMS_WORDS * 4) as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        // emplacements de paramètres de lancement : (a, b) en 256 octets chacun ; b = 0 : a < SLOT_A ; b = groupe diffusant : a < SLOT_A_SP
+        let diff_groups: Vec<usize> = (0..ng).filter(|&g| groups[g].len() > 1 && groups[g].iter().any(|&k| sim.reg.phases[k].diffusivity > 0.0)).collect();
+        let mut slot_base = vec![usize::MAX; ng.max(1)];
+        slot_base[0] = 0;
+        let mut nslots = SLOT_A;
+        for &g in &diff_groups {
+            if g > 0 {
+                slot_base[g] = nslots;
+                nslots += SLOT_A_SP;
+            }
+        }
+        let words = SLOT_BYTES as usize / 4;
+        let mut slots = vec![0u32; words * nslots];
+        for a in 0..SLOT_A {
+            slots[a * words] = a as u32;
+        }
+        for &g in &diff_groups {
+            if g > 0 {
+                for a in 0..SLOT_A_SP {
+                    slots[(slot_base[g] + a) * words] = a as u32;
+                    slots[(slot_base[g] + a) * words + 1] = g as u32;
+                }
+            }
+        }
+        let slot_buf = mk("slots", SLOT_BYTES * nslots as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let pers_len = pers_end - pers_start;
+        let snap_s = mk("snapshot S", (pers_len * 4) as u64, wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
+        let snap_d = mk("snapshot D", (D_LEN * 4) as u64, wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
+        let rd = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ;
+        let d_read = mk("D readback", (D_LEN * 4) as u64, rd);
+        let s_read = mk("S readback", (pers_len * 4) as u64, rd);
+        let r_read = mk("R readback", (n * 4) as u64, rd);
+        queue.write_buffer(&slot_buf, 0, bytemuck::cast_slice(&slots));
 
-        let source = format!("{header}{WGSL_TEMPLATE}");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("multiphase shaders"),
-            source: wgpu::ShaderSource::Wgsl(source.clone().into()),
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mp bgl0"),
+            entries: &[
+                entry(0, wgpu::BufferBindingType::Uniform),
+                entry(1, wgpu::BufferBindingType::Storage { read_only: false }),
+                entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
+                entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
+                entry(4, wgpu::BufferBindingType::Storage { read_only: false }),
+            ],
         });
-        let layout_entries = [
-            wgpu::BindGroupLayoutEntry {
+        let bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mp bgl1"),
+            entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(16) },
                 count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            },
-        ];
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mp bgl"), entries: &layout_entries });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mp bind group"),
-            layout: &bgl,
+            }],
+        });
+        let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mp bg0"),
+            layout: &bgl0,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: s_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: t_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: d_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: r_buf.as_entire_binding() },
             ],
         });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mp pl"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-        let mut pipelines = HashMap::new();
-        for name in kernel_names(&source) {
-            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(&name), layout: Some(&pl), module: &shader, entry_point: &name });
-            pipelines.insert(name, p);
-        }
-        let mut g = MultiphaseGpu { device, queue, s_buf, params_buf, readback, bind_group, pipelines, nx, ny, np, total, offsets, pcg_iter: (6 * nx.max(ny)) as u32, newton_iter: 3 };
+        let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mp bg1"),
+            layout: &bgl1,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &slot_buf, offset: 0, size: wgpu::BufferSize::new(16) }),
+            }],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mp pl"), bind_group_layouts: &[&bgl0, &bgl1], push_constant_ranges: &[] });
+
+        let surf_pairs: Vec<bool> = sim
+            .reg
+            .changes
+            .iter()
+            .map(|pc| groups.iter().find(|g| g.contains(&pc.vapor)).map_or(false, |g| g.iter().any(|&k| k != pc.vapor && sim.reg.phases[k].is_gas())))
+            .collect();
+        let has_flames = sim.reg.reactions.iter().any(|r| r.flame_thickness > 0.0);
+        let has_radiators = sim.reg.phases.iter().any(|p| p.radiator != Radiator::None && p.is_gas());
+
+        let mut g = MultiphaseGpu {
+            device,
+            queue,
+            s_buf,
+            t_buf,
+            d_buf,
+            r_buf,
+            params_buf,
+            slot_buf,
+            snap_s,
+            snap_d,
+            d_read,
+            s_read,
+            r_read,
+            bg0,
+            bg1,
+            pl,
+            shader,
+            pipelines: HashMap::new(),
+            sl,
+            tl,
+            pers: (pers_start, pers_len),
+            acc: (acc_start, pers_end - acc_start),
+            nx,
+            ny,
+            np,
+            ng,
+            npc,
+            nre,
+            levels,
+            mg_tail,
+            slot_base,
+            nwg,
+            diff_groups,
+            surf_pairs,
+            has_flames,
+            has_radiators,
+            software,
+            adapter_name,
+            has_extras: false,
+            has_accel: false,
+            has_thermal: false,
+            ntp: 0,
+            slots_of_dest: vec![],
+            heat_on: false,
+            newton_budget: 3,
+            pcg_budget: 30,
+            cond_budget: 8,
+            sp_budget: 8,
+            base: Baselines::default(),
+            host_stale: false,
+            last: GpuStepInfo::default(),
+        };
+        let _ = (&g.r_buf, &g.slot_buf, g.ng, g.nwg);
+        g.device.push_error_scope(wgpu::ErrorFilter::Validation);
         g.upload(sim);
-        Some(g)
+        // les noyaux de base sont compilés tout de suite : une erreur de pilote apparaît ici et non au premier pas
+        for k in ["k_refresh", "k_red_dt", "k_dt_final", "k_sanity", "k_sanity_final"] {
+            g.pipeline(k);
+        }
+        if let Some(e) = pollster::block_on(g.device.pop_error_scope()) {
+            return Err(format!("initialisation GPU : {e}"));
+        }
+        Ok(g)
     }
 
-    /// Envoie l'état CPU (m_k, ε, p, u, v, solides) vers le GPU
+    fn pipeline(&mut self, k: &'static str) {
+        if !self.pipelines.contains_key(k) {
+            trace(&format!("pipeline {k}"));
+            let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(k), layout: Some(&self.pl), module: &self.shader, entry_point: k, compilation_options: Default::default() });
+            self.pipelines.insert(k, p);
+        }
+    }
+
+    /// décalage dynamique de l'emplacement (Q.a = a, Q.b = b)
+    fn slot(&self, a: usize, b: usize) -> u32 {
+        let base = self.slot_base[b];
+        let lim = if b == 0 { SLOT_A } else { SLOT_A_SP };
+        debug_assert!(base != usize::MAX && a < lim);
+        ((base + a.min(lim - 1)) as u64 * SLOT_BYTES) as u32
+    }
+
+    // ================================================================ envoi de l'état
+    /// Envoie l'état CPU complet (et les tables) vers le GPU. À appeler après toute modification de `sim` hors du GPU (outils, scène).
     pub fn upload(&mut self, sim: &MultiphaseSim) {
-        let mut img = vec![0f32; self.total];
-        sim.gpu_state().write_into(sim, &mut img);
-        self.queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(&img));
-    }
-
-    fn off(&self, name: &str) -> usize {
-        self.offsets.iter().find(|x| x.0 == name).unwrap().1
-    }
-
-    /// Un pas complet sur GPU. dt, sous-pas de conduction : choisis côté CPU à partir de l'état relu au pas précédent.
-    pub fn step(&mut self, sim: &mut MultiphaseSim) -> f64 {
-        sim.refresh();
-        let dt = sim.choose_dt();
-        let nsub = sim.conduction_substeps(dt);
-        let mut params = sim.gpu_params_bytes(dt, nsub, self.newton_iter, self.pcg_iter);
-        let parity = (sim.step_count % 2) as u32;
-        let flags = u32::from_le_bytes([params[80], params[81], params[82], params[83]]);
-        self.queue.write_buffer(&self.params_buf, 0, &params);
-        params.clear();
-
+        trace("upload");
         let (nx, ny, np) = (self.nx, self.ny, self.np);
         let n = nx * ny;
-        let (nu, nv) = ((nx + 1) * ny, nx * (ny + 1));
-        let nf = nu.max(nv);
-        let nn = (nx + 1) * (ny + 1);
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase step") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("multiphase"), timestamp_writes: None });
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            let pipes = &self.pipelines;
-            let mut d = |name: &str, count: usize| {
-                pass.set_pipeline(&pipes[name]);
-                pass.dispatch_workgroups(((count + 63) / 64).max(1) as u32, 1, 1);
-            };
-            let (st, vi, co, pc) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
-            d("k_refresh", n);
-            d("k_force_init", nf);
-            if st {
-                d("k_marker", n); d("k_smooth", n); d("k_curv", n); d("k_force_st_u", nu); d("k_force_st_v", nv);
+        let (nfu, nfv) = ((nx + 1) * ny, nx * (ny + 1));
+        let ph = &sim.reg.phases;
+        let h0: Vec<f64> = ph.iter().map(|p| p.e_int(T_STD)).collect();
+        // ---------------- tables
+        let mut t = vec![0f32; self.tl.total];
+        let groups = sim.reg.miscible_groups();
+        let mut gid = vec![0usize; np];
+        for (g, m) in groups.iter().enumerate() {
+            for &k in m {
+                gid[k] = g;
             }
-            if vi {
-                d("k_visc_diag", n); d("k_visc_xy", nn); d("k_visc_u", nu); d("k_visc_v", nv);
-            }
-            d("k_save_mtot", n); d("k_zero_flux", nf); d("k_aw_init", np * n);
-            for q in 0..2u32 {
-                let dir = (parity + q) % 2;
-                let (sfx, nfd) = if dir == 0 { ("x", nu) } else { ("y", nv) };
-                d("k_an", n);
-                d(&format!("k_sweep_flux_{sfx}"), nfd);
-                d(&format!("k_sweep_scale_{sfx}"), n);
-                d(&format!("k_sweep_apply_{sfx}"), nfd);
-                d(&format!("k_sweep_update_{sfx}"), n);
-            }
-            d("k_mom_u", nu); d("k_mom_v", nv); d("k_add_forces", nf);
-            d("k_refresh", n);
-            if co {
-                for _ in 0..nsub {
-                    d("k_conduct_step", n);
-                    d("k_conduct_commit", n);
-                }
-            }
-            if pc {
-                d("k_phase_change", n);
-            }
-            d("k_refresh", n); d("k_save_p", n);
-            for _ in 0..self.newton_iter {
-                d("k_closure", n); d("k_face_tmp", nf); d("k_rhs", n); d("k_stencil", n); d("k_pcg_init", n);
-                d("k_dot_rz", n); d("k_fin_rz0", 1);
-                for _ in 0..self.pcg_iter {
-                    d("k_apply", n); d("k_dot_pap", n); d("k_fin_pap", 1); d("k_cg_update", n);
-                    d("k_dot_rz", n); d("k_fin_rznew", 1); d("k_cg_dir", n);
-                }
-                d("k_p_update", n);
-            }
-            d("k_face_final", nf); d("k_pressure_work", n); d("k_refresh", n);
         }
-        enc.copy_buffer_to_buffer(&self.s_buf, 0, &self.readback, 0, (self.total * 4) as u64);
-        self.queue.submit(Some(enc.finish()));
+        for (k, p) in ph.iter().enumerate() {
+            let b = self.tl.o("PH") + k * PH_STRIDE;
+            let mut r = [0f64; PH_STRIDE];
+            r[0] = if p.is_gas() { 0.0 } else { 1.0 };
+            r[1] = p.cp;
+            r[2] = p.c_e();
+            r[3] = p.cp_slope;
+            match p.eos {
+                Eos::IdealGas { r_spec } => r[4] = r_spec,
+                Eos::Tait { p0, b, n, thermal } => {
+                    r[4] = b;
+                    r[5] = n;
+                    r[31] = p0;
+                    match thermal {
+                        Thermal::Kell => r[6] = 1.0,
+                        Thermal::Beta { rho0, t0, beta } => {
+                            r[7] = rho0;
+                            r[8] = t0;
+                            r[9] = beta;
+                        }
+                    }
+                }
+            }
+            let (mi, ma, mb) = p.mu_law.gpu_params();
+            let (ki, ka, kb) = p.k_law.gpu_params();
+            r[10] = p.mu_ref;
+            r[11] = mi as f64;
+            r[12] = ma as f64;
+            r[13] = mb as f64;
+            r[14] = p.conductivity;
+            r[15] = ki as f64;
+            r[16] = ka as f64;
+            r[17] = kb as f64;
+            r[18] = p.t_ref;
+            r[19] = p.sigma;
+            r[20] = p.molar_mass;
+            r[21] = p.diffusivity;
+            r[22] = h0[k];
+            r[23] = p.e0;
+            r[24] = p.s_standard;
+            r[25] = match p.radiator {
+                Radiator::None => 0.0,
+                Radiator::Water => 1.0,
+                Radiator::CarbonDioxide => 2.0,
+            };
+            r[26] = gid[k] as f64;
+            r[27] = p.color[0] as f64;
+            r[28] = p.color[1] as f64;
+            r[29] = p.color[2] as f64;
+            for q in 0..PH_STRIDE {
+                t[b + q] = r[q] as f32;
+            }
+        }
+        for (s, so) in sim.reg.solids.iter().enumerate() {
+            let b = self.tl.o("SOL") + s * SOL_STRIDE;
+            for (q, v) in [so.rho_cp(), so.conductivity, so.rho, so.cp, so.color[0] as f64, so.color[1] as f64, so.color[2] as f64].iter().enumerate() {
+                t[b + q] = *v as f32;
+            }
+        }
+        for (q, pc) in sim.reg.changes.iter().enumerate() {
+            let b = self.tl.o("PC") + q * PC_STRIDE;
+            for (i, v) in [pc.liquid as f64, pc.vapor as f64, pc.l_ref, pc.t_ref, pc.p_ref, pc.r_v, pc.dcp, h0[pc.vapor] - h0[pc.liquid]].iter().enumerate() {
+                t[b + i] = *v as f32;
+            }
+        }
+        let gs = 1 + np.max(1);
+        for (g, m) in groups.iter().enumerate() {
+            let b = self.tl.o("GRP") + g * gs;
+            t[b] = m.len() as f32;
+            for (q, &k) in m.iter().enumerate() {
+                t[b + 1 + q] = k as f32;
+            }
+        }
+        for (pos, g) in sim.group_order(&groups).into_iter().enumerate() {
+            t[self.tl.o("GORD") + pos] = g as f32;
+        }
+        let amb = sim.ambient_alpha();
+        for k in 0..np {
+            t[self.tl.o("AMB") + k] = amb[k] as f32;
+        }
+        for side in 0..4 {
+            let b = self.tl.o("INL") + 4 * side;
+            if let (Some(inl), Bc::Wall) = (sim.inlet[side], sim.bc[side]) {
+                let k = inl.phase.min(np - 1);
+                t[b] = 1.0;
+                t[b + 1] = k as f32;
+                t[b + 2] = inl.temp as f32;
+                t[b + 3] = if k == sim.ambient_phase { 1.0 } else { 0.0 };
+            }
+        }
+        for (l, &(a, bb)) in self.levels.iter().enumerate() {
+            let b = self.tl.o("LEV") + l * LEV_STRIDE;
+            let offs = if l == 0 {
+                [self.sl.o("sd"), self.sl.o("sae"), self.sl.o("san"), self.sl.o("sact"), self.sl.o("cz"), self.sl.o("cr")]
+            } else {
+                ["d", "ae", "an", "act", "x", "b"].map(|q| self.sl.o(&format!("mg{l}_{q}")))
+            };
+            t[b] = a as f32;
+            t[b + 1] = bb as f32;
+            for (q, o) in offs.iter().enumerate() {
+                t[b + 2 + q] = *o as f32;
+            }
+        }
+        let mut kc_next = self.tl.o("KC");
+        for (j, r) in sim.reg.reactions.iter().enumerate() {
+            let b = self.tl.o("RX") + j * RX_STRIDE;
+            let (ma, mb) = r.mass_balance(ph);
+            let mut row = [0f64; RX_STRIDE];
+            row[0] = r.reactants.len() as f64;
+            row[1] = r.products.len() as f64;
+            row[2] = r.modifiers.len() as f64;
+            row[3] = if r.reversible { 1.0 } else { 0.0 };
+            row[4] = if r.flame_thickness > 0.0 { 1.0 } else { 0.0 };
+            row[5] = if r.pre_exp > 0.0 { r.pre_exp.ln() } else { -1e30 };
+            row[6] = r.temp_exponent;
+            row[7] = r.activation_energy / super::phases::R_GAS;
+            row[8] = if mb > 0.0 { ma / mb } else { 1.0 };
+            for (i, &(s, nu)) in r.reactants.iter().enumerate() {
+                row[10 + i] = s as f64;
+                row[16 + i] = nu;
+                row[22 + i] = r.order(i);
+            }
+            for (i, &(s, nu)) in r.products.iter().enumerate() {
+                row[28 + i] = s as f64;
+                row[34 + i] = nu;
+            }
+            for (i, &(s, o)) in r.modifiers.iter().enumerate() {
+                row[40 + i] = s as f64;
+                row[44 + i] = o;
+            }
+            if r.reversible {
+                row[9] = kc_next as f64;
+                for i in 0..KC_N {
+                    let tt = KC_T0 + KC_DT * i as f64;
+                    t[kc_next + i] = r.ln_kc(ph, tt).clamp(-1e30, 1e30) as f32;
+                }
+                kc_next += KC_N;
+            }
+            for q in 0..RX_STRIDE {
+                t[b + q] = row[q] as f32;
+            }
+        }
+        // ---------------- cellules spéciales (comme prepare_special)
+        let (pin, pf_u, pf_v) = sim.special_tables();
+        let mut dests: Vec<usize> = vec![];
+        let mut pairs: Vec<(usize, usize)> = vec![];
+        for c in 0..n {
+            if let Some(PinInfo { kind: 1, tp_dest: Some(d), .. }) = pin[c] {
+                let s = match dests.iter().position(|&x| x == d) {
+                    Some(s) => s,
+                    None => {
+                        dests.push(d);
+                        dests.len() - 1
+                    }
+                };
+                pairs.push((c, s));
+            }
+        }
+        for &d in sim.tp_mix.keys() {
+            if d < n && matches!(pin[d], Some(PinInfo { kind: 2, .. })) && !dests.contains(&d) {
+                dests.push(d);
+            }
+        }
+        dests.truncate(TP_CAP);
+        pairs.retain(|&(_, s)| s < TP_CAP);
+        for (q, &(c, s)) in pairs.iter().enumerate().take(TP_CAP) {
+            t[self.tl.o("TP") + 2 * q] = c as f32;
+            t[self.tl.o("TP") + 2 * q + 1] = s as f32;
+        }
+        self.ntp = pairs.len().min(TP_CAP);
+        self.slots_of_dest = dests.clone();
+        self.has_extras = sim.has_extras();
+        self.queue.write_buffer(&self.t_buf, 0, bytemuck::cast_slice(&t));
 
-        // relecture
-        let slice = self.readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().expect("map readback");
-        {
-            let data = slice.get_mapped_range();
-            let all: &[f32] = bytemuck::cast_slice(&data);
-            let take = |name: &str, len: usize| all[self.off(name)..self.off(name) + len].to_vec();
-            let st = GpuState {
-                mass: take("mass", np * n),
-                eps: take("eps", n),
-                prel: take("prel", n),
-                u: take("U", nu),
-                v: take("V", nv),
-                solid: sim.solid.clone(),
-            };
-            sim.load_gpu_state(&st);
+        // ---------------- statique + persistant
+        let mut s = vec![0f32; self.pers.0 + self.pers.1];
+        let o = |name: &str| self.sl.o(name);
+        let (o_solid, o_pk, o_pp, o_pt, o_ptp) = (o("solid"), o("pin_kind"), o("pin_phase"), o("pin_temp"), o("pin_tp"));
+        let (o_acc_on, o_ax, o_ay, o_thk, o_thv, o_ht, o_ovl) = (o("acc_on"), o("acc_x"), o("acc_y"), o("th_kind"), o("th_val"), o("heat_t"), o("ovl"));
+        self.has_accel = false;
+        self.has_thermal = false;
+        let mut ovl = vec![0u32; n];
+        for c in 0..n {
+            s[o_solid + c] = sim.solid[c] as f32;
+            s[o_ptp + c] = -1.0;
+            if let Some(pi) = pin[c] {
+                s[o_pk + c] = pi.kind as f32;
+                s[o_pp + c] = if pi.phase == sim.ambient_phase { -1.0 } else { pi.phase as f32 };
+                s[o_pt + c] = pi.temp as f32;
+                if pi.kind == 2 {
+                    if let Some(sl) = dests.iter().position(|&d| d == c) {
+                        s[o_ptp + c] = sl as f32;
+                    }
+                }
+            }
+            if !sim.is_solid(c) {
+                if let Some(MpEffect::Accelerator { ax, ay }) = sim.special[c] {
+                    s[o_acc_on + c] = 1.0;
+                    s[o_ax + c] = ax as f32;
+                    s[o_ay + c] = ay as f32;
+                    self.has_accel = true;
+                }
+            } else {
+                match sim.thermal[c] {
+                    MpThermal::Isothermal(tt) => {
+                        s[o_thk + c] = 1.0;
+                        s[o_thv + c] = tt as f32;
+                        self.has_thermal = true;
+                    }
+                    MpThermal::Heater(w) => {
+                        s[o_thk + c] = 2.0;
+                        s[o_thv + c] = w as f32;
+                        self.has_thermal = true;
+                    }
+                    MpThermal::Passive => {}
+                }
+            }
+            if sim.heat_active && !sim.is_solid(c) && !sim.heat_target[c].is_nan() {
+                s[o_ht + c] = sim.heat_target[c] as f32;
+            }
+            let col = |r: u32, g: u32, b: u32| r | (g << 8) | (b << 16);
+            match sim.special[c] {
+                Some(MpEffect::Sink { .. }) => ovl[c] = col(0xff, 0, 0) + 1,
+                Some(MpEffect::Emitter { .. }) => ovl[c] = col(0, 0xff, 0) + 1,
+                Some(MpEffect::Accelerator { .. }) => ovl[c] = col(0xff, 0, 0xff) + 1,
+                Some(MpEffect::Teleporter { dest, .. }) => {
+                    ovl[c] = col(0, 0, 0xff) + 1;
+                    if dest < n && !sim.is_solid(dest) && sim.special[dest].is_none() {
+                        ovl[dest] = col(0, 0xff, 0xff) + 1;
+                    }
+                }
+                None => {}
+            }
         }
-        self.readback.unmap();
-        sim.time += dt;
-        sim.last_dt = dt;
-        sim.step_count += 1;
-        dt
+        for c in 0..n {
+            s[o_ovl + c] = ovl[c] as f32;
+        }
+        self.heat_on = sim.heat_active;
+        let (o_pfuo, o_pfu, o_pfvo, o_pfv) = (o("pfu_on"), o("pfu"), o("pfv_on"), o("pfv"));
+        for f in 0..nfu {
+            if !pf_u[f].is_nan() {
+                s[o_pfuo + f] = 1.0;
+                s[o_pfu + f] = pf_u[f] as f32;
+            }
+        }
+        for f in 0..nfv {
+            if !pf_v[f].is_nan() {
+                s[o_pfvo + f] = 1.0;
+                s[o_pfv + f] = pf_v[f] as f32;
+            }
+        }
+        // persistant
+        let (o_m, o_e, o_p, o_u, o_v, o_t, o_a) = (o("mass"), o("eps"), o("prel"), o("U"), o("V"), o("temp"), o("alpha"));
+        let (o_rho, o_mu, o_k, o_cl, o_fl, o_hr, o_tpm) = (o("rho_mix"), o("mu_cell"), o("k_cell"), o("clamped"), o("flame"), o("heat_rel"), o("tpmix"));
+        for c in 0..n {
+            let mut ch = 0.0;
+            for k in 0..np {
+                let m = sim.mass[k][c];
+                s[o_m + k * n + c] = m as f32;
+                s[o_a + k * n + c] = sim.alpha[k][c] as f32;
+                ch += m * h0[k];
+            }
+            s[o_e + c] = if sim.is_solid(c) { (sim.e[c] - sim.reg.solids[sim.solid[c] as usize].rho_cp() * T_STD) as f32 } else { (sim.e[c] - ch) as f32 };
+            s[o_p + c] = (sim.p[c] - P0) as f32;
+            s[o_t + c] = sim.temp[c] as f32;
+            s[o_rho + c] = sim.rho_mix[c] as f32;
+            s[o_mu + c] = sim.mu_cell[c] as f32;
+            s[o_k + c] = sim.k_cell[c] as f32;
+            s[o_cl + c] = if sim.pressure_clamped.get(c).copied().unwrap_or(false) { 1.0 } else { 0.0 };
+            s[o_fl + c] = sim.flame_factor.get(c).copied().unwrap_or(1.0) as f32;
+            s[o_hr + c] = sim.heat_release.get(c).copied().unwrap_or(0.0) as f32;
+        }
+        for f in 0..nfu {
+            s[o_u + f] = sim.u[f] as f32;
+        }
+        for f in 0..nfv {
+            s[o_v + f] = sim.v[f] as f32;
+        }
+        for (slot, &d) in dests.iter().enumerate() {
+            if let Some((a, tt)) = sim.tp_mix.get(&d) {
+                let b = o_tpm + slot * (np + 2);
+                s[b] = 1.0;
+                s[b + 1] = *tt as f32;
+                for k in 0..np.min(a.len()) {
+                    s[b + 2 + k] = a[k] as f32;
+                }
+            }
+        }
+        self.queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(&s));
+        // scalaires dynamiques
+        let mut d = vec![0f32; D_LEN];
+        d[D_DTCHEM] = if sim.dt_chem.is_finite() { sim.dt_chem as f32 } else { 3e38 };
+        d[D_DTPHASE] = if sim.dt_phase.is_finite() { sim.dt_phase as f32 } else { 3e38 };
+        self.queue.write_buffer(&self.d_buf, 0, bytemuck::cast_slice(&d));
+        self.base = Baselines {
+            boundary_flux: sim.boundary_flux.clone(),
+            transferred: sim.transferred.clone(),
+            energy_input: sim.energy_input,
+            chem_heat: sim.chem_heat,
+            radiated: sim.radiated,
+            reacted: sim.reacted.clone(),
+        };
+        self.host_stale = false;
+    }
+
+    /// Envoie seulement les cibles du pinceau « Chauffer » (sans toucher à l'état).
+    pub fn sync_heat_targets(&mut self, sim: &MultiphaseSim) {
+        if !sim.heat_active && !self.heat_on {
+            return;
+        }
+        trace("heat targets");
+        let n = self.nx * self.ny;
+        let ht: Vec<f32> = (0..n).map(|c| if sim.heat_active && !sim.is_solid(c) && !sim.heat_target[c].is_nan() { sim.heat_target[c] as f32 } else { 0.0 }).collect();
+        self.queue.write_buffer(&self.s_buf, (self.sl.o("heat_t") * 4) as u64, bytemuck::cast_slice(&ht));
+        self.heat_on = sim.heat_active;
+    }
+
+    // ================================================================ relecture de l'état
+    /// Relit l'état complet si des pas ont été faits depuis la dernière relecture.
+    pub fn ensure_host(&mut self, sim: &mut MultiphaseSim) {
+        if self.host_stale {
+            self.download(sim);
+        }
+    }
+
+    /// Relit l'état complet du GPU dans `sim` (masses, énergie, pression, vitesses, propriétés, flammes, bilans).
+    pub fn download(&mut self, sim: &mut MultiphaseSim) {
+        trace("download");
+        let (nx, ny, np) = (self.nx, self.ny, self.np);
+        let n = nx * ny;
+        let (nfu, nfv) = ((nx + 1) * ny, nx * (ny + 1));
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("download") });
+        enc.copy_buffer_to_buffer(&self.s_buf, (self.pers.0 * 4) as u64, &self.s_read, 0, (self.pers.1 * 4) as u64);
+        enc.clear_buffer(&self.s_buf, (self.acc.0 * 4) as u64, Some((self.acc.1 * 4) as u64));
+        self.queue.submit(Some(enc.finish()));
+        let data = read_buffer(&self.device, &self.s_read);
+        let base = self.pers.0;
+        let o = |name: &str| self.sl.o(name) - base;
+        let h0: Vec<f64> = sim.reg.phases.iter().map(|p| p.e_int(T_STD)).collect();
+        let (o_m, o_e, o_p, o_u, o_v, o_t, o_a) = (o("mass"), o("eps"), o("prel"), o("U"), o("V"), o("temp"), o("alpha"));
+        let (o_rho, o_mu, o_k, o_cl, o_fl, o_hr) = (o("rho_mix"), o("mu_cell"), o("k_cell"), o("clamped"), o("flame"), o("heat_rel"));
+        if sim.pressure_clamped.len() != n {
+            sim.pressure_clamped = vec![false; n];
+        }
+        if sim.flame_factor.len() != n {
+            sim.flame_factor = vec![1.0; n];
+        }
+        if sim.heat_release.len() != n {
+            sim.heat_release = vec![0.0; n];
+        }
+        for c in 0..n {
+            let mut ch = 0.0;
+            for k in 0..np {
+                let m = data[o_m + k * n + c] as f64;
+                sim.mass[k][c] = m;
+                sim.alpha[k][c] = data[o_a + k * n + c] as f64;
+                ch += m * h0[k];
+            }
+            let eps = data[o_e + c] as f64;
+            sim.e[c] = if sim.is_solid(c) { eps + sim.reg.solids[sim.solid[c] as usize].rho_cp() * T_STD } else { eps + ch };
+            sim.p[c] = data[o_p + c] as f64 + P0;
+            sim.temp[c] = data[o_t + c] as f64;
+            sim.rho_mix[c] = data[o_rho + c] as f64;
+            sim.mu_cell[c] = data[o_mu + c] as f64;
+            sim.k_cell[c] = data[o_k + c] as f64;
+            sim.pressure_clamped[c] = data[o_cl + c] > 0.5;
+            sim.flame_factor[c] = data[o_fl + c] as f64;
+            sim.heat_release[c] = data[o_hr + c] as f64;
+        }
+        for f in 0..nfu {
+            sim.u[f] = data[o_u + f] as f64;
+        }
+        for f in 0..nfv {
+            sim.v[f] = data[o_v + f] as f64;
+        }
+        let o_tpm = o("tpmix");
+        for (slot, &d) in self.slots_of_dest.iter().enumerate() {
+            let b = o_tpm + slot * (np + 2);
+            if data[b] > 0.5 {
+                sim.tp_mix.insert(d, ((0..np).map(|k| data[b + 2 + k] as f64).collect(), data[b + 1] as f64));
+            }
+        }
+        // bilans : base + Σ accumulateurs par cellule (repartis de zéro sur le GPU)
+        let sum = |name: &str, q: usize| -> f64 { let b = o(name) + q * n; data[b..b + n].iter().map(|&x| x as f64).sum() };
+        for k in 0..np {
+            self.base.boundary_flux[k] += sum("bflux", k);
+        }
+        for q in 0..self.npc {
+            self.base.transferred[q] += sum("acc_tr", q);
+        }
+        self.base.energy_input += sum("acc_ein", 0);
+        self.base.radiated += sum("acc_rad", 0);
+        self.base.chem_heat += sum("acc_chem", 0);
+        if self.base.reacted.len() != self.nre {
+            self.base.reacted = vec![0.0; self.nre];
+        }
+        for j in 0..self.nre {
+            self.base.reacted[j] += sum("acc_xi", j);
+        }
+        sim.boundary_flux.clone_from(&self.base.boundary_flux);
+        sim.transferred.clone_from(&self.base.transferred);
+        sim.energy_input = self.base.energy_input;
+        sim.radiated = self.base.radiated;
+        sim.chem_heat = self.base.chem_heat;
+        sim.reacted.clone_from(&self.base.reacted);
+        self.host_stale = false;
+    }
+
+    // ================================================================ paramètres
+    fn params(&self, sim: &MultiphaseSim, dt_cap: f64) -> [u32; PARAMS_WORDS] {
+        let mut w = [0u32; PARAMS_WORDS];
+        let f = |x: f64| (x as f32).to_bits();
+        let bc = |b: Bc| match b {
+            Bc::Wall => (0u32, 0.0),
+            Bc::Open { p } => (1u32, p - P0),
+        };
+        let fmax = sim
+            .reg
+            .reactions
+            .iter()
+            .filter(|r| r.flame_thickness > 0.0)
+            .map(|r| sim.flame_resolution * sim.dx / r.flame_thickness)
+            .fold(1.0f64, f64::max);
+        let mut flags = 0;
+        if sim.surface_tension {
+            flags |= F_ST;
+        }
+        if sim.viscous {
+            flags |= F_VISC;
+        }
+        if sim.conduction {
+            flags |= F_COND;
+        }
+        if sim.phase_change && self.npc > 0 {
+            flags |= F_PC;
+        }
+        if sim.chemistry && self.nre > 0 {
+            flags |= F_CHEM;
+        }
+        if self.has_extras {
+            flags |= F_EXTRAS;
+        }
+        if sim.conservative_momentum {
+            flags |= F_CONS;
+        }
+        if sim.heat_active {
+            flags |= F_HEAT;
+        }
+        if !self.diff_groups.is_empty() {
+            flags |= F_MISC;
+        }
+        if self.flames_active(sim) {
+            flags |= F_FLAME;
+        }
+        if sim.maccormack {
+            flags |= F_MACC;
+        }
+        w[0] = self.nx as u32;
+        w[1] = self.ny as u32;
+        w[2] = self.np as u32;
+        w[3] = sim.reg.solids.len() as u32;
+        w[4] = self.ng as u32;
+        w[5] = self.npc as u32;
+        w[6] = self.nre as u32;
+        w[7] = self.levels.len() as u32;
+        w[8] = flags;
+        w[9] = sim.ambient_phase as u32;
+        w[10] = self.ntp as u32;
+        w[11] = (sim.step_count % 2) as u32;
+        for s in 0..4 {
+            w[12 + s] = bc(sim.bc[s]).0;
+            w[24 + s] = f(bc(sim.bc[s]).1);
+        }
+        w[16] = f(sim.dx);
+        w[17] = f(sim.gravity[0]);
+        w[18] = f(sim.gravity[1]);
+        w[19] = f(P0);
+        w[20] = f(T_STD);
+        w[21] = f(sim.t_ambient);
+        w[22] = f(sim.cfl);
+        w[23] = f(sim.dt_max);
+        w[28] = f(sim.cap_safety);
+        w[29] = f(sim.speed_limit);
+        w[30] = f(sim.nucleation_superheat);
+        w[31] = f(sim.nucleation_alpha);
+        w[32] = f(sim.nuclei_density);
+        w[33] = f(sim.boil_superheat_max);
+        w[34] = f(sim.phase_relaxation_time);
+        w[35] = f(sim.phase_volume_limit);
+        w[36] = f(sim.heat_tau);
+        w[37] = f(sim.heat_power_max);
+        w[38] = f(sim.flame_resolution);
+        w[39] = f(sim.chem_volume_limit);
+        w[40] = f(sim.pressure_tol.max(1e-6));
+        w[41] = f(dt_cap);
+        w[42] = self.cond_budget as u32;
+        w[43] = self.sp_budget as u32;
+        w[44] = sim.reg.phases.iter().filter(|p| p.is_gas()).count() as u32;
+        w[45] = (!sim.ambient_mix.is_empty()) as u32;
+        w[46] = (sim.radiation && self.has_radiators) as u32;
+        w[47] = self.mg_tail as u32;
+        w[48] = f(fmax);
+        w[49] = sim.flame_resolution.ceil() as u32 + 1;
+        w[50] = 4000;
+        w[55] = self.software as u32;
+        w
+    }
+
+    fn flames_active(&self, sim: &MultiphaseSim) -> bool {
+        let fmax = sim
+            .reg
+            .reactions
+            .iter()
+            .filter(|r| r.flame_thickness > 0.0)
+            .map(|r| sim.flame_resolution * sim.dx / r.flame_thickness)
+            .fold(1.0f64, f64::max);
+        sim.chemistry && self.has_flames && fmax > 1.0
+    }
+
+    // ================================================================ plan d'un pas
+    fn vcycle(&self, ops: &mut Vec<Op>) {
+        let t = self.mg_tail;
+        // V-cycle : Q.a = 2·niveau + couleur
+        let s = |l: usize, c: usize| self.slot(2 * l + c, 0);
+        let half = |l: usize| {
+            let (a, b) = self.levels[l];
+            wg(a.div_ceil(2) * b)
+        };
+        let cells = |l: usize| {
+            let (a, b) = self.levels[l];
+            wg(a * b)
+        };
+        for l in 0..t {
+            ops.push(Op { k: "k_mg_first", wg: cells(l), slot: s(l, 0) });
+            for c in [1, 0, 1] {
+                ops.push(Op { k: "k_mg_smooth", wg: half(l), slot: s(l, c) });
+            }
+            ops.push(Op { k: "k_mg_restrict", wg: cells(l + 1), slot: s(l, 0) });
+        }
+        ops.push(Op { k: "k_mg_tail", wg: 1, slot: 0 });
+        for l in (0..t).rev() {
+            ops.push(Op { k: "k_mg_post1", wg: half(l), slot: s(l, 1) });
+            for c in [0, 1, 0] {
+                ops.push(Op { k: "k_mg_smooth", wg: half(l), slot: s(l, c) });
+            }
+        }
+    }
+
+    fn plan_step(&self, sim: &MultiphaseSim) -> Vec<Op> {
+        self.plan_step_at(sim, sim.step_count)
+    }
+
+    /// plan d'un pas dont le numéro est `step_index` (ordre des balayages x/y alterné comme sur le CPU)
+    fn plan_step_at(&self, sim: &MultiphaseSim, step_index: usize) -> Vec<Op> {
+        let (nx, ny) = (self.nx, self.ny);
+        let n = nx * ny;
+        let (nfu, nfv) = ((nx + 1) * ny, nx * (ny + 1));
+        let nf = nfu.max(nfv);
+        let (wn, wf, wm) = (wg(n), wg(nf), wg(n.max(nf)));
+        let one = |k: &'static str| Op { k, wg: 1, slot: 0 };
+        let cell = |k: &'static str| Op { k, wg: wn, slot: 0 };
+        let face = |k: &'static str| Op { k, wg: wf, slot: 0 };
+        let mut v: Vec<Op> = Vec::with_capacity(2048);
+        let extras = self.has_extras;
+        v.push(cell("k_refresh"));
+        if extras {
+            v.push(face("k_apply_pf"));
+            v.push(cell("k_pin_reset"));
+            v.push(cell("k_refresh"));
+        }
+        v.push(Op { k: "k_red_dt", wg: wm, slot: 0 });
+        v.push(one("k_dt_final"));
+        v.push(face("k_copy_un"));
+        // forces sur l'état n
+        v.push(face("k_force_init"));
+        if self.has_accel {
+            v.push(face("k_accel"));
+        }
+        if sim.surface_tension {
+            v.push(cell("k_marker"));
+            v.push(cell("k_smooth"));
+            v.push(cell("k_curv"));
+            v.push(face("k_force_st"));
+        }
+        if sim.viscous {
+            v.push(cell("k_visc_diag"));
+            v.push(Op { k: "k_visc_xy", wg: wg((nx + 1) * (ny + 1)), slot: 0 });
+            v.push(face("k_visc_apply"));
+        }
+        if !sim.conservative_momentum {
+            v.push(face("k_sl_pass1"));
+            if sim.maccormack {
+                v.push(face("k_sl_pass2"));
+            }
+        }
+        // masses / énergie : balayages PLIC alternés
+        v.push(Op { k: "k_adv_init", wg: wm, slot: 0 });
+        let first = step_index % 2;
+        for q in 0..2 {
+            let dir = (first + q) % 2;
+            let wd = wg(if dir == 0 { nfu } else { nfv });
+            v.push(cell("k_an"));
+            v.push(Op { k: "k_sweep_flux", wg: wd, slot: self.slot(dir, 0) });
+            v.push(Op { k: "k_sweep_scale", wg: wn, slot: self.slot(dir, 0) });
+            // mise à jour séquentielle par ligne (x) / colonne (y), dans l'ordre des faces du CPU
+            v.push(Op { k: "k_sweep_seq", wg: wg(if dir == 0 { ny } else { nx }), slot: self.slot(dir, 0) });
+            v.push(cell("k_temp_update"));
+        }
+        if sim.conservative_momentum {
+            v.push(face("k_mom"));
+        }
+        if extras {
+            if self.ntp > 0 {
+                v.push(one("k_tp_absorb"));
+            }
+            v.push(cell("k_pin_reset"));
+        }
+        // thermique, espèces, chimie, changement de phase sur l'état advecté
+        v.push(cell("k_refresh"));
+        if sim.heat_active || self.has_thermal {
+            v.push(cell("k_thermal_sources"));
+        }
+        if self.flames_active(sim) {
+            v.push(cell("k_flame_omega"));
+            v.push(one("k_flame_wmax"));
+            v.push(cell("k_flame_mask"));
+            v.push(cell("k_flame_dil_x"));
+            v.push(cell("k_flame_dil_y"));
+        } else if self.nre > 0 {
+            v.push(cell("k_flame_one"));
+        }
+        if sim.conduction {
+            v.push(cell("k_cond_prep"));
+            v.push(one("k_cond_nsub"));
+            for s in 0..self.cond_budget {
+                v.push(Op { k: "k_cond_step", wg: wn, slot: self.slot(s, 0) });
+            }
+            v.push(cell("k_cond_finish"));
+        }
+        for &g in &self.diff_groups {
+            v.push(Op { k: "k_sp_dloc", wg: wn, slot: self.slot(0, g) });
+            v.push(one("k_sp_nsub"));
+            v.push(Op { k: "k_sp_prep", wg: wn, slot: self.slot(0, g) });
+            for s in 0..self.sp_budget {
+                v.push(Op { k: "k_sp_step", wg: wn, slot: self.slot(s, g) });
+                v.push(Op { k: "k_sp_commit", wg: wn, slot: self.slot(s, g) });
+            }
+        }
+        if sim.chemistry && self.nre > 0 {
+            v.push(cell("k_chem"));
+            v.push(one("k_chem_final"));
+        } else if self.nre > 0 {
+            v.push(cell("k_heat_zero"));
+        }
+        if sim.radiation && self.has_radiators {
+            v.push(cell("k_radiate"));
+        }
+        if sim.phase_change {
+            for q in 0..self.npc {
+                v.push(Op { k: "k_phase_change", wg: wn, slot: self.slot(q, 0) });
+                v.push(one("k_phase_final"));
+                if self.surf_pairs[q] {
+                    v.push(Op { k: "k_surf_req", wg: wn, slot: self.slot(q, 0) });
+                    v.push(Op { k: "k_surf_apply", wg: wn, slot: self.slot(q, 0) });
+                }
+            }
+        }
+        // pression : Newton + MG-PCG
+        v.push(cell("k_refresh"));
+        v.push(cell("k_save_p"));
+        let last = self.levels.len() - 1;
+        for _ in 0..self.newton_budget {
+            v.push(cell("k_closure"));
+            v.push(cell("k_stencil"));
+            for l in 0..last {
+                let (a, b) = self.levels[l + 1];
+                v.push(Op { k: "k_mg_coarsen_links", wg: wg(a * b), slot: self.slot(l, 0) });
+                v.push(Op { k: "k_mg_coarsen_diag", wg: wg(a * b), slot: self.slot(l + 1, 0) });
+            }
+            v.push(face("k_face_tmp"));
+            v.push(cell("k_rhs"));
+            v.push(cell("k_pcg_init"));
+            v.push(one("k_pcg_bb"));
+            self.vcycle(&mut v);
+            v.push(cell("k_pcg_rz"));
+            v.push(cell("k_pcg_p0"));
+            for it in 0..self.pcg_budget {
+                let sl = self.slot(it % 2, 0);
+                v.push(cell("k_pcg_apply"));
+                v.push(Op { k: "k_pcg_update", wg: wn, slot: sl });
+                v.push(one("k_pcg_rr"));
+                self.vcycle(&mut v);
+                v.push(cell("k_pcg_rz"));
+                v.push(Op { k: "k_pcg_dir", wg: wn, slot: sl });
+            }
+            v.push(cell("k_p_update"));
+            v.push(one("k_newton_check"));
+        }
+        v.push(face("k_face_final"));
+        v.push(cell("k_pressure_work"));
+        v.push(cell("k_refresh"));
+        v.push(Op { k: "k_sanity", wg: wm, slot: 0 });
+        v.push(one("k_sanity_final"));
+        v
+    }
+
+    fn encode(&mut self, enc: &mut wgpu::CommandEncoder, ops: &[Op]) {
+        for op in ops {
+            self.pipeline(op.k);
+        }
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("multiphase"), timestamp_writes: None });
+        pass.set_bind_group(0, &self.bg0, &[]);
+        let mut cur: &str = "";
+        let mut cur_slot = u32::MAX;
+        for op in ops {
+            if op.k != cur {
+                pass.set_pipeline(&self.pipelines[op.k]);
+                cur = op.k;
+            }
+            if op.slot != cur_slot {
+                pass.set_bind_group(1, &self.bg1, &[op.slot]);
+                cur_slot = op.slot;
+            }
+            pass.dispatch_workgroups(op.wg, 1, 1);
+        }
+    }
+
+    // ================================================================ pas de temps protégé
+    /// Un pas complet sur le GPU, protégé comme `MultiphaseSim::step` (retour arrière + dt/4, jusqu'à 5 fois). Met à jour le temps,
+    /// les compteurs et les diagnostics scalaires de `sim` ; les champs de `sim` ne sont relus que par `ensure_host` / `download`.
+    pub fn step(&mut self, sim: &mut MultiphaseSim) -> f64 {
+        trace("step");
+        if sim.diverged {
+            return 0.0;
+        }
+        let clk = Instant::now();
+        let mut dt_cap = sim.dt_max;
+        let mut dt_try = f64::NAN;
+        let (mut tries, mut redos) = (0usize, 0usize);
+        let mut restore = false;
+        loop {
+            let p = self.params(sim, dt_cap);
+            self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+            let ops = self.plan_step(sim);
+            let n_ops = ops.len();
+            let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
+            // un pas très long (budgets élevés) est soumis en plusieurs tampons de commandes de ≤ MAX_BATCH_OPS lancements
+            let chunks: Vec<&[Op]> = ops.chunks(MAX_BATCH_OPS).collect();
+            let last_chunk = chunks.len() - 1;
+            for (ci, ch) in chunks.iter().enumerate() {
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase step") });
+                if ci == 0 {
+                    if restore {
+                        enc.copy_buffer_to_buffer(&self.snap_s, 0, &self.s_buf, ps, pl);
+                        enc.copy_buffer_to_buffer(&self.snap_d, 0, &self.d_buf, 0, (D_LEN * 4) as u64);
+                    } else {
+                        enc.copy_buffer_to_buffer(&self.s_buf, ps, &self.snap_s, 0, pl);
+                        enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.snap_d, 0, (D_LEN * 4) as u64);
+                    }
+                }
+                self.encode(&mut enc, ch);
+                if ci == last_chunk {
+                    enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.d_read, 0, (D_LEN * 4) as u64);
+                }
+                self.queue.submit(Some(enc.finish()));
+            }
+            let d = read_buffer(&self.device, &self.d_read);
+            self.host_stale = true;
+            let dt = d[D_DT] as f64;
+            if dt_try.is_nan() {
+                dt_try = dt;
+            }
+            // budgets de sous-pas insuffisants : on refait le même pas avec un budget suffisant (pas un retour arrière physique)
+            if d[D_REDO] > 0.5 && redos < 3 {
+                redos += 1;
+                self.cond_budget = self.cond_budget.max((d[D_SUB_C] as f64 * 1.25).ceil() as usize + 2).min(2000);
+                self.sp_budget = self.sp_budget.max((d[D_NSUB_S_MAX] as f64 * 1.25).ceil() as usize + 2).min(500);
+                restore = true;
+                continue;
+            }
+            if d[D_BAD] > 0.5 || !dt.is_finite() {
+                if tries < 5 {
+                    tries += 1;
+                    sim.rollbacks += 1;
+                    dt_try *= 0.25;
+                    dt_cap = sim.dt_max.min(dt_try);
+                    restore = true;
+                    continue;
+                }
+                // rien ne passe : état d'avant le pas restauré, simulation arrêtée
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("restore") });
+                enc.copy_buffer_to_buffer(&self.snap_s, 0, &self.s_buf, ps, pl);
+                enc.copy_buffer_to_buffer(&self.snap_d, 0, &self.d_buf, 0, (D_LEN * 4) as u64);
+                self.queue.submit(Some(enc.finish()));
+                sim.diverged = true;
+                sim.profile.secs[P_GPU] += clk.elapsed().as_secs_f64();
+                return 0.0;
+            }
+            // pas accepté
+            let newton = d[D_NEWTON_IT] as usize;
+            let pcg_max = d[D_MAXPCG_N] as usize;
+            sim.time += dt;
+            sim.last_dt = dt;
+            sim.step_count += 1;
+            sim.last_pressure_iters = d[D_PCG_IT] as usize;
+            sim.last_newton_iters = newton;
+            sim.dt_chem = if d[D_DTCHEM] < 1e37 { d[D_DTCHEM] as f64 } else { f64::INFINITY };
+            sim.dt_phase = if d[D_DTPHASE] < 1e37 { d[D_DTPHASE] as f64 } else { f64::INFINITY };
+            let (need_c, need_s) = (d[D_SUB_C] as usize, d[D_NSUB_S_MAX] as usize);
+            self.update_budgets(sim, newton, pcg_max, d[D_PCG_UNCONV] > 0.5, need_c, need_s);
+            self.last = GpuStepInfo { dt, newton, pcg: d[D_PCG_IT] as usize, pcg_max, cond_sub: need_c, species_sub: need_s, retries: tries, redo: redos, dispatches: n_ops };
+            sim.profile.secs[P_GPU] += clk.elapsed().as_secs_f64();
+            sim.profile.steps += 1;
+            return if tries > 0 { sim.last_dt } else { dt };
+        }
+    }
+
+    /// Diagnostic : exécute le plan d'un pas jusqu'à la `occ`-ième occurrence (1 = première) du noyau `stop` incluse, sans
+    /// instantané ni contrôle ; l'état GPU est alors celui du milieu du pas (à relire par `download`).
+    #[cfg(test)]
+    pub(crate) fn debug_partial_step(&mut self, sim: &MultiphaseSim, stop: &str, occ: usize) {
+        let p = self.params(sim, sim.dt_max);
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+        let ops = self.plan_step(sim);
+        let mut seen = 0;
+        let mut end = ops.len();
+        for (i, op) in ops.iter().enumerate() {
+            if op.k == stop {
+                seen += 1;
+                if seen == occ {
+                    end = i + 1;
+                    break;
+                }
+            }
+        }
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("partial") });
+        self.encode(&mut enc, &ops[..end]);
+        self.queue.submit(Some(enc.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        self.host_stale = true;
+    }
+
+    /// Diagnostic : exécute le plan d'un pas noyau par noyau en attendant la fin de chacun (repère un noyau fautif).
+    #[cfg(test)]
+    pub(crate) fn debug_step_one_by_one(&mut self, sim: &MultiphaseSim) {
+        let p = self.params(sim, sim.dt_max);
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+        let ops = self.plan_step(sim);
+        for (i, op) in ops.iter().enumerate() {
+            eprintln!("  [{i}] {}", op.k);
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("one") });
+            self.encode(&mut enc, &ops[i..i + 1]);
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+        self.host_stale = true;
+    }
+
+    /// `k` pas soumis d'un bloc (une seule relecture de contrôle pour la série). Instantané au début de la série ; si un pas est
+    /// invalide ou manque de budget, la série est annulée puis refaite pas à pas avec `step` (retours arrière compris). Retourne le
+    /// temps simulé avancé (0 si la simulation a divergé).
+    pub fn step_batch(&mut self, sim: &mut MultiphaseSim, k: usize) -> f64 {
+        trace(&format!("step_batch {k}"));
+        if k <= 1 || sim.diverged {
+            return self.step(sim);
+        }
+        let clk = Instant::now();
+        let p = self.params(sim, sim.dt_max);
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+        let mut ops: Vec<Op> = vec![];
+        for i in 0..k {
+            ops.extend(self.plan_step_at(sim, sim.step_count + i));
+            ops.push(Op { k: "k_batch_acc", wg: 1, slot: 0 });
+        }
+        let n_ops = ops.len();
+        let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
+        // une seule relecture de contrôle pour toute la série, mais au plus MAX_BATCH_OPS lancements par tampon de commandes
+        // (lavapipe plante sur des tampons de plusieurs milliers de lancements ; aucun coût notable ailleurs)
+        let chunks: Vec<&[Op]> = ops.chunks(MAX_BATCH_OPS).collect();
+        let last_chunk = chunks.len() - 1;
+        for (ci, ch) in chunks.iter().enumerate() {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase batch") });
+            if ci == 0 {
+                enc.copy_buffer_to_buffer(&self.s_buf, ps, &self.snap_s, 0, pl);
+                enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.snap_d, 0, (D_LEN * 4) as u64);
+                enc.clear_buffer(&self.d_buf, (D_B_TSUM * 4) as u64, Some(((D_LEN - D_B_TSUM) * 4) as u64));
+            }
+            self.encode(&mut enc, ch);
+            if ci == last_chunk {
+                enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.d_read, 0, (D_LEN * 4) as u64);
+            }
+            self.queue.submit(Some(enc.finish()));
+        }
+        let d = read_buffer(&self.device, &self.d_read);
+        self.host_stale = true;
+        let tsum = d[D_B_TSUM] as f64;
+        if d[D_B_BAD] > 0.5 || d[D_B_REDO] > 0.5 || !tsum.is_finite() {
+            // série refusée : retour à l'instantané, puis pas à pas (budgets relevés / retours arrière par `step`)
+            if d[D_B_REDO] > 0.5 {
+                self.cond_budget = self.cond_budget.max((d[D_B_SUBC] as f64 * 1.25).ceil() as usize + 2).min(2000);
+                self.sp_budget = self.sp_budget.max((d[D_B_NSUBS] as f64 * 1.25).ceil() as usize + 2).min(500);
+            }
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("batch restore") });
+            enc.copy_buffer_to_buffer(&self.snap_s, 0, &self.s_buf, ps, pl);
+            enc.copy_buffer_to_buffer(&self.snap_d, 0, &self.d_buf, 0, (D_LEN * 4) as u64);
+            self.queue.submit(Some(enc.finish()));
+            sim.profile.secs[P_GPU] += clk.elapsed().as_secs_f64();
+            let t0 = sim.time;
+            for _ in 0..k {
+                if self.step(sim) == 0.0 {
+                    break;
+                }
+            }
+            return sim.time - t0;
+        }
+        let newton = d[D_B_NEWTON] as usize;
+        let pcg_max = d[D_B_MAXPCG] as usize;
+        sim.time += tsum;
+        sim.last_dt = d[D_DT] as f64;
+        sim.step_count += k;
+        sim.last_pressure_iters = d[D_PCG_IT] as usize;
+        sim.last_newton_iters = d[D_NEWTON_IT] as usize;
+        sim.dt_chem = if d[D_DTCHEM] < 1e37 { d[D_DTCHEM] as f64 } else { f64::INFINITY };
+        sim.dt_phase = if d[D_DTPHASE] < 1e37 { d[D_DTPHASE] as f64 } else { f64::INFINITY };
+        self.update_budgets(sim, newton, pcg_max, d[D_B_UNCONV] > 0.5, d[D_B_SUBC] as usize, d[D_B_NSUBS] as usize);
+        self.last = GpuStepInfo {
+            dt: sim.last_dt,
+            newton,
+            pcg: sim.last_pressure_iters,
+            pcg_max,
+            cond_sub: d[D_B_SUBC] as usize,
+            species_sub: d[D_B_NSUBS] as usize,
+            retries: 0,
+            redo: 0,
+            dispatches: n_ops / k,
+        };
+        sim.profile.secs[P_GPU] += clk.elapsed().as_secs_f64();
+        sim.profile.steps += k;
+        tsum
+    }
+
+    /// budgets du pas suivant (marge : besoin constaté + 30 %)
+    fn update_budgets(&mut self, sim: &MultiphaseSim, newton: usize, pcg_max: usize, unconverged: bool, need_c: usize, need_s: usize) {
+        self.newton_budget = (newton + 1).clamp(2, 4);
+        let mut pb = (pcg_max as f64 * 1.3).ceil() as usize + 2;
+        if unconverged {
+            pb = pb.max(2 * self.pcg_budget);
+        }
+        self.pcg_budget = pb.clamp(6, sim.pressure_max_iter.max(6));
+        self.cond_budget = ((need_c as f64 * 1.3).ceil() as usize + 1).clamp(2, 2000);
+        self.sp_budget = ((need_s as f64 * 1.3).ceil() as usize + 1).clamp(2, 500);
+    }
+
+    // ================================================================ rendu
+    /// Rend l'image (mêmes couleurs que `mp_view::render_rgba`) sur le GPU et la relit dans `out` (nx·ny·4 octets, ligne 0 = haut).
+    pub fn render(&mut self, sim: &MultiphaseSim, o: &super::mp_view::RenderOpts, out: &mut Vec<u8>) {
+        trace(&format!("render {:?}", o.display));
+        use super::mp_view::MpDisplay as M;
+        let n = self.nx * self.ny;
+        let mut p = self.params(sim, sim.dt_max);
+        p[51] = match o.display {
+            M::Phases => 0,
+            M::Pressure => 1,
+            M::Temperature => 2,
+            M::Velocity => 3,
+            M::Density => 4,
+            M::Vapor => 5,
+            M::Divergence => 6,
+            M::Flame => 7,
+            M::HeatRelease => 8,
+        };
+        p[52] = (o.show_effects as u32) | ((o.solids_white as u32) << 1);
+        p[53] = (o.t_scale as f32).to_bits();
+        p[54] = (o.p_scale as f32).to_bits();
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+        let ops = [Op { k: "k_rd_red", wg: wg(n), slot: 0 }, Op { k: "k_rd_final", wg: 1, slot: 0 }, Op { k: "k_render", wg: wg(n), slot: 0 }];
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render") });
+        self.encode(&mut enc, &ops);
+        enc.copy_buffer_to_buffer(&self.r_buf, 0, &self.r_read, 0, (n * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        let slice = self.r_read.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        out.resize(n * 4, 255);
+        if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            out.copy_from_slice(&data[..n * 4]);
+            drop(data);
+        }
+        self.r_read.unmap();
+        trace("render terminé");
     }
 }
 
-/// noms des points d'entrée `fn k_…` du source WGSL
-fn kernel_names(src: &str) -> Vec<String> {
-    let mut v = vec![];
-    let mut rest = src;
-    while let Some(i) = rest.find("fn k_") {
-        let tail = &rest[i + 3..];
-        let end = tail.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(tail.len());
-        v.push(tail[..end].to_string());
-        rest = &tail[end..];
+impl Drop for MultiphaseGpu {
+    /// attend la fin du travail soumis avant de détruire le périphérique (certains pilotes, dont lavapipe, plantent sinon)
+    fn drop(&mut self) {
+        trace("drop");
+        self.device.poll(wgpu::Maintain::Wait);
+        trace("drop: GPU inactif");
     }
-    v.sort();
-    v.dedup();
+}
+
+const P0: f64 = 101325.0;
+
+/// diagnostic : MP_GPU_TRACE=1 affiche chaque appel de haut niveau (envoi, pas, relecture, rendu)
+fn trace(what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("MP_GPU_TRACE").is_ok()) {
+        eprintln!("[gpu] {what}");
+    }
+}
+
+/// Relit un buffer MAP_READ entier en f32 (attente bloquante).
+fn read_buffer(device: &wgpu::Device, buf: &wgpu::Buffer) -> Vec<f32> {
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    let v = match rx.recv() {
+        Ok(Ok(())) => {
+            let data = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, f32>(&data).to_vec()
+        }
+        _ => vec![f32::NAN; (buf.size() / 4) as usize],
+    };
+    buf.unmap();
     v
 }

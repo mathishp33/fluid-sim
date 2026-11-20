@@ -117,7 +117,6 @@ fn methane_air_laminar_flame_speed_and_adiabatic_temperature() {
     s.radiation = false;
     let lx = s.nx as f64 * s.dx;
     let (mut t1, mut t2) = (None, None);
-    let mut tb_max: f64 = 0.0;
     while s.time < 0.4 && t2.is_none() {
         s.step();
         assert!(!s.diverged, "divergence");
@@ -128,9 +127,12 @@ fn methane_air_laminar_flame_speed_and_adiabatic_temperature() {
         if x > 0.7 * lx {
             t2 = Some(s.time);
         }
-        let j = s.ny / 2;
-        tb_max = tb_max.max(s.temp[s.idx(s.nx / 2, j)]);
     }
+    // température des gaz brûlés : moyenne du plateau derrière la flamme (0.35 L → 0.6 L) quand elle atteint 0.7 L (le maximum
+    // ponctuel au passage du front est un transitoire de quelques dizaines de K)
+    let j = s.ny / 2;
+    let burnt: Vec<f64> = (0..s.nx).filter(|&i| { let x = (i as f64 + 0.5) * s.dx; x > 0.35 * lx && x < 0.6 * lx }).map(|i| s.temp[s.idx(i, j)]).collect();
+    let tb_max = burnt.iter().sum::<f64>() / burnt.len() as f64;
     let (t1, t2) = (t1.expect("pas de propagation"), t2.expect("flamme trop lente"));
     // la flamme pulse avec l'acoustique du tube : vitesse MOYENNE sur 0.2 L → 0.7 L
     let u_lab = 0.5 * lx / (t2 - t1);
