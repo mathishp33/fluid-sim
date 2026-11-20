@@ -347,6 +347,11 @@ pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, u
         match tool {
             MpTool::Phase(k) => {
                 if !sim.is_solid(c) {
+                    // un liquide au-dessus de sa température d'ébullition (à la pression locale) n'existe pas : on pose sa vapeur
+                    let k = match sim.reg.change_for_liquid(k) {
+                        Some(pc) if temp > pc.t_sat(sim.p[c]) => pc.vapor,
+                        _ => k,
+                    };
                     set_pure(sim, c, k, temp);
                 }
             }
@@ -404,10 +409,18 @@ pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, u
                 }
             }
             MpTool::Heat => {
-                let rate = 1.0 - (-5.0 * dt).exp();
-                let cap = sim.heat_capacity(c);
-                let t = sim.temp[c];
-                sim.e[c] += (temp - t) * cap * rate;
+                // cible de chauffage : la simulation y tend pendant le temps SIMULÉ (constante de temps `heat_tau`), voir
+                // `MultiphaseSim::relax_heat_targets` ; les solides sont chauffés directement (pas de dilatation)
+                if sim.is_solid(c) {
+                    let rate = 1.0 - (-dt / sim.heat_tau).exp();
+                    let cap = sim.heat_capacity(c);
+                    let t = sim.temp[c];
+                    let de = (temp - t) * cap * rate;
+                    sim.e[c] += de;
+                    sim.energy_input += de * sim.dx * sim.dx;
+                } else {
+                    sim.set_heat_target(c, temp);
+                }
             }
             MpTool::Push => {
                 let rate = 1.0 - (-20.0 * dt).exp();
@@ -990,7 +1003,12 @@ mod tests {
         apply_tool(&mut s, MpTool::Solid(ACIER), &brush_cells(30, 30, 5, 5, 2, false), 400.0, (0.0, 0.0), 0.016);
         assert!(s.is_solid(s.idx(5, 5)) && (s.temp[s.idx(5, 5)] - 400.0).abs() < 1e-6);
         apply_tool(&mut s, MpTool::Heat, &cells, 350.0, (0.0, 0.0), 0.1);
-        assert!(s.temp[s.idx(15, 10)] > 293.5);
+        let t0 = s.time;
+        while s.time - t0 < 0.05 {
+            s.step();
+        }
+        s.clear_heat_targets();
+        assert!(s.temp[s.idx(15, 10)] > 293.5, "T = {}", s.temp[s.idx(15, 10)]);
         apply_tool(&mut s, MpTool::EraseSolid, &brush_cells(30, 30, 5, 5, 2, false), 293.15, (0.0, 0.0), 0.016);
         assert!(!s.is_solid(s.idx(5, 5)) && s.alpha[AIR][s.idx(5, 5)] > 0.999);
         apply_tool(&mut s, MpTool::Push, &cells, 293.15, (1.0, 0.0), 0.05);

@@ -344,6 +344,23 @@ impl MultiphaseSim {
         let mut pk = self.p.clone();
         let mut total_it = 0;
         let mut kappa = vec![0.0; n];
+        // plancher de pression par cellule : P_FLOOR, ou la pression de vapeur saturante d'un liquide présent (modèle de cavité discrète,
+        // DVCM) — un liquide ne supporte pas de traction : sous p_sat il se vaporise, la cavité de vapeur comble le déficit de volume
+        // (voir `phase_change_step`). Sans cela l'eau reste à 10 Pa, l'erreur de volume s'accumule et finit en coup de bélier.
+        let floor: Vec<f64> = (0..n)
+            .map(|c| {
+                let mut f = P_FLOOR;
+                if self.phase_change && !self.is_solid(c) {
+                    for pc in &self.reg.changes {
+                        if self.alpha[pc.liquid][c] > 1e-3 {
+                            f = f.max(pc.p_sat(self.temp[c]).min(0.95 * p_start[c].max(P_FLOOR)));
+                        }
+                    }
+                }
+                f
+            })
+            .collect();
+        let mut clamped = vec![false; n];
         let mut newton = 0;
         for _newton in 0..4 {
             newton += 1;
@@ -386,9 +403,12 @@ impl MultiphaseSim {
                     // du gaz étaient protégées : une cellule quasi vide d'eau seule pouvait atteindre −8e7 Pa, puis le travail de pression
                     // −dt·p·∇·u sur sa capacité calorifique minuscule donnait T = −1.6e5 K → NaN.
                     if !pk[c].is_finite() {
-                        pk[c] = p_start[c].max(P_FLOOR);
-                    } else if pk[c] < P_FLOOR {
-                        pk[c] = P_FLOOR;
+                        pk[c] = p_start[c].max(floor[c]);
+                    } else if pk[c] < floor[c] {
+                        pk[c] = floor[c];
+                        clamped[c] = true;
+                    } else {
+                        clamped[c] = false;
                     }
                     dmax = dmax.max(dp[c].abs());
                 }
@@ -398,6 +418,7 @@ impl MultiphaseSim {
             }
         }
         self.last_newton_iters = newton;
+        self.pressure_clamped = clamped;
         let (uf, vf) = self.face_velocities(us, vs, &pk, dt);
         self.u = uf;
         self.v = vf;

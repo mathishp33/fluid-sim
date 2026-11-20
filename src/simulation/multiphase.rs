@@ -59,9 +59,13 @@ pub struct MultiphaseSim {
     pub nucleation_superheat: f64, // K de surchauffe pour amorcer l'ébullition en volume
     pub nucleation_alpha: f64,     // fraction de vapeur créée à l'amorçage (germes)
     pub nuclei_density: f64,       // n0 (1/m³ de liquide) pour Schnerr–Sauer
+    /// surchauffe (K) au-delà de laquelle un liquide chauffé bout en volume (en dessous : métastable, seules les interfaces s'évaporent)
+    pub boil_superheat_max: f64,
     pub time: f64,
     pub last_dt: f64,
     pub last_pressure_iters: usize,
+    /// cellules dont la pression a été bloquée au plancher (p_sat d'un liquide : traction → cavité) au dernier pas
+    pub(crate) pressure_clamped: Vec<bool>,
     /// itérations de Newton de la fermeture volumique au dernier pas
     pub last_newton_iters: usize,
     /// masse (kg par m de profondeur) entrée par les bords ouverts, par phase : M_k(t) − M_k(0) = flux_k − (changements de phase)
@@ -120,6 +124,19 @@ pub struct MultiphaseSim {
     pub reacted: Vec<f64>,
     /// pas de temps maximal imposé par la chimie au pas suivant (s)
     pub dt_chem: f64,
+    /// chauffage au pinceau : température cible par cellule fluide (NaN = aucune), atteinte avec la constante de temps `heat_tau` (s de temps
+    /// SIMULÉ) ; posée par l'outil « Chauffer », effacée par `clear_heat_targets` (la fenêtre le fait à chaque image)
+    pub heat_target: Vec<f64>,
+    pub heat_tau: f64,
+    /// puissance volumique maximale du pinceau « Chauffer » (W/m³)
+    pub heat_power_max: f64,
+    /// fraction du volume d'une cellule que l'ébullition peut transformer en vapeur en un pas (le pas de temps suivant s'adapte)
+    pub phase_volume_limit: f64,
+    /// temps de relaxation de l'écart à la saturation (s), modèle de Lee : l'ébullition ramène T vers T_sat avec ce temps caractéristique
+    pub phase_relaxation_time: f64,
+    /// pas de temps maximal imposé par le changement de phase au pas suivant (s)
+    pub dt_phase: f64,
+    pub(crate) heat_active: bool,
     /// profil de temps de calcul par partie du pas (voir `mp_step::StepProfile`)
     pub profile: super::mp_step::StepProfile,
 }
@@ -199,10 +216,12 @@ impl MultiphaseSim {
             nucleation_superheat: 4.0,
             nucleation_alpha: 1e-3,
             nuclei_density: 1e13,
+            boil_superheat_max: 15.0,
             time: 0.0,
             last_dt: 0.0,
             last_pressure_iters: 0,
             last_newton_iters: 0,
+            pressure_clamped: vec![false; n],
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
             step_count: 0,
@@ -233,6 +252,13 @@ impl MultiphaseSim {
             radiated: 0.0,
             reacted: vec![0.0; nre],
             dt_chem: f64::INFINITY,
+            heat_target: vec![f64::NAN; n],
+            heat_tau: 0.2,
+            heat_power_max: 3e8,
+            phase_volume_limit: 0.25,
+            phase_relaxation_time: 1e-4,
+            dt_phase: f64::INFINITY,
+            heat_active: false,
             profile: Default::default(),
         }
     }
@@ -539,6 +565,52 @@ impl MultiphaseSim {
         let mv = self.v.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         mu.max(mv)
     }
+    /// Fixe une température cible de chauffage (outil « Chauffer ») pour la cellule c.
+    pub fn set_heat_target(&mut self, c: usize, t: f64) {
+        if !self.is_solid(c) {
+            self.heat_target[c] = t;
+            self.heat_active = true;
+        }
+    }
+    /// Supprime toutes les cibles de chauffage (fin du coup de pinceau).
+    pub fn clear_heat_targets(&mut self) {
+        if self.heat_active {
+            self.heat_target.iter_mut().for_each(|t| *t = f64::NAN);
+            self.heat_active = false;
+        }
+    }
+    /// Relaxation vers les cibles pendant dt (implicite exacte : T → T_c + (T − T_c)·e^(−dt/τ)), énergie apportée comptée dans
+    /// `energy_input`. Appelée à chaque pas par le solveur CPU ; la fenêtre l'appelle une fois par image en mode GPU.
+    pub fn relax_heat_targets(&mut self, dt: f64) {
+        if !self.heat_active {
+            return;
+        }
+        let f = 1.0 - (-dt / self.heat_tau.max(1e-6)).exp();
+        let a2 = self.dx * self.dx;
+        for c in 0..self.nx * self.ny {
+            let tt = self.heat_target[c];
+            if tt.is_nan() || self.is_solid(c) {
+                continue;
+            }
+            let lim = self.heat_power_max * dt;
+            let de = (self.heat_capacity(c) * (tt - self.temp[c]) * f).clamp(-lim, lim);
+            self.e[c] += de;
+            self.energy_input += de * a2;
+            self.temp[c] = self.temp_from_energy(c);
+        }
+    }
+    /// plus grand écart |T_cible − T| des cellules chauffées (0 sans chauffage)
+    pub(crate) fn heat_gap(&self) -> f64 {
+        if !self.heat_active {
+            return 0.0;
+        }
+        // échauffement maximal par seconde : min(écart/τ, puissance max / capacité) ; ramené à un « écart équivalent » ×τ
+        (0..self.nx * self.ny)
+            .filter(|&c| !self.heat_target[c].is_nan())
+            .map(|c| (self.heat_target[c] - self.temp[c]).abs().min(self.heat_power_max * self.heat_tau / self.heat_capacity(c).max(1e-30)))
+            .fold(0.0, f64::max)
+    }
+
     /// fractions volumiques du fluide ambiant (une seule phase si `ambient_mix` est vide)
     pub fn ambient_alpha(&self) -> Vec<f64> {
         let np = self.reg.phases.len();

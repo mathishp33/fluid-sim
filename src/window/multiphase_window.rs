@@ -538,6 +538,10 @@ impl MultiphaseWindow {
                 ui.add(egui::Slider::new(&mut self.radius, 1..=60).text("Rayon (C)"));
                 ui.add(egui::Slider::new(&mut self.brush_temp, 100.0..=3000.0).text("T pinceau (K)"));
                 ui.weak("T pinceau : température des phases et mélanges ajoutés, des solides, et cible du chauffage");
+                ui.add(egui::Slider::new(&mut self.sim.heat_power_max, 1e6..=1e10).logarithmic(true).text("Puissance max. du chauffage (W/m³)"));
+                ui.weak("Le chauffage (Maj + clic) apporte sa chaleur pendant le temps SIMULÉ, au plus à cette puissance. Un liquide posé \
+                         au-dessus de son ébullition est posé en vapeur. Faire bouillir de l'eau froide au-delà de ~5e8 W/m³ est une \
+                         explosion de vapeur : la simulation la suit au ralenti (pas de temps de quelques µs).");
                 if self.tool == MpTool::Ignite {
                     ui.add(egui::Slider::new(&mut self.ignite_temp, 1200.0..=3000.0).text("T du noyau de flamme (K)"));
                     ui.weak("Allumer : le mélange local est remplacé par ses gaz brûlés chauds (à pression constante) ; un noyau trop petit \
@@ -895,6 +899,8 @@ impl MultiphaseWindow {
 
             self.mouse(ctx, &response, rect, dt_wall);
             self.simulate(dt_wall);
+            // les cibles du pinceau « Chauffer » ne valent que pour l'image en cours (elles sont reposées tant que le bouton est enfoncé)
+            self.sim.clear_heat_targets();
             self.stats_age += 1;
             if self.stats_age >= 5 || self.paused {
                 self.stats = compute_stats(&self.sim);
@@ -1026,6 +1032,11 @@ impl MultiphaseWindow {
             edited = true;
         }
         if edited {
+            if self.backend == Backend::Gpu && !self.paused {
+                // le GPU n'applique pas les cibles de chauffage : apport de l'image appliqué ici, sur le temps simulé de l'image
+                self.sim.relax_heat_targets(dt * self.speed);
+                self.sim.clear_heat_targets();
+            }
             self.upload_if_gpu();
             self.enforce_backend();
         }

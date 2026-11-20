@@ -77,10 +77,12 @@ impl MultiphaseSim {
 
     pub(crate) fn phase_change_step(&mut self, dt: f64) {
         if !self.phase_change {
+            self.dt_phase = f64::INFINITY;
             return;
         }
         let n = self.nx * self.ny;
         let groups = self.reg.miscible_groups();
+        let mut dt_phase = f64::INFINITY;
         for (pi, pc) in self.reg.changes.clone().iter().enumerate() {
             let (liq, vap) = (pc.liquid, pc.vapor);
             let (pl, pv) = (&self.reg.phases[liq].clone(), &self.reg.phases[vap].clone());
@@ -125,8 +127,12 @@ impl MultiphaseSim {
                 let latent = self.reg.latent_heat(pc, t);
                 let rho_v = pv.rho(p, t);
                 let mut dm = 0.0;
+                let mut bulk_boiling = false;
+                // relaxation de l'écart à T_sat sur `phase_relaxation_time` (modèle de Lee) : instantanée pour dt ≫ τ (comportement
+                // historique), ∝ dt pour dt ≪ τ — sans elle, ébullition et condensation alternent d'un pas à l'autre dans un liquide confiné
+                let relax = 1.0 - (-dt / self.phase_relaxation_time.max(1e-12)).exp();
                 if t > tsat && ml > 1e-12 {
-                    let dm_e = (cap * (t - tsat) / latent).min(ml);
+                    let dm_e = (cap * (t - tsat) / latent * relax).min(ml);
                     let gas = av + a_other_gas;
                     let resolved = gas > 0.02 || (al < 0.98 && gas > 0.0 && a_other_gas > 0.0);
                     if resolved && al > 1e-6 {
@@ -138,8 +144,12 @@ impl MultiphaseSim {
                         let ps = pc.p_sat(t);
                         let rho_m = self.rho_mix[c];
                         let rate = rho_v * pl.rho(p, t) / rho_m * av * (1.0 - av) * 3.0 / r_b.max(1e-9) * (2.0 / 3.0 * (ps - p).max(0.0) / pl.rho(p, t)).sqrt();
-                        // Pour une surchauffe SANS dépression (ébullition en volume) le taux inertiel est nul : ancrage thermique
-                        let thermal = if ps - p <= 0.0 { dm_e } else { 0.0 };
+                        // ébullition en volume (liquide chauffé) : la croissance des bulles est limitée par la chaleur disponible, pas par
+                        // l'inertie ; au-delà de `boil_superheat_max` le liquide ne reste plus métastable (ébullition hétérogène)
+                        // (surchauffe THERMIQUE, mesurée à max(p, 1 atm) : une dépression — cavitation — reste pilotée par l'inertie)
+                        let excess = t - pc.t_sat(p.max(101325.0)) - self.boil_superheat_max;
+                        let thermal = if excess > 0.0 { (cap * excess / latent * relax).min(ml) } else { 0.0 };
+                        bulk_boiling = excess > 0.0;
                         dm = (rate * dt).max(thermal).min(dm_e);
                     } else if av < 1e-7 && a_other_gas < 1e-9 && t - tsat > self.nucleation_superheat {
                         // création de germes (nucléation) : fraction nucleation_alpha de vapeur
@@ -147,7 +157,7 @@ impl MultiphaseSim {
                     }
                 } else if t < tsat && mv > 1e-12 && al > 1e-6 {
                     // condensation : interface résolue ancrée à T_sat ; sous-maille par Schnerr–Sauer
-                    let dm_e = (cap * (tsat - t) / latent).min(mv);
+                    let dm_e = (cap * (tsat - t) / latent * relax).min(mv);
                     let gas = av + a_other_gas;
                     if gas > 0.02 || a_other_gas > 0.0 {
                         dm = -dm_e;
@@ -159,6 +169,21 @@ impl MultiphaseSim {
                         dm = -(rate * dt).max(dm_e * 0.0).min(dm_e).min(mv);
                     }
                 }
+                // cavité discrète (DVCM) : la pression a atteint p_sat (plancher du solveur de pression) et le liquide ne remplit plus la
+                // cellule : la vapeur à p_sat comble exactement le déficit de volume (cinématique, pas de limite de vitesse de croissance)
+                let mut cavity = 0.0;
+                if ml > 1e-12 && al > 1e-3 && dm >= 0.0 {
+                    let ps = pc.p_sat(t);
+                    // seulement dans une cellule que le solveur de pression a dû bloquer au plancher p_sat au pas précédent (traction) —
+                    // pas dans un liquide surchauffé ni à l'équilibre de saturation, qui n'est pas en traction
+                    if self.pressure_clamped[c] && p <= 1.01 * ps {
+                        let (vv, _, _) = self.cell_closure(c, ps, t);
+                        if vv < 1.0 {
+                            let denom = (1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t)).max(1e-12);
+                            cavity = ((1.0 - vv) / denom).min(ml - dm);
+                        }
+                    }
+                }
                 if dm != 0.0 {
                     // couplage implicite local : on ne crée/détruit pas plus de vapeur que ce qui ramène la cellule à p = p_sat(T)
                     // (sinon un pas explicite dépasse l'équilibre : 1 kg d'eau → 1600 m³ de vapeur)
@@ -166,11 +191,32 @@ impl MultiphaseSim {
                     let (vv, _, _) = self.cell_closure(c, ps, t);
                     let denom = 1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t);
                     if dm > 0.0 {
-                        dm = dm.min(((1.0 - vv) / denom).max(0.0));
+                        // … sauf ébullition en volume d'un liquide chauffé (surchauffe > boil_superheat_max) : la vapeur y repousse le liquide, ce que
+                        // fait la projection de pression ; la production est bornée à `phase_volume_limit` du volume de la cellule par pas,
+                        // et le pas suivant est réduit en conséquence (voir dt_phase)
+                        let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
+                        let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
+                        let by_volume = self.phase_volume_limit / dv_unit;
+                        let closure = ((1.0 - vv) / denom).max(0.0);
+                        dm = dm.min(if al > 0.98 && bulk_boiling { closure.max(by_volume) } else { closure });
+                        let dv = dm * dv_unit;
+                        if dv > 1e-3 {
+                            dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                        }
                     } else {
                         dm = -((-dm).min(((vv - 1.0) / denom).max(0.0)));
+                        // effondrement d'une bulle dans un liquide froid : au plus `phase_volume_limit` du volume de la cellule par pas
+                        // (sinon le liquide s'y précipite en un pas : coup de bélier de plusieurs GPa)
+                        let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
+                        let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
+                        dm = -((-dm).min(self.phase_volume_limit / dv_unit));
+                        let dv = -dm * dv_unit;
+                        if dv > 1e-3 {
+                            dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                        }
                     }
                 }
+                let dm = dm + cavity.max(0.0);
                 if dm != 0.0 {
                     self.transfer(c, liq, vap, dm);
                     self.transferred[pi] += dm * self.dx * self.dx;
@@ -180,6 +226,7 @@ impl MultiphaseSim {
                 self.surface_exchange(pi, &others);
             }
         }
+        self.dt_phase = dt_phase.max(1e-8);
     }
 
     /// Évaporation / condensation à travers une interface ALIGNÉE sur la grille (cellule de gaz pur voisine d'une cellule de liquide sans gaz :

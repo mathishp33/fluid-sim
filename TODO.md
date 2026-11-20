@@ -30,6 +30,9 @@ MON AVIS:
 
 
 
+REACTION AVEC SOLIDES & POUDRES (carbones, bois)
+POUDRES (poudre a canon, carbone)
+
 
 
 # TODO — Simulation de fluide en Rust

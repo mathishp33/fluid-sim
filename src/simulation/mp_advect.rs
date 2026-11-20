@@ -324,7 +324,8 @@ impl MultiphaseSim {
                     (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, tf, self.p[d])
                 };
                 let _ = p_d;
-                let mf = fk * rho_d;
+                // jamais plus que la masse présente dans la donneuse (traces : α ≈ 0 et masse volumique de repli EOS)
+                let mf = if d != usize::MAX { (fk * rho_d).min(self.mass[k][d].max(0.0)) } else { fk * rho_d };
                 mtot += mf;
                 ef += mf * self.reg.phases[k].e_int(t_d);
                 if d != usize::MAX {

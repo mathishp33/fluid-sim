@@ -419,6 +419,9 @@ impl MultiphaseSim {
     // ---------------------------------------------------------------- thermique des solides
     /// Chauffages (e += P·dt) et solides isothermes (T imposée), avant la conduction.
     pub(crate) fn apply_thermal_sources(&mut self, dt: f64) {
+        // chauffage au pinceau : apport progressif pendant le temps simulé (un dépôt instantané de chaleur dans un liquide est un chauffage
+        // à volume constant : ~1 MPa/K dans l'eau, l'équivalent d'une explosion)
+        self.relax_heat_targets(dt);
         for c in 0..self.nx * self.ny {
             if !self.is_solid(c) {
                 continue;
