@@ -28,86 +28,105 @@ MON AVIS:
    -> Il faut trouver le point faible qui cause ce crash et le fix.
    -> Peut-être qu'il faut revoir l'architecture/la codebase entière.)
 
-## Prioritaire
-
-Facteur A recalé : les valeurs publiées (Westbrook–Dryer pour le méthane, Marinov pour l’hydrogène) donnaient des vitesses de flamme fausses avec ce solveur. Je les ai recalées sur les vitesses mesurées, ce qui est la façon normale de construire ces mécanismes à une étape. L’allumage spontané d’un mélange chaud, en revanche, n’est qu’approximatif.
-Pas de détonation : le solveur de pression ne gère pas les ondes de choc, donc les explosions restent des déflagrations (le cas des explosions de gaz accidentelles).
-Énergie pendant une explosion : l’énergie totale dérive jusqu’à 5 % de la chaleur dégagée pendant les fortes oscillations de pression.
-Flamme du tube : elle oscille avec l’acoustique du tube, comme dans les expériences. Sa vitesse instantanée varie donc, et seule la moyenne est juste.
-Pas de radicaux ni de suie : sans OH, H, O, les flammes sont environ 50–90 K trop chaudes, et les flammes de diffusion n’ont pas leur couleur jaune.
-GPU : le calcul repasse sur CPU dès qu’il y a de la chimie.
-Changements d’anciens comportements :
-une scène sans liquide n’est plus ralentie par la tension de surface d’un liquide absent ;
-le transport de la température est un peu moins diffusif.
 
 
- - Faire dépendre la diffusivité de la paire de fluides, au lieu d’une valeur par fluide.
- - Ajouter une enthalpie de mélange.
- - Ajouter la dissolution d’un gaz dans un liquide (loi de Henry). 
- - C’est l’usage naturel du cas gaz + liquide miscibles, aujourd’hui seulement signalé par un avertissement.
-
- - METTRE GPU EN F64 & GPU résident : ne plus recopier tout l’état à chaque pas
-Il faut faire une décision d'architecture : 
- - Es ce qu'on supporte seulement sur le GPU ?
- - Es ce qu'on continue à supporter CPU et GPU ?
- - Il faut surement revoir l'architecture du coté GPU ?
-On a des performances horribles (5 fps) en CPU (et même CPU je crois) alors que le CPU est à 11%
-
-Plus de CellEffts: 
- - Door / Valve CellEffect !
- - Compressor ?
- - d'autres ...
-
-advection Rudman / Raessi–Pitsch
-
-IMPLEMENTER TENSION LIQUIDE/LIQUIDE
-
-TENSEUR DE CONTRAINTES. Je n’ai pas implémenté le tenseur complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. 
-Ils comptent surtout quand μ varie fortement sur une courte distance, par exemple une flamme ou un jet à 1000 K. 
-Les inclure demande de réécrire le traitement des parois, et je peux le faire si tu veux ce niveau de fidélité.
-cp et D. cp et la diffusion du traceur restent constants. Pour l’air, cp varie d’environ 3 % de 300 à 600 K.
-Retard d’un pas. Les propriétés sont évaluées sur la température du début de pas.
-Benchmarks. L’effet est négligeable dans la cavité à ΔT = 10 K, mais lance-le pour confirmer, en particulier le test de conduction à 600 K.
-
- - plus d'exemples de materiaux (miel)
- - créateur personnalisé de matériaux
-
-1. encodeur de conditions initiales, fenetre séparé pour faire des experiences précises, pas à pas, en tout sauvegardant, exemple : 
-   - je veux de la température là, puis j'accélère ici, puis je lance la simulation sur 5s puis j'arrête et je sauvegarde des statistiques.
-   -> trouver une "interface" ou un moyen d'implémenter ça ?
-3. save tout le contexte (densité, special_cells, pressions, ...) PAS QUE SOLIDES
-3. PCG (Ax = b) ? pas sur
-5. Teleporter() kind of broken, destination size is not customizable.
-
-CHANGEMENT D ETATS, REACTIONS CHIMIQUES ?
-
-## Moins prioritaire
-
-## Pas prioritaire
-1. faire une option 3D
-
-## Ancien / Autre (Quand même à faire)
-
-1. Optimiser la simulation de fluide
-2. Meilleures conditions aux limites (bordures) (Periodic, Open, PressureOutlet, VelocityOutlet)
-3. Forces externes (archimède, frottements/pas frottements)
-4. solides mobiles
-
-FLIP/PIC ?
-Indicateur vorticité
 
 
-# Fait (Fonctionnalités)
- - solveur Red-Black Gauss-Siedel
- - SOR
- - Sous-pas adaptifs CFL
- - Advection semi-Lagrangienne, upwind et MacCormack (MUSCL ordre 2)
- - grille MAC
- - solides immobiles
- - cellules spéciales
- - diagnostiques de divergence, pression, énérgie, masse, CFL, ...
- - température fluide & solide
- - viscosité (faible)
- - equation Low-Mach pour gaz
- - equation de Tait pour liquides
- - 
+# TODO — Simulation de fluide en Rust
+
+Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
+
+---
+
+## 1. Prioritaire
+
+### Performances et architecture GPU
+- **[M+1] Performances : ~5 fps alors que le CPU n'est utilisé qu'à 11 %.** Le calcul tourne sur un seul cœur : paralléliser (rayon) les boucles par cellule (pression/PCG, advection, conduction, chimie), profiler `step()`.
+- **[M] GPU en f64 et résident** : ne plus recopier tout l'état à chaque pas.
+- **[M] Décision d'architecture à prendre avant d'écrire du code GPU :**
+    - GPU seul, ou CPU **et** GPU maintenus en parallèle ?
+    - Revoir l'architecture côté GPU ?
+    - Aujourd'hui, le GPU (f32, 4 fluides max) est refusé dès qu'il y a cellules spéciales, entrées de bord, miscibilité, chimie ou cp(T) : tout ce qui est récent tourne uniquement sur CPU.
+- [M] PCG (Ax = b) : à revoir ? (préconditionneur, convergence) — pas sûr que ce soit le goulot.
+
+### Expériences reproductibles
+- **[M] Sauvegarder tout le contexte**, pas seulement les solides : masses, énergie, pression, vitesses, cellules spéciales, bords, matériaux utilisés. Aujourd'hui une scène `.mps` contient solides + thermique + cellules spéciales.
+- **[M] Encodeur de conditions initiales / fenêtre d'expérience séparée** pour des expériences précises pas à pas, avec sauvegarde. Exemple : « de la température ici, puis j'accélère là, puis je simule 5 s, j'arrête et je sauvegarde des statistiques ». → trouver l'interface (script d'actions ? timeline ?).
+- **[M] Simulation pré-calculée** : on lance une simulation avec la fenêtre d'expérience séparée (pas encore implémentée), puis on fait une sorte de "vidéo" (un peu comme blender ?) mais avec beaucoup d'informations
+### Bugs / manques des cellules spéciales
+- [M] Téléporteur partiellement cassé : la taille de la destination n'est pas réglable (une seule cellule de destination).
+- [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), Compresseur, Sensor (pression, température, ...), autres…
+- [M] Montée en température : en ajoutant une grosse montée en température très rapide sur un liquide, ça se met sur pause (filet de sécurité ?)
+### Simulation monophasique et multiphasique
+- **[M + 1] Séparer la simulation monophasique et multiphasique**, avec des dossiers ?
+
+---
+
+## 2. Moins prioritaire
+
+### Physique multiphasique
+- [M] Tension de surface **liquide / liquide** (aujourd'hui σ seulement liquide ↔ gaz).
+- [M] Dissolution d'un gaz dans un liquide (loi de Henry). C'est l'usage naturel du cas « gaz + liquide miscibles », aujourd'hui seulement signalé par un avertissement.
+- [M] Diffusivité dépendant de la **paire** de fluides (au lieu d'une valeur par fluide).
+- [M] Enthalpie de mélange.
+- [M] Advection de Raessi–Pitsch (l'advection de quantité de mouvement cohérente avec les flux de masse VOF, idée de Rudman, est déjà en place).
+
+### Combustion (limites connues du modèle actuel)
+- [M] Ondes de choc / détonations : le solveur de pression ne les gère pas, les explosions restent des déflagrations.
+- [M] Dérive d'énergie pendant une explosion (jusqu'à ~5 % de la chaleur dégagée) : schéma en énergie interne, travail de pression discret.
+- [M] Radicaux (OH, H, O) : sans eux les flammes sont ~50–90 K trop chaudes.
+- [M] Suie : flammes de diffusion sans leur couleur jaune ni leur rayonnement.
+- [M] Auto-allumage seulement approximatif (mécanismes globaux à une étape, facteurs A recalés sur la vitesse de flamme).
+
+### Fidélité du solveur monophasique
+- [1] Tenseur des contraintes complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. Ils comptent quand μ varie fortement sur une courte distance (flamme, jet à 1000 K). Demande de réécrire le traitement des parois.
+- [1] cp et diffusion du traceur constants (l'air : cp varie d'environ 3 % entre 300 et 600 K).
+- [1] Retard d'un pas : propriétés évaluées sur la température du début de pas.
+- [1] Benchmarks à relancer pour confirmer (effet négligeable dans la cavité à ΔT = 10 K), en particulier le test de conduction à 600 K.
+
+### Matériaux
+- [M] Plus d'exemples de matériaux (miel, …).
+- [1] Créateur / éditeur de matériaux personnalisés pour le monophasique (le multiphasique a déjà son éditeur).
+
+### Ancien / autre (toujours à faire)
+- [1] Optimiser la simulation de fluide.
+- [M+1] Meilleures conditions aux limites : périodique, ouvert, sortie à pression imposée, sortie à vitesse imposée.
+- [M+1] Forces externes : poussée d'Archimède sur objets, frottements / sans frottement.
+- [M+1] Solides mobiles.
+- [M+1] FLIP/PIC ?
+- [M+1] Indicateur de vorticité (affichage).
+
+---
+
+## 3. Pas prioritaire
+- Option 3D.
+
+---
+
+## 4. Fait
+
+### Solveur et numérique
+- Solveur Red-Black Gauss-Seidel, SOR. [1]
+- Sous-pas adaptatifs CFL. [1]
+- Advection semi-lagrangienne, upwind et MacCormack (MUSCL ordre 2). [1]
+- Grille MAC. [M+1]
+- Solides immobiles. [M+1]
+- Diagnostics : divergence, pression, énergie, masse, CFL, … [M+1]
+- Température fluide & solide. [M+1]
+- Viscosité (faible). [1]
+- Équation low-Mach pour les gaz, équation de Tait pour les liquides. [M+1]
+- Multiphasique : interface PLIC conservative, pression implicite (Newton + PCG), tension de surface, changement de phase (ébullition, condensation, cavitation). [M]
+- Bug NaN du scénario « barrage » corrigé + filet de sécurité (retour arrière, sous-pas, pause au lieu de NaN). [M]
+- Advection MUSCL de la composition et de la température dans les mélanges (diffusion numérique réduite). [M]
+- Pas de temps capillaire seulement pour les liquides présents. [M]
+
+### Fonctionnalités
+- Toutes les fonctionnalités de `main_window.rs` portées dans `multiphase_window.rs` : cellules spéciales (puits, émetteur, accélérateur, téléporteur), solides chauffants / isothermes, bords modifiables en direct, raccourcis, sauvegarde/chargement de scène. [M]
+- Matériaux solides, liquides et gazeux ajoutables et personnalisables (défauts supprimables et restaurables), miscibilité par paire, export/import JSON. [M]
+- Mélanges nommés (air sec O2 + N2, prémélanges) comme pinceaux et fluide ambiant. [M]
+
+### Changements d'état et réactions chimiques
+- Cinétique chimique : Arrhenius, ordres partiels, réactions réversibles vers l'équilibre thermodynamique (dissociation de CO2 / H2O). [M]
+- Thermochimie : enthalpies de formation, entropies, cp(T) calé sur JANAF. [M]
+- Flammes et explosions : modèle de flamme épaissie (vitesse de flamme juste quelle que soit la maille), rayonnement des gaz chauds, outil « Allumer », 4 scénarios (tube, explosion confinée, explosion avec évent, flamme de diffusion), préréglage combustion. [M]
+- Évaporation / condensation à la pression partielle (Dalton), diffusion propre à chaque espèce. [M]
