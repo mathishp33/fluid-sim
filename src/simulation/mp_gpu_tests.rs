@@ -302,11 +302,16 @@ fn gpu_matches_cpu_premixed_methane_flame() {
         cpu.chem_heat, gs.chem_heat, fpos(&cpu), fpos(&gs), cpu.radiated, gs.radiated,
         cpu.flame_factor.iter().fold(0.0f64, |a, &b| a.max(b)), gs.flame_factor.iter().fold(0.0f64, |a, &b| a.max(b)), g.last);
     assert!(cpu.chem_heat > 0.0 && gs.chem_heat > 0.0);
-    assert!(rel(cpu.chem_heat, gs.chem_heat) < 0.1, "chaleur dégagée {} {}", cpu.chem_heat, gs.chem_heat);
-    assert!((fpos(&cpu) - fpos(&gs)).abs() <= 3.0 * cpu.dx, "front {} {}", fpos(&cpu), fpos(&gs));
+    // La flamme n'est pas convergée en temps au dt par défaut : le CPU seul, avec dt_max = 2e-5 / 1e-5 / 5e-6, donne une chaleur
+    // de 256 / 268 / 271 au lieu de 234 et un front 3 à 7 mailles plus loin. Le GPU suit une autre suite de dt (f32 → autres décisions
+    // de pas) : à long terme seul l'ordre de grandeur est comparable (Radeon : chaleur 259, front +4 mailles) ; l'accord pas à pas
+    // ci-dessous valide les équations.
+    assert!(rel(cpu.chem_heat, gs.chem_heat) < 0.2, "chaleur dégagée {} {}", cpu.chem_heat, gs.chem_heat);
+    assert!((fpos(&cpu) - fpos(&gs)).abs() <= 8.0 * cpu.dx, "front {} {}", fpos(&cpu), fpos(&gs));
     for j in 0..cpu.reacted.len() {
         eprintln!("  réaction {j} : CPU {:.4e} GPU {:.4e}", cpu.reacted[j], gs.reacted[j]);
     }
+    one_step_agreement("flamme de prémélange", mk(), 300, 2, 5e-3, 3.0);
 }
 
 #[test]
