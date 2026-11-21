@@ -307,14 +307,10 @@ pub fn all_tools(reg: &Registry) -> Vec<MpTool> {
 fn set_pure(sim: &mut MultiphaseSim, c: usize, k: usize, t: f64) {
     let p = sim.p[c];
     sim.solid[c] = -1;
-    let mut e = 0.0;
     for j in 0..sim.reg.phases.len() {
-        let m = if j == k { sim.reg.phases[j].rho(p, t) } else { 0.0 };
-        sim.mass[j][c] = m;
-        e += m * sim.reg.phases[j].e_int(t);
+        sim.mass[j][c] = if j == k { sim.reg.phases[j].rho(p, t) } else { 0.0 };
     }
-    sim.e[c] = e;
-    sim.temp[c] = t;
+    sim.set_cell_temperature(c, t);
 }
 
 /// Paramètres d'un coup de pinceau.
@@ -362,8 +358,7 @@ pub fn apply_tool_with(sim: &mut MultiphaseSim, tool: MpTool, cells: &[(usize, u
                     sim.mass[k][c] = 0.0;
                     sim.alpha[k][c] = 0.0;
                 }
-                sim.e[c] = sim.reg.solids[s].rho_cp() * temp;
-                sim.temp[c] = temp;
+                sim.set_cell_temperature(c, temp);
                 sim.set_thermal_cell(c, o.thermal);
                 let (a, b, cc, d) = (sim.uidx(i, j), sim.uidx(i + 1, j), sim.vidx(i, j), sim.vidx(i, j + 1));
                 sim.u[a] = 0.0;
@@ -784,6 +779,14 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
         }
         return v;
     }
+    // cellule mixte : température de chaque groupe présent (non-équilibre thermique)
+    let present: Vec<usize> = (0..sim.ngroups()).filter(|&g| sim.groups[g].iter().any(|&k| sim.mass[k][c] > 1e-9)).collect();
+    if present.len() > 1 {
+        for g in present {
+            let name = sim.groups[g].iter().map(|&k| sim.reg.phases[k].name.as_str()).collect::<Vec<_>>().join(" + ");
+            v.push((format!("T {name} (K)"), format!("{:.2}", sim.tg[g][c])));
+        }
+    }
     match sim.special[c] {
         Some(MpEffect::Sink { rate }) => v.push(("Cellule spéciale".into(), format!("puits, aspiration {rate:.3} m/s"))),
         Some(MpEffect::Emitter { vx, vy, phase, temp }) => v.push((
@@ -844,8 +847,7 @@ pub fn reset_temperature(sim: &mut MultiphaseSim, t: f64) {
             sim.e[c] = sim.reg.solids[sim.solid[c] as usize].rho_cp() * tc;
             sim.temp[c] = tc;
         } else {
-            sim.e[c] = (0..sim.reg.phases.len()).map(|k| sim.mass[k][c] * sim.reg.phases[k].e_int(t)).sum();
-            sim.temp[c] = t;
+            sim.set_cell_temperature(c, t);
         }
     }
     sim.refresh();

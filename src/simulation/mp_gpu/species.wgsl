@@ -13,7 +13,7 @@ fn k_sp_dloc(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocat
         for (var q = 0u; q < cnt; q++) {
             let k = gmember(gi, q);
             var d = 0.0;
-            if (!is_solid(c)) { d = max(diff_at(k, S[O_temp + c], pa), 0.0) * max(S[O_flame + c], 1.0); }
+            if (!is_solid(c)) { d = max(diff_at(k, ptemp(k, c), pa), 0.0) * max(S[O_flame + c], 1.0); }
             S[O_dloc + q * n + c] = d;
             v[0] = max(v[0], d);
         }
@@ -77,7 +77,8 @@ fn sp_face(a: u32, b: u32, gi: u32, ds: f32, out: ptr<function, array<f32, NPMAX
     for (var q = 0u; q < cnt; q++) {
         let k = gmember(gi, q);
         (*out)[q] *= sc;
-        var td = S[O_temp + b]; if ((*out)[q] > 0.0) { td = S[O_temp + a]; }
+        let gq = group_k(gmember(gi, q));
+        var td = tgrp(gq, b); if ((*out)[q] > 0.0) { td = tgrp(gq, a); }
         ef += (*out)[q] * erel_k(k, td);
     }
     return ef;
@@ -111,7 +112,8 @@ fn k_sp_step(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
     for (var q = 0u; q < cnt; q++) { S[O_newm + q * n + c] = max(mass(gmember(gi, q), c) + dm[q], 0.0); }
-    S[O_newe + c] = S[O_eps + c] + de;
+    // énergie du groupe thermique de ce groupe miscible (mêmes indices : groupes miscibles = groupes thermiques)
+    S[O_newe + c] = epsg(gi, c) + de;
 }
 @compute @workgroup_size(64)
 fn k_sp_commit(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -120,8 +122,7 @@ fn k_sp_commit(@builtin(global_invocation_id) g: vec3<u32>) {
     let gi = Q.b;
     let cnt = gcount(gi);
     for (var q = 0u; q < cnt; q++) { S[O_mass + gmember(gi, q) * n + c] = S[O_newm + q * n + c]; }
-    S[O_eps + c] = S[O_newe + c];
-    if (!is_solid(c)) { S[O_temp + c] = temp_of(c); }
+    if (!is_solid(c)) { S[O_epsg + gi * n + c] = S[O_newe + c]; cell_sync(c); }
     sp_prep_cell(c, gi);
 }
 
@@ -264,10 +265,14 @@ fn cc_volume(pr: f32, t: f32) -> f32 {
     for (var k = 0u; k < P.np; k++) { v += max(chm(k), 0.0) / rho_k(k, pr, t); }
     return v;
 }
+fn reactive_k(k: u32) -> bool { return ph(k, 30u) > 0.5; }
+// sous-système réactif de la cellule : masses et énergie des seuls groupes réactifs (miroir de integrate_cell)
 fn cc_load(c: u32, feff: f32) {
     cc_c = c;
-    for (var k = 0u; k < P.np; k++) { ch_set(k, mass(k, c)); }
-    ceps = S[O_eps + c];
+    for (var k = 0u; k < P.np; k++) { var m = 0.0; if (reactive_k(k)) { m = mass(k, c); } ch_set(k, m); }
+    var e = 0.0;
+    for (var g = 0u; g < P.ng; g++) { e += select(0.0, epsg(g, c), reactive_k(gmember(g, 0u))); }
+    ceps = e;
     cfe = feff;
 }
 fn chx(o: u32, j: u32) -> f32 { return S[o + j * ncell() + cc_c]; }
@@ -283,12 +288,12 @@ fn k_flame_omega(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_inv
         var wsum = 0.0;
         if (!is_solid(c)) {
             cc_load(c, 1.0);
-            let t = S[O_temp + c];
             for (var j = 0u; j < P.nre; j++) {
                 if (!rx_flame(j)) { continue; }
                 var skip = false;
                 for (var i = 0u; i < rx_nr(j); i++) { if (mass(rx_rs(j, i), c) <= 1e-12) { skip = true; } }
                 if (skip) { continue; }
+                let t = ptemp(rx_rs(j, 0u), c);
                 wsum += abs(max(cc_rate(j, t), 0.0) * cc_heat(j, t));
             }
         }
@@ -479,9 +484,22 @@ fn k_chem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation
             var span = dt; if (stopped) { span = tl; }
             dt_cell = 0.5 * P.chem_vol_lim * span / dv;
         }
-        for (var k = 0u; k < P.np; k++) { S[O_mass + k * n + c] = chm(k); }
-        S[O_eps + c] = ceps;
-        S[O_temp + c] = tn;
+        // groupes réactifs : nouvelles masses, énergie relative du sous-système répartie (un seul groupe : tout ; plusieurs :
+        // température commune tn, le dernier reçoit le reste exact)
+        for (var k = 0u; k < P.np; k++) { if (reactive_k(k)) { S[O_mass + k * n + c] = chm(k); } }
+        // (sélections, sans « continue » : lavapipe)
+        var last = 9999u;
+        for (var gq = 0u; gq < P.ng; gq++) { last = select(last, gq, reactive_k(gmember(gq, 0u)) && group_mass(gq, c) > 0.0); }
+        var acc = 0.0;
+        for (var gq = 0u; gq < P.ng; gq++) {
+            let r = reactive_k(gmember(gq, 0u));
+            let use_t = r && gq != last && group_mass(gq, c) > 0.0;
+            let eg = select(0.0, group_erel_at(gq, c, tn), use_t);
+            acc += eg;
+            S[O_epsg + gq * n + c] = select(epsg(gq, c), eg, r);
+        }
+        if (last < 9999u) { S[O_epsg + last * n + c] = ceps - acc; }
+        cell_sync(c);
         S[O_heat_rel + c] = q / dt;
         let a2 = P.dx * P.dx;
         S[O_acc_chem + c] += q * a2;

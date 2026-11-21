@@ -16,15 +16,15 @@ fn k_refresh(@builtin(global_invocation_id) g: vec3<u32>) {
         S[O_mu_cell + c] = 0.0;
         return;
     }
-    let t = temp_of(c);
-    S[O_temp + c] = t;
+    // énergies / températures des groupes (traces alignées), ε = Σ ε_g, T de mélange
+    cell_sync(c);
     let pr = S[O_prel + c];
     var vol = 0.0;
     var vk: array<f32, NPMAX>;
     var mt = 0.0;
     for (var k = 0u; k < P.np; k++) {
         let m = mass(k, c);
-        if (m > 0.0) { vk[k] = m / rho_k(k, pr, t); } else { vk[k] = 0.0; }
+        if (m > 0.0) { vk[k] = m / rho_k(k, pr, ptemp(k, c)); } else { vk[k] = 0.0; }
         vol += vk[k];
         mt += m;
     }
@@ -33,7 +33,7 @@ fn k_refresh(@builtin(global_invocation_id) g: vec3<u32>) {
     for (var k = 0u; k < P.np; k++) {
         let a = vk[k] * inv;
         S[O_alpha + k * n + c] = a;
-        if (a > 0.0) { mu += a * mu_k(k, t); kc += a * cond_k(k, t); }
+        if (a > 0.0) { let tk = ptemp(k, c); mu += a * mu_k(k, tk); kc += a * cond_k(k, tk); }
     }
     S[O_rho_mix + c] = mt * inv;
     S[O_mu_cell + c] = mu;
@@ -419,7 +419,7 @@ fn k_sweep_flux(@builtin(global_invocation_id) g: vec3<u32>) {
     if (f >= nfaces_dir(dir)) { return; }
     let np = P.np; let n = ncell(); let ng = P.ng;
     for (var k = 0u; k < np; k++) { S[O_fl_vol + f * np + k] = 0.0; }
-    S[O_fdon + f] = -1.0; S[O_frcv + f] = -1.0; S[O_fghost + f] = 0.0; S[O_ftf + f] = -1.0;
+    S[O_fdon + f] = -1.0; S[O_frcv + f] = -1.0; S[O_fghost + f] = 0.0; S[O_ftf + f] = -1.0; S[O_ftg + f] = -1.0;
     let info = face_info(f, dir);
     if (!info.valid) { return; }
     let xi = min(abs(info.uf) * dtv() / P.dx, 1.0);
@@ -498,8 +498,10 @@ fn k_sweep_flux(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
     if (musc) {
-        let tu = S[O_temp + uc]; let td = S[O_temp + dc]; let tr = S[O_temp + rc];
+        // reconstruction de la température DU groupe présent dans les trois cellules
+        let tu = tgrp(gs, uc); let td = tgrp(gs, dc); let tr = tgrp(gs, rc);
         S[O_ftf + f] = td + 0.5 * (1.0 - xi) * van_leer(td - tu, tr - td);
+        S[O_ftg + f] = f32(gs);
     }
     for (var gi = 0u; gi < ng; gi++) {
         if (fg[gi] <= 0.0) { continue; }
@@ -561,7 +563,9 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
         let d = i32(S[O_fdon + f]); let r = i32(S[O_frcv + f]);
         let ghost = S[O_fghost + f] > 0.5;
         if (d < 0 && !ghost) { continue; }
-        var en = 0.0; var mt = 0.0;
+        var eng: array<f32, NPMAX>;
+        for (var gq = 0u; gq < P.ng; gq++) { eng[gq] = 0.0; }
+        var mt = 0.0;
         for (var k = 0u; k < np; k++) {
             var fk = S[O_fl_vol + f * np + k];
             if (fk == 0.0) { continue; }
@@ -574,8 +578,9 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
             } else {
                 let dc = u32(d);
                 fk = fk * S[O_scale + k * n + dc];
-                let told = S[O_temp + dc];
-                t_d = told; if (S[O_ftf + f] > 0.0) { t_d = S[O_ftf + f]; }
+                // température du groupe de la phase dans la donneuse (reconstruite si la face est celle de ce groupe)
+                let told = ptemp(k, dc);
+                t_d = told; if (S[O_ftf + f] > 0.0 && S[O_ftg + f] == f32(group_k(k))) { t_d = S[O_ftf + f]; }
                 let aw = S[O_aw + k * n + dc];
                 var rho_d = rho_k(k, S[O_prel + dc], told);
                 if (aw > 1e-8) { let qq = mass(k, dc) / aw; if (qq > 0.0 && qq < 1e30) { rho_d = qq; } }
@@ -588,11 +593,15 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
                 S[O_aw + k * n + u32(r)] += fk;
                 S[O_mass + k * n + u32(r)] += mf;
             }
-            en += mf * erel_k(k, t_d);
+            eng[group_k(k)] += mf * erel_k(k, t_d);
             mt += mf;
         }
-        if (d >= 0) { S[O_eps + u32(d)] -= en; }
-        if (r >= 0) { S[O_eps + u32(r)] += en; }
+        for (var gq = 0u; gq < P.ng; gq++) {
+            let en = eng[gq];
+            if (en == 0.0) { continue; }
+            if (d >= 0) { S[O_epsg + gq * n + u32(d)] -= en; S[O_eps + u32(d)] -= en; }
+            if (r >= 0) { S[O_epsg + gq * n + u32(r)] += en; S[O_eps + u32(r)] += en; }
+        }
         if (dir == 0u) { var sg = 1.0; if (S[O_U + f] < 0.0) { sg = -1.0; } S[O_mfx + f] += sg * mt; }
         else { var sg = 1.0; if (S[O_V + f] < 0.0) { sg = -1.0; } S[O_mfy + f] += sg * mt; }
     }
@@ -601,7 +610,23 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
 fn k_temp_update(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
     if (c >= ncell() || is_solid(c)) { return; }
-    S[O_temp + c] = temp_of(c);
+    // plancher d'énergie par groupe (T_g ≥ T_PW_MIN) : cellule presque vide dont le flux d'énergie sortant dépasse le contenu
+    let n = ncell();
+    for (var gq = 0u; gq < P.ng; gq++) {
+        if (group_mass(gq, c) > 0.0) {
+            let emin = group_erel_at(gq, c, T_PW_MIN);
+            if (epsg(gq, c) < emin) { S[O_epsg + gq * n + c] = emin; }
+        }
+    }
+    cell_sync(c);
+}
+// erreur de fermeture héritée Σ m/ρ(p, T) − 1 au début du pas (sous-relaxée dans k_rhs)
+@compute @workgroup_size(64)
+fn k_err0(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell()) { return; }
+    if (is_solid(c) || pinned(c)) { S[O_err0 + c] = 0.0; return; }
+    S[O_err0 + c] = cell_vol_at(c, S[O_prel + c]) - 1.0;
 }
 
 // ---------------------------------------------------------------- quantité de mouvement conservative (Rudman)
@@ -695,29 +720,49 @@ fn k_save_p(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= n) { return; }
     let p0 = S[O_prel + c];
     S[O_p_start + c] = p0;
-    S[O_tst + c] = S[O_temp + c];
+    for (var gq = 0u; gq < P.ng; gq++) { S[O_tst + gq * n + c] = tgrp(gq, c); }
+    S[O_chi + c] = thermal_coupling(c, dtv());
     S[O_clamped + c] = 0.0;
-    // plancher : P_FLOOR ou p_sat d'un liquide présent (cavité discrète)
+    // plancher : P_FLOOR ou p_sat d'un liquide présent (cavité discrète), à la température de ce liquide
     var fl = P_FLOOR;
     if (has(F_PC) && !is_solid(c)) {
         for (var q = 0u; q < P.npc; q++) {
             let liq = u32(T[T_PC + q * PC_STRIDE]);
-            if (alpha(liq, c) > 1e-3) { fl = max(fl, min(psat_q(q, S[O_temp + c]), 0.95 * max(p0 + P.p0, P_FLOOR))); }
+            if (alpha(liq, c) > 1e-3) { fl = max(fl, min(psat_q(q, ptemp(liq, c)), 0.95 * max(p0 + P.p0, P_FLOOR))); }
         }
     }
     S[O_floor + c] = fl - P.p0;
 }
-// V, κ_eff, γ_T à (pression relative pr, T)
-fn closure(c: u32, pr: f32, t: f32) -> vec3<f32> {
-    var v = 0.0; var kap = 0.0; var vb = 0.0; var mcp = 0.0;
-    for (var k = 0u; k < P.np; k++) {
-        let m = mass(k, c);
-        if (m <= 0.0) { continue; }
-        let vk = m / rho_k(k, pr, t);
-        v += vk; kap += vk * kappa_k(k, pr); vb += vk * beta_k(k, t); mcp += m * cp_k(k);
+// Volume V et κ_eff à la pression relative pr, groupe g à la température t[g], couplage χ (miroir de cell_closure_g) ; gam[g] =
+// dT_g/dp, wpw[g] = part du groupe dans le travail de pression
+fn closure_g(c: u32, pr: f32, t: ptr<function, array<f32, NPMAX>>, chi_in: f32, gam: ptr<function, array<f32, NPMAX>>, wpw: ptr<function, array<f32, NPMAX>>) -> vec2<f32> {
+    var v = 0.0; var kt = 0.0; var own = 0.0; var vb_all = 0.0; var mcp_all = 0.0; var mcpt = 0.0;
+    var vbg: array<f32, NPMAX>; var mcpg: array<f32, NPMAX>;
+    for (var g = 0u; g < P.ng; g++) {
+        let tg = (*t)[g];
+        var vb = 0.0; var mcp = 0.0;
+        // borne uniforme (P.np) et appartenance testée, sans « continue » (lavapipe)
+        for (var k = 0u; k < P.np; k++) {
+            let m = mass(k, c);
+            if (group_k(k) == g && m > 0.0) {
+                let vk = m / rho_k(k, pr, tg);
+                v += vk; kt += vk * kappa_k(k, pr); vb += vk * beta_k(k, tg); mcp += m * cp_k(k);
+            }
+        }
+        vbg[g] = vb; mcpg[g] = mcp;
+        if (mcp > 0.0) { own += tg * vb * vb / mcp; }
+        vb_all += vb; mcp_all += mcp; mcpt += mcp * tg;
     }
-    mcp = max(mcp, 1e-30);
-    return vec3<f32>(v, kap - t * vb * vb / mcp, t * vb / mcp);
+    let chi = clamp(chi_in, 0.0, 1.0);
+    var tm = 0.0; var gm = 0.0;
+    if (mcp_all > 0.0) { tm = mcpt / mcp_all; gm = tm * vb_all / mcp_all; }
+    let mix = gm * vb_all;
+    for (var g = 0u; g < P.ng; g++) {
+        var go = 0.0; if (mcpg[g] > 0.0) { go = (*t)[g] * vbg[g] / mcpg[g]; }
+        (*gam)[g] = chi * gm + (1.0 - chi) * go;
+        (*wpw)[g] = max(mcpg[g] * (*gam)[g], 0.0);
+    }
+    return vec2<f32>(v, kt - (chi * mix + (1.0 - chi) * own));
 }
 fn newton_done() -> bool { return D[D_NEWTON_DONE] > 0.5; }
 @compute @workgroup_size(64)
@@ -726,9 +771,17 @@ fn k_closure(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= ncell() || newton_done()) { return; }
     if (is_solid(c)) { S[O_vol + c] = 1.0; S[O_kappa + c] = 1e-30; return; }
     if (pinned(c)) { S[O_vol + c] = 1.0; S[O_kappa + c] = 1.0; return; }
-    let g0 = closure(c, S[O_p_start + c], S[O_tst + c]).z;
-    let tk = S[O_tst + c] + g0 * (S[O_prel + c] - S[O_p_start + c]);
-    let cl = closure(c, S[O_prel + c], tk);
+    let n = ncell();
+    var ts: array<f32, NPMAX>; var gam: array<f32, NPMAX>; var wp: array<f32, NPMAX>;
+    for (var gq = 0u; gq < P.ng; gq++) { ts[gq] = S[O_tst + gq * n + c]; }
+    let chi = S[O_chi + c];
+    _ = closure_g(c, S[O_p_start + c], &ts, chi, &gam, &wp);
+    var tk: array<f32, NPMAX>;
+    for (var gq = 0u; gq < P.ng; gq++) {
+        tk[gq] = ts[gq] + gam[gq] * (S[O_prel + c] - S[O_p_start + c]);
+        S[O_tk + gq * n + c] = tk[gq];
+    }
+    let cl = closure_g(c, S[O_prel + c], &tk, chi, &gam, &wp);
     S[O_vol + c] = cl.x;
     S[O_kappa + c] = max(cl.y, 1e-30);
 }
@@ -789,7 +842,17 @@ fn k_rhs(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = c % P.nx; let j = c / P.nx;
     let dn = (S[O_Fx + uidx(i + 1u, j)] - S[O_Fx + uidx(i, j)] + S[O_Fy + vidx(i, j + 1u)] - S[O_Fy + vidx(i, j)]) / P.dx;
     let d0 = (S[O_Un + uidx(i + 1u, j)] - S[O_Un + uidx(i, j)] + S[O_Vn + vidx(i, j + 1u)] - S[O_Vn + vidx(i, j)]) / P.dx;
-    S[O_rhs + c] = (S[O_vol + c] - 1.0) / dtv() - (dn - d0);
+    // part corrigée de l'erreur héritée (miroir de mp_pressure::closure_correction)
+    var ag = 0.0;
+    for (var k = 0u; k < P.np; k++) { if (is_gas(k)) { ag += alpha(k, c); } }
+    ag = clamp(ag, 0.0, 1.0);
+    let e0 = S[O_err0 + c];
+    let r = clamp(P.closure_relax, 0.0, 1.0);
+    let small = 0.1 * P.closure_small_scale;   // mp_pressure::CLOSURE_SMALL
+    var liq = e0;
+    if (abs(e0) > small) { liq = sign(e0) * max(small, r * abs(e0)); }
+    let corr = ag * e0 + (1.0 - ag) * liq;
+    S[O_rhs + c] = (S[O_vol + c] - 1.0 - (e0 - corr)) / dtv() - (dn - d0);
 }
 // couplage : 0 aucun (solide, face imposée), 1 complet, 2 Dirichlet (voisin épinglé)
 fn link(a: u32, b: u32, fixed: bool) -> u32 {
@@ -825,6 +888,28 @@ fn k_stencil(@builtin(global_invocation_id) g: vec3<u32>) {
     } else if (P.bc_b == 1u) { d += 2.0 * dt / (S[O_rho_mix + c] * dx2); }
     S[O_sd + c] = d;
 }
+// mise à jour de Newton d'une cellule contenant du gaz quand |δp| > 50 % de p : loi polytropique tangente au même κ
+// (miroir de MultiphaseSim::gas_newton_update ; pr = pression relative)
+fn gas_newton_update(c: u32, pr: f32, kap: f32, dp: f32) -> f32 {
+    let pa = pr + P.p0;
+    if (abs(dp) <= 0.5 * max(pa, P_FLOOR)) { return dp; }
+    var vg = 0.0; var kl = 0.0;
+    let n = ncell();
+    for (var k = 0u; k < P.np; k++) {
+        let m = mass(k, c);
+        if (m <= 0.0) { continue; }
+        let vk = m / rho_k(k, pr, S[O_tk + group_k(k) * n + c]);
+        if (is_gas(k)) { vg += vk; } else { kl += vk * kappa_k(k, pr); }
+    }
+    let kg = kap - kl;
+    if (vg <= 1e-9 || kg <= 0.0) { return dp; }
+    let npoly = clamp(vg / (max(pa, 1.0) * kg), 1.0, 2.0);
+    let vgt = max(vg - kg * dp, 0.02 * vg);
+    let d = pa * (pow(vg / vgt, npoly) - 1.0);
+    // au plus 4 fois la tangente à la compression (le reste du système est linéarisé autour de p_k)
+    if (dp > 0.0) { return min(d, 4.0 * dp); }
+    return d;
+}
 // pk += δp, plancher (cavité), |δp| max par groupe
 @compute @workgroup_size(64)
 fn k_p_update(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
@@ -832,15 +917,16 @@ fn k_p_update(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invoca
     var v: array<f32, 8>;
     v[0] = 0.0;
     if (c < ncell() && !newton_done() && !is_solid(c) && !pinned(c)) {
-        let dp = S[O_cx + c];
-        var pk = S[O_prel + c] + dp;
+        let p_old = S[O_prel + c];
+        let dp = gas_newton_update(c, p_old, S[O_kappa + c], S[O_cx + c]);
+        var pk = p_old + dp;
         let fl = S[O_floor + c];
         if (!(pk == pk) || abs(pk) > 1e30) { pk = max(S[O_p_start + c], fl); }
         else if (pk < fl) { pk = fl; S[O_clamped + c] = 1.0; }
         else { S[O_clamped + c] = 0.0; }
         S[O_prel + c] = pk;
         // f32 : |δp| rapporté au bruit d'arrondi (0.1 Pa, 2e-6 p)
-        v[0] = abs(dp) / max(0.1, 2e-6 * max(pk + P.p0, 0.0));
+        v[0] = abs(pk - p_old) / max(0.1, 2e-6 * max(pk + P.p0, 0.0));
     }
     wg_reduce(v, 1u, 1u, l.x, w.x, 0u);
 }
@@ -867,7 +953,51 @@ fn k_pressure_work(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = c % P.nx; let j = c / P.nx;
     let dt = dtv();
     let d = clamp(dt * div_uv(i, j), -0.5, 0.5) / dt;
-    S[O_eps + c] -= dt * max(S[O_prel + c] + P.p0, 0.0) * d;
+    // répartition entre groupes comme dans la fermeture (C_g dT_g/dp, couplage χ) ; par groupe : au plus −50 % / +100 % de T et pas
+    // de refroidissement sous T_PW_MIN (miroir de pressure_work)
+    let n = ncell();
+    var ts: array<f32, NPMAX>; var gam: array<f32, NPMAX>; var wp: array<f32, NPMAX>;
+    for (var gq = 0u; gq < P.ng; gq++) { ts[gq] = tgrp(gq, c); }
+    _ = closure_g(c, S[O_prel + c], &ts, S[O_chi + c], &gam, &wp);
+    var ksum = 0.0; var asum = 0.0;
+    for (var gq = 0u; gq < P.ng; gq++) { ksum += wp[gq]; asum += group_alpha(gq, c); }
+    asum = max(asum, 1e-30);
+    let de_tot = -dt * max(S[O_prel + c] + P.p0, 0.0) * d;
+    for (var gq = 0u; gq < P.ng; gq++) {
+        let w = select(group_alpha(gq, c) / asum, wp[gq] / ksum, ksum > 0.0);
+        let t = max(ts[gq], 1.0);
+        let cap = group_cap_at(gq, c, t);
+        let de_min = min(max(-0.5 * cap * t, cap * (T_PW_MIN - t)), 0.0);
+        S[O_epsg + gq * n + c] += select(0.0, clamp(de_tot * w, de_min, cap * t), group_mass(gq, c) > 0.0);
+    }
+    cell_sync(c);
+}
+// cavités sans liquide volatil : cellule bloquée au plancher dont le contenu n'occupe plus tout le volume → gaz ambiant à cette
+// pression (miroir de MultiphaseSim::fill_cavities)
+@compute @workgroup_size(64)
+fn k_fill_cav(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n || is_solid(c) || pinned(c) || S[O_clamped + c] < 0.5) { return; }
+    if (has(F_PC)) {
+        for (var q = 0u; q < P.npc; q++) {
+            let liq = u32(T[T_PC + q * PC_STRIDE]);
+            if (alpha(liq, c) > 1e-3) { return; }
+        }
+    }
+    let pr = S[O_prel + c];
+    var t = S[O_temp + c];
+    if (t == t && abs(t) < 1e30) { t = clamp(t, 150.0, 5000.0); } else { t = P.t_amb; }
+    let deficit = 1.0 - cell_vol_at(c, pr);
+    if (deficit <= 1e-6) { return; }
+    for (var k = 0u; k < P.np; k++) {
+        let a = amb_alpha(k);
+        if (a > 0.0) {
+            let m = deficit * a * rho_k(k, pr, t);
+            S[O_mass + k * n + c] += m;
+            S[O_epsg + group_k(k) * n + c] += m * erel_k(k, t);
+        }
+    }
+    cell_sync(c);
 }
 
 // ---------------------------------------------------------------- contrôle de fin de pas (miroir de state_is_sane) + extrema
@@ -884,6 +1014,9 @@ fn k_sanity(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
         if (!(t == t) || !(e == e) || !(p == p) || abs(t) > 1e30 || abs(e) > 1e37 || abs(p) > 1e37) { v[0] = 1.0; }
         if (!is_solid(i)) {
             if (t < 50.0 || t > 5000.0 || p < 0.0) { v[0] = 1.0; }
+            for (var gq = 0u; gq < P.ng; gq++) {
+                if (group_mass(gq, i) > 0.0) { let tq = tgrp(gq, i); if (!(tq == tq) || tq < 50.0 || tq > 5000.0) { v[0] = 1.0; } }
+            }
             for (var k = 0u; k < P.np; k++) { let m = mass(k, i); if (!(m == m) || m < -1e-6 || abs(m) > 1e30) { v[0] = 1.0; } }
             v[2] = -p; v[3] = p;
         }
@@ -901,7 +1034,10 @@ fn k_sanity_final(@builtin(local_invocation_id) l: vec3<u32>) {
     let tmin = -final_reduce(4u, nw, 1u, l.x);
     let tmax = final_reduce(5u, nw, 1u, l.x);
     if (l.x == 0u) {
-        D[D_BAD] = bad; D[D_UMAX] = um; D[D_PMIN] = pmin; D[D_PMAX] = pmax; D[D_TMIN] = tmin; D[D_TMAX] = tmax;
+        // vitesses produites par le pas trop grandes pour son dt (choc thermique, effondrement de poche) : pas refait à dt/4
+        var b = bad;
+        if (um * dtv() > P.cfl_reject * P.dx) { b = 1.0; }
+        D[D_BAD] = b; D[D_UMAX] = um; D[D_PMIN] = pmin; D[D_PMAX] = pmax; D[D_TMIN] = tmin; D[D_TMAX] = tmax;
         D[D_DTCHEM] = D[D_DTCHEM_NEW];
         D[D_DTPHASE] = D[D_DTPHASE_NEW];
     }

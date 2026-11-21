@@ -17,14 +17,10 @@ fn fill_mix_tp(c: u32, slot: u32, t: f32) {
     let pr = S[O_prel + c];
     let n = ncell();
     let b = O_tpmix + slot * (P.np + 2u);
-    var eps = 0.0;
     for (var k = 0u; k < P.np; k++) {
-        let m = S[b + 2u + k] * rho_k(k, pr, t);
-        S[O_mass + k * n + c] = m;
-        eps += m * erel_k(k, t);
+        S[O_mass + k * n + c] = S[b + 2u + k] * rho_k(k, pr, t);
     }
-    S[O_eps + c] = eps;
-    S[O_temp + c] = t;
+    set_cell_temp(c, t);
 }
 
 @compute @workgroup_size(64)

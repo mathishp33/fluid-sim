@@ -9,6 +9,7 @@ POUDRES (poudre a canon, carbone)
 
 En scénario combustion confinée hydrogène : 
 lorsque la combustion est fine/presque finie, lorsque je passe en vue PHASE, ça crash.
+
 # TODO — Simulation de fluide en Rust
 
 Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
@@ -23,6 +24,10 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - [P] GPU : contournements de bogues de lavapipe à revérifier sur une vraie carte — dans la chimie, chaque fil fait au moins une itération de boucle (seulement sur adaptateur logiciel) ; partout, une série de pas est soumise en tampons de commandes de ≤ 1200 lancements (lavapipe plantait au-delà de ~2500). Coût attendu nul, à confirmer.
 - [M] GPU f32 : limites de précision connues — la fermeture volumique 1 − Σ m/ρ n'est connue qu'à ~1e-7 près (masses stockées en f32) : dans une cellule presque pleine de liquide, la vapeur produite par pas est bruitée de ~1 % et la pression du liquide de quelques Pa. Piste : stocker les masses des liquides en écart à une référence (m − ρ₀α).
 - [M] Advection PLIC : les flux sont appliqués face par face dans l'ordre des indices (la donneuse est lue après ses flux entrants pour un écoulement vers +x, avant pour −x). La forme « flux pure » (tout évalué sur l'état d'avant le balayage, indépendante de l'ordre) a été essayée : elle diverge sur un jet d'eau entrant dans l'air (écarts de remplissage m/α ≠ ρ transportés sans amortissement). À creuser, puis à reporter sur le GPU (qui reproduit aujourd'hui exactement l'ordre du CPU).
+
+### Robustesse : contacts très chauds ↔ froids
+- **[M] Une température par phase (ou au moins liquide / gaz) dans les cellules mixtes.** Aujourd'hui une cellule n'a qu'UNE température : de l'huile à 2000 °C qui entre dans une cellule d'air ou d'eau la porte aussitôt à ~1900 °C (l'huile a ~1000 fois la capacité calorifique du gaz) — le gaz se dilate de ×7 d'un coup, l'eau devient vapeur supercritique. Le solveur y survit le plus souvent (voir « Fait » ; à 2000 °C dans l'eau chaude, le GPU atteint encore la limite de 1000 m/s), mais la violence est très surestimée (pression de dizaines de bar, vitesses de 100 m/s là où la réalité donne un film de vapeur isolant). Gros chantier (CPU + GPU) : énergie par phase, échange à l'interface (coefficient h × aire d'interface), conduction, changement de phase, chimie, fermeture.
+- [M] Les poches de gaz très détendues (quelques centaines de Pa) refroidissent par détente jusqu'au plancher de 60 K : physique dans le modèle, mais c'est la conduction des voisines qui devrait les réchauffer plus vite.
 
 ### Expériences reproductibles
 - **[M] Sauvegarder tout le contexte**, pas seulement les solides : masses, énergie, pression, vitesses, cellules spéciales, bords, matériaux utilisés. Aujourd'hui une scène `.mps` contient solides + thermique + cellules spéciales.
@@ -104,6 +109,7 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - Évaporation / condensation à la pression partielle (Dalton), diffusion propre à chaque espèce. [M]
 
 ### Performances, robustesse, GPU
+- **Huile chaude au pinceau dans une cuve fermée (eau + vapeur chauffée) : divergences numériques corrigées** (CPU et GPU, mêmes formules). Vérifié sans pause : huile à 2000 K dans l'air, huile à 400–500 K sur l'eau chaude ; huile à 2000 K sur l'eau chaude : le CPU passe, le GPU s'arrête encore après ~4 trames sur la limite de 1000 m/s (explosion de vapeur surestimée par la température unique, voir « Une température par phase »). Faiblesses corrigées : (1) Newton de pression linéarisé qui ne faisait que doubler la pression d'une poche de gaz recomprimée (la cellule devenait un puits qui aspirait ses voisines) et la rendait négative à la détente → mise à jour polytropique quand |δp| > 50 % de p (≤ 4× la tangente) ; (2) vitesses produites par un pas jamais contrôlées → pas refait (dt/4) si Courant > 2 ; (3) cavités vides dans un liquide non volatil (huile) → complétées de gaz ambiant à 10 Pa ; (4) détente et advection qui menaient T sous 0 dans les cellules presque vides → planchers à 60 K ; (5) chaleur latente extrapolée NÉGATIVE au-delà de 1450 K (masse de vapeur < 0) → bornée, et vaporisation bornée par la chaleur disponible ; (6) vaporisation d'un bloc quel que soit dt (vitesse ∝ 1/dt, le filet de sécurité ne pouvait rien) → débit volumique borné (phase_volume_limit / phase_relaxation_time) ; (7) grosse erreur de fermeture (> 0.1) héritée dans un liquide, corrigée en un pas par un schéma neutre-stable → corrigée à 25 % par pas. Message de pause plus utile (cause probable, « Reset flow » pour repartir). Tests CPU et GPU de non-régression. [M]
 - Performances CPU : préconditionneur multigrille du gradient conjugué (≈ 20 itérations au lieu de ≈ 270 avec IC(0)), boucles par cellule parallélisées (rayon), profil de `step()` par partie. [M]
 - Montée en température brutale (2000 °C au pinceau sur un liquide) sans mise en pause : chauffage progressif en temps simulé (puissance plafonnée), ébullition en volume au-delà de 15 K de surchauffe, cavité de vapeur (DVCM) au plancher de pression. [M]
 - Filet de sécurité : un NaN né pendant un pas n'arrête plus le programme (bornes « clamp » tolérantes aux NaN) ; il est détecté en fin de pas et le pas est refait avec dt/4. [M]

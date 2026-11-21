@@ -180,12 +180,14 @@ impl MultiphaseSim {
             if g.iter().all(|&k| !(self.reg.phases[k].diffusivity > 0.0)) {
                 continue;
             }
+            // groupe thermique de ce groupe miscible : la diffusion déplace masse ET énergie à sa température
+            let gt = self.group_of[g[0]];
             // diffusivités locales D_k(T, p) × F_eff (flamme épaissie)
             let dloc: Vec<Vec<f64>> = g
                 .iter()
                 .map(|&k| {
                     (0..n)
-                        .map(|c| if self.is_solid(c) { 0.0 } else { self.reg.phases[k].diffusivity_at(self.temp[c], self.p[c]).max(0.0) * self.flame_factor[c].max(1.0) })
+                        .map(|c| if self.is_solid(c) { 0.0 } else { self.reg.phases[k].diffusivity_at(self.tg[gt][c], self.p[c]).max(0.0) * self.flame_factor[c].max(1.0) })
                         .collect()
                 })
                 .collect();
@@ -235,7 +237,7 @@ impl MultiphaseSim {
                     *ef = 0.0;
                     for (q, &k) in g.iter().enumerate() {
                         out[q] *= scale;
-                        let t_don = if out[q] > 0.0 { this.temp[a] } else { this.temp[b] };
+                        let t_don = if out[q] > 0.0 { this.tg[gt][a] } else { this.tg[gt][b] };
                         *ef += out[q] * this.reg.phases[k].e_int(t_don);
                     }
                     true
@@ -265,7 +267,7 @@ impl MultiphaseSim {
                             for (q, &k) in g.iter().enumerate() {
                                 *nm[q].at(c) = (this.mass[k][c] + dm[q]).max(0.0);
                             }
-                            *ne.at(c) = this.e[c] + de;
+                            *ne.at(c) = this.eg[gt][c] + de;
                         }
                     }
                 };
@@ -278,7 +280,7 @@ impl MultiphaseSim {
                     for (q, &k) in g.iter().enumerate() {
                         new_m[q].copy_from_slice(&self.mass[k]);
                     }
-                    new_e.copy_from_slice(&self.e);
+                    new_e.copy_from_slice(&self.eg[gt]);
                     let mut out = [0.0f64; super::phases::MAX_PHASES];
                     let mut ef = 0.0;
                     for j in 0..ny {
@@ -305,10 +307,10 @@ impl MultiphaseSim {
                 for (q, &k) in g.iter().enumerate() {
                     std::mem::swap(&mut self.mass[k], &mut new_m[q]);
                 }
-                std::mem::swap(&mut self.e, &mut new_e);
+                std::mem::swap(&mut self.eg[gt], &mut new_e);
                 for c in 0..n {
                     if !self.is_solid(c) {
-                        self.temp[c] = self.temp_from_energy(c);
+                        self.cell_sync(c);
                     }
                 }
             }
@@ -339,12 +341,13 @@ impl MultiphaseSim {
                 continue;
             }
             let cc = CellChem { phases, rx, m: (0..np).map(|k| self.mass[k][c]).collect(), e: self.e[c], f_eff: 1.0, scale: vec![1.0; rx.len()] };
-            let t = self.temp[c];
             let mut w = 0.0;
             for &j in &flames {
                 if rx[j].reactants.iter().any(|&(s, _)| self.mass[s][c] <= 1e-12) {
                     continue;
                 }
+                // température du groupe des réactifs
+                let t = self.phase_temp(rx[j].reactants[0].0, c);
                 w += (cc.rate(j, t).max(0.0) * cc.heat(j, t)).abs();
             }
             omega[c] = w;
@@ -402,9 +405,10 @@ impl MultiphaseSim {
         for h in self.heat_release.iter_mut() {
             *h = 0.0;
         }
+        let reactive = self.reactive_groups();
         // intégration indépendante cellule par cellule : en parallèle, puis application séquentielle des résultats
         let this = &*self;
-        let cell = |c: usize| this.integrate_cell(c, dt, target, &phases, &rx, &scale);
+        let cell = |c: usize| this.integrate_cell(c, dt, target, &phases, &rx, &scale, &reactive);
         let out: Vec<ChemOut> = if n >= super::mp_mg::PAR_MIN_CELLS / 4 {
             use rayon::prelude::*;
             (0..n).into_par_iter().filter_map(cell).collect()
@@ -414,10 +418,30 @@ impl MultiphaseSim {
         let mut dt_next = f64::INFINITY;
         for o in out {
             let c = o.c;
+            // seuls les groupes réactifs ont participé : leurs masses, et une température commune (énergie absolue conservée)
             for k in 0..np {
-                self.mass[k][c] = o.m[k];
+                if reactive[self.group_of[k]] {
+                    self.mass[k][c] = o.m[k];
+                }
             }
-            self.temp[c] = o.temp;
+            // énergie absolue des groupes réactifs inchangée (la chimie la conserve) : exacte au bit près pour un seul groupe ;
+            // plusieurs groupes réactifs dans la cellule prennent la température commune, le dernier reçoit le reste exact
+            let rg: Vec<usize> = (0..self.groups.len()).filter(|&g| reactive[g] && self.group_mass(g, c) > 0.0).collect();
+            let e_r: f64 = (0..self.groups.len()).filter(|&g| reactive[g]).map(|g| self.eg[g][c]).sum();
+            for g in 0..self.groups.len() {
+                if reactive[g] {
+                    self.eg[g][c] = 0.0;
+                }
+            }
+            if let Some((&last, rest)) = rg.split_last() {
+                let mut acc = 0.0;
+                for &g in rest {
+                    self.eg[g][c] = self.group_energy_at(g, c, o.temp);
+                    acc += self.eg[g][c];
+                }
+                self.eg[last][c] = e_r - acc;
+            }
+            self.cell_sync(c);
             self.heat_release[c] = o.q / dt;
             self.chem_heat += o.q * a2;
             for j in 0..nre {
@@ -429,7 +453,20 @@ impl MultiphaseSim {
     }
 
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir.
-    fn integrate_cell(&self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64]) -> Option<ChemOut> {
+    /// groupes contenant au moins une phase qui intervient dans une réaction (réactif, produit, modulateur)
+    pub(crate) fn reactive_groups(&self) -> Vec<bool> {
+        let mut r = vec![false; self.groups.len()];
+        for k in 0..self.reg.phases.len() {
+            if self.reg.is_reactive(k) {
+                r[self.group_of[k]] = true;
+            }
+        }
+        r
+    }
+
+    /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir. Seuls les groupes
+    /// réactifs participent (masses et énergie) : de l'eau liquide voisine ne sert pas de puits de chaleur instantané à une flamme.
+    fn integrate_cell(&self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64], reactive: &[bool]) -> Option<ChemOut> {
         let np = phases.len();
         let nre = rx.len();
         {
@@ -444,7 +481,9 @@ impl MultiphaseSim {
             if !possible {
                 return None;
             }
-            let mut cc = CellChem { phases, rx, m: (0..np).map(|k| self.mass[k][c]).collect(), e: self.e[c], f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec() };
+            let m_r: Vec<f64> = (0..np).map(|k| if reactive[self.group_of[k]] { self.mass[k][c] } else { 0.0 }).collect();
+            let e_r: f64 = (0..self.groups.len()).filter(|&g| reactive[g]).map(|g| self.eg[g][c]).sum();
+            let mut cc = CellChem { phases, rx, m: m_r, e: e_r, f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec() };
             let t0 = cc.temp();
             // cellule « gelée » ou déjà à l'équilibre ? (aucune réaction n'avancerait de 1e-7 de sa masse disponible pendant dt)
             let active = (0..nre).any(|j| {
@@ -588,31 +627,41 @@ impl MultiphaseSim {
         }
         let ta = self.t_ambient;
         let a2 = self.dx * self.dx;
+        // chaque groupe gazeux contenant un émetteur rayonne à SA température (fraction molaire des émetteurs dans ce groupe)
+        let rad_groups: Vec<usize> = (0..self.groups.len()).filter(|&g| rads.iter().any(|&k| self.group_of[k] == g)).collect();
         for c in 0..self.nx * self.ny {
             if self.is_solid(c) || self.pinned(c) {
                 continue;
             }
-            let t = self.temp[c];
-            if (t - ta).abs() < 50.0 {
-                continue;
+            let mut touched = false;
+            for &g in &rad_groups {
+                let t = self.tg[g][c];
+                if (t - ta).abs() < 50.0 || self.group_mass(g, c) <= 0.0 {
+                    continue;
+                }
+                let members = &self.groups[g];
+                let ngas: f64 = members.iter().filter(|&&k| self.reg.phases[k].is_gas()).map(|&k| self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass).sum();
+                if ngas <= 0.0 {
+                    continue;
+                }
+                let a_gas: f64 = members.iter().filter(|&&k| self.reg.phases[k].is_gas()).map(|&k| self.alpha[k][c]).sum();
+                let p_atm = self.p[c] / 101325.0;
+                let kappa: f64 = rads
+                    .iter()
+                    .filter(|&&k| self.group_of[k] == g)
+                    .map(|&k| (self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass / ngas) * p_atm * self.reg.phases[k].radiator.planck_mean(t))
+                    .sum();
+                let q = 4.0 * SIGMA_SB * kappa * (t.powi(4) - ta.powi(4)) * a_gas;
+                // jamais plus de la moitié de l'écart à l'ambiante en un pas (stabilité)
+                let lim = 0.5 * self.group_cap_at(g, c, t) * (t - ta).abs();
+                let de = clampf(q * dt, -lim, lim);
+                self.eg[g][c] -= de;
+                self.radiated += de * a2;
+                touched = true;
             }
-            let ngas: f64 = (0..np).filter(|&k| self.reg.phases[k].is_gas()).map(|k| self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass).sum();
-            if ngas <= 0.0 {
-                continue;
+            if touched {
+                self.cell_sync(c);
             }
-            let a_gas: f64 = (0..np).filter(|&k| self.reg.phases[k].is_gas()).map(|k| self.alpha[k][c]).sum();
-            let p_atm = self.p[c] / 101325.0;
-            let kappa: f64 = rads
-                .iter()
-                .map(|&k| (self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass / ngas) * p_atm * self.reg.phases[k].radiator.planck_mean(t))
-                .sum();
-            let q = 4.0 * SIGMA_SB * kappa * (t.powi(4) - ta.powi(4)) * a_gas;
-            // jamais plus de la moitié de l'écart à l'ambiante en un pas (stabilité)
-            let lim = 0.5 * self.heat_capacity(c) * (t - ta).abs();
-            let de = clampf(q * dt, -lim, lim);
-            self.e[c] -= de;
-            self.radiated += de * a2;
-            self.temp[c] = self.temp_from_energy(c);
         }
     }
 }

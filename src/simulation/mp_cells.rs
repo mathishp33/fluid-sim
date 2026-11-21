@@ -128,14 +128,10 @@ impl MultiphaseSim {
     /// Remplit la cellule d'une phase pure à (p courant, T) ; les faces ne sont pas modifiées.
     pub fn fill_pure(&mut self, c: usize, k: usize, t: f64) {
         let p = self.p[c];
-        let mut e = 0.0;
         for j in 0..self.reg.phases.len() {
-            let m = if j == k { self.reg.phases[j].rho(p, t) } else { 0.0 };
-            self.mass[j][c] = m;
-            e += m * self.reg.phases[j].e_int(t);
+            self.mass[j][c] = if j == k { self.reg.phases[j].rho(p, t) } else { 0.0 };
         }
-        self.e[c] = e;
-        self.temp[c] = t;
+        self.set_cell_temperature(c, t);
     }
 
     /// Remplit la cellule du fluide ambiant (pur ou mélange, ex. air O2/N2) à (p courant, T).
@@ -147,14 +143,10 @@ impl MultiphaseSim {
     /// Remplit la cellule d'un mélange (fractions volumiques `alpha`, somme 1) à (p courant, T).
     pub fn fill_mixture(&mut self, c: usize, alpha: &[f64], t: f64) {
         let p = self.p[c];
-        let mut e = 0.0;
         for j in 0..self.reg.phases.len() {
-            let m = alpha[j] * self.reg.phases[j].rho(p, t);
-            self.mass[j][c] = m;
-            e += m * self.reg.phases[j].e_int(t);
+            self.mass[j][c] = alpha[j] * self.reg.phases[j].rho(p, t);
         }
-        self.e[c] = e;
-        self.temp[c] = t;
+        self.set_cell_temperature(c, t);
     }
 
     /// Un des extras (effet spécial, solide thermique, entrée) est-il actif ? (le GPU ne les gère pas)

@@ -32,6 +32,16 @@ pub struct MultiphaseSim {
     pub alpha: Vec<Vec<f64>>, // [phase][cell] (dérivé)
     pub e: Vec<f64>,          // énergie interne J/m³ (solide : ρ_s c_s T)
     pub temp: Vec<f64>,
+    /// groupes thermiques (= groupes miscibles du registre) et groupe de chaque phase (voir mp_groups.rs)
+    pub(crate) groups: Vec<Vec<usize>>,
+    pub(crate) group_of: Vec<usize>,
+    /// énergie interne absolue de chaque groupe par cellule (J/m³ de cellule) ; e = Σ_g eg (cellules fluides)
+    pub eg: Vec<Vec<f64>>,
+    /// température de chaque groupe par cellule (K) ; groupe absent : température de la cellule
+    pub tg: Vec<Vec<f64>>,
+    /// facteur λ de l'échange de chaleur entre groupes d'une cellule mixte (1 = conduction à travers la demi-épaisseur de chaque
+    /// phase ; ∞ = une seule température par cellule, modèle historique ; 0 = aucun échange)
+    pub phase_heat_exchange: f64,
     pub p: Vec<f64>,
     pub u: Vec<f64>,
     pub v: Vec<f64>,
@@ -81,6 +91,18 @@ pub struct MultiphaseSim {
     pub conservative_momentum: bool,
     /// vitesse au-delà de laquelle un pas est jugé aberrant (m/s) — déclenche le retour arrière avec sous-pas
     pub speed_limit: f64,
+    /// Fraction r d'une GROSSE erreur de fermeture volumique héritée du pas précédent (Σ m/ρ − 1 au début du pas, > 0.1) que ce
+    /// pas corrige dans la partie liquide d'une cellule (voir `mp_pressure::closure_correction` ; le gaz et les petites erreurs sont
+    /// corrigés entièrement). 1 = correction complète en un pas (schéma historique : neutre-stable, oscille et peut s'emballer quand
+    /// un liquide très chaud rencontre de l'eau ou un gaz froid) ; 0.25 = amortissement le plus rapide (facteur 0.5 par pas). Réduite
+    /// d'un facteur 4 à chaque retour arrière (la vitesse de correction reste celle du pas nominal au lieu d'être multipliée par 4).
+    pub closure_relax: f64,
+    pub(crate) closure_relax_scale: f64,
+    /// Un pas est refait (dt/4) si les vitesses QU'IL PRODUIT dépassent ce nombre de Courant (u·dt/dx). Le pas de temps est choisi
+    /// avec les vitesses du début du pas (CFL `cfl` = 0.4) ; un choc thermique (liquide très chaud au contact d'un gaz froid) ou un
+    /// effondrement de poche de gaz les multiplie parfois par 50 en un pas : sans ce contrôle, l'advection suivante déborde. 2 laisse
+    /// passer les accélérations ordinaires (démarrage d'un jet d'entrée : ×3).
+    pub cfl_reject: f64,
     /// nombre de pas annulés puis refaits avec un dt plus petit (état invalide : NaN, T hors plage, masse négative, vitesse aberrante)
     pub rollbacks: usize,
     /// true si même le plus petit sous-pas reste invalide : l'état n'avance plus (la fenêtre se met en pause au lieu de passer en NaN)
@@ -171,6 +193,11 @@ pub fn temp_from_masses(phases: &[super::phases::Phase], m: impl Iterator<Item =
         slope += mk * p.cp_slope;
         off += mk * p.e0;
     }
+    temp_from_parts(cap, slope, off, e)
+}
+
+/// Même inversion à partir de C = Σ m c_e, S = Σ m s, E0 = Σ m e0 (sous-ensemble de phases : un groupe).
+pub fn temp_from_parts(cap: f64, slope: f64, off: f64, e: f64) -> f64 {
     let t0 = super::phases::T_STD;
     let rhs = e - off - cap * t0; // = C τ + ½ S τ²
     if slope.abs() <= 1e-12 * cap.abs().max(1e-300) {
@@ -189,10 +216,23 @@ impl MultiphaseSim {
         let np = reg.phases.len();
         let nch = reg.changes.len();
         let nre = reg.reactions.len();
+        let groups = reg.miscible_groups();
+        let mut group_of = vec![0; np];
+        for (g, members) in groups.iter().enumerate() {
+            for &k in members {
+                group_of[k] = g;
+            }
+        }
+        let ng = groups.len().max(1);
         MultiphaseSim {
             nx,
             ny,
             dx,
+            groups,
+            group_of,
+            eg: vec![vec![0.0; n]; ng],
+            tg: vec![vec![293.15; n]; ng],
+            phase_heat_exchange: 1.0,
             reg,
             gravity: [0.0, -9.81],
             bc: [Bc::Wall; 4],
@@ -237,6 +277,9 @@ impl MultiphaseSim {
             m_tot_old: vec![0.0; n],
             conservative_momentum: true,
             speed_limit: 1000.0,
+            closure_relax: 0.25,
+            closure_relax_scale: 1.0,
+            cfl_reject: 2.0,
             rollbacks: 0,
             diverged: false,
             special: vec![None; n],
@@ -428,13 +471,10 @@ impl MultiphaseSim {
                 continue;
             }
             let (p, t) = (self.p[c], self.temp[c]);
-            let mut e = 0.0;
             for k in 0..self.reg.phases.len() {
-                let m = self.alpha[k][c] * self.reg.phases[k].rho(p, t);
-                self.mass[k][c] = m;
-                e += m * self.reg.phases[k].e_int(t);
+                self.mass[k][c] = self.alpha[k][c] * self.reg.phases[k].rho(p, t);
             }
-            self.e[c] = e;
+            self.set_cell_temperature(c, t);
         }
         self.refresh();
     }
@@ -462,7 +502,11 @@ impl MultiphaseSim {
         let np = self.reg.phases.len();
         let (nx, ny) = (self.nx, self.ny);
         let n = nx * ny;
+        let ng = self.groups.len();
         let temp = SyncPtr(self.temp.as_mut_ptr());
+        let etot = SyncPtr(self.e.as_mut_ptr());
+        let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect();
+        let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect();
         let rho_mix = SyncPtr(self.rho_mix.as_mut_ptr());
         let mu_cell = SyncPtr(self.mu_cell.as_mut_ptr());
         let k_cell = SyncPtr(self.k_cell.as_mut_ptr());
@@ -470,6 +514,8 @@ impl MultiphaseSim {
         let this = &*self;
         let row = |j: usize| {
             let mut vk = [0.0f64; super::phases::MAX_PHASES];
+            let mut egn = [0.0f64; super::phases::MAX_PHASES];
+            let mut tgn = [0.0f64; super::phases::MAX_PHASES];
             for i in 0..nx {
                 let c = j * nx + i;
                 // SAFETY : chaque cellule c n'est écrite que par la ligne j qui la contient (lignes réparties entre les fils)
@@ -482,13 +528,19 @@ impl MultiphaseSim {
                         *mu_cell.at(c) = 0.0;
                         continue;
                     }
-                    let t = temp_from_masses(&this.reg.phases, (0..np).map(|k| this.mass[k][c]), this.e[c]);
-                    *temp.at(c) = t;
+                    // énergies et températures des groupes (traces alignées), e = Σ eg, température « de mélange »
+                    let (e, tc) = this.sync_calc(c, &mut egn, &mut tgn, true);
+                    *temp.at(c) = tc;
+                    *etot.at(c) = e;
+                    for g in 0..ng {
+                        *egp[g].at(c) = egn[g];
+                        *tgp[g].at(c) = tgn[g];
+                    }
                     let p = this.p[c];
                     let mut vol = 0.0;
                     for k in 0..np {
                         let m = this.mass[k][c];
-                        vk[k] = if m > 0.0 { m / this.reg.phases[k].rho(p, t) } else { 0.0 };
+                        vk[k] = if m > 0.0 { m / this.reg.phases[k].rho(p, tgn[this.group_of[k]]) } else { 0.0 };
                         vol += vk[k];
                     }
                     let (mut rho, mut mu, mut kc) = (0.0, 0.0, 0.0);
@@ -498,8 +550,9 @@ impl MultiphaseSim {
                         *alpha[k].at(c) = a;
                         rho += this.mass[k][c];
                         if a > 0.0 {
-                            mu += a * this.reg.phases[k].mu(t);
-                            kc += a * this.reg.phases[k].k(t);
+                            let tk = tgn[this.group_of[k]];
+                            mu += a * this.reg.phases[k].mu(tk);
+                            kc += a * this.reg.phases[k].k(tk);
                         }
                     }
                     *rho_mix.at(c) = rho * inv;
@@ -600,10 +653,25 @@ impl MultiphaseSim {
                 continue;
             }
             let lim = self.heat_power_max * dt;
-            let de = clampf(self.heat_capacity(c) * (tt - self.temp[c]) * f, -lim, lim);
-            self.e[c] += de;
-            self.energy_input += de * a2;
-            self.temp[c] = self.temp_from_energy(c);
+            // chaque groupe tend vers la cible ; puissance totale bornée
+            let ng = self.groups.len();
+            let mut de = [0.0f64; super::phases::MAX_PHASES];
+            let mut sum_abs = 0.0;
+            for g in 0..ng {
+                if self.group_mass(g, c) > 0.0 {
+                    de[g] = self.group_cap_at(g, c, self.tg[g][c]) * (tt - self.tg[g][c]) * f;
+                    sum_abs += de[g].abs();
+                }
+            }
+            let scale = if sum_abs > lim { lim / sum_abs } else { 1.0 };
+            for g in 0..ng {
+                let d = de[g] * scale;
+                if d.is_finite() {
+                    self.eg[g][c] += d;
+                    self.energy_input += d * a2;
+                }
+            }
+            self.cell_sync(c);
         }
     }
     /// plus grand écart |T_cible − T| des cellules chauffées (0 sans chauffage)

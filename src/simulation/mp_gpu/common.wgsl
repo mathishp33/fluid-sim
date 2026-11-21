@@ -20,6 +20,7 @@ struct Params {
     ngas: u32, has_mix: u32, rad_on: u32, mg_tail: u32,
     fmax: f32, dil_r: u32, chem_max_sub: u32, rd_mode: u32,
     rd_flags: u32, rd_tscale: f32, rd_pscale: f32, lvp_safe: u32,   // lvp_safe : contournements pour lavapipe (pilote logiciel)
+    closure_relax: f32, cfl_reject: f32, closure_small_scale: f32, phase_exch: f32,   // fermeture héritée (r, échelle) ; Courant de refus ; λ (≥ 1e37 : ∞)
 };
 // drapeaux (Params.flags)
 const F_ST: u32 = 1u;        // tension de surface
@@ -48,6 +49,8 @@ const PI: f32 = 3.14159265;
 const R_GAS: f32 = 8.314462618;
 const P_STD: f32 = 1.0e5;
 const P_FLOOR: f32 = 10.0;
+const T_PW_MIN: f32 = 60.0;
+const TRACE_CAP: f32 = 1e-9;      // mp_groups::TRACE_CAP    // la détente / l'advection ne refroidissent pas une cellule sous cette température (mp_thermo.rs)
 
 fn ncell() -> u32 { return P.nx * P.ny; }
 fn nfu() -> u32 { return (P.nx + 1u) * P.ny; }
@@ -190,33 +193,117 @@ fn div_uv(i: u32, j: u32) -> f32 {
     return (S[O_U + uidx(i + 1u, j)] - S[O_U + uidx(i, j)] + S[O_V + vidx(i, j + 1u)] - S[O_V + vidx(i, j)]) / P.dx;
 }
 
+// ----- température PAR GROUPE (miroir de mp_groups.rs) : ε_g = Σ_k∈g m_k (e_k(T_g) − e_k(T0)), T_g ; ε = Σ_g ε_g -----
+fn epsg(g: u32, c: u32) -> f32 { return S[O_epsg + g * ncell() + c]; }
+fn tgrp(g: u32, c: u32) -> f32 { return S[O_tg + g * ncell() + c]; }
+fn ptemp(k: u32, c: u32) -> f32 { return tgrp(group_k(k), c); }
+// boucles sur TOUTES les phases (borne uniforme P.np) avec appartenance par sélection, plutôt que sur les membres du groupe (borne
+// lue dans la table) : lavapipe plante, selon les données, sur des boucles imbriquées à borne chargée en mémoire
+fn group_mass(g: u32, c: u32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(0.0, max(mass(k, c), 0.0), group_k(k) == g); }
+    return s;
+}
+fn group_cap_at(g: u32, c: u32, t: f32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(0.0, max(mass(k, c), 0.0) * cet_k(k, t), group_k(k) == g); }
+    return s;
+}
+fn group_erel_at(g: u32, c: u32, t: f32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(0.0, max(mass(k, c), 0.0) * erel_k(k, t), group_k(k) == g); }
+    return s;
+}
+fn group_temp_from(g: u32, c: u32, e: f32) -> f32 {
+    var cap = 0.0; var sl = 0.0;
+    for (var k = 0u; k < P.np; k++) {
+        let m = select(0.0, max(mass(k, c), 0.0), group_k(k) == g);
+        cap += m * ce_k(k); sl += m * slope_k(k);
+    }
+    return P.t0 + tau_from(cap, sl, e);
+}
+fn group_alpha(g: u32, c: u32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(0.0, alpha(k, c), group_k(k) == g); }
+    return min(s, 1.0);
+}
+fn group_kcond(g: u32, c: u32) -> f32 {
+    var a = 0.0; var kk = 0.0;
+    let t = tgrp(g, c);
+    for (var k = 0u; k < P.np; k++) {
+        let al = select(0.0, max(alpha(k, c), 0.0), group_k(k) == g);
+        a += al; kk += al * cond_k(k, t);
+    }
+    if (a > 0.0) { return kk / a; }
+    return 0.0;
+}
+// tous les groupes de la cellule fluide c à t ; ε, T, T_g cohérents
+fn set_cell_temp(c: u32, t: f32) {
+    let n = ncell();
+    var e = 0.0;
+    for (var g = 0u; g < P.ng; g++) { let eg = group_erel_at(g, c, t); S[O_epsg + g * n + c] = eg; S[O_tg + g * n + c] = t; e += eg; }
+    S[O_eps + c] = e;
+    S[O_temp + c] = t;
+}
+// ε = Σ ε_g, T (mélange), traces alignées sur T (écart d'énergie au groupe principal), groupes vides → énergie au principal, T_g
+fn cell_sync(c: u32) {
+    if (is_solid(c)) { return; }
+    let n = ncell();
+    var e = 0.0;
+    for (var g = 0u; g < P.ng; g++) { e += epsg(g, c); }
+    S[O_eps + c] = e;
+    let tc = temp_of(c);
+    S[O_temp + c] = tc;
+    if (P.ng == 1u) { S[O_tg + c] = tc; return; }
+    // sans « continue » ni branche divergente dans les boucles (lavapipe plante sur ces motifs, selon les données) : sélections
+    // et écart du groupe principal cumulé dans un scalaire
+    var main = 0u; var cmax = -1.0; var ctot = 0.0;
+    for (var g = 0u; g < P.ng; g++) {
+        let cg = group_cap_at(g, c, tc);
+        ctot += cg;
+        let better = cg > cmax;
+        main = select(main, g, better);
+        cmax = select(cmax, cg, better);
+    }
+    var dmain = 0.0;
+    for (var g = 0u; g < P.ng; g++) {
+        let eg0 = epsg(g, c);
+        let empty = group_mass(g, c) <= 0.0;
+        let trace = !empty && group_cap_at(g, c, tc) < TRACE_CAP * ctot;
+        let tgt_e = select(eg0, group_erel_at(g, c, tc), trace);
+        let eg1 = select(select(eg0, tgt_e, trace), 0.0, empty);
+        let moved = select(eg0 - eg1, 0.0, g == main);
+        dmain += moved;
+        S[O_epsg + g * n + c] = eg0 - moved;
+    }
+    S[O_epsg + main * n + c] += dmain;
+    for (var g = 0u; g < P.ng; g++) {
+        let m = group_mass(g, c);
+        let tf = group_temp_from(g, c, epsg(g, c));
+        S[O_tg + g * n + c] = select(tc, tf, m > 0.0);
+    }
+}
+
 // ----- remplissages (équilibre p, T) -----
 fn fill_alpha(c: u32, kk: u32, t: f32) {
     // phase pure kk
     let pr = S[O_prel + c];
     let n = ncell();
-    var eps = 0.0;
     for (var k = 0u; k < P.np; k++) {
         var m = 0.0;
         if (k == kk) { m = rho_k(k, pr, t); }
         S[O_mass + k * n + c] = m;
-        eps += m * erel_k(k, t);
     }
-    S[O_eps + c] = eps;
-    S[O_temp + c] = t;
+    set_cell_temp(c, t);
 }
 fn amb_alpha(k: u32) -> f32 { return T[T_AMB + k]; }
 fn fill_ambient(c: u32, t: f32) {
     let pr = S[O_prel + c];
     let n = ncell();
-    var eps = 0.0;
     for (var k = 0u; k < P.np; k++) {
-        let m = amb_alpha(k) * rho_k(k, pr, t);
-        S[O_mass + k * n + c] = m;
-        eps += m * erel_k(k, t);
+        S[O_mass + k * n + c] = amb_alpha(k) * rho_k(k, pr, t);
     }
-    S[O_eps + c] = eps;
-    S[O_temp + c] = t;
+    set_cell_temp(c, t);
 }
 
 // ----- réductions : sommes partielles par groupe de travail (64), 8 quantités par passe -----

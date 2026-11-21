@@ -633,3 +633,160 @@ fn extras_survive_a_dam_break_without_nan() {
     }
     assert!(!s.diverged && s.state_is_sane());
 }
+
+/// Cuve FERMÉE (haut en paroi) d'un scénario prédéfini.
+pub(crate) fn closed_scenario(sc: super::mp_view::MpScenario, nx: usize, ny: usize, dx: f64) -> MultiphaseSim {
+    let mut s = super::mp_view::build_scenario(sc, nx, ny, dx, 9.81);
+    s.bc[3] = Bc::Wall;
+    s
+}
+
+/// Trame `f` d'un trait de pinceau d'huile à `t_oil` : part du haut de la cuve, descend vers l'eau puis balaie vers la droite.
+pub(crate) fn hot_oil_stroke(s: &mut MultiphaseSim, f: usize, frames: usize, t_oil: f64) {
+    use super::mp_view::{apply_tool_with, brush_cells, MpTool, ToolOpts};
+    let (nx, ny) = (s.nx, s.ny);
+    let oil = s.reg.phases.iter().position(|p| p.name == "huile").expect("huile");
+    let ci = (nx / 4 + (f * nx / 2) / frames.max(1)).min(nx - 1);
+    let cj = ny * 3 / 4 - (f.min(20) * ny / 3) / 20;
+    let cells = brush_cells(nx, ny, ci, cj, 3, true);
+    apply_tool_with(s, MpTool::Phase(oil), &cells, &ToolOpts { temp: t_oil, cursor: (0.0, 0.0), dt: 1.0 / 60.0, thermal: MpThermal::Passive });
+}
+
+#[test]
+fn very_hot_oil_brushed_into_a_closed_tank_does_not_diverge() {
+    // cas signalé : huile très chaude peinte dans une cuve fermée (vide, ou eau chauffée + air) → « divergence numérique » en quelques
+    // trames. Causes corrigées : Newton de pression linéaire sur des poches de gaz basse pression (puits), erreur de fermeture corrigée
+    // en un pas (oscillation neutre-stable), vitesses produites non contrôlées, cavités vides dans l'huile, chaleur latente négative
+    // extrapolée au-delà de 1450 K, débit de vaporisation indépendant de dt.
+    use super::mp_view::MpScenario;
+    for (sc, t_oil) in [(MpScenario::Empty, 2000.0), (MpScenario::Boiling, 400.0)] {
+        let mut s = closed_scenario(sc, 40, 30, 0.02);
+        let frames = 40;
+        for f in 0..frames {
+            if f < 26 {
+                hot_oil_stroke(&mut s, f, frames, t_oil);
+            }
+            let t1 = s.time + 1.0 / 60.0;
+            while s.time < t1 && !s.diverged {
+                s.step();
+            }
+            assert!(!s.diverged, "{} / huile à {t_oil} K : divergence à la trame {f}", sc.name());
+        }
+        assert!(s.state_is_sane(), "{}", sc.name());
+    }
+}
+
+// ------------------------------------------------------------------ température par groupe (non-équilibre thermique)
+
+/// boîte fermée sans gravité, chaque cellule moitié air / moitié huile, air à `t_air`, huile à `t_oil`
+fn mixed_air_oil_box(t_air: f64, t_oil: f64) -> (MultiphaseSim, usize, usize) {
+    let mut r = Registry::new();
+    let air = r.add_phase(Phase::air());
+    let huile = r.add_phase(Phase::oil());
+    let mut s = MultiphaseSim::new(6, 6, 0.01, r, air);
+    s.gravity = [0.0, 0.0];
+    s.surface_tension = false;
+    for c in 0..36 {
+        s.alpha[air][c] = 0.5;
+        s.alpha[huile][c] = 0.5;
+    }
+    s.finalize_init(|_, _| t_air);
+    let go = s.group_of[huile];
+    for c in 0..36 {
+        s.set_group_temperature(c, go, t_oil);
+    }
+    s.refresh();
+    (s, air, huile)
+}
+
+#[test]
+fn groups_of_a_mixed_cell_relax_to_a_common_temperature_and_conserve_energy() {
+    // air froid et huile chaude dans les mêmes cellules : chacun garde sa température, l'échange par conduction à travers la demi-
+    // épaisseur de chaque phase les rapproche (constante de temps de l'air ≈ α²dx²ρc/(2k) ≈ 0.6 s), énergie totale conservée
+    let (mut s, air, huile) = mixed_air_oil_box(300.0, 600.0);
+    let (ga, go) = (s.group_of[air], s.group_of[huile]);
+    let u0 = s.total_internal_energy();
+    let c = s.idx(3, 3);
+    assert!((s.tg[ga][c] - 300.0).abs() < 1e-9 && (s.tg[go][c] - 600.0).abs() < 1e-9);
+    while s.time < 0.05 {
+        s.step();
+    }
+    let (ta, to) = (s.tg[ga][c], s.tg[go][c]);
+    eprintln!("après 0.05 s : air {ta:.1} K, huile {to:.1} K");
+    assert!(ta > 302.0 && ta < 400.0, "l'air ne doit se réchauffer que progressivement : {ta}");
+    assert!(to > 590.0, "huile {to}");
+    while s.time < 4.0 {
+        s.step();
+    }
+    let (ta, to) = (s.tg[ga][c], s.tg[go][c]);
+    eprintln!("après 4 s : air {ta:.1} K, huile {to:.1} K");
+    assert!((ta - to).abs() < 3.0, "températures non égalisées : {ta} / {to}");
+    let u1 = s.total_internal_energy() + s.kinetic_energy();
+    assert!((u1 - u0).abs() < 1e-6 * u0.abs(), "énergie {u0} → {u1}");
+    assert!(!s.diverged && s.max_speed() < 1e-3);
+    // λ = ∞ : modèle à une température, égalisation au premier pas
+    let (mut s, _, _) = mixed_air_oil_box(300.0, 600.0);
+    s.phase_heat_exchange = f64::INFINITY;
+    s.step();
+    assert!((s.tg[ga][c] - s.tg[go][c]).abs() < 1e-6, "λ = ∞ : {} / {}", s.tg[ga][c], s.tg[go][c]);
+}
+
+#[test]
+fn very_hot_oil_entering_cold_air_does_not_heat_it_instantly() {
+    // cas signalé : huile à 2000 K peinte dans l'air d'une cuve fermée. Avec une seule température par cellule, l'air des cellules
+    // mixtes prenait d'un coup ~1900 K (l'huile y stocke ~1000 fois plus de chaleur) et se dilatait de ×7.
+    use super::mp_view::MpScenario;
+    let mut s = closed_scenario(MpScenario::Empty, 40, 30, 0.02);
+    hot_oil_stroke(&mut s, 0, 40, 2000.0);
+    let t1 = s.time + 1.0 / 60.0;
+    while s.time < t1 {
+        s.step();
+    }
+    assert!(!s.diverged);
+    let (ga, go) = (s.group_of[s.ambient_phase], s.group_of[s.reg.phases.iter().position(|p| p.name == "huile").unwrap()]);
+    let (mut n_mixed, mut t_air_max) = (0, 0.0f64);
+    for c in 0..s.nx * s.ny {
+        let ao = s.group_alpha(go, c);
+        if ao > 0.05 && ao < 0.95 {
+            n_mixed += 1;
+            t_air_max = t_air_max.max(s.tg[ga][c]);
+            assert!(s.tg[go][c] > 1500.0, "huile refroidie trop vite : {}", s.tg[go][c]);
+        }
+    }
+    eprintln!("cellules mixtes {n_mixed}, air le plus chaud {t_air_max:.0} K");
+    assert!(n_mixed > 0, "pas de cellule mixte (test à revoir)");
+    assert!(t_air_max < 900.0, "air des cellules mixtes à {t_air_max} K");
+}
+
+#[test]
+fn hot_oil_poured_onto_water_does_not_flash_boil_it() {
+    // huile à 600 K versée sur de l'eau à 293 K : l'eau des cellules mixtes ne doit pas être portée d'un coup au-delà de 100 °C
+    // (vaporisation éclair du modèle à une température) ; comparaison avec λ = ∞
+    use super::mp_view::MpScenario;
+    let run = |lambda: f64| {
+        let mut s = closed_scenario(MpScenario::DamBreak, 40, 30, 0.02);
+        s.phase_heat_exchange = lambda;
+        let huile = s.reg.phases.iter().position(|p| p.name == "huile").unwrap();
+        let vap = s.reg.changes[0].vapor;
+        // couche d'huile chaude sur toute la largeur, posée sur l'eau du barrage (qui n'a pas encore bougé)
+        let eau = s.reg.changes[0].liquid;
+        for i in 0..s.nx {
+            let top = (0..s.ny).filter(|&j| s.alpha[eau][s.idx(i, j)] > 0.5).max();
+            if let Some(j) = top {
+                for jj in j + 1..(j + 4).min(s.ny) {
+                    super::mp_view::apply_tool(&mut s, super::mp_view::MpTool::Phase(huile), &[(i, jj)], 600.0, (0.0, 0.0), 0.0);
+                }
+            }
+        }
+        s.refresh();
+        while s.time < 0.1 && !s.diverged {
+            s.step();
+        }
+        (s.total_mass(vap), s.diverged)
+    };
+    let (v1, d1) = run(1.0);
+    let (v_inf, _) = run(f64::INFINITY);
+    eprintln!("vapeur produite : λ = 1 → {v1:.3e} kg/m, λ = ∞ → {v_inf:.3e} kg/m");
+    assert!(!d1);
+    assert!(v1 < 0.2 * v_inf.max(1e-12), "l'eau ne doit plus bouillir d'un coup : {v1} vs {v_inf}");
+}

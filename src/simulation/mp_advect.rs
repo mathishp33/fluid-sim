@@ -160,7 +160,9 @@ impl MultiphaseSim {
         let mut ghost_t = vec![self.t_ambient; nf];
         // température reconstruite à la face (MUSCL, limiteur de van Leer) ; NaN = celle de la cellule donneuse
         let mut face_t = vec![f64::NAN; nf];
-        let t_old = self.temp.clone();
+        // groupe concerné par la reconstruction de la face (le seul présent à 99 % dans les trois cellules)
+        let mut face_g = vec![usize::MAX; nf];
+        let t_old = self.tg.clone();
         let van_leer = |a: f64, b: f64| if a * b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
         // cellule fluide sans interface (un seul groupe présent à 99 %) : la reconstruction d'ordre 2 y est sûre
         let single = |c: usize| -> Option<usize> { (0..ng).find(|&g| ag[g][c] > 0.99) };
@@ -243,9 +245,10 @@ impl MultiphaseSim {
                             }
                             _ => None,
                         };
-                        if let Some((uc, rcv, _)) = smooth {
-                            let (tu, td, tr) = (t_old[uc], t_old[dc], t_old[rcv]);
+                        if let Some((uc, rcv, gs)) = smooth {
+                            let (tu, td, tr) = (t_old[gs][uc], t_old[gs][dc], t_old[gs][rcv]);
                             face_t[f] = td + 0.5 * (1.0 - xi) * van_leer(td - tu, tr - td);
+                            face_g[f] = gs;
                         }
                         // flux du groupe → membres, au prorata de leur composition (reconstruite à la face si possible)
                         for g in 0..ng {
@@ -310,7 +313,7 @@ impl MultiphaseSim {
                 continue;
             }
             let (d, r) = (donor[f], recv[f]);
-            let mut ef = 0.0;
+            let mut efg = [0.0f64; super::phases::MAX_PHASES];
             let mut mtot = 0.0;
             for k in 0..np {
                 let fk = ff[f * np + k];
@@ -321,17 +324,18 @@ impl MultiphaseSim {
                     let pr = if r != usize::MAX { self.p[r] } else { 101325.0 };
                     (self.reg.phases[k].rho(pr, ghost_t[f]), ghost_t[f], pr)
                 } else {
-                    // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0
-                    let rho_eos = self.reg.phases[k].rho(self.p[d], t_old[d]);
+                    // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0 ; température de SON groupe
+                    let gk = self.group_of[k];
+                    let rho_eos = self.reg.phases[k].rho(self.p[d], t_old[gk][d]);
                     let rho = if aw[k][d] > 1e-8 { self.mass[k][d] / aw[k][d] } else { rho_eos };
-                    let tf = if face_t[f].is_nan() { t_old[d] } else { face_t[f] };
+                    let tf = if face_g[f] == gk && !face_t[f].is_nan() { face_t[f] } else { t_old[gk][d] };
                     (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, tf, self.p[d])
                 };
                 let _ = p_d;
                 // jamais plus que la masse présente dans la donneuse (traces : α ≈ 0 et masse volumique de repli EOS)
                 let mf = if d != usize::MAX { (fk * rho_d).min(self.mass[k][d].max(0.0)) } else { fk * rho_d };
                 mtot += mf;
-                ef += mf * self.reg.phases[k].e_int(t_d);
+                efg[self.group_of[k]] += mf * self.reg.phases[k].e_int(t_d);
                 if d != usize::MAX {
                     aw[k][d] -= fk;
                     self.mass[k][d] -= mf;
@@ -350,16 +354,34 @@ impl MultiphaseSim {
                 let sgn = if dir == 0 { self.u[self.uidx(fi_, fj_)] } else { self.v[self.vidx(fi_, fj_)] }.signum();
                 if dir == 0 { let q = self.uidx(fi_, fj_); self.mfx[q] += sgn * mtot; } else { let q = self.vidx(fi_, fj_); self.mfy[q] += sgn * mtot; }
             }
-            if d != usize::MAX {
-                self.e[d] -= ef;
-            }
-            if r != usize::MAX {
-                self.e[r] += ef;
+            for g in 0..ng {
+                let ef = efg[g];
+                if ef == 0.0 {
+                    continue;
+                }
+                if d != usize::MAX {
+                    self.eg[g][d] -= ef;
+                    self.e[d] -= ef;
+                }
+                if r != usize::MAX {
+                    self.eg[g][r] += ef;
+                    self.e[r] += ef;
+                }
             }
         }
         for c in 0..n {
             if !self.is_solid(c) {
-                self.temp[c] = self.temp_from_energy(c);
+                // plancher d'énergie par groupe (T ≥ T_PW_MIN) : dans une cellule presque vide, le flux d'énergie sortant (à la
+                // température du début du balayage) peut dépasser le contenu → T < 0. Énergie ajoutée négligeable (capacité ~0).
+                for g in 0..ng {
+                    if self.group_mass(g, c) > 0.0 {
+                        let emin = self.group_energy_at(g, c, super::mp_thermo::T_PW_MIN);
+                        if self.eg[g][c] < emin {
+                            self.eg[g][c] = emin;
+                        }
+                    }
+                }
+                self.cell_sync(c);
             }
         }
         let _ = Bc::Wall;

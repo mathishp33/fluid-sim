@@ -577,6 +577,17 @@ impl MultiphaseWindow {
                 ui.separator();
                 ui.heading("Simulation");
                 ui.add(egui::Slider::new(&mut self.speed, 0.001..=10.0).logarithmic(true).text("Vitesse (×temps réel)"));
+                // une température par groupe de phases dans les cellules mixtes : vitesse de l'échange de chaleur entre elles
+                ui.horizontal(|ui| {
+                    let mut eq = !self.sim.phase_heat_exchange.is_finite();
+                    if ui.checkbox(&mut eq, "Une seule température par cellule").changed() {
+                        self.sim.phase_heat_exchange = if eq { f64::INFINITY } else { 1.0 };
+                    }
+                });
+                if self.sim.phase_heat_exchange.is_finite() {
+                    ui.add(egui::Slider::new(&mut self.sim.phase_heat_exchange, 0.01..=100.0).logarithmic(true).text("Échange de chaleur entre phases (×)"));
+                    ui.weak("Cellules mixtes : chaque groupe de phases (liquide, gaz…) garde sa température ; ils échangent par conduction à                              travers l'interface (1 = conductivités et taille de maille). Huile très chaude dans l'air : l'air ne prend pas                              instantanément 2000 K ; huile sur l'eau : pas de vaporisation éclair. Coché : modèle historique (équilibre immédiat).");
+                }
                 ui.horizontal(|ui| {
                     ui.label("Calcul");
                     let cur = self.backend;
@@ -950,7 +961,7 @@ impl MultiphaseWindow {
                 self.stats_age = 0;
                 if !self.stats.finite && !self.paused {
                     self.paused = true;
-                    self.status = "Divergence numérique : simulation mise en pause (réduire dt max / CFL, ou recommencer)".into();
+                    self.status = "Divergence numérique : valeurs non finies, simulation mise en pause (Reset flow (R) ou Recommencer)".into();
                 }
             }
             self.update_texture(ctx);
@@ -1126,7 +1137,11 @@ impl MultiphaseWindow {
             if self.sim.diverged {
                 self.paused = true;
                 self.step_frame = 0;
-                self.status = "Divergence numérique : simulation mise en pause (état invalide détecté, dernier état sain conservé en CPU). Réduire CFL / dt max, ou recommencer".into();
+                self.status = "Divergence numérique : simulation mise en pause, dernier état sain conservé (même à dt/1024, le pas donne un état \
+                               invalide). Cause habituelle : un contact très chaud ↔ froid (une cellule n'a qu'une température : du liquide à \
+                               1000 °C mêlé à de l'eau la vaporise d'un bloc). « Reset flow (R) » repart de cet état, vitesses à zéro ; baisser la \
+                               température du pinceau évite le cas."
+                    .into();
                 break;
             }
             if self.paused {

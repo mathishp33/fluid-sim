@@ -19,7 +19,7 @@ use std::time::Instant;
 use super::mp_cells::{MpEffect, MpThermal, PinInfo};
 use super::mp_step::P_GPU;
 use super::multiphase::{Bc, MultiphaseSim};
-use super::phases::{Eos, Radiator, Thermal, T_STD};
+use super::phases::{Eos, Radiator, Thermal, MAX_PHASES, T_STD};
 
 const SHADERS: [&str; 8] = [
     include_str!("mp_gpu/common.wgsl"),
@@ -47,9 +47,10 @@ const D_LEN: usize = 64;
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
 const SLOT_BYTES: u64 = 256;
-const PARAMS_WORDS: usize = 56;
-/// lancements de noyaux au plus par tampon de commandes d'une série de pas
-const MAX_BATCH_OPS: usize = 1200;
+const PARAMS_WORDS: usize = 60;
+/// lancements de noyaux au plus par tampon de commandes d'une série de pas (lavapipe plantait de temps en temps — non reproductible
+/// en soumettant les lancements un par un — à 1200 avec la température par groupe, qui ajoute des noyaux plus longs)
+const MAX_BATCH_OPS: usize = 400;
 
 // cases du buffer D (miroir de common.wgsl)
 const D_DT: usize = 0;
@@ -218,6 +219,8 @@ pub struct MultiphaseGpu {
     base: Baselines,
     /// l'état CPU (`sim`) est en retard sur le GPU (pas effectués depuis la dernière relecture)
     host_stale: bool,
+    /// facteur appliqué à `closure_relax` pendant les retours arrière (0.25 par essai, comme `MultiphaseSim::step`)
+    relax_scale: f64,
     pub last: GpuStepInfo,
 }
 
@@ -268,6 +271,8 @@ impl MultiphaseGpu {
         let pers_start = sl.total;
         sl.add("mass", np * n);
         sl.add("eps", n);
+        sl.add("epsg", ng.max(1) * n);
+        sl.add("tg", ng.max(1) * n);
         sl.add("prel", n);
         sl.add("U", nfu);
         sl.add("V", nfv);
@@ -300,16 +305,20 @@ impl MultiphaseGpu {
         sl.add("ag", ng * n);
         sl.add("scale", np * n);
         sl.add("fl_vol", nf * np);
-        for name in ["fdon", "frcv", "fghost", "ftf"] {
+        for name in ["fdon", "frcv", "fghost", "ftf", "ftg"] {
             sl.add(name, nf);
         }
         sl.add("mfx", nfu);
         sl.add("mfy", nfv);
         for name in [
-            "mtot_old", "p_start", "tst", "floor", "vol", "kappa", "rhs", "sd", "sae", "san", "sact", "cx", "cr", "cz", "cp", "cap", "kc2", "capc",
-            "tc", "tn", "sx_dm", "sx_tgt", "sx_e", "mgs", "newe", "omega", "mask", "mtmp",
+            "mtot_old", "p_start", "floor", "vol", "kappa", "err0", "chi", "rhs", "sd", "sae", "san", "sact", "cx", "cr", "cz", "cp", "cap",
+            "sx_dm", "sx_tgt", "sx_e", "mgs", "newe", "omega", "mask", "mtmp",
         ] {
             sl.add(name, n);
+        }
+        // nœuds (cellule, groupe) : températures de la projection, conduction
+        for name in ["tst", "tk", "kc2", "capc", "tc", "tn", "agc"] {
+            sl.add(name, ng.max(1) * n);
         }
         for name in ["ch_m", "ch_s", "ch_b", "ch_o", "ch_cons"] {
             sl.add(name, npmax * n);
@@ -549,6 +558,7 @@ impl MultiphaseGpu {
             sp_budget: 8,
             base: Baselines::default(),
             host_stale: false,
+            relax_scale: 1.0,
             last: GpuStepInfo::default(),
         };
         let _ = (&g.r_buf, &g.slot_buf, g.ng, g.nwg);
@@ -644,6 +654,8 @@ impl MultiphaseGpu {
                 Radiator::CarbonDioxide => 2.0,
             };
             r[26] = gid[k] as f64;
+            // groupe réactif (une de ses phases intervient dans une réaction) : seul il participe à la chimie
+            r[30] = if sim.reg.phases.iter().enumerate().any(|(j, _)| gid[j] == gid[k] && sim.reg.is_reactive(j)) { 1.0 } else { 0.0 };
             r[27] = p.color[0] as f64;
             r[28] = p.color[1] as f64;
             r[29] = p.color[2] as f64;
@@ -851,6 +863,7 @@ impl MultiphaseGpu {
         }
         // persistant
         let (o_m, o_e, o_p, o_u, o_v, o_t, o_a) = (o("mass"), o("eps"), o("prel"), o("U"), o("V"), o("temp"), o("alpha"));
+        let (o_eg, o_tg) = (o("epsg"), o("tg"));
         let (o_rho, o_mu, o_k, o_cl, o_fl, o_hr, o_tpm) = (o("rho_mix"), o("mu_cell"), o("k_cell"), o("clamped"), o("flame"), o("heat_rel"), o("tpmix"));
         for c in 0..n {
             let mut ch = 0.0;
@@ -861,6 +874,23 @@ impl MultiphaseGpu {
                 ch += m * h0[k];
             }
             s[o_e + c] = if sim.is_solid(c) { (sim.e[c] - sim.reg.solids[sim.solid[c] as usize].rho_cp() * T_STD) as f32 } else { (sim.e[c] - ch) as f32 };
+            // énergies relatives et températures des groupes (ε_g = E_g − Σ_k∈g m_k h0_k), après adoption des retouches directes de
+            // `e` comme le fait `refresh` sur le CPU (écart réparti au prorata des capacités)
+            let ngr = sim.groups.len();
+            if sim.is_solid(c) || ngr == 0 {
+                for g in 0..ngr {
+                    s[o_eg + g * n + c] = 0.0;
+                    s[o_tg + g * n + c] = sim.temp[c] as f32;
+                }
+            } else {
+                let (mut egn, mut tgn) = ([0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES]);
+                sim.sync_calc(c, &mut egn[..ngr], &mut tgn[..ngr], true);
+                for (g, members) in sim.groups.iter().enumerate() {
+                    let chg: f64 = members.iter().map(|&k| sim.mass[k][c] * h0[k]).sum();
+                    s[o_eg + g * n + c] = (egn[g] - chg) as f32;
+                    s[o_tg + g * n + c] = tgn[g] as f32;
+                }
+            }
             s[o_p + c] = (sim.p[c] - P0) as f32;
             s[o_t + c] = sim.temp[c] as f32;
             s[o_rho + c] = sim.rho_mix[c] as f32;
@@ -938,6 +968,7 @@ impl MultiphaseGpu {
         let o = |name: &str| self.sl.o(name) - base;
         let h0: Vec<f64> = sim.reg.phases.iter().map(|p| p.e_int(T_STD)).collect();
         let (o_m, o_e, o_p, o_u, o_v, o_t, o_a) = (o("mass"), o("eps"), o("prel"), o("U"), o("V"), o("temp"), o("alpha"));
+        let (o_eg, o_tg) = (o("epsg"), o("tg"));
         let (o_rho, o_mu, o_k, o_cl, o_fl, o_hr) = (o("rho_mix"), o("mu_cell"), o("k_cell"), o("clamped"), o("flame"), o("heat_rel"));
         if sim.pressure_clamped.len() != n {
             sim.pressure_clamped = vec![false; n];
@@ -958,6 +989,16 @@ impl MultiphaseGpu {
             }
             let eps = data[o_e + c] as f64;
             sim.e[c] = if sim.is_solid(c) { eps + sim.reg.solids[sim.solid[c] as usize].rho_cp() * T_STD } else { eps + ch };
+            let mut esum = 0.0;
+            for (g, members) in sim.groups.iter().enumerate() {
+                let chg: f64 = members.iter().map(|&k| sim.mass[k][c] * h0[k]).sum();
+                sim.eg[g][c] = if sim.is_solid(c) { 0.0 } else { data[o_eg + g * n + c] as f64 + chg };
+                sim.tg[g][c] = data[o_tg + g * n + c] as f64;
+                esum += sim.eg[g][c];
+            }
+            if !sim.is_solid(c) {
+                sim.e[c] = esum; // référence : Σ E_g (l'agrégat ε relu en f32 n'en diffère que de l'arrondi)
+            }
             sim.p[c] = data[o_p + c] as f64 + P0;
             sim.temp[c] = data[o_t + c] as f64;
             sim.rho_mix[c] = data[o_rho + c] as f64;
@@ -1103,6 +1144,10 @@ impl MultiphaseGpu {
         w[49] = sim.flame_resolution.ceil() as u32 + 1;
         w[50] = 4000;
         w[55] = self.software as u32;
+        w[56] = f(sim.closure_relax * self.relax_scale);
+        w[57] = f(sim.cfl_reject);
+        w[58] = f(self.relax_scale);
+        w[59] = f(if sim.phase_heat_exchange.is_finite() { sim.phase_heat_exchange } else { 1e38 });
         w
     }
 
@@ -1170,6 +1215,7 @@ impl MultiphaseGpu {
         }
         v.push(Op { k: "k_red_dt", wg: wm, slot: 0 });
         v.push(one("k_dt_final"));
+        v.push(cell("k_err0"));
         v.push(face("k_copy_un"));
         // forces sur l'état n
         v.push(face("k_force_init"));
@@ -1265,6 +1311,10 @@ impl MultiphaseGpu {
                 }
             }
         }
+        // échange entre groupes d'une cellule mixte, en dernier avant la projection (comme le CPU)
+        if self.ng > 1 {
+            v.push(cell("k_exchange"));
+        }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));
         v.push(cell("k_save_p"));
@@ -1298,6 +1348,7 @@ impl MultiphaseGpu {
         }
         v.push(face("k_face_final"));
         v.push(cell("k_pressure_work"));
+        v.push(cell("k_fill_cav"));
         v.push(cell("k_refresh"));
         v.push(Op { k: "k_sanity", wg: wm, slot: 0 });
         v.push(one("k_sanity_final"));
@@ -1339,13 +1390,16 @@ impl MultiphaseGpu {
         let (mut tries, mut redos) = (0usize, 0usize);
         let mut restore = false;
         loop {
+            self.relax_scale = 0.25f64.powi(tries as i32);
             let p = self.params(sim, dt_cap);
+            self.relax_scale = 1.0;
             self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
             let ops = self.plan_step(sim);
             let n_ops = ops.len();
             let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
             // un pas très long (budgets élevés) est soumis en plusieurs tampons de commandes de ≤ MAX_BATCH_OPS lancements
-            let chunks: Vec<&[Op]> = ops.chunks(MAX_BATCH_OPS).collect();
+            // (diagnostic MP_GPU_SYNC : un lancement par tampon, attente après chacun, nom affiché avant)
+            let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { MAX_BATCH_OPS }).collect();
             let last_chunk = chunks.len() - 1;
             for (ci, ch) in chunks.iter().enumerate() {
                 let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase step") });
@@ -1362,7 +1416,13 @@ impl MultiphaseGpu {
                 if ci == last_chunk {
                     enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.d_read, 0, (D_LEN * 4) as u64);
                 }
+                if sync_debug() {
+                    eprintln!("[gpu sync] {}", ch[0].k);
+                }
                 self.queue.submit(Some(enc.finish()));
+                if sync_debug() {
+                    self.device.poll(wgpu::Maintain::Wait);
+                }
             }
             let d = read_buffer(&self.device, &self.d_read);
             self.host_stale = true;
@@ -1440,6 +1500,40 @@ impl MultiphaseGpu {
         self.host_stale = true;
     }
 
+    /// Diagnostic : un pas BRUT (sans retour arrière) avec dt ≤ `dt_cap` et la fermeture héritée à `relax_scale` ; l'état obtenu est
+    /// relu dans `sim`, puis l'état d'avant le pas est rétabli sur le GPU (`download` le relit). Retourne (pas refusé ?, dt).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_raw_step(&mut self, sim: &mut MultiphaseSim, dt_cap: f64, relax_scale: f64) -> (bool, f64) {
+        self.relax_scale = relax_scale;
+        let p = self.params(sim, dt_cap);
+        self.relax_scale = 1.0;
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
+        let ops = self.plan_step(sim);
+        let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("raw snapshot") });
+        enc.copy_buffer_to_buffer(&self.s_buf, ps, &self.snap_s, 0, pl);
+        enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.snap_d, 0, (D_LEN * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        for ch in ops.chunks(MAX_BATCH_OPS) {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("raw step") });
+            self.encode(&mut enc, ch);
+            self.queue.submit(Some(enc.finish()));
+        }
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("raw read") });
+        enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.d_read, 0, (D_LEN * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        let d = read_buffer(&self.device, &self.d_read);
+        self.download(sim);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("raw restore") });
+        enc.copy_buffer_to_buffer(&self.snap_s, 0, &self.s_buf, ps, pl);
+        enc.copy_buffer_to_buffer(&self.snap_d, 0, &self.d_buf, 0, (D_LEN * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        self.host_stale = true;
+        (d[D_BAD] > 0.5, d[D_DT] as f64)
+    }
+
     /// Diagnostic : exécute le plan d'un pas noyau par noyau en attendant la fin de chacun (repère un noyau fautif).
     #[cfg(test)]
     pub(crate) fn debug_step_one_by_one(&mut self, sim: &MultiphaseSim) {
@@ -1476,9 +1570,12 @@ impl MultiphaseGpu {
         let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
         // une seule relecture de contrôle pour toute la série, mais au plus MAX_BATCH_OPS lancements par tampon de commandes
         // (lavapipe plante sur des tampons de plusieurs milliers de lancements ; aucun coût notable ailleurs)
-        let chunks: Vec<&[Op]> = ops.chunks(MAX_BATCH_OPS).collect();
+        let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { MAX_BATCH_OPS }).collect();
         let last_chunk = chunks.len() - 1;
         for (ci, ch) in chunks.iter().enumerate() {
+            if sync_debug() {
+                eprintln!("[gpu sync] {}", ch[0].k);
+            }
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase batch") });
             if ci == 0 {
                 enc.copy_buffer_to_buffer(&self.s_buf, ps, &self.snap_s, 0, pl);
@@ -1490,6 +1587,9 @@ impl MultiphaseGpu {
                 enc.copy_buffer_to_buffer(&self.d_buf, 0, &self.d_read, 0, (D_LEN * 4) as u64);
             }
             self.queue.submit(Some(enc.finish()));
+            if sync_debug() {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
         }
         let d = read_buffer(&self.device, &self.d_read);
         self.host_stale = true;
@@ -1612,6 +1712,12 @@ fn trace(what: &str) {
     if *ON.get_or_init(|| std::env::var("MP_GPU_TRACE").is_ok()) {
         eprintln!("[gpu] {what}");
     }
+}
+
+/// diagnostic : MP_GPU_SYNC=1 soumet chaque lancement de `step` seul et attend sa fin (localise un plantage de pilote)
+fn sync_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MP_GPU_SYNC").is_ok())
 }
 
 /// Relit un buffer MAP_READ entier en f32 (attente bloquante).

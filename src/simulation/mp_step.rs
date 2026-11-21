@@ -58,6 +58,7 @@ impl StepProfile {
 
 struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
+    eg: Vec<Vec<f64>>, tg: Vec<Vec<f64>>,
     rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
     flame_factor: Vec<f64>, heat_release: Vec<f64>, chem_heat: f64, radiated: f64, reacted: Vec<f64>, dt_chem: f64,
@@ -120,6 +121,15 @@ impl MultiphaseSim {
             if self.temp[c] < 50.0 || self.temp[c] > 5000.0 || self.p[c] < 0.0 {
                 return false;
             }
+            // température de chaque groupe présent
+            for g in 0..self.groups.len() {
+                if self.group_mass(g, c) > 0.0 {
+                    let t = self.tg[g][c];
+                    if !t.is_finite() || t < 50.0 || t > 5000.0 || !self.eg[g][c].is_finite() {
+                        return false;
+                    }
+                }
+            }
             for k in 0..self.mass.len() {
                 let m = self.mass[k][c];
                 if !m.is_finite() || m < -1e-6 {
@@ -130,9 +140,15 @@ impl MultiphaseSim {
         true
     }
 
+    /// Nombre de Courant des vitesses produites par le pas ≤ `cfl_reject` ?
+    fn courant_ok(&self, dt: f64) -> bool {
+        self.max_speed() * dt <= self.cfl_reject * self.dx
+    }
+
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             mass: self.mass.clone(), alpha: self.alpha.clone(), e: self.e.clone(), temp: self.temp.clone(), p: self.p.clone(),
+            eg: self.eg.clone(), tg: self.tg.clone(),
             u: self.u.clone(), v: self.v.clone(), rho_mix: self.rho_mix.clone(), mu_cell: self.mu_cell.clone(), k_cell: self.k_cell.clone(),
             boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(),
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
@@ -145,6 +161,7 @@ impl MultiphaseSim {
 
     fn restore(&mut self, s: &Snapshot) {
         self.mass.clone_from(&s.mass); self.alpha.clone_from(&s.alpha); self.e.clone_from(&s.e); self.temp.clone_from(&s.temp);
+        self.eg.clone_from(&s.eg); self.tg.clone_from(&s.tg);
         self.p.clone_from(&s.p); self.u.clone_from(&s.u); self.v.clone_from(&s.v); self.rho_mix.clone_from(&s.rho_mix);
         self.mu_cell.clone_from(&s.mu_cell); self.k_cell.clone_from(&s.k_cell);
         self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred);
@@ -165,7 +182,7 @@ impl MultiphaseSim {
         let snap = self.snapshot();
         let dt_max0 = self.dt_max;
         let dt = self.step_raw();
-        if self.state_is_sane() {
+        if self.state_is_sane() && self.courant_ok(dt) {
             return dt;
         }
         let mut dt_try = dt;
@@ -173,15 +190,18 @@ impl MultiphaseSim {
             self.restore(&snap);
             dt_try *= 0.25;
             self.dt_max = dt_max0.min(dt_try);
+            self.closure_relax_scale *= 0.25;
             self.rollbacks += 1;
-            self.step_raw();
-            if self.state_is_sane() {
+            let dt = self.step_raw();
+            if self.state_is_sane() && self.courant_ok(dt) {
                 self.dt_max = dt_max0;
+                self.closure_relax_scale = 1.0;
                 return self.last_dt;
             }
         }
         self.restore(&snap);
         self.dt_max = dt_max0;
+        self.closure_relax_scale = 1.0;
         self.diverged = true;
         0.0
     }
@@ -209,6 +229,11 @@ impl MultiphaseSim {
             self.refresh();
         }
         let dt = self.choose_dt();
+        // erreur de fermeture héritée (Σ m/ρ(p, T) − 1 avec les masses du début du pas), sous-relaxée dans l'équation de pression
+        let n = self.nx * self.ny;
+        let err0: Vec<f64> = (0..n)
+            .map(|c| if self.is_solid(c) || self.pinned(c) { 0.0 } else { self.cell_volume(c, self.p[c]) - 1.0 })
+            .collect();
         lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());
         // 2. prédiction de vitesse
@@ -255,14 +280,18 @@ impl MultiphaseSim {
         self.radiate(dt);
         lap(&mut prof, P_CHEM);
         self.phase_change_step(dt);
+        // échange entre groupes d'une cellule mixte : en dernier, juste avant la projection, qui voit ainsi l'état qu'il produit
+        // (son couplage χ entre dans la fermeture et la répartition du travail de pression)
+        self.exchange_heat(dt);
         lap(&mut prof, P_PHASE);
         // 5-6. pression
         self.refresh_after_thermo();
         lap(&mut prof, P_REFRESH);
-        self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &un, &vn);
+        self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &un, &vn, &err0);
         lap(&mut prof, P_PRESSURE);
         // 7. travail de pression et état final
         self.pressure_work(dt);
+        self.fill_cavities();
         self.refresh();
         lap(&mut prof, P_REFRESH);
         prof.steps += 1;

@@ -13,6 +13,19 @@ use super::multiphase::{Bc, MultiphaseSim};
 
 /// pression absolue minimale d'une cellule fluide (Pa)
 pub(crate) const P_FLOOR: f64 = 10.0;
+/// erreur de fermeture héritée corrigée entièrement en un pas tant qu'elle reste sous ce seuil (usage normal : < 1e-2 ; bulle de
+/// vapeur qui grossit dans l'eau : jusqu'à ~0.1, qu'il faut corriger entièrement sous peine de courants parasites)
+pub(crate) const CLOSURE_SMALL: f64 = 0.1;
+
+/// Part de l'erreur de fermeture héritée `e0` (Σ m/ρ − 1 au début du pas) que ce pas corrige. Dans le gaz (fraction `ag`) : tout,
+/// par compression. Dans le liquide : tout si |e0| ≤ `small` (une erreur, même petite, laissée dans un liquide raide fausse sa pression
+/// de |e0|/κ), sinon max(small, r·|e0|) — corrigée en un pas, une grosse erreur dans un liquide impose une vitesse ∝ |e0|/dt
+/// (schéma neutre-stable qui s'emballe : huile très chaude au contact d'eau ou d'air froid). Même formule sur le GPU (k_rhs).
+pub(crate) fn closure_correction(e0: f64, ag: f64, r: f64, small: f64) -> f64 {
+    let liq = if e0.abs() <= small { e0 } else { e0.signum() * small.max(r * e0.abs()) };
+    let ag = ag.clamp(0.0, 1.0);
+    ag * e0 + (1.0 - ag) * liq
+}
 
 struct Stencil {
     diag: Vec<f64>,
@@ -21,22 +34,98 @@ struct Stencil {
 }
 
 impl MultiphaseSim {
-    /// Volume du mélange V, κ_eff et γ_T = dT/dp (adiabatique) d'une cellule à (p, T).
-    pub(crate) fn cell_closure(&self, c: usize, p: f64, t: f64) -> (f64, f64, f64) {
-        let (mut v, mut kap, mut vb, mut mcp) = (0.0, 0.0, 0.0, 0.0);
+    /// Volume V et κ_eff d'une cellule à la pression p, le groupe g étant à la température t[g], avec le couplage thermique `chi`
+    /// des groupes pendant le pas (`thermal_coupling`). `gam[g]` reçoit dT_g/dp et `wpw[g]` ∝ C_g·dT_g/dp, la part du groupe dans
+    /// le travail de pression (même modèle, sinon la fin du pas contredit la fermeture). χ = 0 : chaque groupe se comprime
+    /// adiabatiquement pour son compte (une bulle d'air dans de l'huile chaude a κ = V/(γp)) ; χ = 1 : température commune
+    /// (κ_eff = Σκ_T − T(ΣVβ)²/Σm c_p, modèle à une température : une bulle de vapeur dans l'eau se comprime presque isotherme).
+    pub(crate) fn cell_closure_g(&self, c: usize, p: f64, t: &[f64], chi: f64, gam: &mut [f64], wpw: &mut [f64]) -> (f64, f64) {
+        let ng = self.groups.len();
+        let (mut v, mut kt_all) = (0.0, 0.0);
+        let (mut own, mut vb_all, mut mcp_all, mut mcpt) = (0.0, 0.0, 0.0, 0.0);
+        let mut vbg = [0.0f64; super::phases::MAX_PHASES];
+        let mut mcpg = [0.0f64; super::phases::MAX_PHASES];
+        for (g, members) in self.groups.iter().enumerate() {
+            let tg = t[g];
+            let (mut vb, mut mcp) = (0.0, 0.0);
+            for &k in members {
+                let m = self.mass[k][c];
+                if m <= 0.0 {
+                    continue;
+                }
+                let ph = &self.reg.phases[k];
+                let vk = m / ph.rho(p, tg);
+                v += vk;
+                kt_all += vk * ph.kappa_t(p, tg);
+                vb += vk * ph.beta(p, tg);
+                mcp += m * ph.cp;
+            }
+            vbg[g] = vb;
+            mcpg[g] = mcp;
+            if mcp > 0.0 {
+                own += tg * vb * vb / mcp;
+            }
+            vb_all += vb;
+            mcp_all += mcp;
+            mcpt += mcp * tg;
+        }
+        let chi = chi.clamp(0.0, 1.0);
+        let tm = if mcp_all > 0.0 { mcpt / mcp_all } else { 0.0 };
+        let gm = if mcp_all > 0.0 { tm * vb_all / mcp_all } else { 0.0 };
+        let mix = gm * vb_all;
+        for g in 0..ng {
+            let go = if mcpg[g] > 0.0 { t[g] * vbg[g] / mcpg[g] } else { 0.0 };
+            gam[g] = chi * gm + (1.0 - chi) * go;
+            wpw[g] = (mcpg[g] * gam[g]).max(0.0);
+        }
+        (v, kt_all - (chi * mix + (1.0 - chi) * own))
+    }
+
+    /// Volume de la cellule à la pression p avec les températures de groupe courantes (tg).
+    pub(crate) fn cell_volume(&self, c: usize, p: f64) -> f64 {
+        (0..self.reg.phases.len())
+            .filter(|&k| self.mass[k][c] > 0.0)
+            .map(|k| self.mass[k][c] / self.reg.phases[k].rho(p, self.phase_temp(k, c)))
+            .sum()
+    }
+
+    /// Mise à jour de Newton δ d'une cellule CONTENANT DU GAZ quand |δp| > 50 % de p : la tangente V(p_k) − κ δp sous-estime
+    /// énormément la pression nécessaire pour recomprimer une poche de gaz basse pression (p ne fait que doubler par itération, la
+    /// cellule reste un puits qui aspire ses voisines) et passe sous zéro à la détente (plancher → déficit de volume). On impose au gaz
+    /// la variation de volume que le système linéaire lui attribue, ΔV_g = (κ − κ_l) δp, avec la loi polytropique V_g ∝ p^(−1/n)
+    /// tangente au même κ (n = V_g / (p (κ − κ_l)) ∈ [1, 2] : adiabatique dans un gaz pur, isotherme au contact d'un liquide) :
+    /// p' = p (V_g / (V_g − ΔV_g))ⁿ, ≡ p + δp au premier ordre. Mêmes formules sur le GPU (`k_p_update`).
+    pub(crate) fn gas_newton_update(&self, c: usize, pk: f64, t: &[f64], kappa: f64, dp: f64) -> f64 {
+        if dp.abs() <= 0.5 * pk.max(P_FLOOR) {
+            return dp;
+        }
+        let (mut vg, mut kl) = (0.0, 0.0);
         for (k, ph) in self.reg.phases.iter().enumerate() {
             let m = self.mass[k][c];
             if m <= 0.0 {
                 continue;
             }
-            let vk = m / ph.rho(p, t);
-            v += vk;
-            kap += vk * ph.kappa_t(p, t);
-            vb += vk * ph.beta(p, t);
-            mcp += m * ph.cp;
+            let tk = t[self.group_of[k]];
+            let vk = m / ph.rho(pk, tk);
+            if ph.is_gas() {
+                vg += vk;
+            } else {
+                kl += vk * ph.kappa_t(pk, tk);
+            }
         }
-        let gamma_t = t * vb / mcp.max(1e-30);
-        (v, kap - t * vb * vb / mcp.max(1e-30), gamma_t)
+        let kg = kappa - kl;
+        if vg <= 1e-9 || kg <= 0.0 {
+            return dp;
+        }
+        let n = (vg / (pk.max(1.0) * kg)).clamp(1.0, 2.0);
+        let vgt = (vg - kg * dp).max(0.02 * vg);
+        // au plus 4 fois la tangente à la compression : le reste du système (vitesses des faces voisines) est linéarisé autour de p_k
+        let d = pk * ((vg / vgt).powf(n) - 1.0);
+        if dp > 0.0 {
+            d.min(4.0 * dp)
+        } else {
+            d
+        }
     }
 
     /// vitesse de face corrigée Ũ = u* − dt/ρ_f ∇p (0 sur parois/solides)
@@ -336,11 +425,33 @@ impl MultiphaseSim {
 
     /// Projette (u*, v*) : met à jour self.p et self.u/self.v (u^{n+1}). `un`, `vn` = vitesses du début de pas (celles qui ont
     /// servi à advecter les masses). Retourne le nombre total d'itérations PCG.
-    pub(crate) fn solve_pressure(&mut self, dt: f64, us: &[f64], vs: &[f64], un: &[f64], vn: &[f64]) -> usize {
+    pub(crate) fn solve_pressure(&mut self, dt: f64, us: &[f64], vs: &[f64], un: &[f64], vn: &[f64], err0: &[f64]) -> usize {
+        let relax = (self.closure_relax * self.closure_relax_scale).clamp(0.0, 1.0);
+        let small = CLOSURE_SMALL * self.closure_relax_scale;
+        let gas_ids: Vec<usize> = (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].is_gas()).collect();
         let (nx, ny) = (self.nx, self.ny);
         let n = nx * ny;
         let p_start = self.p.clone();
-        let t_star: Vec<f64> = (0..n).map(|c| self.temp[c]).collect();
+        let ng = self.groups.len();
+        // températures de groupe du début de la projection et dT_g/dp adiabatique (fixes pendant les itérations de Newton)
+        let t_star = self.tg.clone();
+        let mut gam0 = vec![vec![0.0; n]; ng];
+        let chi: Vec<f64> = (0..n).map(|c| self.thermal_coupling(c, dt)).collect();
+        {
+            let (mut tc, mut ga, mut ks) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
+            for c in 0..n {
+                if self.is_solid(c) || self.pinned(c) {
+                    continue;
+                }
+                for g in 0..ng {
+                    tc[g] = t_star[g][c];
+                }
+                self.cell_closure_g(c, p_start[c], &tc, chi[c], &mut ga, &mut ks);
+                for g in 0..ng {
+                    gam0[g][c] = ga[g];
+                }
+            }
+        }
         let mut pk = self.p.clone();
         let mut total_it = 0;
         let mut kappa = vec![0.0; n];
@@ -353,7 +464,7 @@ impl MultiphaseSim {
                 if self.phase_change && !self.is_solid(c) {
                     for pc in &self.reg.changes {
                         if self.alpha[pc.liquid][c] > 1e-3 {
-                            f = f.max(pc.p_sat(self.temp[c]).min(0.95 * p_start[c].max(P_FLOOR)));
+                            f = f.max(pc.p_sat(self.phase_temp(pc.liquid, c)).min(0.95 * p_start[c].max(P_FLOOR)));
                         }
                     }
                 }
@@ -361,7 +472,9 @@ impl MultiphaseSim {
             })
             .collect();
         let mut clamped = vec![false; n];
+        let mut tkv = t_star.clone();
         let mut newton = 0;
+        let (mut tc, mut ga, mut ks) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
         for _newton in 0..4 {
             newton += 1;
             let mut vol = vec![1.0; n];
@@ -373,9 +486,11 @@ impl MultiphaseSim {
                     kappa[c] = 1.0;
                     continue; // cellule épinglée : δp = 0
                 }
-                let (_, _, g0) = self.cell_closure(c, p_start[c], t_star[c]);
-                let tk = t_star[c] + g0 * (pk[c] - p_start[c]);
-                let (v, kap, _) = self.cell_closure(c, pk[c], tk);
+                for g in 0..ng {
+                    tc[g] = t_star[g][c] + gam0[g][c] * (pk[c] - p_start[c]);
+                    tkv[g][c] = tc[g];
+                }
+                let (v, kap) = self.cell_closure_g(c, pk[c], &tc, chi[c], &mut ga, &mut ks);
                 vol[c] = v;
                 kappa[c] = kap.max(1e-30);
             }
@@ -390,7 +505,8 @@ impl MultiphaseSim {
                     }
                     let d_new = self.divergence_of(&ut, &vt, i, j);
                     let d_old = self.divergence_of(un, vn, i, j);
-                    b[c] = (vol[c] - 1.0) / dt - (d_new - d_old);
+                    let corr = closure_correction(err0[c], gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
+                    b[c] = (vol[c] - 1.0 - (err0[c] - corr)) / dt - (d_new - d_old);
                 }
             }
             let mut dp = vec![0.0; n];
@@ -398,7 +514,12 @@ impl MultiphaseSim {
             let mut dmax = 0.0f64;
             for c in 0..n {
                 if !self.is_solid(c) && !self.pinned(c) {
-                    pk[c] += dp[c];
+                    // très grands écarts (> 50 % de p) dans une cellule contenant du gaz : mise à jour polytropique (voir `gas_newton_update`)
+                    let p_old = pk[c];
+                    for g in 0..ng {
+                        tc[g] = tkv[g][c];
+                    }
+                    pk[c] = p_old + self.gas_newton_update(c, p_old, &tc, kappa[c], dp[c]);
                     // Plancher de pression : aucun fluide ne descend sous P_FLOOR (vide / cavitation). Avant, seules les cellules contenant
                     // du gaz étaient protégées : une cellule quasi vide d'eau seule pouvait atteindre −8e7 Pa, puis le travail de pression
                     // −dt·p·∇·u sur sa capacité calorifique minuscule donnait T = −1.6e5 K → NaN.
@@ -410,7 +531,7 @@ impl MultiphaseSim {
                     } else {
                         clamped[c] = false;
                     }
-                    dmax = dmax.max(dp[c].abs());
+                    dmax = dmax.max((pk[c] - p_old).abs());
                 }
             }
             if dmax < 1e-3 {
