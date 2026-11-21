@@ -930,3 +930,55 @@ fn gpu_heating_one_step_diag() {
     }
     let _ = e0;
 }
+
+/// Mesure de vitesse (à lancer sur une vraie carte, en release) :
+/// `cargo test --release gpu_speed_benchmark -- --ignored --nocapture`
+/// ms par pas : CPU f64 (rayon), GPU `step` (une relecture par pas), GPU `step_batch(8)` (fenêtre) ; lancements de noyaux par pas.
+/// `MP_GPU_BATCH_OPS=n` change la taille max des tampons de commandes (contournement lavapipe, défaut 400).
+#[test]
+#[ignore]
+fn gpu_speed_benchmark() {
+    use std::time::Instant;
+    let scenes = [MpScenario::DamBreak, MpScenario::Boiling, MpScenario::ConfinedExplosion];
+    let sizes = [(80usize, 60usize), (160, 120), (320, 240)];
+    let mut printed = false;
+    for &sc in &scenes {
+        for &(nx, ny) in &sizes {
+            let dx = 0.01 * 160.0 / nx as f64;
+            let mk = || build_scenario(sc, nx, ny, dx, 9.81);
+            let Some(mut g) = gpu_or_skip(&mk()) else { return };
+            if !printed {
+                eprintln!("adaptateur : {}", g.adapter_name);
+                eprintln!("{:<22} {:>9} {:>11} {:>11} {:>11} {:>9} {:>7}", "scène", "grille", "CPU ms/pas", "GPU step", "GPU ×8", "noyaux", "PCG");
+                printed = true;
+            }
+            // CPU
+            let mut c = mk();
+            for _ in 0..3 { c.step(); }
+            let n_cpu = if nx >= 320 { 5 } else { 15 };
+            let t0 = Instant::now();
+            for _ in 0..n_cpu { c.step(); }
+            let cpu_ms = t0.elapsed().as_secs_f64() * 1e3 / n_cpu as f64;
+            // GPU pas à pas
+            let mut s = mk();
+            for _ in 0..5 { g.step(&mut s); }
+            let n = 40;
+            let t0 = Instant::now();
+            let mut disp = 0;
+            for _ in 0..n { g.step(&mut s); disp += g.last.dispatches; }
+            let gpu_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+            let pcg = g.last.pcg;
+            // GPU par séries de 8
+            let mut s2 = mk();
+            let mut g2 = gpu_or_skip(&s2).unwrap();
+            for _ in 0..2 { g2.step_batch(&mut s2, 8); }
+            let s0 = s2.step_count;
+            let t0 = Instant::now();
+            for _ in 0..10 { g2.step_batch(&mut s2, 8); }
+            let nb = (s2.step_count - s0).max(1);
+            let batch_ms = t0.elapsed().as_secs_f64() * 1e3 / nb as f64;
+            eprintln!("{:<22} {:>9} {:>11.2} {:>11.2} {:>11.2} {:>9} {:>7}{}", sc.name(), format!("{nx}×{ny}"), cpu_ms, gpu_ms, batch_ms,
+                disp / n, pcg, if s.diverged || s2.diverged { "  DIVERGÉ" } else { "" });
+        }
+    }
+}

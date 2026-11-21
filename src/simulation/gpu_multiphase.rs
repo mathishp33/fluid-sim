@@ -1399,7 +1399,7 @@ impl MultiphaseGpu {
             let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
             // un pas très long (budgets élevés) est soumis en plusieurs tampons de commandes de ≤ MAX_BATCH_OPS lancements
             // (diagnostic MP_GPU_SYNC : un lancement par tampon, attente après chacun, nom affiché avant)
-            let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { MAX_BATCH_OPS }).collect();
+            let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { max_batch_ops() }).collect();
             let last_chunk = chunks.len() - 1;
             for (ci, ch) in chunks.iter().enumerate() {
                 let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("multiphase step") });
@@ -1570,7 +1570,7 @@ impl MultiphaseGpu {
         let (ps, pl) = ((self.pers.0 * 4) as u64, (self.pers.1 * 4) as u64);
         // une seule relecture de contrôle pour toute la série, mais au plus MAX_BATCH_OPS lancements par tampon de commandes
         // (lavapipe plante sur des tampons de plusieurs milliers de lancements ; aucun coût notable ailleurs)
-        let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { MAX_BATCH_OPS }).collect();
+        let chunks: Vec<&[Op]> = ops.chunks(if sync_debug() { 1 } else { max_batch_ops() }).collect();
         let last_chunk = chunks.len() - 1;
         for (ci, ch) in chunks.iter().enumerate() {
             if sync_debug() {
@@ -1737,4 +1737,10 @@ fn read_buffer(device: &wgpu::Device, buf: &wgpu::Buffer) -> Vec<f32> {
     };
     buf.unmap();
     v
+}
+
+/// taille max d'un tampon de commandes (contournement lavapipe) ; diagnostic : MP_GPU_BATCH_OPS=n pour mesurer son coût sur une vraie carte
+fn max_batch_ops() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("MP_GPU_BATCH_OPS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(MAX_BATCH_OPS))
 }
