@@ -184,6 +184,19 @@ impl MultiphaseSim {
             caps[gl] = self.group_cap_at(gl, c, tl);
             ctot = caps[..ng].iter().sum();
         }
+        // volume créé / détruit, à p et aux températures de la masse déplacée (vapeur formée à t_vap, condensée à T_v ; brouillard :
+        // liquide formé à T_v)
+        {
+            let p = self.p[c];
+            let tv0 = self.tg[gv][c];
+            let fog0 = dm < 0.0 && self.mass[liq][c] < -dm;
+            let t_v = if dm > 0.0 { t_vap } else { tv0 };
+            let t_l = if fog0 { tv0 } else { tl };
+            let dvol = dm * (1.0 / self.reg.phases[vap].rho(p, t_v) - 1.0 / self.reg.phases[liq].rho(p, t_l));
+            if dvol.is_finite() {
+                self.pc_dvol[gl][c] += dvol;
+            }
+        }
         self.mass[liq][c] -= dm;
         self.mass[vap][c] += dm;
         if gl != gv {
@@ -216,6 +229,12 @@ impl MultiphaseSim {
     }
 
     pub(crate) fn phase_change_step(&mut self, dt: f64) {
+        let (ng, nc) = (self.groups.len().max(1), self.nx * self.ny);
+        if self.pc_dvol.len() != ng || self.pc_dvol[0].len() != nc {
+            self.pc_dvol = vec![vec![0.0; nc]; ng];
+        } else {
+            self.pc_dvol.iter_mut().for_each(|v| v.fill(0.0));
+        }
         if !self.phase_change {
             self.dt_phase = f64::INFINITY;
             return;
@@ -330,6 +349,14 @@ impl MultiphaseSim {
                         if vv < 1.0 {
                             let denom = (1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t)).max(1e-12);
                             cavity = ((1.0 - vv) / denom).min(ml - dm);
+                            // même débit volumique maximal que la vaporisation (rate_cap ∝ dt) : remplie d'un bloc, la cavité vidait
+                            // le liquide (et refroidissait la cellule sous 0 K) quel que soit dt — le filet de sécurité ne pouvait rien
+                            // (huile à 2000 K au contact de l'eau chaude, cuve fermée)
+                            cavity = cavity.min(rate_cap / denom);
+                            let dv = cavity * denom;
+                            if dv > 1e-3 {
+                                dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                            }
                         }
                     }
                 }
@@ -370,13 +397,24 @@ impl MultiphaseSim {
                     }
                 }
                 let mut dm = dm + cavity.max(0.0);
+                let chi = self.thermal_coupling(c, dt);
                 if dm > 0.0 {
                     // la chaleur latente prélevée ne peut pas faire tomber T de plus de la moitié de l'écart à T_PW_MIN (cavité remplie de
-                    // vapeur dense dans une eau très chaude : sinon T < 0)
-                    dm = dm.min(0.5 * cap * (t - T_PW_MIN).max(0.0) / latent);
+                    // vapeur dense dans une eau très chaude : sinon T < 0). `transfer` la répartit au prorata des capacités : tous les
+                    // groupes qui y participent baissent d'autant — c'est le plus froid qui borne (air détendu à 130 K à côté d'eau à
+                    // 430 K : borné par l'eau seule, l'air passait sous 0 K)
+                    let gl = self.group_of[liq];
+                    let mut head = t - T_PW_MIN;
+                    if chi > 0.0 && gl != self.group_of[vap] {
+                        for g in 0..self.groups.len() {
+                            if g != gl && self.group_mass(g, c) > 0.0 && !self.latent_excluded(g, c) {
+                                head = head.min(self.tg[g][c] - T_PW_MIN);
+                            }
+                        }
+                    }
+                    dm = dm.min(0.5 * cap * head.max(0.0) / latent);
                 }
                 if dm != 0.0 {
-                    let chi = self.thermal_coupling(c, dt);
                     self.transfer(c, liq, vap, dm, tsat.min(t), chi);
                     self.transferred[pi] += dm * self.dx * self.dx;
                 }
@@ -542,16 +580,56 @@ impl MultiphaseSim {
                 self.cell_closure_g(c, self.p[c], &tgs[..ng], chi, &mut gam[..ng], &mut ks[..ng]);
                 let ksum: f64 = (0..ng).map(|g| ks[g].max(0.0)).sum();
                 let asum: f64 = (0..ng).map(|g| self.group_alpha(g, c)).sum::<f64>().max(1e-300);
-                let de_tot = -dt * self.p[c].max(0.0) * d;
+                let pc = self.p[c].max(0.0);
+                let de_tot = -dt * pc * d;
+                // part due au changement de phase du pas (−p·ΔV_pc) : revient au groupe du liquide qui a changé d'état, partagée comme
+                // la chaleur latente (liquide C_l, autres χ·C_g, voir `transfer`) — répartie par compressibilité, le p·ΔV d'une vapeur
+                // qui se condense chauffait l'air voisin (air d'une cellule air + eau porté à 5000 K, huile à 2000 K sur l'eau chaude).
+                // Bornée au signe et à l'amplitude de −p∇·u dt (la projection ne réalise pas forcément tout ΔV_pc).
+                let mut de_pc = [0.0f64; super::phases::MAX_PHASES];
+                let mut pc_sum = 0.0;
+                for g in 0..ng.min(self.pc_dvol.len()) {
+                    de_pc[g] = -pc * self.pc_dvol[g][c];
+                    pc_sum += de_pc[g];
+                }
+                let scale = if pc_sum != 0.0 && pc_sum * de_tot > 0.0 { (de_tot / pc_sum).min(1.0) } else { 0.0 };
+                let de_rest = de_tot - scale * pc_sum;
+                let mut de_g = [0.0f64; super::phases::MAX_PHASES];
+                for g in 0..ng {
+                    if self.group_mass(g, c) > 0.0 {
+                        de_g[g] = de_rest * if ksum > 0.0 { ks[g].max(0.0) / ksum } else { self.group_alpha(g, c) / asum };
+                    }
+                }
+                if scale > 0.0 {
+                    for gs in 0..ng {
+                        if de_pc[gs] == 0.0 {
+                            continue;
+                        }
+                        let q = scale * de_pc[gs];
+                        let mut caps = [0.0f64; super::phases::MAX_PHASES];
+                        for g in 0..ng {
+                            if self.group_mass(g, c) > 0.0 && (g == gs || !self.latent_excluded(g, c)) {
+                                caps[g] = self.group_cap_at(g, c, tgs[g].max(1.0)) * if g == gs { 1.0 } else { chi };
+                            }
+                        }
+                        let ctot: f64 = caps[..ng].iter().sum();
+                        for g in 0..ng {
+                            if ctot > 0.0 {
+                                de_g[g] += q * caps[g] / ctot;
+                            } else if g == gs {
+                                de_g[g] += q;
+                            }
+                        }
+                    }
+                }
                 for g in 0..ng {
                     if self.group_mass(g, c) <= 0.0 {
                         continue;
                     }
-                    let w = if ksum > 0.0 { ks[g].max(0.0) / ksum } else { self.group_alpha(g, c) / asum };
                     let t = tgs[g].max(1.0);
                     let cap = self.group_cap_at(g, c, t);
                     let de_min = (-0.5 * cap * t).max(cap * (T_PW_MIN - t)).min(0.0);
-                    self.eg[g][c] += (de_tot * w).clamp(de_min, cap * t);
+                    self.eg[g][c] += de_g[g].clamp(de_min, cap * t);
                 }
                 self.cell_sync(c);
             }

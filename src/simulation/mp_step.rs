@@ -11,6 +11,10 @@ use std::time::Instant;
 
 use super::multiphase::MultiphaseSim;
 
+/// Diagnostic : cellule sondée par `step_raw` après chaque étape (usize::MAX = aucune). Affiche T et e massique de chaque groupe, masses,
+/// p, fermeture Σ m/ρ − 1 et vitesse max des faces : repère l'étape qui fait diverger une cellule.
+pub(crate) static PROBE_CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 pub const P_REFRESH: usize = 0;
 pub const P_FORCES: usize = 1;
 pub const P_ADVECT_MASS: usize = 2;
@@ -234,6 +238,7 @@ impl MultiphaseSim {
         let err0: Vec<f64> = (0..n)
             .map(|c| if self.is_solid(c) || self.pinned(c) { 0.0 } else { self.cell_volume(c, self.p[c]) - 1.0 })
             .collect();
+        self.probe("début");
         lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());
         // 2. prédiction de vitesse
@@ -268,31 +273,43 @@ impl MultiphaseSim {
             self.pin_reset();
         }
         // 4. conduction + changement de phase sur l'état advecté
+        self.probe("advection");
         self.refresh();
         self.apply_thermal_sources(dt);
+        self.probe("refresh + sources");
         lap(&mut prof, P_REFRESH);
         self.update_flame_factor(dt);
         self.conduct(dt);
+        self.probe("conduction");
         lap(&mut prof, P_CONDUCT);
         self.diffuse_species(dt);
+        self.probe("diffusion espèces");
         lap(&mut prof, P_SPECIES);
         self.react_step(dt);
         self.radiate(dt);
+        self.probe("chimie + rayonnement");
         lap(&mut prof, P_CHEM);
         self.phase_change_step(dt);
+        self.probe("changement de phase");
         // échange entre groupes d'une cellule mixte : en dernier, juste avant la projection, qui voit ainsi l'état qu'il produit
         // (son couplage χ entre dans la fermeture et la répartition du travail de pression)
         self.exchange_heat(dt);
+        self.probe("échange entre groupes");
         lap(&mut prof, P_PHASE);
         // 5-6. pression
         self.refresh_after_thermo();
+        self.probe("refresh");
         lap(&mut prof, P_REFRESH);
         self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &un, &vn, &err0);
+        self.probe("pression");
         lap(&mut prof, P_PRESSURE);
         // 7. travail de pression et état final
         self.pressure_work(dt);
+        self.probe("travail de pression");
         self.fill_cavities();
+        self.probe("cavités");
         self.refresh();
+        self.probe("refresh final");
         lap(&mut prof, P_REFRESH);
         prof.steps += 1;
         self.profile = prof;
@@ -300,6 +317,25 @@ impl MultiphaseSim {
         self.last_dt = dt;
         self.step_count += 1;
         dt
+    }
+
+    fn probe(&self, stage: &str) {
+        let c = PROBE_CELL.load(std::sync::atomic::Ordering::Relaxed);
+        if c == usize::MAX {
+            return;
+        }
+        let mut line = format!("  {stage:<24} p {:>11.4e} vol−1 {:>+10.3e} |u| {:>9.3e}", self.p[c], self.cell_volume(c, self.p[c]) - 1.0, self.face_speed(c));
+        for g in 0..self.ngroups() {
+            let m = self.group_mass(g, c);
+            if m > 0.0 {
+                line += &format!(" | g{g} m {m:.3e} T {:.1} e/m {:.4e}", self.tg[g][c], self.eg[g][c] / m);
+            }
+        }
+        eprintln!("{line}");
+    }
+    fn face_speed(&self, c: usize) -> f64 {
+        let (i, j) = (c % self.nx, c / self.nx);
+        [self.u[self.uidx(i, j)], self.u[self.uidx(i + 1, j)], self.v[self.vidx(i, j)], self.v[self.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()))
     }
 
     /// Met à jour ρ, α, μ, k à partir des masses courantes SANS recalculer T depuis e (T déjà à jour après conduction).

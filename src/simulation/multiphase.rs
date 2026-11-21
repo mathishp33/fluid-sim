@@ -76,6 +76,9 @@ pub struct MultiphaseSim {
     pub last_pressure_iters: usize,
     /// cellules dont la pression a été bloquée au plancher (p_sat d'un liquide : traction → cavité) au dernier pas
     pub(crate) pressure_clamped: Vec<bool>,
+    /// volume créé (> 0) / détruit (< 0) par le changement de phase pendant le pas, par groupe du LIQUIDE (fraction du volume de la
+    /// cellule) : `pressure_work` rend −p·ΔV à ce groupe (chaleur latente en Δe : le p·Δv vient du travail de pression)
+    pub(crate) pc_dvol: Vec<Vec<f64>>,
     /// itérations de Newton de la fermeture volumique au dernier pas
     pub last_newton_iters: usize,
     /// masse (kg par m de profondeur) entrée par les bords ouverts, par phase : M_k(t) − M_k(0) = flux_k − (changements de phase)
@@ -269,6 +272,7 @@ impl MultiphaseSim {
             last_pressure_iters: 0,
             last_newton_iters: 0,
             pressure_clamped: vec![false; n],
+            pc_dvol: vec![vec![0.0; n]; ng],
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
             step_count: 0,

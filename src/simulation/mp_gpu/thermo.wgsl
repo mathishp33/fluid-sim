@@ -283,6 +283,10 @@ fn do_transfer(c: u32, q: u32, dm: f32, t_vap: f32, chi: f32) {
         let tl = tgrp(gl, c);
         var exl = 0.0; var exv = 0.0;   // e_x − h0_l, e_x − h0_v
         let fog = dm < 0.0 && ml0 < -dm;
+        // volume créé / détruit par le transfert (miroir de transfer : pc_dvol) — rendu au groupe du liquide par k_pressure_work
+        let pr = S[O_prel + c];
+        let dvol = dm * (1.0 / rho_k(vap, pr, select(tv, t_vap, dm > 0.0)) - 1.0 / rho_k(liq, pr, select(tl, tv, fog)));
+        S[O_pc_dv + gl * n + c] += dvol;
         if (dm > 0.0) { let r = erel_k(vap, t_vap); exl = r + pcq(q, 7u); exv = r; }
         else if (fog) { let r = erel_k(liq, tv); exl = r; exv = r - pcq(q, 7u); }
         else { let r = erel_k(vap, tv); exl = r + pcq(q, 7u); exv = r; }
@@ -303,6 +307,8 @@ fn do_transfer(c: u32, q: u32, dm: f32, t_vap: f32, chi: f32) {
         S[O_epsg + gv * n + c] += dm * exv;
     } else {
         S[O_epsg + gl * n + c] -= dm * pcq(q, 7u);   // Δε = dm (h0_l − h0_v)
+        let pr = S[O_prel + c]; let tq = tgrp(gl, c);
+        S[O_pc_dv + gl * n + c] += dm * (1.0 / rho_k(vap, pr, select(tq, t_vap, dm > 0.0)) - 1.0 / rho_k(liq, pr, tq));
     }
     S[O_mass + liq * n + c] -= dm;
     S[O_mass + vap * n + c] += dm;
@@ -399,6 +405,10 @@ fn k_phase_change(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_in
                     if (vv < 1.0) {
                         let den = max(1.0 / rho_k(vap, ps - P.p0, t) - 1.0 / rho_k(liq, ps - P.p0, t), 1e-12);
                         cavity = min((1.0 - vv) / den, ml - dm);
+                        // même débit volumique maximal que la vaporisation (miroir du CPU)
+                        cavity = min(cavity, rate_cap / den);
+                        let dvc = cavity * den;
+                        if (dvc > 1e-3) { dtp = min(dtp, 0.5 * P.pc_vol_lim * dt / dvc); }
                     }
                 }
             }
@@ -426,8 +436,17 @@ fn k_phase_change(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_in
             }
             var dtot = dm + max(cavity, 0.0);
             // la chaleur latente prélevée ne fait pas tomber T de plus de la moitié de l'écart à T_PW_MIN
-            if (dtot > 0.0) { dtot = min(dtot, 0.5 * cap * max(t - T_PW_MIN, 0.0) / latent); }
-            if (dtot != 0.0) { do_transfer(c, q, dtot, min(tsat, t), thermal_coupling(c, dt)); }
+            // borné par le groupe participant le plus froid (miroir du CPU ; boucle à borne uniforme, appartenance par sélection)
+            let chi = thermal_coupling(c, dt);
+            let glq = group_k(liq);
+            var head = t - T_PW_MIN;
+            let share = chi > 0.0 && glq != group_k(vap);
+            for (var gq = 0u; gq < P.ng; gq++) {
+                let part = share && gq != glq && group_mass(gq, c) > 0.0 && !latent_excluded(gq, c);
+                head = select(head, min(head, tgrp(gq, c) - T_PW_MIN), part);
+            }
+            if (dtot > 0.0) { dtot = min(dtot, 0.5 * cap * max(head, 0.0) / latent); }
+            if (dtot != 0.0) { do_transfer(c, q, dtot, min(tsat, t), chi); }
             break;
         }
     }

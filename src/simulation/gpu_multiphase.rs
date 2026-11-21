@@ -317,7 +317,7 @@ impl MultiphaseGpu {
             sl.add(name, n);
         }
         // nœuds (cellule, groupe) : températures de la projection, conduction
-        for name in ["tst", "tk", "kc2", "capc", "tc", "tn", "agc"] {
+        for name in ["tst", "tk", "kc2", "capc", "tc", "tn", "agc", "pc_dv"] {
             sl.add(name, ng.max(1) * n);
         }
         for name in ["ch_m", "ch_s", "ch_b", "ch_o", "ch_cons"] {

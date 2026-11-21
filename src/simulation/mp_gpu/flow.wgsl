@@ -962,13 +962,40 @@ fn k_pressure_work(@builtin(global_invocation_id) g: vec3<u32>) {
     var ksum = 0.0; var asum = 0.0;
     for (var gq = 0u; gq < P.ng; gq++) { ksum += wp[gq]; asum += group_alpha(gq, c); }
     asum = max(asum, 1e-30);
-    let de_tot = -dt * max(S[O_prel + c] + P.p0, 0.0) * d;
+    let pc = max(S[O_prel + c] + P.p0, 0.0);
+    let de_tot = -dt * pc * d;
+    // part due au changement de phase (−p·ΔV_pc) : au groupe du liquide, partagée comme la chaleur latente, bornée au signe et à
+    // l'amplitude de −p∇·u dt (miroir de pressure_work) ; ΔV_pc remis à zéro pour le pas suivant
+    var pc_sum = 0.0;
+    for (var gq = 0u; gq < P.ng; gq++) { pc_sum += -pc * S[O_pc_dv + gq * n + c]; }
+    var scale = 0.0;
+    if (pc_sum != 0.0 && pc_sum * de_tot > 0.0) { scale = min(de_tot / pc_sum, 1.0); }
+    let de_rest = de_tot - scale * pc_sum;
+    let chi = S[O_chi + c];
+    var de_g: array<f32, NPMAX>;
     for (var gq = 0u; gq < P.ng; gq++) {
         let w = select(group_alpha(gq, c) / asum, wp[gq] / ksum, ksum > 0.0);
+        de_g[gq] = select(0.0, de_rest * w, group_mass(gq, c) > 0.0);
+    }
+    for (var gs = 0u; gs < P.ng; gs++) {
+        let q = scale * (-pc * S[O_pc_dv + gs * n + c]);
+        var ctot = 0.0;
+        for (var gq = 0u; gq < P.ng; gq++) {
+            let part = group_mass(gq, c) > 0.0 && (gq == gs || !latent_excluded(gq, c));
+            ctot += select(0.0, group_cap_at(gq, c, max(ts[gq], 1.0)) * select(chi, 1.0, gq == gs), part);
+        }
+        for (var gq = 0u; gq < P.ng; gq++) {
+            let part = group_mass(gq, c) > 0.0 && (gq == gs || !latent_excluded(gq, c));
+            let cw = select(0.0, group_cap_at(gq, c, max(ts[gq], 1.0)) * select(chi, 1.0, gq == gs), part);
+            de_g[gq] += select(select(0.0, q, gq == gs), q * cw / ctot, ctot > 0.0);
+        }
+        S[O_pc_dv + gs * n + c] = 0.0;
+    }
+    for (var gq = 0u; gq < P.ng; gq++) {
         let t = max(ts[gq], 1.0);
         let cap = group_cap_at(gq, c, t);
         let de_min = min(max(-0.5 * cap * t, cap * (T_PW_MIN - t)), 0.0);
-        S[O_epsg + gq * n + c] += select(0.0, clamp(de_tot * w, de_min, cap * t), group_mass(gq, c) > 0.0);
+        S[O_epsg + gq * n + c] += select(0.0, clamp(de_g[gq], de_min, cap * t), group_mass(gq, c) > 0.0);
     }
     cell_sync(c);
 }

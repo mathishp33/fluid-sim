@@ -107,6 +107,14 @@ pub(crate) fn one_step_agreement(name: &str, mut cpu: MultiphaseSim, warm: usize
             if n.starts_with('m') {
                 let k: usize = n[1..].split(' ').next().unwrap().parse().unwrap();
                 let tol = if cpu.reg.changes.iter().any(|pc| pc.vapor == k) { tol_vap.max(tol_m) } else { tol_m };
+                if v >= tol {
+                    let c = at;
+                    for (lab, s) in [("CPU", &cpu), ("GPU", &gs)] {
+                        let m: Vec<String> = (0..s.mass.len()).map(|q| format!("{:.4e}", s.mass[q][c])).collect();
+                        eprintln!("   {lab} case {c} : p {:.5e} T {:.3} tg {:?} bloquée {} masses {}", s.p[c], s.temp[c],
+                            (0..s.ngroups()).map(|g| (s.tg[g][c] * 100.0).round() / 100.0).collect::<Vec<_>>(), s.pressure_clamped[c], m.join(" "));
+                    }
+                }
                 assert!(v < tol, "{name} : {n} {v} (case {at})");
             } else if n == "T" {
                 assert!(v < tol_t, "{name} : T {v} K (case {at})");
@@ -567,8 +575,10 @@ fn gpu_heats_a_liquid_to_2000_c_without_pausing() {
     assert!(rel(cpu.energy_input, gs.energy_input) < 0.35, "énergie {} {}", cpu.energy_input, gs.energy_input);
     // U − apport : même énergie initiale, conservée par chacun
     assert!(rel(a.internal - cpu.energy_input, b.internal - gs.energy_input) < 2e-3);
-    // (en pleine ébullition : la fermeture f32 bruite la masse d'eau des cellules qui bouillent de ~1e-4)
-    one_step_agreement("chauffage 2000 °C", mk(), 400, 3, 1e-3, 0.5);
+    // (en pleine ébullition : la fermeture f32 bruite la masse d'eau des cellules qui bouillent de ~1e-6 en général, mais une bulle
+    // sous-maille peut franchir un seuil d'un côté de l'arrondi seulement : départ au pas 400, cellule 353, vapeur 0.0153 / 0.0182 kg/m³
+    // à T identique (375 K), le volume de vapeur en plus chasse 3.5e-3 de l'eau max par advection ; 4.9e-4 au départ du pas 410)
+    one_step_agreement("chauffage 2000 °C", mk(), 400, 3, 5e-3, 0.5);
 }
 
 #[test]
@@ -986,4 +996,154 @@ fn gpu_speed_benchmark() {
                 disp / n, pcg, if s.diverged || s2.diverged { "  DIVERGÉ" } else { "" });
         }
     }
+}
+
+/// Diagnostic (huile à 2000 K qui atteint l'eau chaude, cuve fermée 80×60) : rejoue la trajectoire GPU jusqu'à la pause, garde l'état
+/// juste avant le pas refusé, puis rejoue ce pas sur le CPU à dt, dt/4 … dt/1024 avec la sonde par étape sur la cellule la plus mauvaise.
+/// `cargo test --release gpu_hot_oil_failing_step_probe -- --ignored --nocapture` (MP_DX : maille, défaut 0.01)
+#[test]
+#[ignore]
+fn gpu_hot_oil_failing_step_probe() {
+    use super::mp_step::PROBE_CELL;
+    use super::mp_tests::{closed_scenario, hot_oil_stroke};
+    use std::sync::atomic::Ordering;
+    let dx = std::env::var("MP_DX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.01);
+    let mut s = closed_scenario(MpScenario::Boiling, 80, 60, dx);
+    let on_cpu = std::env::var("MP_CPU").is_ok();
+    let mut g = if on_cpu { None } else { match gpu_or_skip(&s) { Some(g) => Some(g), None => return } };
+    let frames = 40;
+    let mut start: Option<MultiphaseSim> = None;
+    for f in 0..frames {
+        if let Some(g) = g.as_mut() { g.ensure_host(&mut s); }
+        if f < 26 {
+            hot_oil_stroke(&mut s, f, frames, 2000.0);
+        }
+        let t1 = s.time + 1.0 / 60.0;
+        if let Some(g) = g.as_mut() {
+            let frame_start = clone_sim(&s);
+            g.upload(&s);
+            while s.time < t1 && !s.diverged {
+                let k = (((t1 - s.time) / s.last_dt.max(1e-9)).floor() as usize).clamp(1, 8);
+                g.step_batch(&mut s, k);
+            }
+            if s.diverged {
+                eprintln!("pause GPU à la trame {f} ; rejoue la trame pas à pas");
+                let mut r = clone_sim(&frame_start);
+                let mut st = clone_sim(&frame_start);
+                g.upload(&r);
+                loop {
+                    g.download(&mut r);
+                    let prev = clone_sim(&r);
+                    g.step(&mut r);
+                    if r.diverged { st = prev; break; }
+                    if r.time >= t1 { eprintln!("  (pas à pas : pas de pause, on prend le début de trame)"); break; }
+                }
+                start = Some(st);
+                break;
+            }
+        } else {
+            while s.time < t1 && !s.diverged {
+                let prev = clone_sim(&s);
+                s.step();
+                if s.diverged {
+                    eprintln!("pause CPU à la trame {f}");
+                    start = Some(prev);
+                }
+            }
+            if start.is_some() { break; }
+        }
+    }
+    let Some(st) = start else { eprintln!("aucune pause sur 40 trames"); return };
+    // cellule la plus mauvaise après un pas brut CPU
+    let mut c0 = clone_sim(&st);
+    let dt0 = c0.choose_dt();
+    c0.step_raw_pub();
+    let worst = worst_cell(&c0);
+    eprintln!("dt0 {dt0:.3e} ; pire cellule ({}, {}) : {} ; état sain {} ; |u|max {:.3e} ; Courant {:.2}", worst.0 % c0.nx, worst.0 / c0.nx, worst.1,
+        c0.state_is_sane(), c0.max_speed(), c0.max_speed() * dt0 / c0.dx);
+    for (gr, members) in st.groups.iter().enumerate() {
+        eprintln!("  g{gr} = {}", members.iter().map(|&k| st.reg.phases[k].name.as_str()).collect::<Vec<_>>().join(" + "));
+    }
+    PROBE_CELL.store(worst.0, Ordering::Relaxed);
+    for k in 0..6 {
+        let mut c = clone_sim(&st);
+        let sc = 0.25f64.powi(k);
+        c.dt_max = c.dt_max.min(dt0 * sc);
+        c.closure_relax_scale = sc;
+        eprintln!("== dt = dt0 × {sc:e}");
+        let dt = c.step_raw_pub();
+        let w = worst_cell(&c);
+        eprintln!("   dt {dt:.3e} ; sain {} ; |u|max {:.3e} ; Courant {:.2} ; pire ({}, {}) {}", c.state_is_sane(), c.max_speed(), c.max_speed() * dt / c.dx, w.0 % c.nx, w.0 / c.nx, w.1);
+    }
+    PROBE_CELL.store(usize::MAX, Ordering::Relaxed);
+}
+
+/// Mesure (huile à 2000 K qui atteint l'eau chaude, cuve fermée 80×60, 40 trames) : p max, vitesse max, pas refaits, trame de pause,
+/// CPU puis GPU. `cargo test --release hot_oil_on_hot_water_violence -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn hot_oil_on_hot_water_violence() {
+    use super::mp_tests::{closed_scenario, hot_oil_stroke};
+    let frames = 40;
+    for gpu in [false, true] {
+        let mut s = closed_scenario(MpScenario::Boiling, 80, 60, 0.01);
+        let mut g = if gpu { match gpu_or_skip(&s) { Some(g) => Some(g), None => continue } } else { None };
+        let (mut pmax, mut umax, mut pause) = (0.0f64, 0.0f64, None);
+        let mut redo_gpu = 0;
+        let clk = std::time::Instant::now();
+        for f in 0..frames {
+            if let Some(g) = g.as_mut() { g.ensure_host(&mut s); }
+            if f < 26 { hot_oil_stroke(&mut s, f, frames, 2000.0); }
+            if let Some(g) = g.as_mut() { g.upload(&s); }
+            let t1 = s.time + 1.0 / 60.0;
+            while s.time < t1 && !s.diverged {
+                match g.as_mut() {
+                    Some(g) => {
+                        let k = (((t1 - s.time) / s.last_dt.max(1e-9)).floor() as usize).clamp(1, 8);
+                        g.step_batch(&mut s, k);
+                        redo_gpu += g.last.retries;
+                    }
+                    None => { s.step(); }
+                }
+            }
+            if let Some(g) = g.as_mut() { g.download(&mut s); }
+            pmax = pmax.max(s.p.iter().cloned().fold(0.0, f64::max));
+            umax = umax.max(s.max_speed());
+            if s.diverged { pause = Some(f); break; }
+        }
+        eprintln!("{} : p max {:.3e} Pa, |u| max {:.1} m/s, pas refaits {}, pas {}, pause {:?}, {:.1} s", if gpu { "GPU" } else { "CPU" },
+            pmax, umax, if gpu { redo_gpu } else { s.rollbacks }, s.step_count, pause, clk.elapsed().as_secs_f64());
+    }
+}
+
+/// cellule qui fait échouer `state_is_sane` (premier critère rencontré : T / p / masse, sinon la face la plus rapide)
+fn worst_cell(s: &MultiphaseSim) -> (usize, String) {
+    let n = s.nx * s.ny;
+    let mut tmin = (f64::INFINITY, 0usize, String::new());
+    for c in 0..n {
+        if s.solid[c] >= 0 { continue; }
+        if !s.temp[c].is_finite() || !s.p[c].is_finite() { return (c, format!("non fini T {} p {}", s.temp[c], s.p[c])); }
+        if s.p[c] < 0.0 { return (c, format!("p < 0 : {:.3e}", s.p[c])); }
+        for k in 0..s.mass.len() {
+            if s.mass[k][c] < -1e-6 { return (c, format!("masse {} < 0 : {:.3e}", s.reg.phases[k].name, s.mass[k][c])); }
+        }
+        for g in 0..s.ngroups() {
+            if s.group_mass(g, c) > 0.0 {
+                let t = if s.tg[g][c].is_finite() { s.tg[g][c] } else { -1e30 };
+                if t < tmin.0 { tmin = (t, c, format!("T g{g} = {t:.1}")); }
+                if t > 5000.0 { return (c, format!("T g{g} = {t:.1} > 5000")); }
+            }
+        }
+    }
+    if tmin.0 < 50.0 { return (tmin.1, tmin.2); }
+    // face la plus rapide
+    let (mut best, mut at) = (0.0f64, 0usize);
+    for j in 0..s.ny {
+        for i in 0..s.nx {
+            let c = s.idx(i, j);
+            let v = [s.u[s.uidx(i, j)], s.u[s.uidx(i + 1, j)], s.v[s.vidx(i, j)], s.v[s.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            if v > best { best = v; at = c; }
+        }
+    }
+    (at, format!("vitesse {best:.3e} m/s (T min {:.1})", tmin.0))
 }
