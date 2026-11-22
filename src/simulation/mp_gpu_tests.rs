@@ -409,6 +409,7 @@ fn gpu_one_step_field_diffs() {
         if off("MP_NOVISC") { s.viscous = false; }
         if off("MP_NOST") { s.surface_tension = false; }
         if off("MP_NODIFF") { for p in s.reg.phases.iter_mut() { p.diffusivity = 0.0; } }
+        if let Ok(k) = std::env::var("MP_KTH") { s.flame_thermo_substeps = k.parse().unwrap(); }
         s
     };
     let mut cpu = mk();

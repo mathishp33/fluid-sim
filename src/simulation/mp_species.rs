@@ -26,6 +26,14 @@
 use super::multiphase::{clampf, temp_from_masses, MultiphaseSim};
 use super::phases::{Phase, Reaction, Radiator};
 
+/// cellules traitées par un appel de la chimie
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChemSel {
+    All,
+    Flame,
+    NonFlame,
+}
+
 /// constante de Stefan–Boltzmann (W/(m²·K⁴))
 const SIGMA_SB: f64 = 5.670374419e-8;
 /// plancher de concentration pour les ordres négatifs ou les exposants (o − ν) < 0 de la vitesse inverse (mol/m³)
@@ -69,10 +77,26 @@ impl CellChem<'_> {
     }
     /// vitesse NETTE de la réaction j (mol/m³/s) à la température t
     fn rate(&self, j: usize, t: f64) -> f64 {
+        let (rf, rr) = self.rate_parts(j, t);
+        rf - rr
+    }
+    /// Débit du capteur de flamme : débit net pondéré par l'écart à l'équilibre (1 − r_inv/r_dir) — le débit net dans un mélange
+    /// frais, ~0 près de l'équilibre. Sans cette pondération, l'équilibre de dissociation de H2O des gaz brûlés (H2 + ½O2 ⇌ H2O,
+    /// δ_L > 0), déplacé à chaque oscillation de p / T, franchissait le seuil de 2 % : le masque d'épaississement clignotait sur
+    /// 10 mailles de gaz brûlés et entretenait une oscillation thermoacoustique numérique (flamme 14 % trop lente au dt par défaut).
+    fn sensor_rate(&self, j: usize, t: f64) -> f64 {
+        let (rf, rr) = self.rate_parts(j, t);
+        if rf <= 0.0 {
+            return 0.0;
+        }
+        (rf - rr).max(0.0) * (1.0 - rr / rf).clamp(0.0, 1.0)
+    }
+    /// (débit direct, débit inverse) en mol/(m³·s) ; inverse nul pour une réaction irréversible
+    fn rate_parts(&self, j: usize, t: f64) -> (f64, f64) {
         let r = &self.rx[j];
         let k = r.k_forward(t) / if r.flame_thickness > 0.0 { self.f_eff } else { 1.0 };
         if k <= 0.0 {
-            return 0.0;
+            return (0.0, 0.0);
         }
         let mut modif = 1.0;
         for &(s, o) in &r.modifiers {
@@ -86,7 +110,7 @@ impl CellChem<'_> {
             rf *= if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { if c > 0.0 { 1.0 } else { 0.0 } } else { c.powf(o) };
         }
         if !r.reversible {
-            return rf;
+            return (rf, 0.0);
         }
         // vitesse inverse k/Kc · Π c_prod^ν · Π c_réac^(o−ν) : l'équilibre Q = Kc est exact quels que soient les ordres
         let ln_kc = r.ln_kc(self.phases, t);
@@ -94,7 +118,7 @@ impl CellChem<'_> {
         for &(s, nu) in &r.products {
             let c = self.conc(s);
             if c <= 0.0 {
-                return rf;
+                return (rf, 0.0);
             }
             ln_rr += nu * c.ln();
         }
@@ -104,7 +128,7 @@ impl CellChem<'_> {
                 ln_rr += d * self.conc(s).max(C_FLOOR).ln();
             }
         }
-        rf - ln_rr.min(700.0).exp()
+        (rf, ln_rr.min(700.0).exp())
     }
     /// avancement maximal (mol/m³) dans le sens direct (> 0) et inverse (< 0) permis par les masses disponibles
     fn bounds(&self, j: usize) -> (f64, f64) {
@@ -348,7 +372,7 @@ impl MultiphaseSim {
                 }
                 // température du groupe des réactifs
                 let t = self.phase_temp(rx[j].reactants[0].0, c);
-                w += (cc.rate(j, t).max(0.0) * cc.heat(j, t)).abs();
+                w += (cc.sensor_rate(j, t) * cc.heat(j, t)).abs();
             }
             omega[c] = w;
         }
@@ -380,6 +404,12 @@ impl MultiphaseSim {
     // ================================================================ cinétique
     /// Réactions chimiques (APRÈS conduction et diffusion, AVANT le changement de phase). Voir l'en-tête du module.
     pub(crate) fn react_step(&mut self, dt: f64) {
+        self.react_step_sel(dt, ChemSel::All, true);
+    }
+
+    /// Chimie des seules cellules `sel` (flamme : F > 1 ; hors flamme : F = 1) — sous-cyclage des flammes (voir
+    /// `flame_thermo_substeps`). `first` : premier appel du pas (dt_chem repart de cet appel, sinon minimum avec les précédents).
+    pub(crate) fn react_step_sel(&mut self, dt: f64, sel: ChemSel, first: bool) {
         if self.reg.reactions.is_empty() || !self.chemistry {
             self.dt_chem = f64::INFINITY;
             self.heat_release.iter_mut().for_each(|h| *h = 0.0);
@@ -402,13 +432,20 @@ impl MultiphaseSim {
             self.reacted = vec![0.0; nre];
         }
         let target = 0.5 * self.chem_volume_limit;
-        for h in self.heat_release.iter_mut() {
-            *h = 0.0;
+        let selected = |s: &Self, c: usize| match sel {
+            ChemSel::All => true,
+            ChemSel::Flame => s.flame_factor[c] > 1.0,
+            ChemSel::NonFlame => s.flame_factor[c] <= 1.0,
+        };
+        for c in 0..n {
+            if selected(self, c) {
+                self.heat_release[c] = 0.0;
+            }
         }
         let reactive = self.reactive_groups();
         // intégration indépendante cellule par cellule : en parallèle, puis application séquentielle des résultats
         let this = &*self;
-        let cell = |c: usize| this.integrate_cell(c, dt, target, &phases, &rx, &scale, &reactive);
+        let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &reactive) } else { None };
         let out: Vec<ChemOut> = if n >= super::mp_mg::PAR_MIN_CELLS / 4 {
             use rayon::prelude::*;
             (0..n).into_par_iter().filter_map(cell).collect()
@@ -449,7 +486,8 @@ impl MultiphaseSim {
             }
             dt_next = dt_next.min(o.dt_cell);
         }
-        self.dt_chem = if dt_next.is_finite() { dt_next.max(1e-8) } else { f64::INFINITY };
+        let v = if dt_next.is_finite() { dt_next.max(1e-8) } else { f64::INFINITY };
+        self.dt_chem = if first { v } else { self.dt_chem.min(v) };
     }
 
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir.

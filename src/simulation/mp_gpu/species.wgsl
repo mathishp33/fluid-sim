@@ -188,8 +188,16 @@ fn cc_cap(t: f32) -> f32 {
     for (var k = 0u; k < P.np; k++) { s += max(chm(k), 0.0) * cet_k(k, t); }
     return s;
 }
-fn cc_rate(j: u32, t: f32) -> f32 {
-    if (rxv(j, 5u) < -1e29) { return 0.0; }
+fn cc_rate(j: u32, t: f32) -> f32 { let r = cc_rate_parts(j, t); return r.x - r.y; }
+// capteur de flamme : débit net pondéré par l'écart à l'équilibre (1 − r_inv/r_dir) (miroir de CellChem::sensor_rate)
+fn cc_sensor_rate(j: u32, t: f32) -> f32 {
+    let r = cc_rate_parts(j, t);
+    if (r.x <= 0.0) { return 0.0; }
+    return max(r.x - r.y, 0.0) * clamp(1.0 - r.y / r.x, 0.0, 1.0);
+}
+// (débit direct, débit inverse) (miroir de CellChem::rate_parts)
+fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
+    if (rxv(j, 5u) < -1e29) { return vec2<f32>(0.0, 0.0); }
     var lk = ln_kf(j, t);
     if (rx_flame(j)) { lk -= log(cfe); }
     var lmod = 0.0;
@@ -223,7 +231,7 @@ fn cc_rate(j: u32, t: f32) -> f32 {
     }
     var rr = 0.0;
     if (!pzero) { rr = exp(min(lrr, 80.0)); }
-    return rf - rr;
+    return vec2<f32>(rf, rr);
 }
 fn cc_bounds(j: u32) -> vec2<f32> {
     var fwd = 3.0e38;
@@ -294,7 +302,7 @@ fn k_flame_omega(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_inv
                 for (var i = 0u; i < rx_nr(j); i++) { if (mass(rx_rs(j, i), c) <= 1e-12) { skip = true; } }
                 if (skip) { continue; }
                 let t = ptemp(rx_rs(j, 0u), c);
-                wsum += abs(max(cc_rate(j, t), 0.0) * cc_heat(j, t));
+                wsum += abs(cc_sensor_rate(j, t) * cc_heat(j, t));
             }
         }
         S[O_omega + c] = wsum;
@@ -363,7 +371,10 @@ fn k_chem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation
     let dt = dtv();
     var dt_cell = 3.0e38;
     // tri rapide
-    var go = inside && !(is_solid(c) || pinned(c));
+    // sélection (Q.a) : 0 toutes les cellules, 1 cellules de flamme (F > 1), 2 hors flamme (miroir de react_step_sel)
+    let fl = S[O_flame + c] > 1.0;
+    let sel_ok = Q.a == 0u || (Q.a == 1u && fl) || (Q.a == 2u && !fl);
+    var go = inside && sel_ok && !(is_solid(c) || pinned(c));
     var possible = false;
     for (var j = 0u; j < P.nre; j++) {
         var all_r = true;
@@ -478,7 +489,7 @@ fn k_chem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation
     for (var k = 0u; k < P.np; k++) { q -= (chm(k) - S[O_ch_o + k * n + c]) * e0_k(k); }
     let tn = cc_temp();
     let dv = abs(cc_volume(pr, tn) - v0) / max(v0, 1e-30);
-    if (inside) { S[O_heat_rel + c] = 0.0; }
+    if (inside && sel_ok) { S[O_heat_rel + c] = 0.0; }
     if (go) {
         if (dv > 1e-3) {
             var span = dt; if (stopped) { span = tl; }
@@ -515,6 +526,6 @@ fn k_chem_final(@builtin(local_invocation_id) l: vec3<u32>) {
     if (l.x == 0u) {
         var d = 3.0e38;
         if (m < 1e37) { d = max(m, 1e-8); }
-        D[D_DTCHEM_NEW] = d;
+        D[D_DTCHEM_NEW] = min(D[D_DTCHEM_NEW], d);   // plusieurs appels par pas (sous-pas des flammes) : minimum
     }
 }

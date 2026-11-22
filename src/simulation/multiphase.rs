@@ -95,11 +95,22 @@ pub struct MultiphaseSim {
     /// Prédicteur-correcteur : le pas est d'abord calculé normalement (prédiction de u^{n+1}), puis refait depuis l'état n en
     /// advectant masses et énergie avec (u^n + u^{n+1})/2. Supprime le retard d'un pas entre la vitesse qui transporte un front et
     /// celle que produit sa source de volume (flamme, changement de phase) — sans lui, boucle thermoacoustique numérique : flamme
-    /// 14 % trop lente au dt par défaut. Coût : ~2 pas. Désactivé par défaut tant que le GPU ne le fait pas (accord CPU / GPU).
+    /// 14 % trop lente au dt par défaut. Coût : ~2 pas (CPU et GPU, mêmes formules). Toujours utilisé quand une flamme épaissie est
+    /// possible (`use_predictor_corrector`) ; ailleurs seulement si demandé.
     pub predictor_corrector: bool,
+    /// Flammes épaissies actives : conduction, diffusion des espèces et chimie intercalées en `flame_thermo_substeps` sous-pas (le
+    /// découpage de Lie diffusion ↔ réaction, raide, est l'erreur dominante d'une flamme : Strang n'y gagne rien).
+    pub flame_thermo_substeps: usize,
+    /// Flamme présente (une cellule F > 1) : dt ≤ cfl_flame·dx / flame_speed_floor, temps propre de la flamme par maille (la CFL
+    /// ordinaire gère les écoulements rapides). Sous prédicteur-correcteur les vitesses sont calmes et la CFL seule laisse dt grimper
+    /// bien au-delà de la résolution en temps de la flamme. `flame_speed_floor` ≈ vitesse d'expansion (σ − 1)·S_L d'une flamme
+    /// d'hydrocarbure ou d'hydrogène (0.1 · 1 mm / 2.5 m/s = 4e-5 s).
+    pub cfl_flame: f64,
+    pub flame_speed_floor: f64,
     /// vitesses d'advection masse / énergie imposées (correcteur) et pas de temps imposé
     pub(crate) adv_vel: Option<(Vec<f64>, Vec<f64>)>,
     pub(crate) dt_force: Option<f64>,
+    pub(crate) pc_predicting: bool,
     /// vitesse au-delà de laquelle un pas est jugé aberrant (m/s) — déclenche le retour arrière avec sous-pas
     pub speed_limit: f64,
     /// Fraction r d'une GROSSE erreur de fermeture volumique héritée du pas précédent (Σ m/ρ − 1 au début du pas, > 0.1) que ce
@@ -289,8 +300,12 @@ impl MultiphaseSim {
             m_tot_old: vec![0.0; n],
             conservative_momentum: true,
             predictor_corrector: false,
+            flame_thermo_substeps: 4,
+            cfl_flame: 0.1,
+            flame_speed_floor: 2.5,
             adv_vel: None,
             dt_force: None,
+            pc_predicting: false,
             speed_limit: 1000.0,
             closure_relax: 0.25,
             closure_relax_scale: 1.0,

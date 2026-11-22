@@ -47,7 +47,17 @@ const D_LEN: usize = 64;
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
 const SLOT_BYTES: u64 = 256;
-const PARAMS_WORDS: usize = 60;
+const PARAMS_WORDS: usize = 64;
+/// groupes de travail des copies d'instantané du prédicteur-correcteur (boucle à pas SNAP_STRIDE = 1024 × 64 dans k_pc_save / k_pc_restore)
+const PC_GROUPS: u32 = 1024;
+
+/// passe d'un pas : simple, prédiction ou correction (prédicteur-correcteur)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Single,
+    Pred,
+    Corr,
+}
 /// lancements de noyaux au plus par tampon de commandes d'une série de pas (lavapipe plantait de temps en temps — non reproductible
 /// en soumettant les lancements un par un — à 1200 avec la température par groupe, qui ajoute des noyaux plus longs)
 const MAX_BATCH_OPS: usize = 400;
@@ -290,6 +300,12 @@ impl MultiphaseGpu {
         sl.add("acc_chem", n);
         sl.add("acc_xi", nre.max(1) * n);
         let pers_end = sl.total;
+        // prédicteur-correcteur : u^{n+1} prédit, instantané de l'état persistant et de D
+        sl.add("Up", nfu);
+        sl.add("Vp", nfv);
+        sl.add("pcs", pers_end - pers_start);
+        sl.add("pcd", D_LEN);
+        sl.add("pcf", 8);
         for name in ["Un", "Us", "Fx", "ust"] {
             sl.add(name, nfu);
         }
@@ -359,6 +375,7 @@ impl MultiphaseGpu {
         for (name, off, _) in &tl.items {
             header += &format!("const T_{name}: u32 = {off}u;\n");
         }
+        header += &format!("const PERS_START: u32 = {pers_start}u;\nconst PERS_LEN: u32 = {}u;\n", pers_end - pers_start);
         header += &format!(
             "const NPMAX: u32 = {npmax}u;\nconst NREMAX: u32 = {}u;\nconst NWG: u32 = {nwg}u;\nconst PH_STRIDE: u32 = {PH_STRIDE}u;\nconst SOL_STRIDE: u32 = {SOL_STRIDE}u;\n\
              const PC_STRIDE: u32 = {PC_STRIDE}u;\nconst GRP_STRIDE: u32 = {}u;\nconst LEV_STRIDE: u32 = {LEV_STRIDE}u;\nconst RX_STRIDE: u32 = {RX_STRIDE}u;\n\
@@ -1148,7 +1165,16 @@ impl MultiphaseGpu {
         w[57] = f(sim.cfl_reject);
         w[58] = f(self.relax_scale);
         w[59] = f(if sim.phase_heat_exchange.is_finite() { sim.phase_heat_exchange } else { 1e38 });
+        w[60] = f(sim.cfl_flame);
+        w[61] = f(sim.flame_speed_floor);
+        w[62] = self.thermo_k(sim) as u32;
         w
+    }
+
+    /// sous-pas du bloc thermique (conduction, diffusion, chimie) du correcteur / d'un pas simple : `flame_thermo_substeps` si une flamme
+    /// épaissie est possible (miroir de step_raw)
+    fn thermo_k(&self, sim: &MultiphaseSim) -> usize {
+        if self.flames_active(sim) { sim.flame_thermo_substeps.max(1) } else { 1 }
     }
 
     fn flames_active(&self, sim: &MultiphaseSim) -> bool {
@@ -1195,8 +1221,24 @@ impl MultiphaseGpu {
         self.plan_step_at(sim, sim.step_count)
     }
 
-    /// plan d'un pas dont le numéro est `step_index` (ordre des balayages x/y alterné comme sur le CPU)
+    /// plan d'un pas dont le numéro est `step_index` (ordre des balayages x/y alterné comme sur le CPU) ; prédicteur-correcteur (miroir
+    /// de `MultiphaseSim::step_pc`) : instantané, prédiction (un sous-pas thermique), u^{n+1} gardé, restauration, correcteur
     fn plan_step_at(&self, sim: &MultiphaseSim, step_index: usize) -> Vec<Op> {
+        if !sim.use_predictor_corrector() {
+            return self.plan_pass(sim, step_index, Pass::Single);
+        }
+        let n_pc = PC_GROUPS;
+        let mut v = vec![Op { k: "k_pc_save", wg: n_pc, slot: 0 }];
+        v.extend(self.plan_pass(sim, step_index, Pass::Pred));
+        let wf = wg(((self.nx + 1) * self.ny).max(self.nx * (self.ny + 1)));
+        v.push(Op { k: "k_pc_keep", wg: wf, slot: 0 });
+        v.push(Op { k: "k_pc_restore", wg: n_pc, slot: 0 });
+        v.extend(self.plan_pass(sim, step_index, Pass::Corr));
+        v.push(Op { k: "k_pc_merge", wg: 1, slot: 0 });
+        v
+    }
+
+    fn plan_pass(&self, sim: &MultiphaseSim, step_index: usize, pass: Pass) -> Vec<Op> {
         let (nx, ny) = (self.nx, self.ny);
         let n = nx * ny;
         let (nfu, nfv) = ((nx + 1) * ny, nx * (ny + 1));
@@ -1240,6 +1282,9 @@ impl MultiphaseGpu {
             }
         }
         // masses / énergie : balayages PLIC alternés
+        if pass == Pass::Corr {
+            v.push(face("k_pc_adv"));
+        }
         v.push(Op { k: "k_adv_init", wg: wm, slot: 0 });
         let first = step_index % 2;
         for q in 0..2 {
@@ -1251,6 +1296,9 @@ impl MultiphaseGpu {
             // mise à jour séquentielle par ligne (x) / colonne (y), dans l'ordre des faces du CPU
             v.push(Op { k: "k_sweep_seq", wg: wg(if dir == 0 { ny } else { nx }), slot: self.slot(dir, 0) });
             v.push(cell("k_temp_update"));
+        }
+        if pass == Pass::Corr {
+            v.push(face("k_pc_back"));
         }
         if sim.conservative_momentum {
             v.push(face("k_mom"));
@@ -1275,27 +1323,44 @@ impl MultiphaseGpu {
         } else if self.nre > 0 {
             v.push(cell("k_flame_one"));
         }
-        if sim.conduction {
-            v.push(cell("k_cond_prep"));
-            v.push(one("k_cond_nsub"));
-            for s in 0..self.cond_budget {
-                v.push(Op { k: "k_cond_step", wg: wn, slot: self.slot(s, 0) });
-            }
-            v.push(cell("k_cond_finish"));
+        // flammes : conduction, diffusion et chimie intercalées en sous-pas (chimie des seules cellules de flamme), puis chimie hors
+        // flamme sur dt (miroir de step_raw) ; la prédiction se contente d'un sous-pas
+        let kth = if pass == Pass::Pred { 1 } else { self.thermo_k(sim) };
+        let chem = sim.chemistry && self.nre > 0;
+        if kth > 1 {
+            v.push(one("k_dtf_sub"));
         }
-        for &g in &self.diff_groups {
-            v.push(Op { k: "k_sp_dloc", wg: wn, slot: self.slot(0, g) });
-            v.push(one("k_sp_nsub"));
-            v.push(Op { k: "k_sp_prep", wg: wn, slot: self.slot(0, g) });
-            for s in 0..self.sp_budget {
-                v.push(Op { k: "k_sp_step", wg: wn, slot: self.slot(s, g) });
-                v.push(Op { k: "k_sp_commit", wg: wn, slot: self.slot(s, g) });
+        for _ in 0..kth {
+            if sim.conduction {
+                v.push(cell("k_cond_prep"));
+                v.push(one("k_cond_nsub"));
+                for s in 0..self.cond_budget {
+                    v.push(Op { k: "k_cond_step", wg: wn, slot: self.slot(s, 0) });
+                }
+                v.push(cell("k_cond_finish"));
+            }
+            for &g in &self.diff_groups {
+                v.push(Op { k: "k_sp_dloc", wg: wn, slot: self.slot(0, g) });
+                v.push(one("k_sp_nsub"));
+                v.push(Op { k: "k_sp_prep", wg: wn, slot: self.slot(0, g) });
+                for s in 0..self.sp_budget {
+                    v.push(Op { k: "k_sp_step", wg: wn, slot: self.slot(s, g) });
+                    v.push(Op { k: "k_sp_commit", wg: wn, slot: self.slot(s, g) });
+                }
+            }
+            if chem {
+                v.push(Op { k: "k_chem", wg: wn, slot: self.slot(if kth > 1 { 1 } else { 0 }, 0) });
+                v.push(one("k_chem_final"));
             }
         }
-        if sim.chemistry && self.nre > 0 {
-            v.push(cell("k_chem"));
-            v.push(one("k_chem_final"));
-        } else if self.nre > 0 {
+        if kth > 1 {
+            v.push(one("k_dtf_one"));
+            if chem {
+                v.push(Op { k: "k_chem", wg: wn, slot: self.slot(2, 0) });
+                v.push(one("k_chem_final"));
+            }
+        }
+        if !chem && self.nre > 0 {
             v.push(cell("k_heat_zero"));
         }
         if sim.radiation && self.has_radiators {

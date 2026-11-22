@@ -83,6 +83,10 @@ impl MultiphaseSim {
             dt = dt.min((self.heat_tau * 20.0 / gap).max(1e-6));
         }
         dt = dt.min(self.cfl * dx / umax.max(1e-9));
+        // flamme présente (facteur d'épaississement du pas précédent) : borne de pas propre aux flammes
+        if self.flames_active() && self.flame_factor.iter().any(|&f| f > 1.0) {
+            dt = dt.min(self.cfl_flame * dx / self.flame_speed_floor);
+        }
         let g = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
         if g > 0.0 {
             dt = dt.min(0.5 * (dx / g).sqrt());
@@ -216,11 +220,13 @@ impl MultiphaseSim {
     /// Pas brut, en prédicteur-correcteur si `predictor_corrector` (voir le champ). La prédiction invalide (NaN, T aberrante…) est
     /// rendue telle quelle : le filet de sécurité de `step` la refait avec dt/4.
     pub(crate) fn step_pc(&mut self) -> f64 {
-        if !self.predictor_corrector {
+        if !self.use_predictor_corrector() {
             return self.step_raw();
         }
         let snap = self.snapshot();
+        self.pc_predicting = true;
         let dt = self.step_raw();
+        self.pc_predicting = false;
         if !self.state_is_sane() {
             return dt;
         }
@@ -309,15 +315,28 @@ impl MultiphaseSim {
         self.probe("refresh + sources");
         lap(&mut prof, P_REFRESH);
         self.update_flame_factor(dt);
-        self.conduct(dt);
-        self.probe("conduction");
-        lap(&mut prof, P_CONDUCT);
-        self.diffuse_species(dt);
-        self.probe("diffusion espèces");
-        lap(&mut prof, P_SPECIES);
-        self.react_step(dt);
+        // flammes : conduction, diffusion et chimie intercalées en sous-pas (voir `flame_thermo_substeps`)
+        // (la prédiction du prédicteur-correcteur, qui ne sert qu'à estimer u^{n+1}, se contente d'un sous-pas)
+        let kth = if self.flames_active() && !self.pc_predicting { self.flame_thermo_substeps.max(1) } else { 1 };
+        let h = dt / kth as f64;
+        // (chimie sous-cyclée dans les seules cellules de flamme, F > 1 ; les autres — gaz brûlés à l'équilibre, l'essentiel du coût
+        // de la chimie — réagissent une fois sur dt)
+        use super::mp_species::ChemSel;
+        for s in 0..kth {
+            self.conduct(h);
+            lap(&mut prof, P_CONDUCT);
+            self.diffuse_species(h);
+            lap(&mut prof, P_SPECIES);
+            self.react_step_sel(h, if kth > 1 { ChemSel::Flame } else { ChemSel::All }, s == 0);
+            lap(&mut prof, P_CHEM);
+        }
+        if kth > 1 {
+            self.react_step_sel(dt, ChemSel::NonFlame, false);
+            lap(&mut prof, P_CHEM);
+        }
+        self.probe("conduction + diffusion + chimie");
         self.radiate(dt);
-        self.probe("chimie + rayonnement");
+        self.probe("rayonnement");
         lap(&mut prof, P_CHEM);
         self.phase_change_step(dt);
         self.probe("changement de phase");
@@ -367,6 +386,23 @@ impl MultiphaseSim {
     fn face_speed(&self, c: usize) -> f64 {
         let (i, j) = (c % self.nx, c / self.nx);
         [self.u[self.uidx(i, j)], self.u[self.uidx(i + 1, j)], self.v[self.vidx(i, j)], self.v[self.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()))
+    }
+
+    /// prédicteur-correcteur demandé, ou automatique dès qu'une flamme épaissie est possible (boucle thermoacoustique)
+    pub fn use_predictor_corrector(&self) -> bool {
+        self.predictor_corrector || self.flames_active()
+    }
+
+    /// flammes épaissies actives (miroir de `MultiphaseGpu::flames_active`) : chimie, réaction à δ_L > 0, F_max > 1
+    pub(crate) fn flames_active(&self) -> bool {
+        let fmax = self
+            .reg
+            .reactions
+            .iter()
+            .filter(|r| r.flame_thickness > 0.0)
+            .map(|r| self.flame_resolution * self.dx / r.flame_thickness)
+            .fold(1.0f64, f64::max);
+        self.chemistry && fmax > 1.0
     }
 
     /// advection masse / énergie avec la vitesse imposée par le correcteur (sinon la vitesse courante u^n)

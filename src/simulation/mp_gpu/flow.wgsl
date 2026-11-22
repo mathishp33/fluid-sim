@@ -1,6 +1,7 @@
 // ===== Écoulement : propriétés, pas de temps, forces, advection PLIC (groupes miscibles, MUSCL), QDM, pression =====
 
-fn dtv() -> f32 { return D[D_DT]; }
+// pas de temps des noyaux : dt × fraction (sous-pas du bloc thermique ; fraction nulle = D pas encore initialisé → 1)
+fn dtv() -> f32 { let fr = D[D_DTF]; return D[D_DT] * select(1.0, fr, fr > 0.0); }
 
 // ---------------------------------------------------------------- refresh : T, α, ρ_mix, μ, k depuis (m, ε, p)
 @compute @workgroup_size(64)
@@ -71,8 +72,9 @@ fn k_red_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
                 v[5] = min(abs(tt - S[O_temp + i]), P.heat_pmax * P.heat_tau / cap);
             }
         }
+        if (S[O_flame + i] > 1.0) { v[6] = 1.0; }
     }
-    wg_reduce(v, 6u, 1u, l.x, w.x, 0u);
+    wg_reduce(v, 7u, 1u, l.x, w.x, 0u);
 }
 @compute @workgroup_size(256)
 fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
@@ -83,10 +85,13 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
     let dtvis = -final_reduce(3u, nw, 1u, l.x);
     let sig = final_reduce(4u, nw, 1u, l.x);
     let gap = final_reduce(5u, nw, 1u, l.x);
+    let flame = final_reduce(6u, nw, 1u, l.x);
     if (l.x == 0u) {
         var dt = min(min(P.dt_max, D[D_DTCHEM]), min(D[D_DTPHASE], P.dt_cap));
         if (gap > 0.0) { dt = min(dt, max(P.heat_tau * 20.0 / gap, 1e-6)); }
         dt = min(dt, P.cfl * P.dx / max(umax, 1e-9));
+        // flamme présente (miroir de choose_dt)
+        if (has(F_FLAME) && flame > 0.5) { dt = min(dt, P.cfl_flame * P.dx / P.flame_u_floor); }
         let gg = sqrt(P.gx * P.gx + P.gy * P.gy);
         if (gg > 0.0) { dt = min(dt, 0.5 * sqrt(P.dx / gg)); }
         if (dtvis > 0.0 && dtvis < 1e37) { dt = min(dt, dtvis); }
@@ -94,12 +99,68 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
             dt = min(dt, P.cap_safety * sqrt((rmin + rmax) * P.dx * P.dx * P.dx / (4.0 * PI * sig)));
         }
         D[D_DT] = dt;
+        D[D_DTF] = 1.0;
         D[D_SUB_C] = 0.0; D[D_SUB_S] = 0.0;
         D[D_NEWTON_DONE] = 0.0; D[D_NEWTON_IT] = 0.0; D[D_NEWTON_MAX] = 0.0;
         D[D_PCG_DONE] = 0.0; D[D_PCG_IT] = 0.0; D[D_PCG_ITN] = 0.0; D[D_MAXPCG_N] = 0.0;
         D[D_DTCHEM_NEW] = 3.0e38; D[D_DTPHASE_NEW] = 3.0e38;
         D[D_REDO] = 0.0; D[D_NSUB_S_MAX] = 0.0; D[D_PCG_UNCONV] = 0.0; D[D_NSUB_C] = 0.0; D[D_NSUB_S] = 0.0;
     }
+}
+
+// ---------------------------------------------------------------- sous-pas du bloc thermique des flammes (miroir de step_raw)
+@compute @workgroup_size(64)
+fn k_dtf_sub(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x == 0u) { D[D_DTF] = 1.0 / f32(max(P.thermo_k, 1u)); } }
+@compute @workgroup_size(64)
+fn k_dtf_one(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x == 0u) { D[D_DTF] = 1.0; } }
+
+// ---------------------------------------------------------------- prédicteur-correcteur (miroir de step_pc)
+// instantané de l'état persistant (S) et des scalaires (D) au début du pas ; boucle à pas fixe (dispatch de PC_GROUPS groupes, pas SNAP_STRIDE)
+const SNAP_STRIDE: u32 = 65536u;   // = 1024 groupes × 64 fils
+@compute @workgroup_size(64)
+fn k_pc_save(@builtin(global_invocation_id) g: vec3<u32>) {
+    for (var i = g.x; i < PERS_LEN; i += SNAP_STRIDE) { S[O_pcs + i] = S[PERS_START + i]; }
+    if (g.x < D_LEN) { S[O_pcd + g.x] = D[g.x]; }
+}
+@compute @workgroup_size(64)
+fn k_pc_restore(@builtin(global_invocation_id) g: vec3<u32>) {
+    for (var i = g.x; i < PERS_LEN; i += SNAP_STRIDE) { S[PERS_START + i] = S[O_pcs + i]; }
+    if (g.x < D_LEN) { D[g.x] = S[O_pcd + g.x]; }
+}
+// fin de la prédiction : u^{n+1} prédit ; budgets / refus de la prédiction gardés (la restauration de D et k_dt_final du correcteur
+// les effaceraient : une prédiction qui dépasse un budget de sous-pas sautait sa diffusion sans que le budget ne grandisse)
+@compute @workgroup_size(64)
+fn k_pc_keep(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    if (f < nfu()) { S[O_Up + f] = S[O_U + f]; }
+    if (f < nfv()) { S[O_Vp + f] = S[O_V + f]; }
+    if (f == 0u) {
+        S[O_pcf + 0u] = D[D_SUB_C]; S[O_pcf + 1u] = D[D_NSUB_S_MAX]; S[O_pcf + 2u] = D[D_REDO];
+        S[O_pcf + 3u] = D[D_MAXPCG_N]; S[O_pcf + 4u] = D[D_PCG_UNCONV]; S[O_pcf + 5u] = D[D_BAD];
+    }
+}
+// fin du correcteur : maxima des deux passes
+@compute @workgroup_size(64)
+fn k_pc_merge(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x == 0u) {
+        D[D_SUB_C] = max(D[D_SUB_C], S[O_pcf + 0u]); D[D_NSUB_S_MAX] = max(D[D_NSUB_S_MAX], S[O_pcf + 1u]);
+        D[D_REDO] = max(D[D_REDO], S[O_pcf + 2u]); D[D_MAXPCG_N] = max(D[D_MAXPCG_N], S[O_pcf + 3u]);
+        D[D_PCG_UNCONV] = max(D[D_PCG_UNCONV], S[O_pcf + 4u]);
+    }
+}
+// correcteur, avant l'advection masse / énergie : U ← (u^n + u^{n+1})/2 (et Un, second membre de la pression), u^n gardé dans Up
+@compute @workgroup_size(64)
+fn k_pc_adv(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    if (f < nfu()) { let un = S[O_U + f]; let ua = 0.5 * (un + S[O_Up + f]); S[O_Up + f] = un; S[O_U + f] = ua; S[O_Un + f] = ua; }
+    if (f < nfv()) { let vn = S[O_V + f]; let va = 0.5 * (vn + S[O_Vp + f]); S[O_Vp + f] = vn; S[O_V + f] = va; S[O_Vn + f] = va; }
+}
+// après l'advection masse / énergie : U ← u^n (quantité de mouvement transportée, flux de masse de l'advection)
+@compute @workgroup_size(64)
+fn k_pc_back(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    if (f < nfu()) { S[O_U + f] = S[O_Up + f]; }
+    if (f < nfv()) { S[O_V + f] = S[O_Vp + f]; }
 }
 
 // ---------------------------------------------------------------- forces
