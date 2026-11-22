@@ -4,7 +4,7 @@
 //!  * clic gauche : outil courant ; Ctrl + clic gauche : pose le type de cellule choisi (solide + comportement thermique, puits, émetteur,
 //!    accélérateur, téléporteur) ; clic droit : pousse le fluide ; clic milieu (ou Ctrl + milieu) : efface solide et effet ;
 //!    Maj + clic gauche ou Maj + clic milieu : chauffe / refroidit vers la T du pinceau.
-//!  * raccourcis : Espace, → / ↑, S / L (sauver l'état complet / charger un état ou une géométrie), I (solides blancs), V, M, C / Maj+C (rayon), R (reset flow),
+//!  * raccourcis : Espace, → / ↑, S / L (sauver l'état complet / charger un état ou une géométrie), H (panneaux), I (solides blancs), V, M, C / Maj+C (rayon), R (reset flow),
 //!    Maj+R (recommencer le scénario), Échap.
 
 use std::time::{Duration, Instant};
@@ -29,6 +29,27 @@ const P_ATM: f64 = 101325.0;
 const FRAME_BUDGET: Duration = Duration::from_millis(14);
 /// rayons de pinceau (cellules) parcourus par la touche C
 const RADII: &[usize] = &[1, 2, 3, 5, 8, 12, 16, 24, 32, 48, 60];
+
+/// Section repliable d'un panneau : titre en gras, état ouvert / fermé mémorisé par egui.
+fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong().size(15.0)).id_source(title).default_open(open).show(ui, |ui| {
+        airy(ui);
+        add(ui);
+        ui.add_space(4.0);
+    });
+}
+
+/// curseur affiché en notation scientifique (puissances, pressions : « 3.0e8 » plutôt que « 300000000 ») ; saisie libre (1e8, 300000…)
+fn sci(s: egui::Slider<'_>) -> egui::Slider<'_> {
+    s.custom_formatter(|v, _| if v == 0.0 { "0".into() } else { format!("{v:.1e}") }).custom_parser(|t| t.trim().replace(',', ".").parse::<f64>().ok())
+}
+
+/// espacements un peu plus généreux que ceux d'egui par défaut (panneaux moins tassés)
+fn airy(ui: &mut egui::Ui) {
+    let sp = ui.spacing_mut();
+    sp.item_spacing = egui::vec2(8.0, 6.0);
+    sp.slider_width = 150.0;
+}
 
 fn cycle_radius(current: usize, reverse: bool) -> usize {
     if reverse {
@@ -135,6 +156,9 @@ pub struct MultiphaseWindow {
     stats_age: usize,
     status: String,
     show_help: bool,
+    /// panneaux latéraux affichés (réglages à gauche, infos à droite) ; H les rabat / rouvre tous les deux
+    show_controls: bool,
+    show_info: bool,
     fps: f32,
     frames: usize,
     last_fps: Instant,
@@ -210,6 +234,8 @@ impl MultiphaseWindow {
             stats_age: 0,
             status,
             show_help: false,
+            show_controls: true,
+            show_info: true,
             fps: 0.0,
             frames: 0,
             last_fps: Instant::now(),
@@ -351,12 +377,16 @@ impl MultiphaseWindow {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("LMB : outil (Ctrl : cellule spéciale) | RMB : pousser | MMB : effacer (solide + effet) | Maj+LMB / Maj+MMB : chauffer vers T pinceau");
+                    ui.weak("Clic G : outil · Ctrl + clic : cellule spéciale · Clic D : pousser · Clic milieu : effacer · Maj + clic : chauffer · H : panneaux");
                 });
             });
         });
-        self.controls(ctx);
-        self.info(ctx);
+        if self.show_controls {
+            self.controls(ctx);
+        }
+        if self.show_info {
+            self.info(ctx);
+        }
         self.canvas(ctx, dt_wall);
         self.help(ctx);
         ctx.request_repaint();
@@ -388,6 +418,12 @@ impl MultiphaseWindow {
         }
         if pressed(egui::Key::I) {
             self.solids_white = !self.solids_white;
+        }
+        if pressed(egui::Key::H) {
+            // les deux panneaux ensemble : s'il en reste un ouvert, on rabat tout
+            let any = self.show_controls || self.show_info;
+            self.show_controls = !any;
+            self.show_info = !any;
         }
         if pressed(egui::Key::V) {
             self.display = self.display.next();
@@ -532,51 +568,71 @@ impl MultiphaseWindow {
 
     fn top_bar(&mut self, ctx: &egui::Context, action: &mut WindowAction) {
         egui::TopBottomPanel::top("mp_top").show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                if ui.button("Sauver l'état complet (S)").on_hover_text("Fluide, solides, cellules spéciales, bords, réglages, matériaux : la simulation reprend exactement au même point").clicked() {
-                    self.save_scene();
-                }
-                if ui.small_button("Géométrie seule").on_hover_text("Solides, comportements thermiques et cellules spéciales seulement (réutilisables sur un autre écoulement)").clicked() {
-                    self.save_geometry();
-                }
-                if ui.button("Charger (L)").on_hover_text("État complet ou géométrie seule (.mps)").clicked() {
-                    self.load_scene();
-                }
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.toggle_value(&mut self.show_controls, "Réglages").on_hover_text("Afficher / rabattre le panneau de réglages (H : les deux panneaux)");
                 ui.separator();
-                let label = if self.paused { "Reprendre (Espace)" } else { "Pause (Espace)" };
-                if ui.button(label).clicked() {
-                    self.paused = !self.paused;
-                }
-                if ui.add_enabled(self.paused, egui::Button::new("Pas (→)")).clicked() {
-                    self.step_frame = 1;
-                }
-                if ui.button("Reset flow (R)").clicked() {
-                    self.do_reset_flow();
-                }
-                if ui.button("Recommencer (Maj+R)").clicked() {
-                    self.reset();
-                }
-                ui.separator();
-                if ui.button("Aide").clicked() {
-                    self.show_help = !self.show_help;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Retour aux réglages (Échap)").clicked() {
-                        *action = WindowAction::BackToSettings;
+                ui.menu_button("Fichier", |ui| {
+                    if ui.button("Sauver l'état complet… (S)").on_hover_text("Fluide, solides, cellules spéciales, bords, réglages, matériaux : la simulation reprend exactement au même point").clicked() {
+                        ui.close_menu();
+                        self.save_scene();
+                    }
+                    if ui.button("Sauver la géométrie seule…").on_hover_text("Solides, comportements thermiques et cellules spéciales (réutilisables sur un autre écoulement)").clicked() {
+                        ui.close_menu();
+                        self.save_geometry();
+                    }
+                    ui.separator();
+                    if ui.button("Charger… (L)").on_hover_text("État complet ou géométrie seule (.mps)").clicked() {
+                        ui.close_menu();
+                        self.load_scene();
                     }
                 });
+                ui.separator();
+                let label = if self.paused { "Reprendre" } else { "Pause" };
+                if ui.button(label).on_hover_text("Espace").clicked() {
+                    self.paused = !self.paused;
+                }
+                if ui.add_enabled(self.paused, egui::Button::new("Pas")).on_hover_text("→ : 1 pas, ↑ : 10 pas (en pause)").clicked() {
+                    self.step_frame = 1;
+                }
+                if ui.button("Reset flow").on_hover_text("R : vitesses à zéro").clicked() {
+                    self.do_reset_flow();
+                }
+                if ui.button("Recommencer").on_hover_text("Maj + R : reconstruit le scénario").clicked() {
+                    self.reset();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.button("Retour aux réglages").on_hover_text("Échap").clicked() {
+                        *action = WindowAction::BackToSettings;
+                    }
+                    ui.toggle_value(&mut self.show_help, "Aide");
+                    ui.separator();
+                    ui.toggle_value(&mut self.show_info, "Infos").on_hover_text("Afficher / rabattre le panneau d'informations (H : les deux panneaux)");
+                });
             });
+            ui.add_space(2.0);
         });
     }
 
     fn controls(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("mp_controls").default_width(300.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Multiphasique");
-                ui.separator();
-
+        egui::SidePanel::left("mp_controls").default_width(310.0).min_width(240.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Réglages");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("«").on_hover_text("Rabattre le panneau (H : les deux panneaux)").clicked() {
+                        self.show_controls = false;
+                    }
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                airy(ui);
+                // ---- scénario
                 let mut chosen = None;
-                egui::ComboBox::from_label("Scénario préréglé").selected_text(self.scenario.name()).show_ui(ui, |ui| {
+                ui.label("Scénario préréglé");
+                egui::ComboBox::from_id_source("mp_scenario").width(ui.available_width() - 8.0).selected_text(self.scenario.name()).show_ui(ui, |ui| {
                     for sc in MpScenario::ALL {
                         if ui.selectable_label(sc == self.scenario, sc.name()).clicked() {
                             chosen = Some(sc);
@@ -587,152 +643,173 @@ impl MultiphaseWindow {
                     self.scenario = sc;
                     self.reset();
                 }
+                ui.add_space(4.0);
 
-                ui.separator();
-                ui.label("Affichage (V)");
-                for m in MpDisplay::ALL {
-                    ui.selectable_value(&mut self.display, m, m.name());
-                }
-                if self.display == MpDisplay::Temperature {
-                    ui.add(egui::Slider::new(&mut self.t_scale, 1.0..=1000.0).logarithmic(true).text("Échelle ΔT (K)"));
-                }
-                if self.display == MpDisplay::Pressure {
-                    ui.add(egui::Slider::new(&mut self.p_scale, 0.0..=1e6).text("Échelle p (Pa, 0 = auto)"));
-                }
-                ui.checkbox(&mut self.solids_white, "Solides blancs (I)");
-
-                ui.separator();
-                ui.heading("Pinceau");
-                for t in sim_tools(&self.sim) {
-                    let name = tool_label(&self.sim, t);
-                    ui.selectable_value(&mut self.tool, t, name);
-                }
-                ui.selectable_value(&mut self.tool, MpTool::ClearCell, tool_name(&self.sim.reg, MpTool::ClearCell));
-                ui.horizontal(|ui| {
-                    ui.label("Forme (M)");
-                    ui.selectable_value(&mut self.circle, true, "Rond");
-                    ui.selectable_value(&mut self.circle, false, "Carré");
+                section(ui, "Affichage", true, |ui| {
+                    egui::ComboBox::from_label("Champ (V)").selected_text(self.display.name()).show_ui(ui, |ui| {
+                        for m in MpDisplay::ALL {
+                            ui.selectable_value(&mut self.display, m, m.name());
+                        }
+                    });
+                    if self.display == MpDisplay::Temperature {
+                        ui.add(egui::Slider::new(&mut self.t_scale, 1.0..=1000.0).logarithmic(true).text("Échelle ΔT (K)"));
+                    }
+                    if self.display == MpDisplay::Pressure {
+                        ui.add(sci(egui::Slider::new(&mut self.p_scale, 0.0..=1e6).text("Échelle p (Pa)"))).on_hover_text("0 = automatique");
+                    }
+                    ui.checkbox(&mut self.solids_white, "Solides blancs (I)");
+                    ui.checkbox(&mut self.show_effects, "Couleurs des cellules spéciales");
                 });
-                ui.add(egui::Slider::new(&mut self.radius, 1..=60).text("Rayon (C)"));
-                ui.add(egui::Slider::new(&mut self.brush_temp, 100.0..=3000.0).text("T pinceau (K)"));
-                ui.weak("T pinceau : température des phases et mélanges ajoutés, des solides, et cible du chauffage");
-                ui.add(egui::Slider::new(&mut self.sim.heat_power_max, 1e6..=1e10).logarithmic(true).text("Puissance max. du chauffage (W/m³)"));
-                ui.weak("Le chauffage (Maj + clic) apporte sa chaleur pendant le temps SIMULÉ, au plus à cette puissance. Un liquide posé \
+
+                section(ui, "Pinceau", true, |ui| {
+                    let label = |w: &Self, t: MpTool| if t == MpTool::ClearCell { tool_name(&w.sim.reg, t) } else { tool_label(&w.sim, t) };
+                    let mut tools = sim_tools(&self.sim);
+                    tools.push(MpTool::ClearCell);
+                    let current = label(self, self.tool);
+                    egui::ComboBox::from_label("Outil").width(ui.available_width() - 60.0).selected_text(current).show_ui(ui, |ui| {
+                        for t in tools {
+                            let name = label(self, t);
+                            ui.selectable_value(&mut self.tool, t, name);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Forme (M)");
+                        ui.selectable_value(&mut self.circle, true, "Rond");
+                        ui.selectable_value(&mut self.circle, false, "Carré");
+                    });
+                    ui.add(egui::Slider::new(&mut self.radius, 1..=60).text("Rayon (C)"));
+                    ui.add(egui::Slider::new(&mut self.brush_temp, 100.0..=3000.0).text("T pinceau (K)"))
+                        .on_hover_text("Température des phases, mélanges et solides ajoutés, et cible du chauffage (Maj + clic)");
+                    if self.tool == MpTool::Ignite {
+                        ui.add(egui::Slider::new(&mut self.ignite_temp, 1200.0..=3000.0).text("T du noyau (K)")).on_hover_text(
+                            "Allumer : le mélange local est remplacé par ses gaz brûlés chauds (à pression constante) ; un noyau trop petit \
+                             (< ~10 mailles de diamètre) peut s'éteindre, comme une étincelle trop faible.",
+                        );
+                    }
+                    ui.add(sci(egui::Slider::new(&mut self.sim.heat_power_max, 1e6..=1e10).logarithmic(true).text("Chauffage max (W/m³)"))).on_hover_text(
+                        "Le chauffage (Maj + clic) apporte sa chaleur pendant le temps SIMULÉ, au plus à cette puissance. Un liquide posé \
                          au-dessus de son ébullition est posé en vapeur. Faire bouillir de l'eau froide au-delà de ~5e8 W/m³ est une \
-                         explosion de vapeur : la simulation la suit au ralenti (pas de temps de quelques µs).");
-                if self.tool == MpTool::Ignite {
-                    ui.add(egui::Slider::new(&mut self.ignite_temp, 1200.0..=3000.0).text("T du noyau de flamme (K)"));
-                    ui.weak("Allumer : le mélange local est remplacé par ses gaz brûlés chauds (à pression constante) ; un noyau trop petit \
-                             (< ~10 mailles de diamètre) peut s'éteindre, comme une étincelle trop faible.");
-                }
+                         explosion de vapeur : la simulation la suit au ralenti (pas de temps de quelques µs).",
+                    );
+                });
 
-                ui.separator();
-                self.cell_effects_ui(ui);
+                section(ui, "Cellules spéciales (Ctrl + clic)", false, |ui| {
+                    self.cell_effects_ui(ui);
+                });
 
-                ui.separator();
-                self.materials_ui(ui);
+                section(ui, "Simulation", true, |ui| {
+                    ui.add(egui::Slider::new(&mut self.speed, 0.001..=10.0).logarithmic(true).text("Vitesse (× temps réel)"));
+                    ui.horizontal(|ui| {
+                        ui.label("Calcul");
+                        let cur = self.backend;
+                        let mut b = cur;
+                        ui.selectable_value(&mut b, Backend::Cpu, "CPU f64");
+                        ui.selectable_value(&mut b, Backend::Gpu, "GPU f32");
+                        if b != cur {
+                            self.set_backend(b);
+                        }
+                    });
+                    if let Some(why) = gpu_unsupported_reason(&self.sim) {
+                        ui.weak(format!("GPU indisponible pour cette scène : {why}"));
+                    }
+                    if self.backend == Backend::Gpu {
+                        if let Some(g) = &self.gpu {
+                            let l = g.last;
+                            ui.weak(format!("{} — {} noyaux par pas", g.adapter_name, l.dispatches)).on_hover_text(format!(
+                                "dt {:.2e} s, {} Newton, {} PCG (max {} par résolution), sous-pas : {} conduction, {} espèces{}{}",
+                                l.dt,
+                                l.newton,
+                                l.pcg,
+                                l.pcg_max,
+                                l.cond_sub,
+                                l.species_sub,
+                                if l.retries > 0 { format!(", {} retour(s) arrière", l.retries) } else { String::new() },
+                                if l.redo > 0 { format!(", {} pas refait(s) (budget)", l.redo) } else { String::new() }
+                            ));
+                        }
+                    }
+                    if ui.button("Température à l'ambiante").clicked() {
+                        self.sync_host();
+                        let t_amb = self.sim.t_ambient;
+                        reset_temperature(&mut self.sim, t_amb);
+                        self.upload_if_gpu();
+                        self.status = "Température remise à l'ambiante".into();
+                    }
+                });
 
-                ui.separator();
-                ui.heading("Simulation");
-                ui.add(egui::Slider::new(&mut self.speed, 0.001..=10.0).logarithmic(true).text("Vitesse (×temps réel)"));
-                // une température par groupe de phases dans les cellules mixtes : vitesse de l'échange de chaleur entre elles
-                ui.horizontal(|ui| {
+                section(ui, "Physique", false, |ui| {
+                    let mut g = -self.sim.gravity[1];
+                    if ui.add(egui::Slider::new(&mut g, 0.0..=100.0).text("Gravité (m/s²)")).changed() {
+                        self.sim.gravity = [0.0, -g];
+                    }
+                    ui.checkbox(&mut self.sim.surface_tension, "Tension de surface");
+                    ui.checkbox(&mut self.sim.viscous, "Viscosité");
+                    ui.checkbox(&mut self.sim.conduction, "Conduction thermique");
+                    ui.checkbox(&mut self.sim.phase_change, "Changement de phase").on_hover_text("Ébullition, condensation, cavitation, évaporation");
+                    if !self.sim.reg.reactions.is_empty() {
+                        ui.checkbox(&mut self.sim.chemistry, "Réactions chimiques");
+                        ui.checkbox(&mut self.sim.radiation, "Rayonnement des gaz chauds").on_hover_text("H2O, CO2 (optiquement mince)");
+                        ui.add(egui::Slider::new(&mut self.sim.flame_resolution, 4.0..=12.0).text("Épaisseur des flammes (mailles)"))
+                            .on_hover_text("Flamme épaissie : la vitesse de flamme est conservée quelle que soit la maille ; plus de mailles = plus précis, plus lent.");
+                    }
                     let mut eq = !self.sim.phase_heat_exchange.is_finite();
-                    if ui.checkbox(&mut eq, "Une seule température par cellule").changed() {
+                    if ui
+                        .checkbox(&mut eq, "Une seule température par cellule")
+                        .on_hover_text("Coché : modèle historique (équilibre thermique immédiat entre les phases d'une cellule mixte)")
+                        .changed()
+                    {
                         self.sim.phase_heat_exchange = if eq { f64::INFINITY } else { 1.0 };
                     }
-                });
-                if self.sim.phase_heat_exchange.is_finite() {
-                    ui.add(egui::Slider::new(&mut self.sim.phase_heat_exchange, 0.01..=100.0).logarithmic(true).text("Échange de chaleur entre phases (×)"));
-                    ui.weak("Cellules mixtes : chaque groupe de phases (liquide, gaz…) garde sa température ; ils échangent par conduction à                              travers l'interface (1 = conductivités et taille de maille). Huile très chaude dans l'air : l'air ne prend pas                              instantanément 2000 K ; huile sur l'eau : pas de vaporisation éclair. Coché : modèle historique (équilibre immédiat).");
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Calcul");
-                    let cur = self.backend;
-                    let mut b = cur;
-                    ui.selectable_value(&mut b, Backend::Cpu, "CPU f64");
-                    ui.selectable_value(&mut b, Backend::Gpu, "GPU f32");
-                    if b != cur {
-                        self.set_backend(b);
+                    if self.sim.phase_heat_exchange.is_finite() {
+                        ui.add(egui::Slider::new(&mut self.sim.phase_heat_exchange, 0.01..=100.0).logarithmic(true).text("Échange entre phases (×)")).on_hover_text(
+                            "Cellules mixtes : chaque groupe de phases (liquide, gaz…) garde sa température ; ils échangent par conduction à \
+                             travers l'interface (1 = conductivités et taille de maille). Huile très chaude dans l'air : l'air ne prend pas \
+                             instantanément 2000 K ; huile sur l'eau : pas de vaporisation éclair.",
+                        );
                     }
                 });
-                if let Some(why) = gpu_unsupported_reason(&self.sim) {
-                    ui.weak(format!("GPU indisponible pour cette scène : {why}"));
-                }
-                if self.backend == Backend::Gpu {
-                    if let Some(g) = &self.gpu {
-                        let l = g.last;
-                        ui.weak(format!(
-                            "GPU résident ({}) : dt {:.2e} s, {} Newton, {} PCG (max {} par résolution), sous-pas : {} conduction, {} espèces, {} noyaux par pas{}{}",
-                            g.adapter_name,
-                            l.dt,
-                            l.newton,
-                            l.pcg,
-                            l.pcg_max,
-                            l.cond_sub,
-                            l.species_sub,
-                            l.dispatches,
-                            if l.retries > 0 { format!(", {} retour(s) arrière", l.retries) } else { String::new() },
-                            if l.redo > 0 { format!(", {} pas refait(s) (budget)", l.redo) } else { String::new() }
-                        ));
-                    }
-                }
-                ui.add_enabled(
-                    self.backend == Backend::Cpu,
-                    egui::Checkbox::new(&mut self.sim.multigrid, "Pression : préconditionneur multigrille (sinon IC(0), ~10× plus d'itérations ; GPU : toujours multigrille)"),
-                );
-                ui.add(egui::Slider::new(&mut self.sim.cfl, 0.1..=0.9).text("CFL"));
-                ui.add(egui::Slider::new(&mut self.sim.dt_max, 1e-5..=2e-2).logarithmic(true).text("dt max (s)"));
-                let mut g = -self.sim.gravity[1];
-                if ui.add(egui::Slider::new(&mut g, 0.0..=100.0).text("Gravité (m/s²)")).changed() {
-                    self.sim.gravity = [0.0, -g];
-                }
-                ui.checkbox(&mut self.sim.surface_tension, "Tension de surface");
-                ui.checkbox(&mut self.sim.viscous, "Viscosité");
-                ui.checkbox(&mut self.sim.conduction, "Conduction thermique");
-                ui.checkbox(&mut self.sim.phase_change, "Changement de phase (ébullition / cavitation / évaporation)");
-                if !self.sim.reg.reactions.is_empty() {
-                    ui.checkbox(&mut self.sim.chemistry, "Réactions chimiques");
-                    ui.checkbox(&mut self.sim.radiation, "Rayonnement des gaz chauds (H2O, CO2)");
-                    ui.add(egui::Slider::new(&mut self.sim.flame_resolution, 4.0..=12.0).text("Épaisseur des flammes (mailles)"));
-                    ui.weak("Flamme épaissie : la vitesse de flamme est conservée quelle que soit la maille ; plus de mailles = plus précis, plus lent.");
-                }
-                ui.checkbox(&mut self.sim.conservative_momentum, "Quantité de mouvement conservative (sinon semi-lagrangien)");
-                if ui.button("Reset temperature").clicked() {
-                    self.sync_host();
-                    let t_amb = self.sim.t_ambient;
-                    reset_temperature(&mut self.sim, t_amb);
-                    self.upload_if_gpu();
-                    self.status = "Température remise à l'ambiante".into();
-                }
 
-                ui.separator();
-                ui.heading("Bords");
-                let dx = self.settings.dx;
-                let names = ["Gauche", "Droite", "Bas", "Haut"];
-                for k in 0..4 {
-                    boundary_ui(ui, names[k], &mut self.boundaries[k], dx);
-                }
-                ui.weak("Inlet : vitesse imposée sur la face normale, fluide d'entrée choisi à l'écran de démarrage ; Outlet : ouvert à 1 atm.");
-                if self.apply_boundaries() {
-                    self.sync_host();
-                    self.upload_if_gpu();
-                    self.enforce_backend();
-                }
+                section(ui, "Numérique", false, |ui| {
+                    ui.add(egui::Slider::new(&mut self.sim.cfl, 0.1..=0.9).text("CFL"));
+                    ui.add(egui::Slider::new(&mut self.sim.dt_max, 1e-5..=2e-2).logarithmic(true).text("dt max (s)"));
+                    ui.add_enabled(self.backend == Backend::Cpu, egui::Checkbox::new(&mut self.sim.multigrid, "Pression : multigrille"))
+                        .on_hover_text("Préconditionneur multigrille du gradient conjugué (sinon IC(0), ~10× plus d'itérations) ; le GPU est toujours en multigrille");
+                    ui.checkbox(&mut self.sim.conservative_momentum, "Quantité de mouvement conservative").on_hover_text("Sinon semi-lagrangien");
+                    ui.checkbox(&mut self.sim.predictor_corrector, "Prédicteur-correcteur")
+                        .on_hover_text("Advecte masses et énergie avec la moyenne des vitesses du début et de la fin du pas (≈ 2× plus lent)");
+                });
+
+                section(ui, "Bords", false, |ui| {
+                    let dx = self.settings.dx;
+                    let names = ["Gauche", "Droite", "Bas", "Haut"];
+                    for k in 0..4 {
+                        boundary_ui(ui, names[k], &mut self.boundaries[k], dx);
+                    }
+                    ui.weak("Inlet : vitesse imposée sur la face normale (fluide d'entrée choisi à l'écran de démarrage) ; Outlet : ouvert à 1 atm.");
+                });
+
+                self.materials_ui(ui);
             });
         });
+        // bords : appliqués à chaque image, panneau ouvert ou non (rien ne change tant qu'on ne les modifie pas)
+        if self.apply_boundaries() {
+            self.sync_host();
+            self.upload_if_gpu();
+            self.enforce_backend();
+        }
     }
 
     /// « Cell Effects » + « Solid thermal » du mono-fluide
     fn cell_effects_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Cellules spéciales (Ctrl + clic gauche)");
-        ui.checkbox(&mut self.show_effects, "Afficher les effets (couleurs des cellules spéciales)");
-        for k in CellKind::ALL {
-            if ui.selectable_value(&mut self.cell_kind, k, k.name()).changed() {
-                self.picking_destination = false;
+        let before = self.cell_kind;
+        egui::ComboBox::from_label("Type posé").selected_text(self.cell_kind.name()).show_ui(ui, |ui| {
+            for k in CellKind::ALL {
+                ui.selectable_value(&mut self.cell_kind, k, k.name());
             }
+        });
+        if self.cell_kind != before {
+            self.picking_destination = false;
         }
-        ui.separator();
         match self.cell_kind {
             CellKind::Wall => {
                 if self.sim.reg.solids.is_empty() {
@@ -745,22 +822,23 @@ impl MultiphaseWindow {
                         }
                     });
                 }
-                ui.label("Comportement thermique du solide posé");
-                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Passive, "Solide passif");
-                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Isothermal, "Isotherme (T imposée)");
-                ui.selectable_value(&mut self.thermal_mode, ThermalMode::Heater, "Chauffage (W/m³)");
+                ui.horizontal(|ui| {
+                    ui.label("Thermique").on_hover_text("Comportement thermique du solide posé (aussi pour l'outil « Solide » au clic gauche)");
+                    ui.selectable_value(&mut self.thermal_mode, ThermalMode::Passive, "Passif");
+                    ui.selectable_value(&mut self.thermal_mode, ThermalMode::Isothermal, "Isotherme");
+                    ui.selectable_value(&mut self.thermal_mode, ThermalMode::Heater, "Chauffant");
+                });
                 match self.thermal_mode {
                     ThermalMode::Passive => {}
                     ThermalMode::Isothermal => {
                         ui.add(egui::Slider::new(&mut self.thermal_temp, 100.0..=2000.0).text("T (K)"));
                     }
                     ThermalMode::Heater => {
-                        ui.add(egui::Slider::new(&mut self.thermal_power, 1e2..=1e9).logarithmic(true).text("Puissance (W/m³)"));
+                        ui.add(sci(egui::Slider::new(&mut self.thermal_power, 1e2..=1e9).logarithmic(true).text("Puissance (W/m³)")));
                         let dx = self.sim.dx;
                         ui.weak(format!("= {:.2} W par mètre de profondeur et par cellule", self.thermal_power * dx * dx));
                     }
                 }
-                ui.weak("Le même comportement s'applique aux solides posés au clic gauche avec l'outil « Solide ».");
             }
             CellKind::Sink => {
                 ui.add(egui::Slider::new(&mut self.sink_rate, 0.0..=10.0).text("Aspiration (m/s)"));
@@ -806,7 +884,8 @@ impl MultiphaseWindow {
     /// Éditeur de matériaux de la fenêtre : agit sur une copie, appliquée par « Appliquer et recommencer ».
     fn materials_ui(&mut self, ui: &mut egui::Ui) {
         let mut apply = false;
-        ui.collapsing("Matériaux (fluides, solides, miscibilité…)", |ui| {
+        section(ui, "Matériaux", false, |ui| {
+            ui.weak("Fluides, solides, miscibilité, changements d'état, réactions, mélanges");
             if self.editor.ui(ui, &mut self.lib) {
                 self.lib_dirty = true;
             }
@@ -856,79 +935,100 @@ impl MultiphaseWindow {
     }
 
     fn info(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("mp_info").default_width(260.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Info");
-                ui.separator();
-                let st = &self.stats;
-                egui::Grid::new("mp_info_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                    let mut row = |a: &str, b: String| {
-                        ui.label(a);
-                        ui.label(b);
-                        ui.end_row();
-                    };
-                    row("FPS", format!("{:.1}", self.fps));
-                    row("État", if self.paused { "PAUSE".into() } else { "EN COURS".to_string() });
-                    row("Calcul", if self.backend == Backend::Gpu { "GPU f32".into() } else { "CPU f64".to_string() });
-                    row("Grille", format!("{} × {}", self.sim.nx, self.sim.ny));
-                    row("Domaine (m)", format!("{:.3} × {:.3}", self.sim.nx as f64 * self.sim.dx, self.sim.ny as f64 * self.sim.dx));
-                    row("Temps simulé (s)", format!("{:.4}", st.time));
-                    row("Pas", format!("{}", st.steps));
-                    row("dt (s)", format!("{:.2e}", st.dt));
-                    row("Vitesse atteinte", format!("×{:.3}", self.achieved));
-                    row("Itérations pression", format!("{}", st.pressure_iters));
-                    row("Vitesse max (m/s)", format!("{:.3}", st.speed_max));
-                    row("p min / max (Pa)", format!("{:.0} / {:.0}", st.p_min, st.p_max));
-                    row("T min / max (K)", format!("{:.2} / {:.2}", st.t_min, st.t_max));
-                    row("Énergie cinétique (J/m)", format!("{:.4e}", st.kinetic));
-                    row("Énergie interne (J/m)", format!("{:.6e}", st.internal));
-                    row("Chaleur injectée (J/m)", format!("{:.4e}", st.heat_input));
-                    row("Cellules spéciales", format!("{}", st.effects));
-                    row("Pas annulés (filet)", format!("{}", st.rollbacks));
-                    if !st.reactions.is_empty() {
-                        row("Puissance chimique (W/m)", format!("{:.4e}", st.chem_power));
-                        row("Chaleur de réaction (J/m)", format!("{:.4e}", st.chem_heat));
-                        row("Énergie rayonnée (J/m)", format!("{:.4e}", st.radiated));
-                        row("Épaississement des flammes F", format!("{:.0}", st.flame_factor));
-                    }
-                });
-                if !st.reactions.is_empty() {
-                    ui.separator();
-                    ui.label("Avancement des réactions (mol/m)");
-                    egui::Grid::new("mp_rx_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                        for (n, x) in &st.reactions {
-                            ui.label(n);
-                            ui.label(format!("{:.4e}", x));
+        egui::SidePanel::right("mp_info").default_width(270.0).min_width(220.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.small_button("»").on_hover_text("Rabattre le panneau (H : les deux panneaux)").clicked() {
+                    self.show_info = false;
+                }
+                ui.heading("Infos");
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                airy(ui);
+                let grid = |ui: &mut egui::Ui, id: &str, rows: &[(String, String)]| {
+                    egui::Grid::new(id).num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        for (a, b) in rows {
+                            ui.label(a);
+                            ui.label(b);
                             ui.end_row();
                         }
                     });
-                }
-                ui.separator();
-                ui.label("Masse (kg/m) · aire (m²)");
-                egui::Grid::new("mp_mass_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
-                    for (n, m, a) in &st.phases {
-                        ui.label(n);
-                        ui.label(format!("{:.5e}", m));
-                        ui.label(format!("{:.4e}", a));
-                        ui.end_row();
+                };
+                // ---- cellule sous le curseur : en tête (elle change à chaque mouvement de la souris)
+                section(ui, "Cellule sous le curseur", true, |ui| match self.hovered {
+                    Some((i, j)) => {
+                        let rows: Vec<(String, String)> = cell_info(&self.sim, i, j);
+                        grid(ui, "mp_cell_grid", &rows);
+                    }
+                    None => {
+                        ui.weak("Survolez la grille");
                     }
                 });
+
+                let st = &self.stats;
+                let r = |a: &str, b: String| (a.to_string(), b);
+                section(ui, "Simulation", true, |ui| {
+                    let mut rows = vec![
+                        r("État", format!("{} · {}", if self.paused { "PAUSE" } else { "en cours" }, if self.backend == Backend::Gpu { "GPU f32" } else { "CPU f64" })),
+                        r("Temps simulé (s)", format!("{:.4}", st.time)),
+                        r("Pas · dt (s)", format!("{} · {:.2e}", st.steps, st.dt)),
+                        r("Vitesse atteinte", format!("× {:.3}", self.achieved)),
+                        r("Grille", format!("{} × {} ({:.2} × {:.2} m)", self.sim.nx, self.sim.ny, self.sim.nx as f64 * self.sim.dx, self.sim.ny as f64 * self.sim.dx)),
+                        r("FPS", format!("{:.1}", self.fps)),
+                        r("Vitesse max (m/s)", format!("{:.3}", st.speed_max)),
+                        r("p min / max (Pa)", format!("{:.0} / {:.0}", st.p_min, st.p_max)),
+                        r("T min / max (K)", format!("{:.2} / {:.2}", st.t_min, st.t_max)),
+                        r("Itérations pression", format!("{}", st.pressure_iters)),
+                        r("Pas annulés (filet)", format!("{}", st.rollbacks)),
+                        r("Cellules spéciales", format!("{}", st.effects)),
+                    ];
+                    if !st.reactions.is_empty() {
+                        rows.push(r("Épaississement F", format!("{:.0}", st.flame_factor)));
+                    }
+                    grid(ui, "mp_info_grid", &rows);
+                });
+
+                section(ui, "Bilans", false, |ui| {
+                    let mut rows = vec![
+                        r("Énergie cinétique (J/m)", format!("{:.4e}", st.kinetic)),
+                        r("Énergie interne (J/m)", format!("{:.6e}", st.internal)),
+                        r("Chaleur injectée (J/m)", format!("{:.4e}", st.heat_input)),
+                    ];
+                    if !st.reactions.is_empty() {
+                        rows.push(r("Puissance chimique (W/m)", format!("{:.4e}", st.chem_power)));
+                        rows.push(r("Chaleur de réaction (J/m)", format!("{:.4e}", st.chem_heat)));
+                        rows.push(r("Énergie rayonnée (J/m)", format!("{:.4e}", st.radiated)));
+                    }
+                    grid(ui, "mp_bilan_grid", &rows);
+                    ui.add_space(4.0);
+                    ui.strong("Masse (kg/m) · aire (m²)");
+                    egui::Grid::new("mp_mass_grid").num_columns(3).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                        for (n, m, a) in &st.phases {
+                            ui.label(n);
+                            ui.label(format!("{:.5e}", m));
+                            ui.label(format!("{:.4e}", a));
+                            ui.end_row();
+                        }
+                    });
+                    if !st.reactions.is_empty() {
+                        ui.add_space(4.0);
+                        ui.strong("Avancement des réactions (mol/m)");
+                        let rows: Vec<(String, String)> = st.reactions.iter().map(|(n, x)| (n.clone(), format!("{:.4e}", x))).collect();
+                        grid(ui, "mp_rx_grid", &rows);
+                    }
+                });
+
                 if !self.build_warnings.is_empty() {
-                    ui.separator();
+                    ui.add_space(4.0);
                     for w in &self.build_warnings {
                         ui.colored_label(Color32::from_rgb(230, 170, 40), format!("⚠ {w}"));
                     }
                 }
-                ui.separator();
+
                 let mut reset_prof = false;
-                egui::CollapsingHeader::new(format!(
-                    "Profil du calcul : {:.1} ms par pas, {} fil(s)",
-                    1e3 * self.sim.profile.total() / self.sim.profile.steps.max(1) as f64,
-                    rayon::current_num_threads()
-                ))
-                .id_source("mp_prof")
-                .show(ui, |ui| {
-                    egui::Grid::new("mp_prof_grid").num_columns(3).spacing([10.0, 2.0]).show(ui, |ui| {
+                let title = format!("Profil du calcul ({:.1} ms par pas)", 1e3 * self.sim.profile.total() / self.sim.profile.steps.max(1) as f64);
+                egui::CollapsingHeader::new(egui::RichText::new(title).strong().size(15.0)).id_source("mp_prof").default_open(false).show(ui, |ui| {
+                    egui::Grid::new("mp_prof_grid").num_columns(3).spacing([10.0, 2.0]).striped(true).show(ui, |ui| {
                         for (name, ms, frac) in self.sim.profile.report() {
                             ui.label(name);
                             ui.label(format!("{ms:.2} ms"));
@@ -936,29 +1036,18 @@ impl MultiphaseWindow {
                             ui.end_row();
                         }
                     });
-                    ui.label(format!("Itérations : {} PCG, {} Newton (dernier pas)", self.sim.last_pressure_iters, self.sim.last_newton_iters));
+                    ui.label(format!(
+                        "{} fil(s) ; dernier pas : {} PCG, {} Newton",
+                        rayon::current_num_threads(),
+                        self.sim.last_pressure_iters,
+                        self.sim.last_newton_iters
+                    ));
                     if ui.button("Remettre le profil à zéro").clicked() {
                         reset_prof = true;
                     }
                 });
                 if reset_prof {
                     self.sim.profile = Default::default();
-                }
-                ui.separator();
-                ui.heading("Cellule sous le curseur");
-                match self.hovered {
-                    Some((i, j)) => {
-                        egui::Grid::new("mp_cell_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                            for (a, b) in cell_info(&self.sim, i, j) {
-                                ui.label(a);
-                                ui.label(b);
-                                ui.end_row();
-                            }
-                        });
-                    }
-                    None => {
-                        ui.weak("—");
-                    }
                 }
             });
         });
@@ -971,6 +1060,7 @@ impl MultiphaseWindow {
                     ("Espace", "Pause / reprise"),
                     ("→ / ↑", "1 / 10 pas (en pause)"),
                     ("S / L", "Sauver l'état complet (la simulation reprend au même point) / charger un état ou une géométrie seule (.mps)"),
+                    ("H", "Rabattre / rouvrir les panneaux latéraux (aussi : boutons « Réglages » et « Infos » en haut)"),
                     ("I", "Solides blancs"),
                     ("V", "Mode d'affichage suivant (dont divergence)"),
                     ("M", "Pinceau rond / carré"),
@@ -1324,6 +1414,43 @@ mod tests {
         a.sim.step();
         b.sim.step();
         assert_eq!(b.sim.p, a.sim.p);
+    }
+
+    #[test]
+    fn side_panels_fold_and_the_canvas_still_works() {
+        let ctx = egui::Context::default();
+        let mut w = MultiphaseWindow::new(&settings());
+        w.paused = true;
+        frame(&ctx, &mut w, vec![], Modifiers::default());
+        assert!(w.show_controls && w.show_info);
+        // appui puis relâchement (sans relâchement, egui prend l'appui suivant pour une répétition de touche)
+        let tap = |k: egui::Key| {
+            let ev = |pressed| Event::Key { key: k, physical_key: Some(k), pressed, repeat: false, modifiers: Modifiers::default() };
+            vec![ev(true), ev(false)]
+        };
+        // H : les deux panneaux se rabattent, puis se rouvrent
+        frame(&ctx, &mut w, tap(egui::Key::H), Modifiers::default());
+        assert!(!w.show_controls && !w.show_info);
+        for _ in 0..2 {
+            frame(&ctx, &mut w, vec![], Modifiers::default());
+        }
+        // panneaux fermés : le canevas occupe la fenêtre, un clic près du bord gauche pose l'outil (eau)
+        w.tool = MpTool::Phase(w.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap());
+        w.radius = 3;
+        let eau = w.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0: f64 = w.sim.mass[eau].iter().sum();
+        click_at(&ctx, &mut w, pos2(200.0, 475.0), Modifiers::default(), egui::PointerButton::Primary);
+        assert!(w.sim.mass[eau].iter().sum::<f64>() > m0, "clic sur le canevas sans effet, panneaux rabattus");
+        // un seul panneau ouvert : H rabat tout
+        w.show_info = true;
+        frame(&ctx, &mut w, tap(egui::Key::H), Modifiers::default());
+        assert!(!w.show_controls && !w.show_info);
+        frame(&ctx, &mut w, tap(egui::Key::H), Modifiers::default());
+        assert!(w.show_controls && w.show_info);
+        // survol de la grille : la cellule sous le curseur est connue (affichée en tête du panneau d'infos)
+        frame(&ctx, &mut w, vec![Event::PointerMoved(pos2(760.0, 475.0))], Modifiers::default());
+        frame(&ctx, &mut w, vec![], Modifiers::default());
+        assert!(w.hovered.is_some());
     }
 
     #[test]
