@@ -907,13 +907,14 @@ fn k_rhs(@builtin(global_invocation_id) g: vec3<u32>) {
     var ag = 0.0;
     for (var k = 0u; k < P.np; k++) { if (is_gas(k)) { ag += alpha(k, c); } }
     ag = clamp(ag, 0.0, 1.0);
-    let e0 = S[O_err0 + c];
+    // erreur qui restera après l'advection du pas (miroir de solve_pressure : f = err0 − dt·∇·u^n)
+    let e0 = S[O_err0 + c] - dtv() * d0;
     let r = clamp(P.closure_relax, 0.0, 1.0);
     let small = 0.1 * P.closure_small_scale;   // mp_pressure::CLOSURE_SMALL
     var liq = e0;
     if (abs(e0) > small) { liq = sign(e0) * max(small, r * abs(e0)); }
     let corr = ag * e0 + (1.0 - ag) * liq;
-    S[O_rhs + c] = (S[O_vol + c] - 1.0 - (e0 - corr)) / dtv() - (dn - d0);
+    S[O_rhs + c] = (S[O_vol + c] - 1.0 - (S[O_err0 + c] - corr)) / dtv() - (dn - d0);
 }
 // couplage : 0 aucun (solide, face imposée), 1 complet, 2 Dirichlet (voisin épinglé)
 fn link(a: u32, b: u32, fixed: bool) -> u32 {

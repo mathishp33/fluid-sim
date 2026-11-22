@@ -17,7 +17,8 @@ pub(crate) const P_FLOOR: f64 = 10.0;
 /// vapeur qui grossit dans l'eau : jusqu'à ~0.1, qu'il faut corriger entièrement sous peine de courants parasites)
 pub(crate) const CLOSURE_SMALL: f64 = 0.1;
 
-/// Part de l'erreur de fermeture héritée `e0` (Σ m/ρ − 1 au début du pas) que ce pas corrige. Dans le gaz (fraction `ag`) : tout,
+/// Part de l'erreur de fermeture `e0` que ce pas corrige — appelée avec l'erreur qui restera après l'advection du pas,
+/// f = (Σ m/ρ − 1 au début du pas) − dt·∇·u^n (voir solve_pressure). Dans le gaz (fraction `ag`) : tout,
 /// par compression. Dans le liquide : tout si |e0| ≤ `small` (une erreur, même petite, laissée dans un liquide raide fausse sa pression
 /// de |e0|/κ), sinon max(small, r·|e0|) — corrigée en un pas, une grosse erreur dans un liquide impose une vitesse ∝ |e0|/dt
 /// (schéma neutre-stable qui s'emballe : huile très chaude au contact d'eau ou d'air froid). Même formule sur le GPU (k_rhs).
@@ -505,7 +506,12 @@ impl MultiphaseSim {
                     }
                     let d_new = self.divergence_of(&ut, &vt, i, j);
                     let d_old = self.divergence_of(un, vn, i, j);
-                    let corr = closure_correction(err0[c], gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
+                    // erreur qui restera APRÈS l'advection de ce pas (u^n, dont la divergence est la correction décidée au pas
+                    // précédent) : corriger err0 lui-même recorrigeait cette part déjà en route — e_{n+2} = e_{n+1} − e_n, oscillateur
+                    // neutre de période 6 pas (barrage : ε jusqu'à 45 % dans l'eau pure, pression de 1.9 kPa à 93 bar, vapeur à
+                    // l'impact). Sur f = err0 − dt·∇·u^n : f_{n+1} = f_n − corr, sans oscillation.
+                    let f = err0[c] - dt * d_old;
+                    let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
                     b[c] = (vol[c] - 1.0 - (err0[c] - corr)) / dt - (d_new - d_old);
                 }
             }

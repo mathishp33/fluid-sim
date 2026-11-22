@@ -93,10 +93,10 @@ pub struct MultiphaseSim {
     /// advection de la quantité de mouvement conservative, cohérente avec les flux de masse du VOF (défaut) ; false = semi-lagrangien
     pub conservative_momentum: bool,
     /// Prédicteur-correcteur : le pas est d'abord calculé normalement (prédiction de u^{n+1}), puis refait depuis l'état n en
-    /// advectant masses et énergie avec (u^n + u^{n+1})/2. Supprime le retard d'un pas entre la vitesse qui transporte un front et
-    /// celle que produit sa source de volume (flamme, changement de phase) — sans lui, boucle thermoacoustique numérique : flamme
-    /// 14 % trop lente au dt par défaut. Coût : ~2 pas (CPU et GPU, mêmes formules). Toujours utilisé quand une flamme épaissie est
-    /// possible (`use_predictor_corrector`) ; ailleurs seulement si demandé.
+    /// advectant masses et énergie avec (u^n + u^{n+1})/2 (CPU et GPU, mêmes formules ; coût ~2 pas). Option, désactivée par défaut :
+    /// la « boucle thermoacoustique » des flammes qu'il supprimait venait en fait de la correction de fermeture, qui recorrigeait
+    /// l'erreur déjà en route dans l'advection du pas (voir solve_pressure) ; corrigée, une flamme est aussi juste sans lui
+    /// (prémélange, référence ≈ 271 : 252 sans, 255 avec, en deux fois moins de temps).
     pub predictor_corrector: bool,
     /// Flammes épaissies actives : conduction, diffusion des espèces et chimie intercalées en `flame_thermo_substeps` sous-pas (le
     /// découpage de Lie diffusion ↔ réaction, raide, est l'erreur dominante d'une flamme : Strang n'y gagne rien).

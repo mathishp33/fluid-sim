@@ -388,9 +388,9 @@ impl MultiphaseSim {
         [self.u[self.uidx(i, j)], self.u[self.uidx(i + 1, j)], self.v[self.vidx(i, j)], self.v[self.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()))
     }
 
-    /// prédicteur-correcteur demandé, ou automatique dès qu'une flamme épaissie est possible (boucle thermoacoustique)
+    /// prédicteur-correcteur demandé (option, voir le champ `predictor_corrector`)
     pub fn use_predictor_corrector(&self) -> bool {
-        self.predictor_corrector || self.flames_active()
+        self.predictor_corrector
     }
 
     /// flammes épaissies actives (miroir de `MultiphaseGpu::flames_active`) : chimie, réaction à δ_L > 0, F_max > 1
