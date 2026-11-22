@@ -213,9 +213,10 @@ fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
     for (var i = 0u; i < rx_nr(j); i++) {
         let o = rx_rord(j, i);
         let c = cc_conc(rx_rs(j, i));
-        if (o < 0.0) { lrf += o * log(max(c, C_FLOOR)); }
-        else if (o == 0.0) { if (c <= 0.0) { rzero = true; } }
-        else { if (c <= 0.0) { rzero = true; } else { lrf += o * log(c); } }
+        // réactif absent : pas de réaction directe, quel que soit l'ordre (miroir de CellChem::rate_parts)
+        if (c <= 0.0) { rzero = true; }
+        else if (o < 0.0) { lrf += o * log(max(c, C_FLOOR)); }
+        else if (o > 0.0) { lrf += o * log(c); }
     }
     var rf = 0.0;
     if (!rzero) { rf = exp(min(lrf, 80.0)); }
@@ -415,7 +416,9 @@ fn k_chem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation
         for (var k = 0u; k < P.np; k++) { chx_set(O_ch_cons, k, 0.0); }
         for (var j = 0u; j < P.nre; j++) {
             let r0 = chx(O_ch_r0, j);
-            var irr = 1.0; if (rx_rev(j)) { irr = 0.0; }
+            // trace : tout l'avancement possible chaufferait de moins de 5 K → ne borne pas le sous-pas (miroir de TRACE_DT)
+            let sig = cc_bounds(j).y * abs(cc_heat(j, t)) / cap >= 5.0;
+            var irr = 1.0; if (rx_rev(j) || !sig) { irr = 0.0; }
             dtdt += irr * r0 * cc_heat(j, t) / cap;
             for (var i = 0u; i < rx_nr(j); i++) {
                 let s = rx_rs(j, i);

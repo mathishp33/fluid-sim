@@ -38,6 +38,8 @@ pub(crate) enum ChemSel {
 const SIGMA_SB: f64 = 5.670374419e-8;
 /// plancher de concentration pour les ordres négatifs ou les exposants (o − ν) < 0 de la vitesse inverse (mol/m³)
 const C_FLOOR: f64 = 1e-3;
+/// échauffement (K) en dessous duquel l'avancement restant d'une réaction irréversible ne borne pas le sous-pas chimique (trace)
+const TRACE_DT: f64 = 5.0;
 /// nombre maximal de sous-pas chimiques par cellule et par pas
 const MAX_CHEM_SUBSTEPS: usize = 4000;
 
@@ -107,7 +109,11 @@ impl CellChem<'_> {
         for (i, &(s, _)) in r.reactants.iter().enumerate() {
             let o = r.order(i);
             let c = self.conc(s);
-            rf *= if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { if c > 0.0 { 1.0 } else { 0.0 } } else { c.powf(o) };
+            // réactif absent : pas de réaction directe, quel que soit l'ordre (un ordre NÉGATIF — CH4^−0.3 du mécanisme global — donnait,
+            // via le plancher C_FLOOR, un débit direct énorme sans méthane : aucune réaction possible (borne nulle) mais toutes les
+            // cellules « actives » et des sous-pas chimiques de ~1e-6 s bridés par une consommation d'O2 fictive — explosion H2–air
+            // confinée ~20 fois plus lente)
+            rf *= if c <= 0.0 { 0.0 } else if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { 1.0 } else { c.powf(o) };
         }
         if !r.reversible {
             return (rf, 0.0);
@@ -551,6 +557,12 @@ impl MultiphaseSim {
                 let mut cons = vec![0.0; np];
                 for j in 0..nre {
                     if rx[j].reversible {
+                        continue;
+                    }
+                    // réaction dont tout l'avancement possible chaufferait de moins de TRACE_DT : trace (réactif résiduel, mélange
+                    // diffusé), consommée sur le sous-pas sans le borner — sinon une trace de CH4 (ordre négatif plafonné à C_FLOOR,
+                    // débit « normal ») découpait le pas en milliers de sous-pas de consommation ≤ 40 %
+                    if cc.bounds(j).1 * cc.heat(j, t).abs() / cap < TRACE_DT {
                         continue;
                     }
                     dtdt += r0[j] * cc.heat(j, t) / cap;
