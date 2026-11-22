@@ -1148,3 +1148,30 @@ fn worst_cell(s: &MultiphaseSim) -> (usize, String) {
     }
     (at, format!("vitesse {best:.3e} m/s (T min {:.1})", tmin.0))
 }
+
+/// Diagnostic : vapeur à l'impact de la rupture de barrage (grille de la fenêtre 74×120, dx = 1 cm, CPU)
+#[test]
+#[ignore]
+fn dam_break_vapor_cpu() {
+    let mut s = build_scenario(MpScenario::DamBreak, 74, 120, 0.01, 9.81);
+    let vap = s.reg.phases.iter().position(|p| p.name == "vapeur").unwrap();
+    let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+    let mut next = 0.05;
+    let mut first = true;
+    while s.time < 0.8 && !s.diverged {
+        s.step();
+        let mv: f64 = s.mass[vap].iter().sum::<f64>() * s.dx * s.dx;
+        if mv > 0.0 && first {
+            first = false;
+            let c = (0..s.nx * s.ny).max_by(|&a, &b| s.mass[vap][a].partial_cmp(&s.mass[vap][b]).unwrap()).unwrap();
+            eprintln!("PREMIÈRE VAPEUR t={:.4} pas {} case ({},{}) m_v {:.3e} m_eau {:.3e} α_eau {:.3} T {:.2} p {:.0} bloquée {}", s.time, s.step_count, c % s.nx, c / s.nx, s.mass[vap][c], s.mass[eau][c], s.alpha[eau][c], s.temp[c], s.p[c], s.pressure_clamped[c]);
+        }
+        if s.time >= next {
+            let pmin = (0..s.nx * s.ny).map(|c| s.p[c]).fold(f64::MAX, f64::min);
+            let tmin = (0..s.nx * s.ny).map(|c| s.temp[c]).fold(f64::MAX, f64::min);
+            let nv = s.mass[vap].iter().filter(|&&m| m > 1e-9).count();
+            eprintln!("t={:.3} pas {} m_v {:.3e} cellules vapeur {} p min {:.0} T min {:.2} umax {:.2} retours {}", s.time, s.step_count, mv, nv, pmin, tmin, s.max_speed(), s.rollbacks);
+            next += 0.05;
+        }
+    }
+}
