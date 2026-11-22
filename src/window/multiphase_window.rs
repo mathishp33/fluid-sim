@@ -4,7 +4,7 @@
 //!  * clic gauche : outil courant ; Ctrl + clic gauche : pose le type de cellule choisi (solide + comportement thermique, puits, émetteur,
 //!    accélérateur, téléporteur) ; clic droit : pousse le fluide ; clic milieu (ou Ctrl + milieu) : efface solide et effet ;
 //!    Maj + clic gauche ou Maj + clic milieu : chauffe / refroidit vers la T du pinceau.
-//!  * raccourcis : Espace, → / ↑, S / L (sauver / charger la scène), I (solides blancs), V, M, C / Maj+C (rayon), R (reset flow),
+//!  * raccourcis : Espace, → / ↑, S / L (sauver l'état complet / charger un état ou une géométrie), I (solides blancs), V, M, C / Maj+C (rayon), R (reset flow),
 //!    Maj+R (recommencer le scénario), Échap.
 
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use crate::simulation::mp_view::{
     apply_tool_with, brush_cells, build_scenario_with, cell_info, compute_stats, render_rgba, reset_flow, reset_temperature, scene_from_json,
     scene_to_json, sim_tools, tool_label, tool_name, MpDisplay, MpScenario, MpStats, MpTool, RenderOpts, ToolOpts, T_IGNITION,
 };
+use crate::simulation::mp_state::{is_state_file, state_from_bytes, state_to_bytes, StateFile};
 use crate::simulation::multiphase::{Bc, MultiphaseSim};
 use crate::window::main_window::WindowAction;
 use crate::window::material_editor::MaterialEditor;
@@ -448,40 +449,97 @@ impl MultiphaseWindow {
         self.last_mouse = None;
     }
 
+    /// Enregistre l'ÉTAT COMPLET (fluide, solides, cellules spéciales, bords, chauffage, réglages, compteurs, matériaux, scénario) :
+    /// rechargé, la simulation reprend exactement où elle était (voir `mp_state`).
     fn save_scene(&mut self) {
         self.sync_host();
-        let path = rfd::FileDialog::new().add_filter("Scène multiphasique", &["mps"]).set_file_name("scene.mps").save_file();
+        let path = rfd::FileDialog::new().add_filter("État multiphasique complet", &["mps"]).set_file_name("etat.mps").save_file();
         if let Some(path) = path {
-            self.status = match scene_to_json(&self.sim).and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string())) {
-                Ok(()) => format!("Scène enregistrée : {}", path.display()),
+            let bytes = state_to_bytes(&self.sim, Some(&self.settings.materials), Some(self.scenario.index()), Some(self.boundaries));
+            self.status = match bytes.and_then(|b| std::fs::write(&path, &b).map(|_| b.len()).map_err(|e| e.to_string())) {
+                Ok(len) => format!("État complet enregistré (t = {:.4} s, {:.1} Mo) : {}", self.sim.time, len as f64 / 1e6, path.display()),
                 Err(e) => format!("Erreur d'enregistrement : {e}"),
             };
         }
         self.after_blocking_dialog();
     }
 
-    fn load_scene(&mut self) {
-        let path = rfd::FileDialog::new().add_filter("Scène multiphasique", &["mps"]).pick_file();
+    /// Enregistre la GÉOMÉTRIE seule (solides, comportements thermiques, cellules spéciales — ancien format JSON), réutilisable sur
+    /// un autre écoulement ou une autre bibliothèque de matériaux.
+    fn save_geometry(&mut self) {
+        self.sync_host();
+        let path = rfd::FileDialog::new().add_filter("Géométrie multiphasique", &["mps"]).set_file_name("geometrie.mps").save_file();
         if let Some(path) = path {
-            self.sync_host();
-            self.status = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| scene_from_json(&mut self.sim, &s)) {
-                Ok(w) if w.is_empty() => "Scène chargée".into(),
-                Ok(w) => format!("Scène chargée ({} avertissement(s) : {})", w.len(), w[0]),
-                Err(e) => format!("Erreur de chargement : {e}"),
+            self.status = match scene_to_json(&self.sim).and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string())) {
+                Ok(()) => format!("Géométrie enregistrée : {}", path.display()),
+                Err(e) => format!("Erreur d'enregistrement : {e}"),
             };
-            self.upload_if_gpu();
-            self.enforce_backend();
         }
         self.after_blocking_dialog();
+    }
+
+    /// Charge un fichier `.mps` : état complet (remplace la simulation, ses matériaux et son scénario) ou géométrie seule (remplace
+    /// solides / effets / comportements thermiques sur l'écoulement courant).
+    fn load_scene(&mut self) {
+        let path = rfd::FileDialog::new().add_filter("Scène ou état multiphasique", &["mps"]).pick_file();
+        if let Some(path) = path {
+            match std::fs::read(&path) {
+                Err(e) => self.status = format!("Erreur de chargement : {e}"),
+                Ok(bytes) if is_state_file(&bytes) => match state_from_bytes(&bytes) {
+                    Ok(f) => self.load_state(f),
+                    Err(e) => self.status = format!("Erreur de chargement : {e}"),
+                },
+                Ok(bytes) => {
+                    self.sync_host();
+                    self.status = match String::from_utf8(bytes).map_err(|e| e.to_string()).and_then(|s| scene_from_json(&mut self.sim, &s)) {
+                        Ok(w) if w.is_empty() => "Géométrie chargée".into(),
+                        Ok(w) => format!("Géométrie chargée ({} avertissement(s) : {})", w.len(), w[0]),
+                        Err(e) => format!("Erreur de chargement : {e}"),
+                    };
+                    self.upload_if_gpu();
+                    self.enforce_backend();
+                }
+            }
+        }
+        self.after_blocking_dialog();
+    }
+
+    /// Remplace la simulation par un état complet relu (et le contexte de la fenêtre qui l'accompagne).
+    fn load_state(&mut self, f: StateFile) {
+        let was_gpu = self.backend == Backend::Gpu;
+        self.sim = f.sim;
+        self.gpu = None;
+        self.backend = Backend::Cpu;
+        if let Some(lib) = f.library {
+            self.settings.materials = lib.clone();
+            self.lib = lib;
+            self.lib_dirty = false;
+            self.refresh_warnings();
+        }
+        if let Some(sc) = f.scenario {
+            self.scenario = MpScenario::from_index(sc);
+        }
+        // bords de l'interface : ceux de la fenêtre au moment de l'enregistrement (le solveur, lui, a déjà les siens)
+        self.boundaries = f.boundaries.unwrap_or_else(|| Self::boundaries_for(&self.settings, &self.sim));
+        self.fix_selection();
+        self.stats = compute_stats(&self.sim);
+        let msg = format!("État chargé : {} — t = {:.4} s, {} pas, grille {} × {}", self.scenario.name(), self.sim.time, self.sim.steps_done(), self.sim.nx, self.sim.ny);
+        if was_gpu {
+            self.set_backend(Backend::Gpu);
+        }
+        self.status = if self.backend == Backend::Gpu { format!("{msg} (GPU)") } else if was_gpu { format!("{msg} — {}", self.status) } else { msg };
     }
 
     fn top_bar(&mut self, ctx: &egui::Context, action: &mut WindowAction) {
         egui::TopBottomPanel::top("mp_top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Sauver la scène (S)").clicked() {
+                if ui.button("Sauver l'état complet (S)").on_hover_text("Fluide, solides, cellules spéciales, bords, réglages, matériaux : la simulation reprend exactement au même point").clicked() {
                     self.save_scene();
                 }
-                if ui.button("Charger la scène (L)").clicked() {
+                if ui.small_button("Géométrie seule").on_hover_text("Solides, comportements thermiques et cellules spéciales seulement (réutilisables sur un autre écoulement)").clicked() {
+                    self.save_geometry();
+                }
+                if ui.button("Charger (L)").on_hover_text("État complet ou géométrie seule (.mps)").clicked() {
                     self.load_scene();
                 }
                 ui.separator();
@@ -912,7 +970,7 @@ impl MultiphaseWindow {
                 for (k, v) in [
                     ("Espace", "Pause / reprise"),
                     ("→ / ↑", "1 / 10 pas (en pause)"),
-                    ("S / L", "Sauver / charger la scène (solides, thermique, cellules spéciales)"),
+                    ("S / L", "Sauver l'état complet (la simulation reprend au même point) / charger un état ou une géométrie seule (.mps)"),
                     ("I", "Solides blancs"),
                     ("V", "Mode d'affichage suivant (dont divergence)"),
                     ("M", "Pinceau rond / carré"),
@@ -1232,6 +1290,40 @@ mod tests {
         frame(ctx, w, vec![Event::PointerMoved(p)], mods);
         frame(ctx, w, vec![Event::PointerButton { pos: p, button, pressed: true, modifiers: mods }], mods);
         frame(ctx, w, vec![Event::PointerButton { pos: p, button, pressed: false, modifiers: mods }], mods);
+    }
+
+    #[test]
+    fn full_state_saved_from_one_window_resumes_in_another() {
+        let ctx = egui::Context::default();
+        // fenêtre A : rupture de barrage, bord du haut ouvert, quelques pas
+        let mut sa = settings();
+        sa.mp_scenario = MpScenario::DamBreak.index();
+        let mut a = MultiphaseWindow::new(&sa);
+        a.boundaries[3].boundary_type = BoundaryType::Outlet;
+        a.apply_boundaries();
+        for _ in 0..20 {
+            a.sim.step();
+        }
+        let bytes = state_to_bytes(&a.sim, Some(&a.settings.materials), Some(a.scenario.index()), Some(a.boundaries)).unwrap();
+        // fenêtre B : autre scénario (cuve vide) ; chargement de l'état de A
+        let mut b = MultiphaseWindow::new(&settings());
+        assert_ne!(b.scenario, a.scenario);
+        b.load_state(state_from_bytes(&bytes).unwrap());
+        assert_eq!(b.scenario, a.scenario);
+        assert_eq!(b.settings.materials, a.settings.materials);
+        assert_eq!(b.boundaries[3].boundary_type, BoundaryType::Outlet);
+        assert!(matches!(b.sim.bc[3], Bc::Open { .. }));
+        assert_eq!((b.sim.time, b.sim.steps_done()), (a.sim.time, a.sim.steps_done()));
+        assert_eq!(b.sim.mass, a.sim.mass);
+        assert!(b.status.starts_with("État chargé"), "{}", b.status);
+        // la fenêtre B s'affiche (en pause : l'affichage ne fait pas avancer la simulation) et continue comme A
+        b.paused = true;
+        for _ in 0..3 {
+            frame(&ctx, &mut b, vec![], Modifiers::default());
+        }
+        a.sim.step();
+        b.sim.step();
+        assert_eq!(b.sim.p, a.sim.p);
     }
 
     #[test]

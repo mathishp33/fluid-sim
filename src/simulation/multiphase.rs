@@ -9,14 +9,18 @@
 
 use super::mp_cells::{MpEffect, MpInlet, MpThermal, PinInfo, TpMix};
 use super::phases::{PhaseKind, Registry};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Bc {
     Wall,
     /// Bord ouvert à pression imposée (atmosphère). L'air/fluide entrant est la phase `ambient_phase` à `t_ambient`.
     Open { p: f64 },
 }
 
+/// L'état complet est sérialisable (sauvegarde d'expérience, `mp_state`) : un champ ajouté ici est enregistré d'office (le format
+/// bincode n'est pas auto-descriptif : ajouter, retirer ou réordonner un champ change le format — incrémenter `mp_state::VERSION`).
+#[derive(Serialize, Deserialize)]
 pub struct MultiphaseSim {
     pub nx: usize,
     pub ny: usize,
@@ -182,6 +186,7 @@ pub struct MultiphaseSim {
     pub dt_phase: f64,
     pub(crate) heat_active: bool,
     /// profil de temps de calcul par partie du pas (voir `mp_step::StepProfile`)
+    #[serde(skip)]
     pub profile: super::mp_step::StepProfile,
 }
 

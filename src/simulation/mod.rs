@@ -26,5 +26,6 @@ pub mod benchmarks;
 #[cfg(test)]
 pub mod lowmach_regression_tests;
 pub mod mp_view;
+pub mod mp_state;
 pub mod mp_materials;
 pub mod gpu_multiphase;

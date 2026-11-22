@@ -356,7 +356,7 @@ impl Solid {
 }
 
 /// Paire liquide ↔ vapeur (ébullition, condensation, cavitation)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhaseChange {
     pub liquid: usize,
     pub vapor: usize,
@@ -472,7 +472,7 @@ impl Reaction {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
     pub phases: Vec<Phase>,
     pub solids: Vec<Solid>,

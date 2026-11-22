@@ -67,7 +67,7 @@ pub struct MpInlet {
 }
 
 /// Cellule épinglée : 1 = puits (ou source de téléporteur), 2 = émetteur (ou destination de téléporteur)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct PinInfo {
     pub kind: u8,
     pub phase: usize,
