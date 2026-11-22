@@ -552,7 +552,7 @@ impl MultiphaseSim {
         let np = self.reg.phases.len();
         temp_from_masses(&self.reg.phases, (0..np).map(|k| self.mass[k][c]), self.e[c])
     }
-    /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule. Parallèle par lignes sur les grandes grilles ;
+    /// Recalcule T (depuis e), α (depuis m, p, T), ρ_mix, μ, k de chaque cellule. Parallèle par tranches de lignes (`mp_par`) ;
     /// les phases absentes d'une cellule (cas le plus fréquent) ne coûtent rien.
     pub fn refresh(&mut self) {
         let np = self.reg.phases.len();
@@ -617,12 +617,8 @@ impl MultiphaseSim {
                 }
             }
         };
-        if n >= 4096 && rayon::current_num_threads() > 1 {
-            use rayon::prelude::*;
-            (0..ny).into_par_iter().for_each(row);
-        } else {
-            (0..ny).for_each(row);
-        }
+        let _ = n;
+        super::mp_par::for_rows(ny, nx, super::mp_par::MIN_HEAVY, row);
     }
 
     // ---------------------------------------------------------------- diagnostics

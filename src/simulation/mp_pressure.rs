@@ -9,7 +9,9 @@
 //! Matrice SPD résolue par gradients conjugués préconditionnés par un V-cycle multigrille (`mp_mg`, défaut) ou par Cholesky incomplet
 //! IC(0) (`multigrid = false`, séquentiel, ~10× plus d'itérations).
 
-use super::multiphase::{Bc, MultiphaseSim};
+use super::mp_par::{for_ranges, for_rows, map_ranges, MIN_HEAVY, MIN_LIGHT};
+use super::multiphase::{Bc, MultiphaseSim, SyncPtr};
+use super::phases::MAX_PHASES;
 
 /// pression absolue minimale d'une cellule fluide (Pa)
 pub(crate) const P_FLOOR: f64 = 10.0;
@@ -134,11 +136,12 @@ impl MultiphaseSim {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let mut un = vec![0.0; (nx + 1) * ny];
         let mut vn = vec![0.0; nx * (ny + 1)];
-        for j in 0..ny {
+        let up = SyncPtr(un.as_mut_ptr());
+        for_rows(ny, nx + 1, MIN_LIGHT, |j| {
             for i in 0..=nx {
                 let f = j * (nx + 1) + i;
                 let (l, r) = (if i > 0 { Some(j * nx + i - 1) } else { None }, if i < nx { Some(j * nx + i) } else { None });
-                un[f] = match (l, r) {
+                let val = match (l, r) {
                     (Some(a), Some(b)) => {
                         if self.is_solid(a) || self.is_solid(b) { 0.0 } else { us[f] - dt / self.face_rho_x(i, j) * (p[b] - p[a]) / dx }
                     }
@@ -152,13 +155,16 @@ impl MultiphaseSim {
                     },
                     _ => 0.0,
                 };
+                // SAFETY : la face f n'est écrite que par sa ligne
+                unsafe { *up.at(f) = val }
             }
-        }
-        for j in 0..=ny {
+        });
+        let vp = SyncPtr(vn.as_mut_ptr());
+        for_rows(ny + 1, nx, MIN_LIGHT, |j| {
             for i in 0..nx {
                 let f = j * nx + i;
                 let (l, r) = (if j > 0 { Some((j - 1) * nx + i) } else { None }, if j < ny { Some(j * nx + i) } else { None });
-                vn[f] = match (l, r) {
+                let val = match (l, r) {
                     (Some(a), Some(b)) => {
                         if self.is_solid(a) || self.is_solid(b) { 0.0 } else { vs[f] - dt / self.face_rho_y(i, j) * (p[b] - p[a]) / dx }
                     }
@@ -172,8 +178,10 @@ impl MultiphaseSim {
                     },
                     _ => 0.0,
                 };
+                // SAFETY : la face f n'est écrite que par sa ligne
+                unsafe { *vp.at(f) = val }
             }
-        }
+        });
         for (f, p) in self.pf_u.iter().enumerate() {
             if !p.is_nan() {
                 un[f] = *p;
@@ -212,7 +220,9 @@ impl MultiphaseSim {
         let mut s = Stencil { diag: vec![1.0; n], ae: vec![0.0; n], an: vec![0.0; n] };
         let dcu = |f: usize| darcy.map_or(0.0, |d| d.cu[f] / (dx * dx));
         let dcv = |f: usize| darcy.map_or(0.0, |d| d.cv[f] / (dx * dx));
-        for j in 0..ny {
+        let (dgp, aep, anp) = (SyncPtr(s.diag.as_mut_ptr()), SyncPtr(s.ae.as_mut_ptr()), SyncPtr(s.an.as_mut_ptr()));
+        // SAFETY (écritures ci-dessous) : la cellule c n'est écrite que par sa ligne
+        for_rows(ny, nx, MIN_LIGHT, |j| {
             for i in 0..nx {
                 let c = j * nx + i;
                 if self.is_solid(c) || self.pinned(c) {
@@ -226,11 +236,11 @@ impl MultiphaseSim {
                     if k > 0 {
                         let t = dt / (self.face_rho_x(i + 1, j) * dx * dx) + td;
                         if k == 1 {
-                            s.ae[c] = t;
+                            unsafe { *aep.at(c) = t }
                         }
                         d += t;
                     } else if td > 0.0 {
-                        s.ae[c] = td;
+                        unsafe { *aep.at(c) = td }
                         d += td;
                     }
                 } else if let Bc::Open { .. } = self.bc[1] {
@@ -252,11 +262,11 @@ impl MultiphaseSim {
                     if k > 0 {
                         let t = dt / (self.face_rho_y(i, j + 1) * dx * dx) + td;
                         if k == 1 {
-                            s.an[c] = t;
+                            unsafe { *anp.at(c) = t }
                         }
                         d += t;
                     } else if td > 0.0 {
-                        s.an[c] = td;
+                        unsafe { *anp.at(c) = td }
                         d += td;
                     }
                 } else if let Bc::Open { .. } = self.bc[3] {
@@ -271,9 +281,9 @@ impl MultiphaseSim {
                 } else if let Bc::Open { .. } = self.bc[2] {
                     d += 2.0 * dt / (self.rho_mix[c] * dx * dx);
                 }
-                s.diag[c] = d;
+                unsafe { *dgp.at(c) = d }
             }
-        }
+        });
         s
     }
 
@@ -288,25 +298,23 @@ impl MultiphaseSim {
 
     /// Gradient conjugué préconditionné par multigrille (vecteurs et opérateur parallèles).
     fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
-        use super::mp_mg::{dot, Level, Multigrid, PAR_MIN};
-        use rayon::prelude::*;
+        use super::mp_mg::{Level, Multigrid};
+        use super::mp_par::{collect, dot, for_ranges, MIN_LIGHT};
+        use super::multiphase::SyncPtr;
         let n = b.len();
-        let active: Vec<bool> = (0..n).map(|c| !(self.is_solid(c) || self.pinned(c))).collect();
+        let active: Vec<bool> = collect(n, MIN_LIGHT, |c| !(self.is_solid(c) || self.pinned(c)));
         let fine = Level { nx: self.nx, ny: self.ny, diag: st.diag.clone(), ae: st.ae.clone(), an: st.an.clone(), active };
         let mut mg = Multigrid::new(fine);
         let mut r = vec![0.0; n];
         let mut ax = vec![0.0; n];
         mg.levels[0].apply(x, &mut ax);
-        for c in 0..n {
-            r[c] = b[c] - ax[c];
-        }
+        super::mp_par::fill(&mut r, MIN_LIGHT, |c| b[c] - ax[c]);
         let bn = dot(b, b).sqrt().max(1e-300);
         let mut z = vec![0.0; n];
         mg.precondition(&r, &mut z);
         let mut pdir = z.clone();
         let mut rz = dot(&r, &z);
         let mut it = 0;
-        let par = n >= PAR_MIN;
         while it < self.pressure_max_iter {
             if dot(&r, &r).sqrt() <= self.pressure_tol * bn {
                 break;
@@ -317,24 +325,32 @@ impl MultiphaseSim {
                 break;
             }
             let al = rz / pap;
-            let upd = |((xc, rc), (pc, ac)): ((&mut f64, &mut f64), (&f64, &f64))| {
-                *xc += al * pc;
-                *rc -= al * ac;
-            };
-            if par {
-                x.par_iter_mut().zip(r.par_iter_mut()).zip(pdir.par_iter().zip(ax.par_iter())).for_each(upd);
-            } else {
-                x.iter_mut().zip(r.iter_mut()).zip(pdir.iter().zip(ax.iter())).for_each(upd);
+            {
+                let (xp, rp) = (SyncPtr(x.as_mut_ptr()), SyncPtr(r.as_mut_ptr()));
+                let (pd, axr) = (&pdir, &ax);
+                for_ranges(n, MIN_LIGHT, |lo, hi| {
+                    for c in lo..hi {
+                        // SAFETY : chaque c dans une seule tranche
+                        unsafe {
+                            *xp.at(c) += al * pd[c];
+                            *rp.at(c) -= al * axr[c];
+                        }
+                    }
+                });
             }
             mg.precondition(&r, &mut z);
             let rz2 = dot(&r, &z);
             let be = rz2 / rz.max(1e-300);
             rz = rz2;
-            let dir = |(pc, zc): (&mut f64, &f64)| *pc = zc + be * *pc;
-            if par {
-                pdir.par_iter_mut().zip(z.par_iter()).for_each(dir);
-            } else {
-                pdir.iter_mut().zip(z.iter()).for_each(dir);
+            {
+                let pp = SyncPtr(pdir.as_mut_ptr());
+                let zr = &z;
+                for_ranges(n, MIN_LIGHT, |lo, hi| {
+                    for c in lo..hi {
+                        // SAFETY : chaque c dans une seule tranche
+                        unsafe { *pp.at(c) = zr[c] + be * *pp.at(c) }
+                    }
+                });
             }
             it += 1;
         }
@@ -451,21 +467,27 @@ impl MultiphaseSim {
         // températures de groupe du début de la projection et dT_g/dp adiabatique (fixes pendant les itérations de Newton)
         let t_star = self.tg.clone();
         let mut gam0 = vec![vec![0.0; n]; ng];
-        let chi: Vec<f64> = (0..n).map(|c| self.thermal_coupling(c, dt)).collect();
+        let chi: Vec<f64> = super::mp_par::collect(n, MIN_HEAVY, |c| self.thermal_coupling(c, dt));
         {
-            let (mut tc, mut ga, mut ks) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
-            for c in 0..n {
-                if self.is_solid(c) || self.pinned(c) {
-                    continue;
+            let gp: Vec<SyncPtr<f64>> = gam0.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let (ts, ps, chi) = (&t_star, &p_start, &chi);
+            let this = &*self;
+            for_ranges(n, MIN_HEAVY, |lo, hi| {
+                let (mut tc, mut ga, mut ks) = ([0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES]);
+                for c in lo..hi {
+                    if this.is_solid(c) || this.pinned(c) {
+                        continue;
+                    }
+                    for g in 0..ng {
+                        tc[g] = ts[g][c];
+                    }
+                    this.cell_closure_g(c, ps[c], &tc[..ng], chi[c], &mut ga[..ng], &mut ks[..ng]);
+                    for g in 0..ng {
+                        // SAFETY : la cellule c n'est écrite que par sa tranche
+                        unsafe { *gp[g].at(c) = ga[g] }
+                    }
                 }
-                for g in 0..ng {
-                    tc[g] = t_star[g][c];
-                }
-                self.cell_closure_g(c, p_start[c], &tc, chi[c], &mut ga, &mut ks);
-                for g in 0..ng {
-                    gam0[g][c] = ga[g];
-                }
-            }
+            });
         }
         let mut pk = self.p.clone();
         let mut total_it = 0;
@@ -473,8 +495,7 @@ impl MultiphaseSim {
         // plancher de pression par cellule : P_FLOOR, ou la pression de vapeur saturante d'un liquide présent (modèle de cavité discrète,
         // DVCM) — un liquide ne supporte pas de traction : sous p_sat il se vaporise, la cavité de vapeur comble le déficit de volume
         // (voir `phase_change_step`). Sans cela l'eau reste à 10 Pa, l'erreur de volume s'accumule et finit en coup de bélier.
-        let floor: Vec<f64> = (0..n)
-            .map(|c| {
+        let floor: Vec<f64> = super::mp_par::collect(n, MIN_HEAVY, |c| {
                 let mut f = P_FLOOR;
                 if self.phase_change && !self.is_solid(c) {
                     for pc in &self.reg.changes {
@@ -484,39 +505,50 @@ impl MultiphaseSim {
                     }
                 }
                 f
-            })
-            .collect();
+            });
         let mut clamped = vec![false; n];
         let mut tkv = t_star.clone();
         let mut newton = 0;
         // percolation : conductances de Darcy (Ergun évalué sur p du pas précédent) ; divergence du flux de Darcy qui a servi à ce pas
         let darcy = self.darcy_faces();
         let (q_old_u, q_old_v) = (self.q_u.clone(), self.q_v.clone());
-        let (mut tc, mut ga, mut ks) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
         for _newton in 0..4 {
             newton += 1;
             let mut vol = vec![1.0; n];
-            for c in 0..n {
-                if self.is_solid(c) {
-                    continue;
-                }
-                if self.pinned(c) {
-                    kappa[c] = 1.0;
-                    continue; // cellule épinglée : δp = 0
-                }
-                for g in 0..ng {
-                    tc[g] = t_star[g][c] + gam0[g][c] * (pk[c] - p_start[c]);
-                    tkv[g][c] = tc[g];
-                }
-                let (v, kap) = self.cell_closure_g(c, pk[c], &tc, chi[c], &mut ga, &mut ks);
-                vol[c] = v;
-                kappa[c] = kap.max(1e-30);
+            {
+                let (volp, kp) = (SyncPtr(vol.as_mut_ptr()), SyncPtr(kappa.as_mut_ptr()));
+                let tkp: Vec<SyncPtr<f64>> = tkv.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+                let (ts, g0, pkr, ps, chi) = (&t_star, &gam0, &pk, &p_start, &chi);
+                let this = &*self;
+                for_ranges(n, MIN_HEAVY, |lo, hi| {
+                    let (mut tc, mut ga, mut ks) = ([0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES]);
+                    for c in lo..hi {
+                        if this.is_solid(c) {
+                            continue;
+                        }
+                        // SAFETY (écritures) : la cellule c n'est écrite que par sa tranche
+                        if this.pinned(c) {
+                            unsafe { *kp.at(c) = 1.0 };
+                            continue; // cellule épinglée : δp = 0
+                        }
+                        for g in 0..ng {
+                            tc[g] = ts[g][c] + g0[g][c] * (pkr[c] - ps[c]);
+                            unsafe { *tkp[g].at(c) = tc[g] };
+                        }
+                        let (v, kap) = this.cell_closure_g(c, pkr[c], &tc[..ng], chi[c], &mut ga[..ng], &mut ks[..ng]);
+                        unsafe {
+                            *volp.at(c) = v;
+                            *kp.at(c) = kap.max(1e-30);
+                        }
+                    }
+                });
             }
             let st = self.build_stencil(&kappa, dt, darcy.as_ref());
             let (ut, vt) = self.face_velocities(us, vs, &pk, dt);
             let qt = darcy.as_ref().map(|df| self.darcy_flux(df, &pk));
             let mut b = vec![0.0; n];
-            for j in 0..ny {
+            let bp = SyncPtr(b.as_mut_ptr());
+            for_rows(ny, nx, MIN_HEAVY, |j| {
                 for i in 0..nx {
                     let c = j * nx + i;
                     if self.is_solid(c) || self.pinned(c) {
@@ -536,34 +568,51 @@ impl MultiphaseSim {
                     // l'impact). Sur f = err0 − dt·∇·u^n : f_{n+1} = f_n − corr, sans oscillation.
                     let f = err0[c] - dt * d_old;
                     let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
-                    b[c] = (vol[c] - 1.0 - (err0[c] - corr)) / dt - (d_new - d_old);
+                    // SAFETY : la cellule c n'est écrite que par sa ligne
+                    unsafe { *bp.at(c) = (vol[c] - 1.0 - (err0[c] - corr)) / dt - (d_new - d_old) }
                 }
-            }
+            });
             let mut dp = vec![0.0; n];
             total_it += self.pcg(&st, &b, &mut dp);
-            let mut dmax = 0.0f64;
-            for c in 0..n {
-                if !self.is_solid(c) && !self.pinned(c) {
-                    // très grands écarts (> 50 % de p) dans une cellule contenant du gaz : mise à jour polytropique (voir `gas_newton_update`)
-                    let p_old = pk[c];
-                    for g in 0..ng {
-                        tc[g] = tkv[g][c];
+            let dmax = {
+                let (pkp, clp) = (SyncPtr(pk.as_mut_ptr()), SyncPtr(clamped.as_mut_ptr()));
+                let (tkv, kap, dpr, fl, ps) = (&tkv, &kappa, &dp, &floor, &p_start);
+                let this = &*self;
+                map_ranges(n, MIN_HEAVY, |lo, hi| {
+                    let mut tc = [0.0f64; MAX_PHASES];
+                    let mut dmax = 0.0f64;
+                    for c in lo..hi {
+                        if !this.is_solid(c) && !this.pinned(c) {
+                            // très grands écarts (> 50 % de p) dans une cellule contenant du gaz : mise à jour polytropique (voir
+                            // `gas_newton_update`)
+                            // SAFETY (tout le bloc) : la cellule c n'est lue et écrite que par sa tranche
+                            unsafe {
+                                let p_old = *pkp.at(c);
+                                for g in 0..ng {
+                                    tc[g] = tkv[g][c];
+                                }
+                                let mut pn = p_old + this.gas_newton_update(c, p_old, &tc[..ng], kap[c], dpr[c]);
+                                // Plancher de pression : aucun fluide ne descend sous P_FLOOR (vide / cavitation). Avant, seules les cellules
+                                // contenant du gaz étaient protégées : une cellule quasi vide d'eau seule pouvait atteindre −8e7 Pa, puis le
+                                // travail de pression −dt·p·∇·u sur sa capacité calorifique minuscule donnait T = −1.6e5 K → NaN.
+                                if !pn.is_finite() {
+                                    pn = ps[c].max(fl[c]);
+                                } else if pn < fl[c] {
+                                    pn = fl[c];
+                                    *clp.at(c) = true;
+                                } else {
+                                    *clp.at(c) = false;
+                                }
+                                *pkp.at(c) = pn;
+                                dmax = dmax.max((pn - p_old).abs());
+                            }
+                        }
                     }
-                    pk[c] = p_old + self.gas_newton_update(c, p_old, &tc, kappa[c], dp[c]);
-                    // Plancher de pression : aucun fluide ne descend sous P_FLOOR (vide / cavitation). Avant, seules les cellules contenant
-                    // du gaz étaient protégées : une cellule quasi vide d'eau seule pouvait atteindre −8e7 Pa, puis le travail de pression
-                    // −dt·p·∇·u sur sa capacité calorifique minuscule donnait T = −1.6e5 K → NaN.
-                    if !pk[c].is_finite() {
-                        pk[c] = p_start[c].max(floor[c]);
-                    } else if pk[c] < floor[c] {
-                        pk[c] = floor[c];
-                        clamped[c] = true;
-                    } else {
-                        clamped[c] = false;
-                    }
-                    dmax = dmax.max((pk[c] - p_old).abs());
-                }
-            }
+                    dmax
+                })
+                .into_iter()
+                .fold(0.0f64, f64::max)
+            };
             if dmax < 1e-3 {
                 break;
             }

@@ -19,7 +19,8 @@
 //! force NETTE (pesanteur moins poussée hydrostatique), sinon un tas au repos glisserait d'un dt·g par pas. μ_g est plafonnée à
 //! `FRICTION_K_MAX` ρ dx²/dt (borne du nombre d'itérations, voir sa valeur).
 
-use super::multiphase::{Bc, MultiphaseSim};
+use super::mp_par::{collect, for_ranges, for_rows, map_ranges, MIN_HEAVY, MIN_LIGHT};
+use super::multiphase::{Bc, MultiphaseSim, SyncPtr};
 
 /// taux de déformation de régularisation δ (1/s)
 const FRICTION_DELTA: f64 = 1e-3;
@@ -133,7 +134,18 @@ impl MultiphaseSim {
         let mut ramp = vec![0.0; n];
         let mut amx = vec![1.0; n];
         let mut rhof = vec![0.0; n];
-        for c in 0..n {
+        // (trois passes parallèles : par cellule, par cellule, par ligne le long de la gravité)
+        let (asp, wp, rpp, amp, rfp, tpp) = (
+            SyncPtr(a_s.as_mut_ptr()),
+            SyncPtr(w.as_mut_ptr()),
+            SyncPtr(ramp.as_mut_ptr()),
+            SyncPtr(amx.as_mut_ptr()),
+            SyncPtr(rhof.as_mut_ptr()),
+            SyncPtr(g.tanphi.as_mut_ptr()),
+        );
+        // SAFETY (écritures des trois passes) : chaque cellule n'est écrite que par sa tranche
+        for_ranges(n, MIN_HEAVY, |lo, hi| {
+        for c in lo..hi {
             if self.fr_blocked(c) {
                 continue;
             }
@@ -152,19 +164,22 @@ impl MultiphaseSim {
                 }
             }
             let rho_f = if af > 1e-12 { mf / af } else { 0.0 };
-            rhof[c] = rho_f;
+            unsafe { *rfp.at(c) = rho_f };
             if as_ <= 1e-9 {
                 continue;
             }
             let rho_s = ms / as_;
-            a_s[c] = as_;
-            w[c] = (rho_s - rho_f).max(0.0) * as_ * gn * dx;
-            g.tanphi[c] = tp / as_;
             let amax = am / as_;
-            amx[c] = amax;
             let ac = amax - 0.1;
-            ramp[c] = ((as_ - ac) / (amax - ac)).clamp(0.0, 1.0);
+            unsafe {
+                *asp.at(c) = as_;
+                *wp.at(c) = (rho_s - rho_f).max(0.0) * as_ * gn * dx;
+                *tpp.at(c) = tp / as_;
+                *amp.at(c) = amax;
+                *rpp.at(c) = ((as_ - ac) / (amax - ac)).clamp(0.0, 1.0);
+            }
         }
+        });
         // cellules en contact : tassées (α_s ≥ α_c), ou posées sur une cellule tassée (surface d'un tas, cellule partiellement remplie) ;
         // part de la cellule occupée par le matériau granulaire tassé : α_s / α_max
         let vertical = self.gravity[1].abs() >= self.gravity[0].abs();
@@ -179,25 +194,33 @@ impl MultiphaseSim {
                 (i + 1 < nx).then(|| c + 1)
             }
         };
-        for c in 0..n {
-            if a_s[c] <= 1e-9 || self.fr_blocked(c) {
-                continue;
-            }
-            let rest = below(c).map_or(true, |b| self.fr_blocked(b) || ramp[b] > 0.0);
-            if ramp[c] > 0.0 || rest {
-                g.frac[c] = (a_s[c] / amx[c]).clamp(0.0, 1.0);
-            }
+        {
+            let fp = SyncPtr(g.frac.as_mut_ptr());
+            let (a_s, ramp, amx) = (&a_s, &ramp, &amx);
+            for_ranges(n, MIN_LIGHT, |lo, hi| {
+                for c in lo..hi {
+                    if a_s[c] <= 1e-9 || self.fr_blocked(c) {
+                        continue;
+                    }
+                    let rest = below(c).map_or(true, |b| self.fr_blocked(b) || ramp[b] > 0.0);
+                    if ramp[c] > 0.0 || rest {
+                        unsafe { *fp.at(c) = (a_s[c] / amx[c]).clamp(0.0, 1.0) }
+                    }
+                }
+            });
         }
         // pression de contact p_s = pression du mélange (pas précédent : contrainte MOYENNE, nulle au bord libre d'une falaise) moins
         // celle du fluide des pores (hydrostatique depuis le haut du massif), le long de la gravité (axe dominant)
         let (lines, len) = if vertical { (nx, ny) } else { (ny, nx) };
-        for l in 0..lines {
+        let psp = SyncPtr(g.ps.as_mut_ptr());
+        let (frac, rhof, w) = (&g.frac, &rhof, &w);
+        for_rows(lines, len, MIN_HEAVY, |l| {
             let mut pf = f64::NAN;
             let mut prev: Option<usize> = None;
             for t in 0..len {
                 let s_ = if down { len - 1 - t } else { t };
                 let c = if vertical { self.idx(l, s_) } else { self.idx(s_, l) };
-                if self.fr_blocked(c) || g.frac[c] <= 0.0 {
+                if self.fr_blocked(c) || frac[c] <= 0.0 {
                     pf = f64::NAN;
                     prev = if self.fr_blocked(c) { None } else { Some(c) };
                     continue;
@@ -207,10 +230,10 @@ impl MultiphaseSim {
                 } else if let Some(q) = prev {
                     pf += 0.5 * (rhof[q] + rhof[c]) * gn * dx;
                 }
-                g.ps[c] = (self.p[c] - pf).max(0.0);
+                unsafe { *psp.at(c) = (self.p[c] - pf).max(0.0) };
                 prev = Some(c);
             }
-        }
+        });
         g
     }
 
@@ -234,7 +257,8 @@ impl MultiphaseSim {
     pub(crate) fn friction_mu(&self, g: &FrictionGeom, u: &[f64], v: &[f64], dt: f64) -> Vec<f64> {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let mut mu = vec![0.0; nx * ny];
-        for j in 0..ny {
+        let mp = SyncPtr(mu.as_mut_ptr());
+        for_rows(ny, nx, MIN_HEAVY, |j| {
             for i in 0..nx {
                 let c = self.idx(i, j);
                 if g.frac[c] <= 0.0 || self.fr_blocked(c) {
@@ -242,16 +266,17 @@ impl MultiphaseSim {
                 }
                 let d2 = self.strain_rate2(u, v, i, j);
                 let m = g.frac[c] * g.tanphi[c] * g.ps[c] / (2.0 * (d2 + FRICTION_DELTA * FRICTION_DELTA).sqrt());
-                mu[c] = m.min(FRICTION_K_MAX * self.rho_mix[c] * dx * dx / dt);
+                // SAFETY : la cellule c n'est écrite que par sa ligne
+                unsafe { *mp.at(c) = m.min(FRICTION_K_MAX * self.rho_mix[c] * dx * dx / dt) };
             }
-        }
+        });
         mu
     }
 
     /// part implicite de la viscosité des fluides : μ − plafond explicite (0 sans viscosité implicite)
     pub(crate) fn implicit_fluid_mu(&self, dt: f64) -> Vec<f64> {
         let n = self.nx * self.ny;
-        (0..n).map(|c| if self.fr_blocked(c) || !self.implicit_viscosity { 0.0 } else { (self.mu_cell[c] - self.explicit_mu_cap(c, dt)).max(0.0) }).collect()
+        collect(n, MIN_LIGHT, |c| if self.fr_blocked(c) || !self.implicit_viscosity { 0.0 } else { (self.mu_cell[c] - self.explicit_mu_cap(c, dt)).max(0.0) })
     }
 
     /// Viscosité implicite (frottement des grains + excès de viscosité des fluides) sur la vitesse prédite (us, vs) pendant dt (voir
@@ -271,8 +296,10 @@ impl MultiphaseSim {
         }
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let (nu, nv) = ((nx + 1) * ny, nx * (ny + 1));
-        let kinds: Vec<NodeKind> = (0..(nx + 1) * (ny + 1)).map(|q| self.node_kind(q % (nx + 1), q / (nx + 1))).collect();
-        let cells: Vec<Vec<usize>> = (0..(nx + 1) * (ny + 1)).map(|q| self.node_cells(q % (nx + 1), q / (nx + 1))).collect();
+        let nn = (nx + 1) * (ny + 1);
+        let kinds: Vec<NodeKind> = map_ranges(nn, MIN_HEAVY, |lo, hi| (lo..hi).map(|q| self.node_kind(q % (nx + 1), q / (nx + 1))).collect::<Vec<_>>()).concat();
+        let cells: Vec<Vec<usize>> =
+            map_ranges(nn, MIN_HEAVY, |lo, hi| (lo..hi).map(|q| self.node_cells(q % (nx + 1), q / (nx + 1))).collect::<Vec<_>>()).into_iter().flatten().collect();
         // inconnues : faces intérieures entre deux cellules fluides
         let mut ku = vec![false; nu];
         let mut rho_u = vec![0.0; nu];
@@ -419,44 +446,68 @@ fn solve_viscous(
     nx: usize, ny: usize, dx: f64, dt: f64, mg: &[f64], mi: &[f64], kinds: &[NodeKind], cells: &[Vec<usize>], ku: &[bool], kv: &[bool],
     rho_u: &[f64], rho_v: &[f64], uf: &[f64], vf: &[f64], max_it: usize,
 ) -> (usize, Vec<f64>, Vec<f64>) {
+    // (parallèle par tranches, `mp_par` : chaque face / cellule / nœud calculé comme en séquentiel ; produits scalaires par blocs fixes)
+    use super::mp_par::{dsum, for_ranges, for_rows, MIN_LIGHT};
+    use super::multiphase::SyncPtr;
     let (nu, nv) = ((nx + 1) * ny, nx * (ny + 1));
     let dx2 = dx * dx;
     let mu: Vec<f64> = mg.iter().zip(mi).map(|(a, b)| a + b).collect();
     let (mgn, min) = node_mu(kinds, cells, mg, mi);
-    let force = |wu: &[f64], wv: &[f64], fu: &mut [f64], fv: &mut [f64]| {
+    // contraintes (tampons réutilisés) : normales par cellule, de cisaillement par nœud
+    let mut txx = vec![0.0; nx * ny];
+    let mut tyy = vec![0.0; nx * ny];
+    let mut txy = vec![0.0; (nx + 1) * (ny + 1)];
+    let force = |wu: &[f64], wv: &[f64], fu: &mut [f64], fv: &mut [f64], txx: &mut [f64], tyy: &mut [f64], txy: &mut [f64]| {
         let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
         let vi = |i: usize, j: usize| wv[j * nx + i];
-        let mut txx = vec![0.0; nx * ny];
-        let mut tyy = vec![0.0; nx * ny];
-        for j in 0..ny {
-            for i in 0..nx {
-                let c = j * nx + i;
-                if mu[c] > 0.0 {
-                    txx[c] = 2.0 * mu[c] * (ui(i + 1, j) - ui(i, j)) / dx;
-                    tyy[c] = 2.0 * mu[c] * (vi(i, j + 1) - vi(i, j)) / dx;
+        // SAFETY (écritures de ce bloc) : chaque cellule, nœud ou face n'est écrit que par sa ligne
+        {
+            let (xp, yp) = (SyncPtr(txx.as_mut_ptr()), SyncPtr(tyy.as_mut_ptr()));
+            for_rows(ny, nx, MIN_LIGHT, |j| {
+                for i in 0..nx {
+                    let c = j * nx + i;
+                    let (a, b) =
+                        if mu[c] > 0.0 { (2.0 * mu[c] * (ui(i + 1, j) - ui(i, j)) / dx, 2.0 * mu[c] * (vi(i, j + 1) - vi(i, j)) / dx) } else { (0.0, 0.0) };
+                    unsafe {
+                        *xp.at(c) = a;
+                        *yp.at(c) = b;
+                    }
                 }
-            }
+            });
         }
-        let mut txy = vec![0.0; (nx + 1) * (ny + 1)];
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let q = j * (nx + 1) + i;
-                if mgn[q] > 0.0 || min[q] > 0.0 {
-                    txy[q] = node_txy(kinds[q], mgn[q], min[q], wu, wv, nx, i, j, dx);
+        {
+            let tp = SyncPtr(txy.as_mut_ptr());
+            for_rows(ny + 1, nx + 1, MIN_LIGHT, |j| {
+                for i in 0..=nx {
+                    let q = j * (nx + 1) + i;
+                    let t = if mgn[q] > 0.0 || min[q] > 0.0 { node_txy(kinds[q], mgn[q], min[q], wu, wv, nx, i, j, dx) } else { 0.0 };
+                    unsafe { *tp.at(q) = t }
                 }
-            }
+            });
         }
-        for j in 0..ny {
-            for i in 1..nx {
-                let f = j * (nx + 1) + i;
-                fu[f] = if ku[f] { (txx[j * nx + i] - txx[j * nx + i - 1]) / dx + (txy[(j + 1) * (nx + 1) + i] - txy[j * (nx + 1) + i]) / dx } else { 0.0 };
-            }
+        let (txx, tyy, txy) = (&*txx, &*tyy, &*txy);
+        {
+            let up = SyncPtr(fu.as_mut_ptr());
+            for_rows(ny, nx + 1, MIN_LIGHT, |j| {
+                for i in 1..nx {
+                    let f = j * (nx + 1) + i;
+                    let v = if ku[f] { (txx[j * nx + i] - txx[j * nx + i - 1]) / dx + (txy[(j + 1) * (nx + 1) + i] - txy[j * (nx + 1) + i]) / dx } else { 0.0 };
+                    unsafe { *up.at(f) = v }
+                }
+            });
         }
-        for j in 1..ny {
-            for i in 0..nx {
-                let f = j * nx + i;
-                fv[f] = if kv[f] { (tyy[j * nx + i] - tyy[(j - 1) * nx + i]) / dx + (txy[j * (nx + 1) + i + 1] - txy[j * (nx + 1) + i]) / dx } else { 0.0 };
-            }
+        {
+            let vp = SyncPtr(fv.as_mut_ptr());
+            for_rows(ny + 1, nx, MIN_LIGHT, |j| {
+                if j == 0 || j >= ny {
+                    return;
+                }
+                for i in 0..nx {
+                    let f = j * nx + i;
+                    let v = if kv[f] { (tyy[j * nx + i] - tyy[(j - 1) * nx + i]) / dx + (txy[j * (nx + 1) + i + 1] - txy[j * (nx + 1) + i]) / dx } else { 0.0 };
+                    unsafe { *vp.at(f) = v }
+                }
+            });
         }
     };
     // diagonale de A = ρ/dt − F (préconditionneur de Jacobi) : contribution d'un nœud à la face qu'il cisaille
@@ -488,17 +539,23 @@ fn solve_viscous(
         }
     }
     let (mut ru, mut rv) = (vec![0.0; nu], vec![0.0; nv]);
-    force(uf, vf, &mut ru, &mut rv);
-    let apply = |xu: &[f64], xv: &[f64], au: &mut [f64], av: &mut [f64]| {
-        force(xu, xv, au, av);
-        for f in 0..nu {
-            au[f] = if ku[f] { rho_u[f] / dt * xu[f] - au[f] } else { 0.0 };
-        }
-        for f in 0..nv {
-            av[f] = if kv[f] { rho_v[f] / dt * xv[f] - av[f] } else { 0.0 };
-        }
+    force(uf, vf, &mut ru, &mut rv, &mut txx, &mut tyy, &mut txy);
+    let apply = |xu: &[f64], xv: &[f64], au: &mut [f64], av: &mut [f64], txx: &mut [f64], tyy: &mut [f64], txy: &mut [f64]| {
+        force(xu, xv, au, av, txx, tyy, txy);
+        let (ap, bp) = (SyncPtr(au.as_mut_ptr()), SyncPtr(av.as_mut_ptr()));
+        // SAFETY : chaque face dans une seule tranche
+        for_ranges(nu, MIN_LIGHT, |lo, hi| {
+            for f in lo..hi {
+                unsafe { *ap.at(f) = if ku[f] { rho_u[f] / dt * xu[f] - *ap.at(f) } else { 0.0 } }
+            }
+        });
+        for_ranges(nv, MIN_LIGHT, |lo, hi| {
+            for f in lo..hi {
+                unsafe { *bp.at(f) = if kv[f] { rho_v[f] / dt * xv[f] - *bp.at(f) } else { 0.0 } }
+            }
+        });
     };
-    let dot = |a: &[f64], b: &[f64], c: &[f64], d: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>() + c.iter().zip(d).map(|(x, y)| x * y).sum::<f64>();
+    let dot = |a: &[f64], b: &[f64], c: &[f64], d: &[f64]| dsum(a.len(), |i| a[i] * b[i]) + dsum(c.len(), |i| c[i] * d[i]);
     let (mut xu, mut xv) = (vec![0.0; nu], vec![0.0; nv]);
     let (mut zu, mut zv): (Vec<f64>, Vec<f64>) = ((0..nu).map(|f| ru[f] / du[f]).collect(), (0..nv).map(|f| rv[f] / dv[f]).collect());
     let (mut pu, mut pv) = (zu.clone(), zv.clone());
@@ -506,36 +563,47 @@ fn solve_viscous(
     let mut rz = dot(&ru, &zu, &rv, &zv);
     let r0 = dot(&ru, &ru, &rv, &rv).sqrt();
     let mut it = 0;
+    // x += α p ; r −= α A p ; z = r / diag (sur les faces u puis v) ; puis p = z + β p
+    let step_xrz = |x: &mut [f64], r: &mut [f64], z: &mut [f64], p: &[f64], a: &[f64], d: &[f64], al: f64| {
+        let (xp, rp, zp) = (SyncPtr(x.as_mut_ptr()), SyncPtr(r.as_mut_ptr()), SyncPtr(z.as_mut_ptr()));
+        // SAFETY : chaque face dans une seule tranche
+        for_ranges(x.len(), MIN_LIGHT, |lo, hi| {
+            for f in lo..hi {
+                unsafe {
+                    *xp.at(f) += al * p[f];
+                    *rp.at(f) -= al * a[f];
+                    *zp.at(f) = *rp.at(f) / d[f];
+                }
+            }
+        });
+    };
+    let step_p = |p: &mut [f64], z: &[f64], be: f64| {
+        let pp = SyncPtr(p.as_mut_ptr());
+        // SAFETY : chaque face dans une seule tranche
+        for_ranges(p.len(), MIN_LIGHT, |lo, hi| {
+            for f in lo..hi {
+                unsafe { *pp.at(f) = z[f] + be * *pp.at(f) }
+            }
+        });
+    };
     while it < max_it && r0 > 0.0 {
         let rn = dot(&ru, &ru, &rv, &rv).sqrt();
         if rn <= FRICTION_TOL * r0 {
             break;
         }
-        apply(&pu, &pv, &mut au, &mut av);
+        apply(&pu, &pv, &mut au, &mut av, &mut txx, &mut tyy, &mut txy);
         let pap = dot(&pu, &au, &pv, &av);
         if pap <= 0.0 {
             break;
         }
         let al = rz / pap;
-        for f in 0..nu {
-            xu[f] += al * pu[f];
-            ru[f] -= al * au[f];
-            zu[f] = ru[f] / du[f];
-        }
-        for f in 0..nv {
-            xv[f] += al * pv[f];
-            rv[f] -= al * av[f];
-            zv[f] = rv[f] / dv[f];
-        }
+        step_xrz(&mut xu, &mut ru, &mut zu, &pu, &au, &du, al);
+        step_xrz(&mut xv, &mut rv, &mut zv, &pv, &av, &dv, al);
         let rz2 = dot(&ru, &zu, &rv, &zv);
         let be = rz2 / rz.max(1e-300);
         rz = rz2;
-        for f in 0..nu {
-            pu[f] = zu[f] + be * pu[f];
-        }
-        for f in 0..nv {
-            pv[f] = zv[f] + be * pv[f];
-        }
+        step_p(&mut pu, &zu, be);
+        step_p(&mut pv, &zv, be);
         it += 1;
     }
     (it, xu, xv)

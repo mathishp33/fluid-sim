@@ -127,35 +127,46 @@ impl MultiphaseSim {
         let groups = self.reg.miscible_groups();
         let ng = groups.len();
         let gorder = self.group_order(&groups);
+        // Toutes les étapes sont parallèles (`mp_par`) et calculent chaque cellule / face exactement comme la boucle séquentielle
+        // d'origine : résultat identique quel que soit le nombre de fils.
+        use super::mp_par::{collect, for_ranges, for_rows, MIN_HEAVY, MIN_LIGHT};
+        use super::multiphase::SyncPtr;
+        use super::phases::MAX_PHASES;
         // 1. PLIC des groupes mixtes (sur α normalisé)
         let n = nx * ny;
         let mut an = aw.clone();
-        for c in 0..n {
-            let s: f64 = (0..np).map(|k| an[k][c].clamp(0.0, 1.0)).sum::<f64>().max(1e-300);
-            for k in 0..np {
-                an[k][c] = an[k][c].clamp(0.0, 1.0) / s;
-            }
+        {
+            let anp: Vec<SyncPtr<f64>> = an.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            for_ranges(n, MIN_LIGHT, |lo, hi| {
+                for c in lo..hi {
+                    // SAFETY : la cellule c n'est lue et écrite que par sa tranche
+                    unsafe {
+                        let s: f64 = (0..np).map(|k| (*anp[k].at(c)).clamp(0.0, 1.0)).sum::<f64>().max(1e-300);
+                        for k in 0..np {
+                            *anp[k].at(c) = (*anp[k].at(c)).clamp(0.0, 1.0) / s;
+                        }
+                    }
+                }
+            });
         }
-        let ag: Vec<Vec<f64>> = groups.iter().map(|g| (0..n).map(|c| g.iter().map(|&k| an[k][c]).sum::<f64>().min(1.0)).collect()).collect();
+        let ag: Vec<Vec<f64>> = groups.iter().map(|g| collect(n, MIN_LIGHT, |c| g.iter().map(|&k| an[k][c]).sum::<f64>().min(1.0))).collect();
         // groupes DISPERSÉS (phases granulaires : poudre, sable) : jamais d'interface, répartis uniformément dans la cellule (voir
         // GRANULAIRE.md). Les autres groupes ont leur interface reconstruite sur leurs fractions RENORMALISÉES hors grains (du sable dans
         // l'eau n'y crée pas de fausse interface eau / « vide ») ; sans grains, tout est identique à l'algorithme d'origine.
         let disp: Vec<bool> = groups.iter().map(|g| g.iter().all(|&k| self.reg.phases[k].is_granular())).collect();
         let any_disp = disp.iter().any(|&d| d);
         let ad: Vec<f64> = if any_disp {
-            (0..n).map(|c| (0..ng).filter(|&g| disp[g]).map(|g| ag[g][c]).sum::<f64>().min(1.0)).collect()
+            collect(n, MIN_LIGHT, |c| (0..ng).filter(|&g| disp[g]).map(|g| ag[g][c]).sum::<f64>().min(1.0))
         } else {
             vec![0.0; n]
         };
         let agn: Vec<Vec<f64>> = if any_disp {
             (0..ng)
                 .map(|g| {
-                    (0..n)
-                        .map(|c| {
-                            let r = 1.0 - ad[c];
-                            if disp[g] || r <= 1e-10 { 0.0 } else { (ag[g][c] / r).min(1.0) }
-                        })
-                        .collect()
+                    collect(n, MIN_LIGHT, |c| {
+                        let r = 1.0 - ad[c];
+                        if disp[g] || r <= 1e-10 { 0.0 } else { (ag[g][c] / r).min(1.0) }
+                    })
                 })
                 .collect()
         } else {
@@ -166,18 +177,22 @@ impl MultiphaseSim {
             if disp[g] {
                 continue;
             }
-            for j in 0..ny {
+            let pp = SyncPtr(plic[g].as_mut_ptr());
+            let a_g = &agn[g];
+            let this = &*self;
+            for_rows(ny, nx, MIN_HEAVY, |j| {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    let a = agn[g][c];
-                    if a > 1e-10 && a < 1.0 - 1e-10 && !self.is_solid(c) {
-                        let (gx, gy) = self.youngs_grad(&agn[g], i, j);
-                        plic[g][c] = Some(Plic::new(a, gx, gy));
+                    let a = a_g[c];
+                    if a > 1e-10 && a < 1.0 - 1e-10 && !this.is_solid(c) {
+                        let (gx, gy) = this.youngs_grad(a_g, i, j);
+                        // SAFETY : la cellule c n'est écrite que par sa ligne
+                        unsafe { *pp.at(c) = Some(Plic::new(a, gx, gy)) }
                     }
                 }
-            }
+            });
         }
-        // 2. flux géométriques par face
+        // 2. flux géométriques par face (lus sur l'état d'avant le balayage)
         let (fi, fj) = if dir == 0 { (nx + 1, ny) } else { (nx, ny + 1) };
         let nf = fi * fj;
         let mut ff = vec![0.0f64; nf * np];
@@ -193,134 +208,151 @@ impl MultiphaseSim {
         let van_leer = |a: f64, b: f64| if a * b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
         // cellule fluide sans interface (un seul groupe non dispersé présent à 99 % hors grains) : la reconstruction d'ordre 2 y est sûre
         let single = |c: usize| -> Option<usize> { (0..ng).find(|&g| !disp[g] && agn[g][c] > 0.99) };
-        for fj_ in 0..fj {
-            for fi_ in 0..fi {
-                let f = fj_ * fi + fi_;
-                let (uf, lo, hi) = if dir == 0 {
-                    (self.u[self.uidx(fi_, fj_)], if fi_ > 0 { Some(self.idx(fi_ - 1, fj_)) } else { None }, if fi_ < nx { Some(self.idx(fi_, fj_)) } else { None })
-                } else {
-                    (self.v[self.vidx(fi_, fj_)], if fj_ > 0 { Some(self.idx(fi_, fj_ - 1)) } else { None }, if fj_ < ny { Some(self.idx(fi_, fj_)) } else { None })
-                };
-                if uf == 0.0 {
-                    continue;
-                }
-                if lo.map_or(false, |c| self.is_solid(c)) || hi.map_or(false, |c| self.is_solid(c)) {
-                    continue;
-                }
-                let xi = (uf.abs() * dt / self.dx).min(1.0);
-                let (d, r) = if uf > 0.0 { (lo, hi) } else { (hi, lo) };
-                donor[f] = d.unwrap_or(usize::MAX);
-                recv[f] = r.unwrap_or(usize::MAX);
-                match d {
-                    None => {
-                        inflow_ghost[f] = true; // fluide entrant : ambiant, ou celui de l'entrée de bord si le bord en a une
-                        let (ga, gt) = self.ghost_source(dir, fi_, fj_);
-                        for k in 0..np {
-                            ff[f * np + k] = xi * ga[k];
-                        }
-                        ghost_t[f] = gt;
+        // groupes non dispersés dans l'ordre d'allocation des flux
+        let nd: Vec<usize> = gorder.iter().copied().filter(|&g| !disp[g]).collect();
+        {
+            let ffp = SyncPtr(ff.as_mut_ptr());
+            let (dop, rcp, igp) = (SyncPtr(donor.as_mut_ptr()), SyncPtr(recv.as_mut_ptr()), SyncPtr(inflow_ghost.as_mut_ptr()));
+            let (gtp, ftp, fgp) = (SyncPtr(ghost_t.as_mut_ptr()), SyncPtr(face_t.as_mut_ptr()), SyncPtr(face_g.as_mut_ptr()));
+            let (an, ag, agn, plic, t_old, groups, disp, nd) = (&an, &ag, &agn, &plic, &t_old, &groups, &disp, &nd);
+            let this = &*self;
+            for_rows(fj, fi, MIN_HEAVY, |fj_| {
+                let mut spare = [0.0f64; MAX_PHASES];
+                let mut fg = [0.0f64; MAX_PHASES];
+                let mut phi = [0.0f64; MAX_PHASES];
+                for fi_ in 0..fi {
+                    let f = fj_ * fi + fi_;
+                    let (uf, lo, hi) = if dir == 0 {
+                        (this.u[this.uidx(fi_, fj_)], if fi_ > 0 { Some(this.idx(fi_ - 1, fj_)) } else { None }, if fi_ < nx { Some(this.idx(fi_, fj_)) } else { None })
+                    } else {
+                        (this.v[this.vidx(fi_, fj_)], if fj_ > 0 { Some(this.idx(fi_, fj_ - 1)) } else { None }, if fj_ < ny { Some(this.idx(fi_, fj_)) } else { None })
+                    };
+                    if uf == 0.0 {
+                        continue;
                     }
-                    Some(dc) => {
-                        // bande balayée dans la cellule donneuse (coordonnées unité)
-                        let (s0, s1) = if uf > 0.0 { (1.0 - xi, 1.0) } else { (0.0, xi) };
-                        // cellule en amont de la donneuse (pour la pente) et receveuse, si fluides
-                        let up = if dir == 0 {
-                            if uf > 0.0 { (fi_ >= 2).then(|| self.idx(fi_ - 2, fj_)) } else { (fi_ + 1 < nx).then(|| self.idx(fi_ + 1, fj_)) }
-                        } else if uf > 0.0 {
-                            (fj_ >= 2).then(|| self.idx(fi_, fj_ - 2))
-                        } else {
-                            (fj_ + 1 < ny).then(|| self.idx(fi_, fj_ + 1))
-                        };
-                        let up = up.filter(|&c| !self.is_solid(c));
-                        let rc = r.filter(|&c| !self.is_solid(c));
-                        let mut rem = xi;
-                        let mut spare = vec![0.0; ng];
-                        let mut fg = vec![0.0; ng];
-                        // groupes dispersés d'abord : part ξ·α de la bande (α reconstruit à la face, MUSCL / van Leer)
-                        if any_disp {
-                            for g in 0..ng {
-                                let a = ag[g][dc];
-                                if !disp[g] || a <= 0.0 {
-                                    continue;
+                    if lo.map_or(false, |c| this.is_solid(c)) || hi.map_or(false, |c| this.is_solid(c)) {
+                        continue;
+                    }
+                    let xi = (uf.abs() * dt / this.dx).min(1.0);
+                    let (d, r) = if uf > 0.0 { (lo, hi) } else { (hi, lo) };
+                    // SAFETY (tout le bloc) : la face f n'est écrite que par sa ligne de faces
+                    unsafe {
+                        *dop.at(f) = d.unwrap_or(usize::MAX);
+                        *rcp.at(f) = r.unwrap_or(usize::MAX);
+                    }
+                    match d {
+                        None => {
+                            // fluide entrant : ambiant, ou celui de l'entrée de bord si le bord en a une
+                            let (ga, gt) = this.ghost_source(dir, fi_, fj_);
+                            unsafe {
+                                *igp.at(f) = true;
+                                for k in 0..np {
+                                    *ffp.at(f * np + k) = xi * ga[k];
                                 }
-                                let af = match (up, rc) {
-                                    (Some(uc), Some(rcv)) => (a + 0.5 * (1.0 - xi) * van_leer(a - ag[g][uc], ag[g][rcv] - a)).clamp(0.0, 1.0),
-                                    _ => a,
-                                };
-                                let fk = (xi * af).min(a).min(rem).max(0.0);
-                                fg[g] = fk;
-                                rem -= fk;
-                                spare[g] = a - fk;
+                                *gtp.at(f) = gt;
                             }
                         }
-                        // reste de la bande : groupes non dispersés, par la géométrie PLIC (renormalisée hors grains)
-                        let scale = rem / xi;
-                        let pure = (0..ng).find(|&g| !disp[g] && agn[g][dc] >= 1.0 - 1e-10);
-                        if let Some(gp) = pure {
-                            fg[gp] = rem;
-                            rem = 0.0;
-                        } else {
-                            let nd: Vec<usize> = gorder.iter().copied().filter(|&g| !disp[g]).collect();
-                            for (pos, &g) in nd.iter().enumerate() {
-                                let a = ag[g][dc];
-                                let want = if pos == nd.len() - 1 {
-                                    rem
-                                } else if let Some(pl) = plic[g][dc] {
-                                    scale * if dir == 0 { pl.area(s0, s1, 0.0, 1.0) } else { pl.area(0.0, 1.0, s0, s1) }
-                                } else {
-                                    0.0
-                                };
-                                let fk = want.min(rem).min(a).max(0.0);
-                                fg[g] = fk;
-                                rem -= fk;
-                                spare[g] = a - fk;
-                            }
-                        }
-                        if rem > 1e-14 {
-                            let tot: f64 = spare.iter().map(|s| s.max(0.0)).sum();
-                            if tot > 0.0 {
+                        Some(dc) => {
+                            // bande balayée dans la cellule donneuse (coordonnées unité)
+                            let (s0, s1) = if uf > 0.0 { (1.0 - xi, 1.0) } else { (0.0, xi) };
+                            // cellule en amont de la donneuse (pour la pente) et receveuse, si fluides
+                            let up = if dir == 0 {
+                                if uf > 0.0 { (fi_ >= 2).then(|| this.idx(fi_ - 2, fj_)) } else { (fi_ + 1 < nx).then(|| this.idx(fi_ + 1, fj_)) }
+                            } else if uf > 0.0 {
+                                (fj_ >= 2).then(|| this.idx(fi_, fj_ - 2))
+                            } else {
+                                (fj_ + 1 < ny).then(|| this.idx(fi_, fj_ + 1))
+                            };
+                            let up = up.filter(|&c| !this.is_solid(c));
+                            let rc = r.filter(|&c| !this.is_solid(c));
+                            let mut rem = xi;
+                            spare[..ng].fill(0.0);
+                            fg[..ng].fill(0.0);
+                            // groupes dispersés d'abord : part ξ·α de la bande (α reconstruit à la face, MUSCL / van Leer)
+                            if any_disp {
                                 for g in 0..ng {
-                                    fg[g] += rem * spare[g].max(0.0) / tot;
+                                    let a = ag[g][dc];
+                                    if !disp[g] || a <= 0.0 {
+                                        continue;
+                                    }
+                                    let af = match (up, rc) {
+                                        (Some(uc), Some(rcv)) => (a + 0.5 * (1.0 - xi) * van_leer(a - ag[g][uc], ag[g][rcv] - a)).clamp(0.0, 1.0),
+                                        _ => a,
+                                    };
+                                    let fk = (xi * af).min(a).min(rem).max(0.0);
+                                    fg[g] = fk;
+                                    rem -= fk;
+                                    spare[g] = a - fk;
                                 }
                             }
-                        }
-                        // reconstruction MUSCL (ordre 2, TVD) de la composition d'un groupe miscible et de la température, hors interfaces :
-                        // sans elle la diffusion numérique du schéma décentré (≈ u·dx/2) dépasse la diffusion moléculaire des mélanges
-                        let smooth = match (up, rc) {
-                            (Some(uc), Some(rcv)) => {
-                                let gd = single(dc);
-                                if gd.is_some() && single(uc) == gd && single(rcv) == gd { Some((uc, rcv, gd.unwrap())) } else { None }
+                            // reste de la bande : groupes non dispersés, par la géométrie PLIC (renormalisée hors grains)
+                            let scale = rem / xi;
+                            let pure = (0..ng).find(|&g| !disp[g] && agn[g][dc] >= 1.0 - 1e-10);
+                            if let Some(gp) = pure {
+                                fg[gp] = rem;
+                                rem = 0.0;
+                            } else {
+                                for (pos, &g) in nd.iter().enumerate() {
+                                    let a = ag[g][dc];
+                                    let want = if pos == nd.len() - 1 {
+                                        rem
+                                    } else if let Some(pl) = plic[g][dc] {
+                                        scale * if dir == 0 { pl.area(s0, s1, 0.0, 1.0) } else { pl.area(0.0, 1.0, s0, s1) }
+                                    } else {
+                                        0.0
+                                    };
+                                    let fk = want.min(rem).min(a).max(0.0);
+                                    fg[g] = fk;
+                                    rem -= fk;
+                                    spare[g] = a - fk;
+                                }
                             }
-                            _ => None,
-                        };
-                        if let Some((uc, rcv, gs)) = smooth {
-                            let (tu, td, tr) = (t_old[gs][uc], t_old[gs][dc], t_old[gs][rcv]);
-                            face_t[f] = td + 0.5 * (1.0 - xi) * van_leer(td - tu, tr - td);
-                            face_g[f] = gs;
-                        }
-                        // flux du groupe → membres, au prorata de leur composition (reconstruite à la face si possible)
-                        for g in 0..ng {
-                            if fg[g] > 0.0 {
-                                let tot = ag[g][dc].max(1e-300);
-                                match smooth {
-                                    Some((uc, rcv, gs)) if gs == g && groups[g].len() > 1 => {
-                                        let (tu, tr) = (ag[g][uc].max(1e-300), ag[g][rcv].max(1e-300));
-                                        let mut phi: Vec<f64> = groups[g]
-                                            .iter()
-                                            .map(|&k| {
+                            if rem > 1e-14 {
+                                let tot: f64 = spare[..ng].iter().map(|s| s.max(0.0)).sum();
+                                if tot > 0.0 {
+                                    for g in 0..ng {
+                                        fg[g] += rem * spare[g].max(0.0) / tot;
+                                    }
+                                }
+                            }
+                            // reconstruction MUSCL (ordre 2, TVD) de la composition d'un groupe miscible et de la température, hors interfaces :
+                            // sans elle la diffusion numérique du schéma décentré (≈ u·dx/2) dépasse la diffusion moléculaire des mélanges
+                            let smooth = match (up, rc) {
+                                (Some(uc), Some(rcv)) => {
+                                    let gd = single(dc);
+                                    if gd.is_some() && single(uc) == gd && single(rcv) == gd { Some((uc, rcv, gd.unwrap())) } else { None }
+                                }
+                                _ => None,
+                            };
+                            if let Some((uc, rcv, gs)) = smooth {
+                                let (tu, td, tr) = (t_old[gs][uc], t_old[gs][dc], t_old[gs][rcv]);
+                                unsafe {
+                                    *ftp.at(f) = td + 0.5 * (1.0 - xi) * van_leer(td - tu, tr - td);
+                                    *fgp.at(f) = gs;
+                                }
+                            }
+                            // flux du groupe → membres, au prorata de leur composition (reconstruite à la face si possible)
+                            for g in 0..ng {
+                                if fg[g] > 0.0 {
+                                    let tot = ag[g][dc].max(1e-300);
+                                    match smooth {
+                                        Some((uc, rcv, gs)) if gs == g && groups[g].len() > 1 => {
+                                            let (tu, tr) = (ag[g][uc].max(1e-300), ag[g][rcv].max(1e-300));
+                                            let m = groups[g].len();
+                                            for (q, &k) in groups[g].iter().enumerate() {
                                                 let (pu, pd, pr) = (an[k][uc] / tu, an[k][dc] / tot, an[k][rcv] / tr);
-                                                (pd + 0.5 * (1.0 - xi) * van_leer(pd - pu, pr - pd)).max(0.0)
-                                            })
-                                            .collect();
-                                        let sphi: f64 = phi.iter().sum::<f64>().max(1e-300);
-                                        phi.iter_mut().for_each(|x| *x /= sphi);
-                                        for (q, &k) in groups[g].iter().enumerate() {
-                                            ff[f * np + k] = fg[g] * phi[q];
+                                                phi[q] = (pd + 0.5 * (1.0 - xi) * van_leer(pd - pu, pr - pd)).max(0.0);
+                                            }
+                                            let sphi: f64 = phi[..m].iter().sum::<f64>().max(1e-300);
+                                            phi[..m].iter_mut().for_each(|x| *x /= sphi);
+                                            for (q, &k) in groups[g].iter().enumerate() {
+                                                unsafe { *ffp.at(f * np + k) = fg[g] * phi[q] }
+                                            }
                                         }
-                                    }
-                                    _ => {
-                                        for &k in &groups[g] {
-                                            ff[f * np + k] = fg[g] * an[k][dc] / tot;
+                                        _ => {
+                                            for &k in &groups[g] {
+                                                unsafe { *ffp.at(f * np + k) = fg[g] * an[k][dc] / tot }
+                                            }
                                         }
                                     }
                                 }
@@ -328,109 +360,186 @@ impl MultiphaseSim {
                         }
                     }
                 }
-            }
+            });
         }
-        // 3. limiteur de sortie par cellule et par phase
+        // 3. limiteur de sortie par cellule et par phase : somme des flux sortants de la donneuse (sa face basse puis sa face haute,
+        //    l'ordre de l'ancienne accumulation face par face), puis réduction des flux qui la dépassent
         let mut outsum = vec![0.0f64; n * np];
-        for f in 0..nf {
-            if donor[f] != usize::MAX {
-                for k in 0..np {
-                    outsum[donor[f] * np + k] += ff[f * np + k];
-                }
-            }
-        }
-        for f in 0..nf {
-            if donor[f] != usize::MAX {
-                for k in 0..np {
-                    let o = outsum[donor[f] * np + k];
-                    let cap = aw[k][donor[f]].max(0.0) * 0.999;
-                    if o > cap && o > 0.0 {
-                        ff[f * np + k] *= cap / o;
+        {
+            let op = SyncPtr(outsum.as_mut_ptr());
+            let (ffr, dr) = (&ff, &donor);
+            for_rows(ny, nx, MIN_LIGHT, |j| {
+                for i in 0..nx {
+                    let c = j * nx + i;
+                    let (flo, fhi) = if dir == 0 { (j * fi + i, j * fi + i + 1) } else { (j * fi + i, (j + 1) * fi + i) };
+                    for f in [flo, fhi] {
+                        if dr[f] == c {
+                            for k in 0..np {
+                                // SAFETY : la cellule c n'est écrite que par sa ligne
+                                unsafe { *op.at(c * np + k) += ffr[f * np + k] }
+                            }
+                        }
                     }
                 }
-            }
+            });
+        }
+        {
+            let ffp = SyncPtr(ff.as_mut_ptr());
+            let (dr, os, awr) = (&donor, &outsum, &*aw);
+            for_ranges(nf, MIN_LIGHT, |lo, hi| {
+                for f in lo..hi {
+                    if dr[f] != usize::MAX {
+                        for k in 0..np {
+                            let o = os[dr[f] * np + k];
+                            let cap = awr[k][dr[f]].max(0.0) * 0.999;
+                            if o > cap && o > 0.0 {
+                                // SAFETY : la face f n'est écrite que par sa tranche
+                                unsafe { *ffp.at(f * np + k) *= cap / o }
+                            }
+                        }
+                    }
+                }
+            });
         }
         // 4. mise à jour conservative : α, m_k, e, face par face DANS L'ORDRE des indices (la masse volumique m/α de la donneuse est
         //    lue sur l'état courant, flux entrants des faces précédentes compris). NB : une évaluation simultanée sur l'état d'avant le
         //    balayage (forme flux « pure ») a été essayée : elle transporte sans les amortir les écarts de remplissage m/α ≠ ρ des
-        //    cellules d'eau et diverge sur un jet d'eau entrant dans l'air ; le GPU reproduit exactement cet ordre (une ligne, resp.
-        //    une colonne, par fil)
+        //    cellules d'eau et diverge sur un jet d'eau entrant dans l'air. Une face ne touche que les deux cellules de SA ligne (balayage
+        //    en x) ou de SA colonne (en y) : les lignes (colonnes) sont indépendantes et traitées en parallèle, chacune dans l'ordre (le GPU
+        //    fait de même, une ligne par fil) ; les flux aux bords du domaine sont notés par face puis sommés dans l'ordre des faces.
         let a2 = self.dx * self.dx;
-        for f in 0..nf {
-            if donor[f] == usize::MAX && !inflow_ghost[f] {
-                continue;
-            }
-            let (d, r) = (donor[f], recv[f]);
-            let mut efg = [0.0f64; super::phases::MAX_PHASES];
-            let mut mtot = 0.0;
-            for k in 0..np {
-                let fk = ff[f * np + k];
-                if fk == 0.0 {
-                    continue;
-                }
-                let (rho_d, t_d, p_d) = if d == usize::MAX {
-                    let pr = if r != usize::MAX { self.p[r] } else { 101325.0 };
-                    (self.reg.phases[k].rho(pr, ghost_t[f]), ghost_t[f], pr)
-                } else {
-                    // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0 ; température de SON groupe
-                    let gk = self.group_of[k];
-                    let rho_eos = self.reg.phases[k].rho(self.p[d], t_old[gk][d]);
-                    let rho = if aw[k][d] > 1e-8 { self.mass[k][d] / aw[k][d] } else { rho_eos };
-                    let tf = if face_g[f] == gk && !face_t[f].is_nan() { face_t[f] } else { t_old[gk][d] };
-                    (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, tf, self.p[d])
-                };
-                let _ = p_d;
-                // jamais plus que la masse présente dans la donneuse (traces : α ≈ 0 et masse volumique de repli EOS)
-                let mf = if d != usize::MAX { (fk * rho_d).min(self.mass[k][d].max(0.0)) } else { fk * rho_d };
-                mtot += mf;
-                efg[self.group_of[k]] += mf * self.reg.phases[k].e_int(t_d);
-                if d != usize::MAX {
-                    aw[k][d] -= fk;
-                    self.mass[k][d] -= mf;
-                } else {
-                    self.boundary_flux[k] += mf * a2;
-                }
-                if r != usize::MAX {
-                    aw[k][r] += fk;
-                    self.mass[k][r] += mf;
-                } else {
-                    self.boundary_flux[k] -= mf * a2;
-                }
-            }
-            {
-                let (fi_, fj_) = (f % fi, f / fi);
-                let sgn = if dir == 0 { self.u[self.uidx(fi_, fj_)] } else { self.v[self.vidx(fi_, fj_)] }.signum();
-                if dir == 0 { let q = self.uidx(fi_, fj_); self.mfx[q] += sgn * mtot; } else { let q = self.vidx(fi_, fj_); self.mfy[q] += sgn * mtot; }
-            }
-            for g in 0..ng {
-                let ef = efg[g];
-                if ef == 0.0 {
-                    continue;
-                }
-                if d != usize::MAX {
-                    self.eg[g][d] -= ef;
-                    self.e[d] -= ef;
-                }
-                if r != usize::MAX {
-                    self.eg[g][r] += ef;
-                    self.e[r] += ef;
-                }
-            }
-        }
-        for c in 0..n {
-            if !self.is_solid(c) {
-                // plancher d'énergie par groupe (T ≥ T_PW_MIN) : dans une cellule presque vide, le flux d'énergie sortant (à la
-                // température du début du balayage) peut dépasser le contenu → T < 0. Énergie ajoutée négligeable (capacité ~0).
-                for g in 0..ng {
-                    if self.group_mass(g, c) > 0.0 {
-                        let emin = self.group_energy_at(g, c, super::mp_thermo::T_PW_MIN);
-                        if self.eg[g][c] < emin {
-                            self.eg[g][c] = emin;
+        let mut bval = vec![0.0f64; nf * np];
+        let mut bkind = vec![0u8; nf * np];
+        {
+            let awp: Vec<SyncPtr<f64>> = aw.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let mp: Vec<SyncPtr<f64>> = self.mass.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let ep = SyncPtr(self.e.as_mut_ptr());
+            let mfp = SyncPtr(if dir == 0 { self.mfx.as_mut_ptr() } else { self.mfy.as_mut_ptr() });
+            let (bvp, bkp) = (SyncPtr(bval.as_mut_ptr()), SyncPtr(bkind.as_mut_ptr()));
+            let (ffr, dr, rr, igr, gtr, ftr, fgr, t_old) = (&ff, &donor, &recv, &inflow_ghost, &ghost_t, &face_t, &face_g, &t_old);
+            let this = &*self;
+            let (lines, len) = if dir == 0 { (ny, fi) } else { (nx, fj) };
+            for_rows(lines, len, MIN_HEAVY, |line| {
+                for t in 0..len {
+                    let f = if dir == 0 { line * fi + t } else { t * fi + line };
+                    if dr[f] == usize::MAX && !igr[f] {
+                        continue;
+                    }
+                    let (d, r) = (dr[f], rr[f]);
+                    let mut efg = [0.0f64; MAX_PHASES];
+                    let mut mtot = 0.0;
+                    // SAFETY (tout le bloc) : les cellules d et r appartiennent à la ligne (colonne) traitée par ce fil ; la face f aussi
+                    unsafe {
+                        for k in 0..np {
+                            let fk = ffr[f * np + k];
+                            if fk == 0.0 {
+                                continue;
+                            }
+                            let (rho_d, t_d, p_d) = if d == usize::MAX {
+                                let pr = if r != usize::MAX { this.p[r] } else { 101325.0 };
+                                (this.reg.phases[k].rho(pr, gtr[f]), gtr[f], pr)
+                            } else {
+                                // masse volumique de la phase dans la cellule donneuse (m/α), repli EOS si α ≈ 0 ; température de SON groupe
+                                let gk = this.group_of[k];
+                                let rho_eos = this.reg.phases[k].rho(this.p[d], t_old[gk][d]);
+                                let (awd, md) = (*awp[k].at(d), *mp[k].at(d));
+                                let rho = if awd > 1e-8 { md / awd } else { rho_eos };
+                                let tf = if fgr[f] == gk && !ftr[f].is_nan() { ftr[f] } else { t_old[gk][d] };
+                                (if rho.is_finite() && rho > 0.0 { rho } else { rho_eos }, tf, this.p[d])
+                            };
+                            let _ = p_d;
+                            // jamais plus que la masse présente dans la donneuse (traces : α ≈ 0 et masse volumique de repli EOS)
+                            let mf = if d != usize::MAX { (fk * rho_d).min((*mp[k].at(d)).max(0.0)) } else { fk * rho_d };
+                            mtot += mf;
+                            efg[this.group_of[k]] += mf * this.reg.phases[k].e_int(t_d);
+                            if d != usize::MAX {
+                                *awp[k].at(d) -= fk;
+                                *mp[k].at(d) -= mf;
+                            } else {
+                                *bvp.at(f * np + k) = mf * a2;
+                                *bkp.at(f * np + k) = 1;
+                            }
+                            if r != usize::MAX {
+                                *awp[k].at(r) += fk;
+                                *mp[k].at(r) += mf;
+                            } else {
+                                *bvp.at(f * np + k) = mf * a2;
+                                *bkp.at(f * np + k) = 2;
+                            }
+                        }
+                        {
+                            let (fi_, fj_) = (f % fi, f / fi);
+                            let (sgn, q) =
+                                if dir == 0 { (this.u[this.uidx(fi_, fj_)].signum(), this.uidx(fi_, fj_)) } else { (this.v[this.vidx(fi_, fj_)].signum(), this.vidx(fi_, fj_)) };
+                            *mfp.at(q) += sgn * mtot;
+                        }
+                        for g in 0..ng {
+                            let ef = efg[g];
+                            if ef == 0.0 {
+                                continue;
+                            }
+                            if d != usize::MAX {
+                                *egp[g].at(d) -= ef;
+                                *ep.at(d) -= ef;
+                            }
+                            if r != usize::MAX {
+                                *egp[g].at(r) += ef;
+                                *ep.at(r) += ef;
+                            }
                         }
                     }
                 }
-                self.cell_sync(c);
+            });
+        }
+        for f in 0..nf {
+            for k in 0..np {
+                match bkind[f * np + k] {
+                    1 => self.boundary_flux[k] += bval[f * np + k],
+                    2 => self.boundary_flux[k] -= bval[f * np + k],
+                    _ => {}
+                }
             }
+        }
+        // 5. plancher d'énergie par groupe (T ≥ T_PW_MIN) : dans une cellule presque vide, le flux d'énergie sortant (à la température
+        //    du début du balayage) peut dépasser le contenu → T < 0. Énergie ajoutée négligeable (capacité ~0). Puis températures.
+        {
+            let ep = SyncPtr(self.e.as_mut_ptr());
+            let tp = SyncPtr(self.temp.as_mut_ptr());
+            let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let this = &*self;
+            for_ranges(n, MIN_HEAVY, |lo, hi| {
+                let mut egn = [0.0f64; MAX_PHASES];
+                let mut tgn = [0.0f64; MAX_PHASES];
+                for c in lo..hi {
+                    if this.is_solid(c) {
+                        continue;
+                    }
+                    let mut e = 0.0;
+                    for g in 0..ng {
+                        let mut v = this.eg[g][c];
+                        if this.group_mass(g, c) > 0.0 {
+                            let emin = this.group_energy_at(g, c, super::mp_thermo::T_PW_MIN);
+                            if v < emin {
+                                v = emin;
+                            }
+                        }
+                        egn[g] = v;
+                        e += v;
+                    }
+                    let (ec, tc) = this.sync_finish(c, &mut egn, &mut tgn, e);
+                    // SAFETY : la cellule c n'est écrite que par sa tranche
+                    unsafe {
+                        *ep.at(c) = ec;
+                        *tp.at(c) = tc;
+                        for g in 0..ng {
+                            *egp[g].at(c) = egn[g];
+                            *tgp[g].at(c) = tgn[g];
+                        }
+                    }
+                }
+            });
         }
         let _ = Bc::Wall;
     }

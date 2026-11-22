@@ -17,7 +17,9 @@
 //! Le « nœud d'interface » de `exchange_heat` (interface plane à l'échelle de la maille) ne convient pas aux grains : pour de l'air
 //! à 1 cm de maille il donnait une constante de temps de ~800 s, au lieu de quelques millisecondes pour une poudre fine.
 
-use super::multiphase::MultiphaseSim;
+use super::mp_par::{for_ranges, MIN_HEAVY};
+use super::multiphase::{MultiphaseSim, SyncPtr};
+use super::phases::MAX_PHASES;
 
 impl MultiphaseSim {
     /// la simulation contient-elle au moins une phase granulaire ?
@@ -198,39 +200,64 @@ impl MultiphaseSim {
         if !gran.iter().any(|&b| b) {
             return;
         }
-        for c in 0..self.nx * self.ny {
-            if self.is_solid(c) {
+        // (en parallèle : chaque cellule ne dépend que d'elle-même ; énergies mises à jour puis températures, comme `cell_sync`)
+        let n = self.nx * self.ny;
+        let ep = SyncPtr(self.e.as_mut_ptr());
+        let tp = SyncPtr(self.temp.as_mut_ptr());
+        let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let this = &*self;
+        let gran = &gran;
+        for_ranges(n, MIN_HEAVY, |lo, hi| {
+        let mut egn = [0.0f64; MAX_PHASES];
+        let mut tgn = [0.0f64; MAX_PHASES];
+        for c in lo..hi {
+            if this.is_solid(c) {
                 continue;
             }
-            let a_fluid: f64 = (0..ng).filter(|&g| !gran[g]).map(|g| self.group_alpha(g, c)).sum();
+            let a_fluid: f64 = (0..ng).filter(|&g| !gran[g]).map(|g| this.group_alpha(g, c)).sum();
             if a_fluid <= 1e-12 {
                 continue;
             }
+            for g in 0..ng {
+                egn[g] = this.eg[g][c];
+            }
             let mut changed = false;
             for s in 0..ng {
-                if !gran[s] || self.group_mass(s, c) <= 0.0 {
+                if !gran[s] || this.group_mass(s, c) <= 0.0 {
                     continue;
                 }
-                let d = self.reg.phases[self.groups[s][0]].grain_diameter.max(1e-6);
-                let a_s = self.group_alpha(s, c);
+                let d = this.reg.phases[this.groups[s][0]].grain_diameter.max(1e-6);
+                let a_s = this.group_alpha(s, c);
                 for f in 0..ng {
-                    if gran[f] || self.group_mass(f, c) <= 0.0 {
+                    if gran[f] || this.group_mass(f, c) <= 0.0 {
                         continue;
                     }
-                    let (ts, tf) = (self.tg[s][c], self.tg[f][c]);
-                    let g = lam * 12.0 * a_s * self.group_k(f, c) / (d * d) * self.group_alpha(f, c) / a_fluid;
-                    let (cs, cf) = (self.group_cap_at(s, c, ts).max(1e-300), self.group_cap_at(f, c, tf).max(1e-300));
+                    let (ts, tf) = (this.tg[s][c], this.tg[f][c]);
+                    let g = lam * 12.0 * a_s * this.group_k(f, c) / (d * d) * this.group_alpha(f, c) / a_fluid;
+                    let (cs, cf) = (this.group_cap_at(s, c, ts).max(1e-300), this.group_cap_at(f, c, tf).max(1e-300));
                     // échange implicite à deux corps : écart relaxé sans dépassement, énergie conservée exactement
                     let q = g * dt * (tf - ts) / (1.0 + g * dt * (1.0 / cs + 1.0 / cf));
-                    self.eg[s][c] += q;
-                    self.eg[f][c] -= q;
+                    egn[s] += q;
+                    egn[f] -= q;
                     changed = true;
                 }
             }
             if changed {
-                self.cell_sync(c);
+                let e: f64 = egn[..ng].iter().fold(0.0, |a, &b| a + b);
+                let (ec, tc) = this.sync_finish(c, &mut egn, &mut tgn, e);
+                // SAFETY : la cellule c n'est écrite que par sa tranche (et lue avant)
+                unsafe {
+                    *ep.at(c) = ec;
+                    *tp.at(c) = tc;
+                    for g in 0..ng {
+                        *egp[g].at(c) = egn[g];
+                        *tgp[g].at(c) = tgn[g];
+                    }
+                }
             }
         }
+        });
     }
 }
 

@@ -7,7 +7,9 @@
 //!  * Travail de pression −p ∇·u (appliqué APRÈS la projection) : c'est lui qui, avec les décalages d'énergie e0, restitue
 //!    la chaleur latente exacte L(T) (refroidissement du liquide qui bout).
 
-use super::multiphase::MultiphaseSim;
+use super::mp_par::MIN_HEAVY;
+use super::multiphase::{MultiphaseSim, SyncPtr};
+use super::phases::MAX_PHASES;
 
 /// température sous laquelle le travail de détente ne refroidit plus une cellule (voir `pressure_work`)
 pub(crate) const T_PW_MIN: f64 = 60.0;
@@ -21,11 +23,15 @@ impl MultiphaseSim {
         if !self.conduction {
             return;
         }
+        use super::mp_par::{for_ranges, for_rows, map_ranges, MIN_HEAVY, MIN_LIGHT};
+        use super::multiphase::SyncPtr;
+        use super::phases::MAX_PHASES;
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let n = nx * ny;
         let ng = self.groups.len();
         let dx2 = dx * dx;
         let harm = |a: f64, b: f64| if a + b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
+        let ptrs = |v: &mut Vec<Vec<f64>>| -> Vec<SyncPtr<f64>> { v.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect() };
         // nœuds : conductivité (×F_eff des flammes épaissies), fraction, capacité, température
         let mut kg = vec![vec![0.0; n]; ng];
         let mut ag = vec![vec![0.0; n]; ng];
@@ -34,30 +40,46 @@ impl MultiphaseSim {
         let mut ks = vec![0.0; n];
         let mut cs = vec![0.0; n];
         let mut ts = self.temp.clone();
-        let mut amax = 0.0f64;
-        for c in 0..n {
-            if self.is_solid(c) {
-                ks[c] = self.k_cell[c];
-                cs[c] = self.heat_capacity(c);
-                if cs[c] > 0.0 {
-                    amax = amax.max(ks[c] / cs[c]);
+        let amax = {
+            let (kgp, agp, cgp) = (ptrs(&mut kg), ptrs(&mut ag), ptrs(&mut cg));
+            let (ksp, csp) = (SyncPtr(ks.as_mut_ptr()), SyncPtr(cs.as_mut_ptr()));
+            let this = &*self;
+            map_ranges(n, MIN_HEAVY, |lo, hi| {
+                let mut amax = 0.0f64;
+                for c in lo..hi {
+                    // SAFETY : la cellule c n'est écrite que par sa tranche
+                    unsafe {
+                        if this.is_solid(c) {
+                            let (k, cap) = (this.k_cell[c], this.heat_capacity(c));
+                            *ksp.at(c) = k;
+                            *csp.at(c) = cap;
+                            if cap > 0.0 {
+                                amax = amax.max(k / cap);
+                            }
+                            continue;
+                        }
+                        let ff = this.flame_factor[c].max(1.0);
+                        for g in 0..ng {
+                            if this.group_mass(g, c) <= 0.0 {
+                                continue;
+                            }
+                            let a = this.group_alpha(g, c);
+                            let k = this.group_k(g, c) * ff;
+                            let cap = this.group_cap_at(g, c, this.tg[g][c]);
+                            *agp[g].at(c) = a;
+                            *kgp[g].at(c) = k;
+                            *cgp[g].at(c) = cap;
+                            if cap > 0.0 && a > 0.0 {
+                                amax = amax.max(k * a / cap);
+                            }
+                        }
+                    }
                 }
-                continue;
-            }
-            let ff = self.flame_factor[c].max(1.0);
-            for g in 0..ng {
-                if self.group_mass(g, c) <= 0.0 {
-                    continue;
-                }
-                let a = self.group_alpha(g, c);
-                ag[g][c] = a;
-                kg[g][c] = self.group_k(g, c) * ff;
-                cg[g][c] = self.group_cap_at(g, c, self.tg[g][c]);
-                if cg[g][c] > 0.0 && a > 0.0 {
-                    amax = amax.max(kg[g][c] * a / cg[g][c]);
-                }
-            }
-        }
+                amax
+            })
+            .into_iter()
+            .fold(0.0f64, f64::max)
+        };
         if amax <= 0.0 {
             return;
         }
@@ -67,67 +89,109 @@ impl MultiphaseSim {
         let mut des = vec![0.0; n];
         let mut deg = vec![vec![0.0; n]; ng];
         for _ in 0..nsub {
-            des.iter_mut().for_each(|x| *x = 0.0);
-            for d in deg.iter_mut() {
-                d.iter_mut().for_each(|x| *x = 0.0);
-            }
-            for j in 0..ny {
-                for i in 0..nx {
-                    let c = j * nx + i;
-                    for (di, dj) in [(1usize, 0usize), (0, 1)] {
-                        let (ii, jj) = (i + di, j + dj);
-                        if ii >= nx || jj >= ny {
-                            continue;
-                        }
-                        let b = jj * nx + ii;
-                        match (self.is_solid(c), self.is_solid(b)) {
+            // flux rassemblés par cellule, faces sud, ouest, est puis nord : l'ordre où l'ancienne boucle (cellules dans l'ordre, faces
+            // est puis nord de chacune) les accumulait ; chaque face est calculée des deux côtés avec les mêmes opérations (a : cellule du
+            // bas / de gauche, celle qui « visitait » la face) — résultat identique, en parallèle
+            {
+                let desp = SyncPtr(des.as_mut_ptr());
+                let degp = ptrs(&mut deg);
+                let (kg, ag, tgn, ks, ts) = (&kg, &ag, &tgn, &ks, &ts);
+                let this = &*self;
+                for_rows(ny, nx, MIN_HEAVY, |j| {
+                    let mut acc = [0.0f64; MAX_PHASES];
+                    for i in 0..nx {
+                        let c = j * nx + i;
+                        let mut dsc = 0.0;
+                        acc[..ng].fill(0.0);
+                        let mut face = |a: usize, b: usize| match (this.is_solid(a), this.is_solid(b)) {
                             (true, true) => {
-                                let q = harm(ks[c], ks[b]) * (ts[b] - ts[c]) / dx2;
-                                des[c] += q;
-                                des[b] -= q;
+                                let q = harm(ks[a], ks[b]) * (ts[b] - ts[a]) / dx2;
+                                if c == a {
+                                    dsc += q
+                                } else {
+                                    dsc -= q
+                                }
                             }
                             (true, false) | (false, true) => {
-                                let (sc, fc) = if self.is_solid(c) { (c, b) } else { (b, c) };
+                                let (sc, fc) = if this.is_solid(a) { (a, b) } else { (b, a) };
                                 for h in 0..ng {
                                     if ag[h][fc] <= 0.0 {
                                         continue;
                                     }
                                     let q = harm(ks[sc], kg[h][fc]) * ag[h][fc] * (tgn[h][fc] - ts[sc]) / dx2; // vers le solide
-                                    des[sc] += q;
-                                    deg[h][fc] -= q;
+                                    if c == sc {
+                                        dsc += q
+                                    } else {
+                                        acc[h] -= q
+                                    }
                                 }
                             }
                             (false, false) => {
                                 for g in 0..ng {
-                                    if ag[g][c] <= 0.0 {
+                                    if ag[g][a] <= 0.0 {
                                         continue;
                                     }
                                     for h in 0..ng {
                                         if ag[h][b] <= 0.0 {
                                             continue;
                                         }
-                                        let q = harm(kg[g][c], kg[h][b]) * ag[g][c] * ag[h][b] * (tgn[h][b] - tgn[g][c]) / dx2;
-                                        deg[g][c] += q;
-                                        deg[h][b] -= q;
+                                        let q = harm(kg[g][a], kg[h][b]) * ag[g][a] * ag[h][b] * (tgn[h][b] - tgn[g][a]) / dx2;
+                                        if c == a {
+                                            acc[g] += q
+                                        } else {
+                                            acc[h] -= q
+                                        }
                                     }
+                                }
+                            }
+                        };
+                        if j > 0 {
+                            face(c - nx, c);
+                        }
+                        if i > 0 {
+                            face(c - 1, c);
+                        }
+                        if i + 1 < nx {
+                            face(c, c + 1);
+                        }
+                        if j + 1 < ny {
+                            face(c, c + nx);
+                        }
+                        // SAFETY : la cellule c n'est écrite que par sa ligne
+                        unsafe {
+                            *desp.at(c) = dsc;
+                            for g in 0..ng {
+                                *degp[g].at(c) = acc[g];
+                            }
+                        }
+                    }
+                });
+            }
+            {
+                let ep = SyncPtr(self.e.as_mut_ptr());
+                let egp = ptrs(&mut self.eg);
+                let tsp = SyncPtr(ts.as_mut_ptr());
+                let tgp = ptrs(&mut tgn);
+                let (des, deg, cs, cg) = (&des, &deg, &cs, &cg);
+                let this = &*self;
+                for_ranges(n, MIN_LIGHT, |lo, hi| {
+                    for c in lo..hi {
+                        // SAFETY : la cellule c n'est écrite que par sa tranche
+                        unsafe {
+                            if this.is_solid(c) {
+                                *ep.at(c) += ds * des[c];
+                                *tsp.at(c) += ds * des[c] / cs[c].max(1e-30);
+                                continue;
+                            }
+                            for g in 0..ng {
+                                if deg[g][c] != 0.0 {
+                                    *egp[g].at(c) += ds * deg[g][c];
+                                    *tgp[g].at(c) += ds * deg[g][c] / cg[g][c].max(1e-30);
                                 }
                             }
                         }
                     }
-                }
-            }
-            for c in 0..n {
-                if self.is_solid(c) {
-                    self.e[c] += ds * des[c];
-                    ts[c] += ds * des[c] / cs[c].max(1e-30);
-                    continue;
-                }
-                for g in 0..ng {
-                    if deg[g][c] != 0.0 {
-                        self.eg[g][c] += ds * deg[g][c];
-                        tgn[g][c] += ds * deg[g][c] / cg[g][c].max(1e-30);
-                    }
-                }
+                });
             }
             // solides isothermes : température imposée à chaque sous-pas (ils sont des sources / puits de chaleur idéaux)
             for c in iso.iter().copied() {
@@ -140,10 +204,9 @@ impl MultiphaseSim {
         for c in 0..n {
             if self.is_solid(c) {
                 self.temp[c] = ts[c];
-            } else {
-                self.cell_sync(c);
             }
         }
+        self.sync_cells(|_| true);
     }
 
     /// Capacité calorifique qui fournit la chaleur latente d'un changement de phase du liquide `liq` dans c : celle du liquide plus
@@ -168,7 +231,8 @@ impl MultiphaseSim {
     /// c'est avec cette capacité que dm a été estimé (équilibre, ancrage à T_sat). La faire porter au seul liquide quand χ ~ 1 (trace
     /// de liquide fortement couplée au gaz) dépassait l'équilibre : trace d'eau à 560 K après condensation, ou sous 50 K après
     /// évaporation (pas refusé, retours arrière en cascade).
-    fn transfer(&mut self, c: usize, liq: usize, vap: usize, dm: f64, t_vap: f64, chi: f64) {
+    /// `transfer` sans le recalcul des températures de la cellule (fait ensuite par l'appelant, `sync_cells`)
+    fn transfer_nosync(&mut self, c: usize, liq: usize, vap: usize, dm: f64, t_vap: f64, chi: f64) {
         let (gl, gv) = (self.group_of[liq], self.group_of[vap]);
         let tl = self.tg[gl][c];
         // capacités avant transfert (celles de latent_cap)
@@ -225,7 +289,181 @@ impl MultiphaseSim {
                 }
             }
         }
-        self.cell_sync(c);
+    }
+
+    /// Décision du changement de phase `pc` dans la cellule c (lecture seule de l'état) : (Some((dm, T de la vapeur, χ)) à transférer, borne
+    /// de pas dt_phase de la cellule). Une cellule ne dépend que d'elle-même : décisions en parallèle, transferts ensuite.
+    #[allow(clippy::too_many_arguments)]
+    fn phase_decision(
+        &self, c: usize, pc: &super::phases::PhaseChange, pl: &super::phases::Phase, pv: &super::phases::Phase, others: &[usize], dt: f64,
+    ) -> (Option<(f64, f64, f64)>, f64) {
+        let (liq, vap) = (pc.liquid, pc.vapor);
+        let mut dt_phase = f64::INFINITY;
+        if self.is_solid(c) || self.pinned(c) {
+            return (None, dt_phase);
+        }
+        let (ml, mv) = (self.mass[liq][c], self.mass[vap][c]);
+        // température du LIQUIDE (son groupe) : c'est sa surchauffe / son sous-refroidissement qui pilote le changement de phase
+        let (t, p) = (self.phase_temp(liq, c), self.p[c]);
+        let al = self.alpha[liq][c];
+        let av = self.alpha[vap][c];
+        // tri rapide (T_sat(p) se calcule par dichotomie, p_sat(T) par une exponentielle) : sans vapeur et sous la saturation,
+        // ni ébullition, ni nucléation, ni condensation ne sont possibles (sauf évaporation dans un gaz mélangé : voir plus bas)
+        if others.is_empty() && mv <= 1e-12 && pc.p_sat(t) <= p {
+            return (None, dt_phase);
+        }
+        if !others.is_empty() {
+            let n_o: f64 = others.iter().map(|&k| self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass).sum();
+            if n_o > 1e-9 && pc.p_sat(t) < 0.98 * p && (ml > 1e-12 || mv > 1e-12) {
+                if let Some(dm) = self.partial_pressure_equilibrium(c, pc, n_o, ml, mv, al, dt) {
+                    if dm != 0.0 {
+                        let chi = if ml > 1e-12 { self.thermal_coupling(c, dt) } else { 1.0 };
+                        return (Some((dm, t, chi)), dt_phase);
+                    }
+                }
+                return (None, dt_phase);
+            }
+        }
+        let a_other_gas: f64 = (0..self.reg.phases.len()).filter(|&k| k != liq && k != vap && self.reg.phases[k].is_gas()).map(|k| self.alpha[k][c]).sum();
+        // candidats : liquide présent (ébullition/cavitation) ou vapeur + liquide (condensation)
+        if ml <= 1e-12 && mv <= 1e-12 {
+            return (None, dt_phase);
+        }
+        let tsat = pc.t_sat(p);
+        // capacité qui fournit la chaleur latente : le liquide, plus les autres groupes au prorata de leur couplage thermique χ
+        // pendant le pas (χ = 1 : modèle à une température, toute la cellule) ; le transfert la prend au liquide, l'échange de
+        // fin de phase thermique la répartit
+        let cap = self.latent_cap(c, liq, t, dt);
+        // chaleur latente pour ESTIMER la masse à changer (le transfert lui-même garde l'énergie exacte) : évaluée dans le
+        // domaine de validité de p_sat (≤ 640 K) et bornée par le bas — h_v − h_l extrapolé linéairement devient NÉGATIF vers
+        // 1450 K pour l'eau (liquide mêlé à de l'huile à 2000 K) et inversait le sens du transfert (masse de vapeur < 0)
+        let latent = self.reg.latent_heat(pc, t.clamp(200.0, 640.0)).max(0.05 * pc.l_ref);
+        let rho_v = pv.rho(p, t);
+        let mut dm = 0.0;
+        let mut bulk_boiling = false;
+        // relaxation de l'écart à T_sat sur `phase_relaxation_time` (modèle de Lee) : instantanée pour dt ≫ τ (comportement
+        // historique), ∝ dt pour dt ≪ τ — sans elle, ébullition et condensation alternent d'un pas à l'autre dans un liquide confiné
+        let relax = 1.0 - (-dt / self.phase_relaxation_time.max(1e-12)).exp();
+        let rate_cap = self.phase_volume_limit * dt / self.phase_relaxation_time.max(1e-12);
+        if t > tsat && ml > 1e-12 {
+            let dm_e = (cap * (t - tsat) / latent * relax).min(ml);
+            let gas = av + a_other_gas;
+            let resolved = gas > 0.02 || (al < 0.98 && gas > 0.0 && a_other_gas > 0.0);
+            if resolved && al > 1e-6 {
+                // interface résolue (Hardt–Wondra) : ancrage à T_sat
+                dm = dm_e;
+            } else if av >= 1e-7 && a_other_gas < 1e-9 {
+                // germes sous-maille : Schnerr–Sauer (croissance), plafonné par l'énergie disponible
+                let r_b = (av / (1.0 - av).max(1e-9) * 3.0 / (4.0 * std::f64::consts::PI * self.nuclei_density)).cbrt();
+                let ps = pc.p_sat(t);
+                let rho_m = self.rho_mix[c];
+                let rate = rho_v * pl.rho(p, t) / rho_m * av * (1.0 - av) * 3.0 / r_b.max(1e-9) * (2.0 / 3.0 * (ps - p).max(0.0) / pl.rho(p, t)).sqrt();
+                // ébullition en volume (liquide chauffé) : la croissance des bulles est limitée par la chaleur disponible, pas par
+                // l'inertie ; au-delà de `boil_superheat_max` le liquide ne reste plus métastable (ébullition hétérogène)
+                // (surchauffe THERMIQUE, mesurée à max(p, 1 atm) : une dépression — cavitation — reste pilotée par l'inertie)
+                let excess = t - pc.t_sat(p.max(101325.0)) - self.boil_superheat_max;
+                let thermal = if excess > 0.0 { (cap * excess / latent * relax).min(ml) } else { 0.0 };
+                bulk_boiling = excess > 0.0;
+                dm = (rate * dt).max(thermal).min(dm_e);
+            } else if av < 1e-7 && a_other_gas < 1e-9 && t - tsat > self.nucleation_superheat {
+                // création de germes (nucléation) : fraction nucleation_alpha de vapeur
+                dm = (self.nucleation_alpha * rho_v).min(dm_e);
+            }
+        } else if t < tsat && mv > 1e-12 && al > 1e-6 {
+            // condensation : interface résolue ancrée à T_sat ; sous-maille par Schnerr–Sauer
+            let dm_e = (cap * (tsat - t) / latent * relax).min(mv);
+            let gas = av + a_other_gas;
+            if gas > 0.02 || a_other_gas > 0.0 {
+                dm = -dm_e;
+            } else if av > 1e-7 {
+                let r_b = (av / (1.0 - av).max(1e-9) * 3.0 / (4.0 * std::f64::consts::PI * self.nuclei_density)).cbrt();
+                let ps = pc.p_sat(t);
+                let rho_m = self.rho_mix[c];
+                let rate = rho_v * pl.rho(p, t) / rho_m * av * (1.0 - av) * 3.0 / r_b.max(1e-9) * (2.0 / 3.0 * (p - ps).max(0.0) / pl.rho(p, t)).sqrt();
+                dm = -(rate * dt).max(dm_e * 0.0).min(dm_e).min(mv);
+            }
+        }
+        // cavité discrète (DVCM) : la pression a atteint p_sat (plancher du solveur de pression) et le liquide ne remplit plus la
+        // cellule : la vapeur à p_sat comble exactement le déficit de volume (cinématique, pas de limite de vitesse de croissance)
+        let mut cavity = 0.0;
+        if ml > 1e-12 && al > 1e-3 && dm >= 0.0 {
+            let ps = pc.p_sat(t);
+            // seulement dans une cellule que le solveur de pression a dû bloquer au plancher p_sat au pas précédent (traction) —
+            // pas dans un liquide surchauffé ni à l'équilibre de saturation, qui n'est pas en traction
+            if self.pressure_clamped[c] && p <= 1.01 * ps {
+                let vv = self.cell_volume(c, ps);
+                if vv < 1.0 {
+                    let denom = (1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t)).max(1e-12);
+                    cavity = ((1.0 - vv) / denom).min(ml - dm);
+                    // même débit volumique maximal que la vaporisation (rate_cap ∝ dt) : remplie d'un bloc, la cavité vidait
+                    // le liquide (et refroidissait la cellule sous 0 K) quel que soit dt — le filet de sécurité ne pouvait rien
+                    // (huile à 2000 K au contact de l'eau chaude, cuve fermée)
+                    cavity = cavity.min(rate_cap / denom);
+                    let dv = cavity * denom;
+                    if dv > 1e-3 {
+                        dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                    }
+                }
+            }
+        }
+        if dm != 0.0 {
+            // couplage implicite local : on ne crée/détruit pas plus de vapeur que ce qui ramène la cellule à p = p_sat(T)
+            // (sinon un pas explicite dépasse l'équilibre : 1 kg d'eau → 1600 m³ de vapeur)
+            let ps = pc.p_sat(t);
+            let vv = self.cell_volume(c, ps);
+            let denom = 1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t);
+            if dm > 0.0 {
+                // … sauf ébullition en volume d'un liquide chauffé (surchauffe > boil_superheat_max) : la vapeur y repousse le liquide, ce que
+                // fait la projection de pression ; la production est bornée à `phase_volume_limit` du volume de la cellule par pas,
+                // et le pas suivant est réduit en conséquence (voir dt_phase)
+                let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
+                let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
+                let by_volume = self.phase_volume_limit / dv_unit;
+                let closure = ((1.0 - vv) / denom).max(0.0);
+                dm = dm.min(if al > 0.98 && bulk_boiling { closure.max(by_volume) } else { closure });
+                // débit volumique borné à phase_volume_limit / phase_relaxation_time (≈ 2500 /s) : sans cette borne, un liquide
+                // porté bien au-delà de T_sat (eau au contact d'huile à 2000 K, même température dans la cellule) se vaporise d'un
+                // bloc quel que soit dt, la vitesse produite varie en 1/dt et réduire le pas ne sert à rien
+                dm = dm.min(rate_cap / dv_unit);
+                let dv = dm * dv_unit;
+                if dv > 1e-3 {
+                    dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                }
+            } else {
+                dm = -((-dm).min(((vv - 1.0) / denom).max(0.0)));
+                // effondrement d'une bulle dans un liquide froid : au plus `phase_volume_limit` du volume de la cellule par pas
+                // (sinon le liquide s'y précipite en un pas : coup de bélier de plusieurs GPa)
+                let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
+                let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
+                dm = -((-dm).min(self.phase_volume_limit.min(rate_cap) / dv_unit));
+                let dv = -dm * dv_unit;
+                if dv > 1e-3 {
+                    dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
+                }
+            }
+        }
+        let mut dm = dm + cavity.max(0.0);
+        let chi = self.thermal_coupling(c, dt);
+        if dm > 0.0 {
+            // la chaleur latente prélevée ne peut pas faire tomber T de plus de la moitié de l'écart à T_PW_MIN (cavité remplie de
+            // vapeur dense dans une eau très chaude : sinon T < 0). `transfer` la répartit au prorata des capacités : tous les
+            // groupes qui y participent baissent d'autant — c'est le plus froid qui borne (air détendu à 130 K à côté d'eau à
+            // 430 K : borné par l'eau seule, l'air passait sous 0 K)
+            let gl = self.group_of[liq];
+            let mut head = t - T_PW_MIN;
+            if chi > 0.0 && gl != self.group_of[vap] {
+                for g in 0..self.groups.len() {
+                    if g != gl && self.group_mass(g, c) > 0.0 && !self.latent_excluded(g, c) {
+                        head = head.min(self.tg[g][c] - T_PW_MIN);
+                    }
+                }
+            }
+            dm = dm.min(0.5 * cap * head.max(0.0) / latent);
+        }
+        if dm != 0.0 {
+            return (Some((dm, tsat.min(t), chi)), dt_phase);
+        }
+        (None, dt_phase)
     }
 
     pub(crate) fn phase_change_step(&mut self, dt: f64) {
@@ -251,174 +489,20 @@ impl MultiphaseSim {
                 .find(|g| g.contains(&vap))
                 .map(|g| g.iter().copied().filter(|&k| k != vap && self.reg.phases[k].is_gas()).collect())
                 .unwrap_or_default();
-            for c in 0..n {
-                if self.is_solid(c) || self.pinned(c) {
-                    continue;
-                }
-                let (ml, mv) = (self.mass[liq][c], self.mass[vap][c]);
-                // température du LIQUIDE (son groupe) : c'est sa surchauffe / son sous-refroidissement qui pilote le changement de phase
-                let (t, p) = (self.phase_temp(liq, c), self.p[c]);
-                let al = self.alpha[liq][c];
-                let av = self.alpha[vap][c];
-                // tri rapide (T_sat(p) se calcule par dichotomie, p_sat(T) par une exponentielle) : sans vapeur et sous la saturation,
-                // ni ébullition, ni nucléation, ni condensation ne sont possibles (sauf évaporation dans un gaz mélangé : voir plus bas)
-                if others.is_empty() && mv <= 1e-12 && pc.p_sat(t) <= p {
-                    continue;
-                }
-                if !others.is_empty() {
-                    let n_o: f64 = others.iter().map(|&k| self.mass[k][c].max(0.0) / self.reg.phases[k].molar_mass).sum();
-                    if n_o > 1e-9 && pc.p_sat(t) < 0.98 * p && (ml > 1e-12 || mv > 1e-12) {
-                        if let Some(dm) = self.partial_pressure_equilibrium(c, pc, n_o, ml, mv, al, dt) {
-                            if dm != 0.0 {
-                                let chi = if ml > 1e-12 { self.thermal_coupling(c, dt) } else { 1.0 };
-                                self.transfer(c, liq, vap, dm, t, chi);
-                                self.transferred[pi] += dm * self.dx * self.dx;
-                            }
-                        }
-                        continue;
-                    }
-                }
-                let a_other_gas: f64 = (0..self.reg.phases.len()).filter(|&k| k != liq && k != vap && self.reg.phases[k].is_gas()).map(|k| self.alpha[k][c]).sum();
-                // candidats : liquide présent (ébullition/cavitation) ou vapeur + liquide (condensation)
-                if ml <= 1e-12 && mv <= 1e-12 {
-                    continue;
-                }
-                let tsat = pc.t_sat(p);
-                // capacité qui fournit la chaleur latente : le liquide, plus les autres groupes au prorata de leur couplage thermique χ
-                // pendant le pas (χ = 1 : modèle à une température, toute la cellule) ; le transfert la prend au liquide, l'échange de
-                // fin de phase thermique la répartit
-                let cap = self.latent_cap(c, liq, t, dt);
-                // chaleur latente pour ESTIMER la masse à changer (le transfert lui-même garde l'énergie exacte) : évaluée dans le
-                // domaine de validité de p_sat (≤ 640 K) et bornée par le bas — h_v − h_l extrapolé linéairement devient NÉGATIF vers
-                // 1450 K pour l'eau (liquide mêlé à de l'huile à 2000 K) et inversait le sens du transfert (masse de vapeur < 0)
-                let latent = self.reg.latent_heat(pc, t.clamp(200.0, 640.0)).max(0.05 * pc.l_ref);
-                let rho_v = pv.rho(p, t);
-                let mut dm = 0.0;
-                let mut bulk_boiling = false;
-                // relaxation de l'écart à T_sat sur `phase_relaxation_time` (modèle de Lee) : instantanée pour dt ≫ τ (comportement
-                // historique), ∝ dt pour dt ≪ τ — sans elle, ébullition et condensation alternent d'un pas à l'autre dans un liquide confiné
-                let relax = 1.0 - (-dt / self.phase_relaxation_time.max(1e-12)).exp();
-                let rate_cap = self.phase_volume_limit * dt / self.phase_relaxation_time.max(1e-12);
-                if t > tsat && ml > 1e-12 {
-                    let dm_e = (cap * (t - tsat) / latent * relax).min(ml);
-                    let gas = av + a_other_gas;
-                    let resolved = gas > 0.02 || (al < 0.98 && gas > 0.0 && a_other_gas > 0.0);
-                    if resolved && al > 1e-6 {
-                        // interface résolue (Hardt–Wondra) : ancrage à T_sat
-                        dm = dm_e;
-                    } else if av >= 1e-7 && a_other_gas < 1e-9 {
-                        // germes sous-maille : Schnerr–Sauer (croissance), plafonné par l'énergie disponible
-                        let r_b = (av / (1.0 - av).max(1e-9) * 3.0 / (4.0 * std::f64::consts::PI * self.nuclei_density)).cbrt();
-                        let ps = pc.p_sat(t);
-                        let rho_m = self.rho_mix[c];
-                        let rate = rho_v * pl.rho(p, t) / rho_m * av * (1.0 - av) * 3.0 / r_b.max(1e-9) * (2.0 / 3.0 * (ps - p).max(0.0) / pl.rho(p, t)).sqrt();
-                        // ébullition en volume (liquide chauffé) : la croissance des bulles est limitée par la chaleur disponible, pas par
-                        // l'inertie ; au-delà de `boil_superheat_max` le liquide ne reste plus métastable (ébullition hétérogène)
-                        // (surchauffe THERMIQUE, mesurée à max(p, 1 atm) : une dépression — cavitation — reste pilotée par l'inertie)
-                        let excess = t - pc.t_sat(p.max(101325.0)) - self.boil_superheat_max;
-                        let thermal = if excess > 0.0 { (cap * excess / latent * relax).min(ml) } else { 0.0 };
-                        bulk_boiling = excess > 0.0;
-                        dm = (rate * dt).max(thermal).min(dm_e);
-                    } else if av < 1e-7 && a_other_gas < 1e-9 && t - tsat > self.nucleation_superheat {
-                        // création de germes (nucléation) : fraction nucleation_alpha de vapeur
-                        dm = (self.nucleation_alpha * rho_v).min(dm_e);
-                    }
-                } else if t < tsat && mv > 1e-12 && al > 1e-6 {
-                    // condensation : interface résolue ancrée à T_sat ; sous-maille par Schnerr–Sauer
-                    let dm_e = (cap * (tsat - t) / latent * relax).min(mv);
-                    let gas = av + a_other_gas;
-                    if gas > 0.02 || a_other_gas > 0.0 {
-                        dm = -dm_e;
-                    } else if av > 1e-7 {
-                        let r_b = (av / (1.0 - av).max(1e-9) * 3.0 / (4.0 * std::f64::consts::PI * self.nuclei_density)).cbrt();
-                        let ps = pc.p_sat(t);
-                        let rho_m = self.rho_mix[c];
-                        let rate = rho_v * pl.rho(p, t) / rho_m * av * (1.0 - av) * 3.0 / r_b.max(1e-9) * (2.0 / 3.0 * (p - ps).max(0.0) / pl.rho(p, t)).sqrt();
-                        dm = -(rate * dt).max(dm_e * 0.0).min(dm_e).min(mv);
-                    }
-                }
-                // cavité discrète (DVCM) : la pression a atteint p_sat (plancher du solveur de pression) et le liquide ne remplit plus la
-                // cellule : la vapeur à p_sat comble exactement le déficit de volume (cinématique, pas de limite de vitesse de croissance)
-                let mut cavity = 0.0;
-                if ml > 1e-12 && al > 1e-3 && dm >= 0.0 {
-                    let ps = pc.p_sat(t);
-                    // seulement dans une cellule que le solveur de pression a dû bloquer au plancher p_sat au pas précédent (traction) —
-                    // pas dans un liquide surchauffé ni à l'équilibre de saturation, qui n'est pas en traction
-                    if self.pressure_clamped[c] && p <= 1.01 * ps {
-                        let vv = self.cell_volume(c, ps);
-                        if vv < 1.0 {
-                            let denom = (1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t)).max(1e-12);
-                            cavity = ((1.0 - vv) / denom).min(ml - dm);
-                            // même débit volumique maximal que la vaporisation (rate_cap ∝ dt) : remplie d'un bloc, la cavité vidait
-                            // le liquide (et refroidissait la cellule sous 0 K) quel que soit dt — le filet de sécurité ne pouvait rien
-                            // (huile à 2000 K au contact de l'eau chaude, cuve fermée)
-                            cavity = cavity.min(rate_cap / denom);
-                            let dv = cavity * denom;
-                            if dv > 1e-3 {
-                                dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
-                            }
-                        }
-                    }
-                }
-                if dm != 0.0 {
-                    // couplage implicite local : on ne crée/détruit pas plus de vapeur que ce qui ramène la cellule à p = p_sat(T)
-                    // (sinon un pas explicite dépasse l'équilibre : 1 kg d'eau → 1600 m³ de vapeur)
-                    let ps = pc.p_sat(t);
-                    let vv = self.cell_volume(c, ps);
-                    let denom = 1.0 / pv.rho(ps, t) - 1.0 / pl.rho(ps, t);
-                    if dm > 0.0 {
-                        // … sauf ébullition en volume d'un liquide chauffé (surchauffe > boil_superheat_max) : la vapeur y repousse le liquide, ce que
-                        // fait la projection de pression ; la production est bornée à `phase_volume_limit` du volume de la cellule par pas,
-                        // et le pas suivant est réduit en conséquence (voir dt_phase)
-                        let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
-                        let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
-                        let by_volume = self.phase_volume_limit / dv_unit;
-                        let closure = ((1.0 - vv) / denom).max(0.0);
-                        dm = dm.min(if al > 0.98 && bulk_boiling { closure.max(by_volume) } else { closure });
-                        // débit volumique borné à phase_volume_limit / phase_relaxation_time (≈ 2500 /s) : sans cette borne, un liquide
-                        // porté bien au-delà de T_sat (eau au contact d'huile à 2000 K, même température dans la cellule) se vaporise d'un
-                        // bloc quel que soit dt, la vitesse produite varie en 1/dt et réduire le pas ne sert à rien
-                        dm = dm.min(rate_cap / dv_unit);
-                        let dv = dm * dv_unit;
-                        if dv > 1e-3 {
-                            dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
-                        }
-                    } else {
-                        dm = -((-dm).min(((vv - 1.0) / denom).max(0.0)));
-                        // effondrement d'une bulle dans un liquide froid : au plus `phase_volume_limit` du volume de la cellule par pas
-                        // (sinon le liquide s'y précipite en un pas : coup de bélier de plusieurs GPa)
-                        let pe = p.max(pc.p_sat(t)); // la vapeur formée est au moins à sa pression de saturation
-                        let dv_unit = (1.0 / pv.rho(pe, t) - 1.0 / pl.rho(pe, t)).max(1e-12);
-                        dm = -((-dm).min(self.phase_volume_limit.min(rate_cap) / dv_unit));
-                        let dv = -dm * dv_unit;
-                        if dv > 1e-3 {
-                            dt_phase = dt_phase.min(0.5 * self.phase_volume_limit * dt / dv);
-                        }
-                    }
-                }
-                let mut dm = dm + cavity.max(0.0);
-                let chi = self.thermal_coupling(c, dt);
-                if dm > 0.0 {
-                    // la chaleur latente prélevée ne peut pas faire tomber T de plus de la moitié de l'écart à T_PW_MIN (cavité remplie de
-                    // vapeur dense dans une eau très chaude : sinon T < 0). `transfer` la répartit au prorata des capacités : tous les
-                    // groupes qui y participent baissent d'autant — c'est le plus froid qui borne (air détendu à 130 K à côté d'eau à
-                    // 430 K : borné par l'eau seule, l'air passait sous 0 K)
-                    let gl = self.group_of[liq];
-                    let mut head = t - T_PW_MIN;
-                    if chi > 0.0 && gl != self.group_of[vap] {
-                        for g in 0..self.groups.len() {
-                            if g != gl && self.group_mass(g, c) > 0.0 && !self.latent_excluded(g, c) {
-                                head = head.min(self.tg[g][c] - T_PW_MIN);
-                            }
-                        }
-                    }
-                    dm = dm.min(0.5 * cap * head.max(0.0) / latent);
-                }
-                if dm != 0.0 {
-                    self.transfer(c, liq, vap, dm, tsat.min(t), chi);
+            // décisions cellule par cellule (lecture seule, en parallèle), puis transferts dans l'ordre des cellules (sommes inchangées) ;
+            // températures des cellules touchées recalculées ensuite, en parallèle
+            let dec: Vec<(Option<(f64, f64, f64)>, f64)> =
+                super::mp_par::collect(n, MIN_HEAVY, |c| self.phase_decision(c, pc, pl, pv, &others, dt));
+            let mut touched = vec![false; n];
+            for (c, &(act, dtp)) in dec.iter().enumerate() {
+                dt_phase = dt_phase.min(dtp);
+                if let Some((dm, tv, chi)) = act {
+                    self.transfer_nosync(c, liq, vap, dm, tv, chi);
                     self.transferred[pi] += dm * self.dx * self.dx;
+                    touched[c] = true;
                 }
             }
+            self.sync_cells(|c| touched[c]);
             if !others.is_empty() {
                 self.surface_exchange(pi, &others);
             }
@@ -554,35 +638,44 @@ impl MultiphaseSim {
     }
 
     /// Travail de pression : e −= dt · p · ∇·u (u^{n+1}, p^{n+1})
+    /// (en parallèle : chaque cellule ne dépend que d'elle-même ; énergies de groupe mises à jour puis températures, comme `cell_sync`)
     pub(crate) fn pressure_work(&mut self, dt: f64) {
-        for j in 0..self.ny {
-            for i in 0..self.nx {
-                let c = self.idx(i, j);
-                if self.is_solid(c) || self.pinned(c) {
+        let (nx, ny) = (self.nx, self.ny);
+        let ng = self.groups.len();
+        let ep = SyncPtr(self.e.as_mut_ptr());
+        let tp = SyncPtr(self.temp.as_mut_ptr());
+        let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let this = &*self;
+        super::mp_par::for_rows(ny, nx, MIN_HEAVY, |j| {
+            let mut egn = [0.0f64; MAX_PHASES];
+            let mut tgn = [0.0f64; MAX_PHASES];
+            for i in 0..nx {
+                let c = this.idx(i, j);
+                if this.is_solid(c) || this.pinned(c) {
                     continue;
                 }
                 // dt·∇·u = variation relative de volume du pas : au-delà de ±50 % la cellule est quasi vide / en cavitation violente,
                 // où p·∇·u n'a plus de sens physique (et divise par une capacité calorifique qui tend vers 0)
                 // (+ divergence du flux de percolation : le fluide des pores se détend ou se comprime aussi)
-                let dq = if self.percolation { self.divergence_of(&self.q_u, &self.q_v, i, j) } else { 0.0 };
-                let d = (dt * (self.divergence_of(&self.u, &self.v, i, j) + dq)).clamp(-0.5, 0.5) / dt;
+                let dq = if this.percolation { this.divergence_of(&this.q_u, &this.q_v, i, j) } else { 0.0 };
+                let d = (dt * (this.divergence_of(&this.u, &this.v, i, j) + dq)).clamp(-0.5, 0.5) / dt;
                 // au plus −50 % / +100 % de T par pas, et pas de refroidissement sous T_PW_MIN : une cellule presque vide (liquide
                 // arraché, poche de gaz raréfiée par un écoulement violent) a une capacité calorifique quasi nulle et p·∇·u y donnerait des
                 // températures absurdes (< 50 K → pas refusé à tout dt). L'énergie ainsi écrêtée est négligeable (capacité ~0).
                 // répartition entre groupes comme dans la fermeture de la projection (C_g·dT_g/dp) : sans couplage, c'est le gaz qui se
                 // détend / se comprime, pas le liquide qui l'entoure ; groupes couplés : au prorata des capacités (température commune)
-                let ng = self.groups.len();
                 let mut tgs = [0.0f64; super::phases::MAX_PHASES];
                 let mut gam = [0.0f64; super::phases::MAX_PHASES];
                 let mut ks = [0.0f64; super::phases::MAX_PHASES];
                 for g in 0..ng {
-                    tgs[g] = self.tg[g][c];
+                    tgs[g] = this.tg[g][c];
                 }
-                let chi = self.thermal_coupling(c, dt);
-                self.cell_closure_g(c, self.p[c], &tgs[..ng], chi, &mut gam[..ng], &mut ks[..ng]);
+                let chi = this.thermal_coupling(c, dt);
+                this.cell_closure_g(c, this.p[c], &tgs[..ng], chi, &mut gam[..ng], &mut ks[..ng]);
                 let ksum: f64 = (0..ng).map(|g| ks[g].max(0.0)).sum();
-                let asum: f64 = (0..ng).map(|g| self.group_alpha(g, c)).sum::<f64>().max(1e-300);
-                let pc = self.p[c].max(0.0);
+                let asum: f64 = (0..ng).map(|g| this.group_alpha(g, c)).sum::<f64>().max(1e-300);
+                let pc = this.p[c].max(0.0);
                 let de_tot = -dt * pc * d;
                 // part due au changement de phase du pas (−p·ΔV_pc) : revient au groupe du liquide qui a changé d'état, partagée comme
                 // la chaleur latente (liquide C_l, autres χ·C_g, voir `transfer`) — répartie par compressibilité, le p·ΔV d'une vapeur
@@ -590,16 +683,16 @@ impl MultiphaseSim {
                 // Bornée au signe et à l'amplitude de −p∇·u dt (la projection ne réalise pas forcément tout ΔV_pc).
                 let mut de_pc = [0.0f64; super::phases::MAX_PHASES];
                 let mut pc_sum = 0.0;
-                for g in 0..ng.min(self.pc_dvol.len()) {
-                    de_pc[g] = -pc * self.pc_dvol[g][c];
+                for g in 0..ng.min(this.pc_dvol.len()) {
+                    de_pc[g] = -pc * this.pc_dvol[g][c];
                     pc_sum += de_pc[g];
                 }
                 let scale = if pc_sum != 0.0 && pc_sum * de_tot > 0.0 { (de_tot / pc_sum).min(1.0) } else { 0.0 };
                 let de_rest = de_tot - scale * pc_sum;
                 let mut de_g = [0.0f64; super::phases::MAX_PHASES];
                 for g in 0..ng {
-                    if self.group_mass(g, c) > 0.0 {
-                        de_g[g] = de_rest * if ksum > 0.0 { ks[g].max(0.0) / ksum } else { self.group_alpha(g, c) / asum };
+                    if this.group_mass(g, c) > 0.0 {
+                        de_g[g] = de_rest * if ksum > 0.0 { ks[g].max(0.0) / ksum } else { this.group_alpha(g, c) / asum };
                     }
                 }
                 if scale > 0.0 {
@@ -610,8 +703,8 @@ impl MultiphaseSim {
                         let q = scale * de_pc[gs];
                         let mut caps = [0.0f64; super::phases::MAX_PHASES];
                         for g in 0..ng {
-                            if self.group_mass(g, c) > 0.0 && (g == gs || !self.latent_excluded(g, c)) {
-                                caps[g] = self.group_cap_at(g, c, tgs[g].max(1.0)) * if g == gs { 1.0 } else { chi };
+                            if this.group_mass(g, c) > 0.0 && (g == gs || !this.latent_excluded(g, c)) {
+                                caps[g] = this.group_cap_at(g, c, tgs[g].max(1.0)) * if g == gs { 1.0 } else { chi };
                             }
                         }
                         let ctot: f64 = caps[..ng].iter().sum();
@@ -625,17 +718,30 @@ impl MultiphaseSim {
                     }
                 }
                 for g in 0..ng {
-                    if self.group_mass(g, c) <= 0.0 {
+                    egn[g] = this.eg[g][c];
+                }
+                for g in 0..ng {
+                    if this.group_mass(g, c) <= 0.0 {
                         continue;
                     }
                     let t = tgs[g].max(1.0);
-                    let cap = self.group_cap_at(g, c, t);
+                    let cap = this.group_cap_at(g, c, t);
                     let de_min = (-0.5 * cap * t).max(cap * (T_PW_MIN - t)).min(0.0);
-                    self.eg[g][c] += de_g[g].clamp(de_min, cap * t);
+                    egn[g] += de_g[g].clamp(de_min, cap * t);
                 }
-                self.cell_sync(c);
+                let e: f64 = egn[..ng].iter().fold(0.0, |a, &b| a + b);
+                let (ec, tc) = this.sync_finish(c, &mut egn, &mut tgn, e);
+                // SAFETY : la cellule c n'est écrite que par sa ligne
+                unsafe {
+                    *ep.at(c) = ec;
+                    *tp.at(c) = tc;
+                    for g in 0..ng {
+                        *egp[g].at(c) = egn[g];
+                        *tgp[g].at(c) = tgn[g];
+                    }
+                }
             }
-        }
+        });
     }
 
     /// Cavités sans liquide volatil : une cellule dont la pression est bloquée au plancher alors que son contenu n'occupe plus tout

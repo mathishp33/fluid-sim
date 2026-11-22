@@ -13,10 +13,13 @@ pub mod mp_groups;
 pub mod mp_granular;
 pub mod mp_friction;
 pub mod mp_percolation;
+pub mod mp_par;
 #[cfg(test)]
 mod mp_chem_tests;
 #[cfg(test)]
 mod mp_gpu_tests;
+#[cfg(test)]
+mod mp_perf_tests;
 pub mod mp_cells;
 pub mod multiphase;
 pub mod phases;

@@ -14,7 +14,8 @@
 //! température (équilibre instantané). Une trace (α → 0) a une constante de temps α² dx²/(2D) → 0 : elle est à la température de
 //! l'interface. Sans cet échange fini, de l'huile à 2000 °C entrant dans une cellule d'air ou d'eau la portait d'un coup à ~1900 °C.
 
-use super::multiphase::{temp_from_masses, MultiphaseSim};
+use super::mp_par::{for_ranges, MIN_HEAVY};
+use super::multiphase::{temp_from_masses, MultiphaseSim, SyncPtr};
 
 /// part de capacité calorifique sous laquelle un groupe est une trace : sa température est alignée sur celle du reste de la cellule
 /// (l'écart d'énergie va au groupe principal ; sans cela T = E/C d'une masse de 1e-15 kg/m³ est du bruit d'arrondi)
@@ -155,6 +156,13 @@ impl MultiphaseSim {
                 }
             }
         }
+        self.sync_finish(c, egn, tgn, e)
+    }
+
+    /// Suite de `sync_calc` à partir des énergies de groupe `egn` déjà lues (éventuellement corrigées) et de leur somme `e`.
+    pub(crate) fn sync_finish(&self, c: usize, egn: &mut [f64], tgn: &mut [f64], e: f64) -> (f64, f64) {
+        let ng = self.groups.len();
+        let np = self.reg.phases.len();
         let tc = temp_from_masses(&self.reg.phases, (0..np).map(|k| self.mass[k][c].max(0.0)), e);
         if ng == 1 {
             tgn[0] = tc;
@@ -200,6 +208,36 @@ impl MultiphaseSim {
             };
         }
         (e, tc)
+    }
+
+    /// `cell_sync` de chaque cellule non solide c telle que `sel(c)`, en parallèle (calcul par cellule : résultat identique)
+    pub(crate) fn sync_cells(&mut self, sel: impl Fn(usize) -> bool + Sync) {
+        let ng = self.groups.len();
+        let n = self.nx * self.ny;
+        let e = SyncPtr(self.e.as_mut_ptr());
+        let temp = SyncPtr(self.temp.as_mut_ptr());
+        let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect();
+        let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect();
+        let this = &*self;
+        for_ranges(n, MIN_HEAVY, |lo, hi| {
+            let mut egn = [0.0f64; super::phases::MAX_PHASES];
+            let mut tgn = [0.0f64; super::phases::MAX_PHASES];
+            for c in lo..hi {
+                if this.is_solid(c) || !sel(c) {
+                    continue;
+                }
+                let (ec, tc) = this.sync_calc(c, &mut egn, &mut tgn, false);
+                // SAFETY : la cellule c n'est écrite que par sa tranche
+                unsafe {
+                    *e.at(c) = ec;
+                    *temp.at(c) = tc;
+                    for q in 0..ng {
+                        *egp[q].at(c) = egn[q];
+                        *tgp[q].at(c) = tgn[q];
+                    }
+                }
+            }
+        });
     }
 
     /// Conductance d'échange G_g (W/(m³·K)) du groupe g avec l'interface de sa cellule (voir l'en-tête du module). Infinie pour une
@@ -268,16 +306,22 @@ impl MultiphaseSim {
         // groupes granulaires : échange par la surface des grains (`exchange_grains`), pas par l'interface plane du nœud commun
         // (λ = ∞, une seule température par cellule : ils y participent comme les autres)
         let skip: Vec<bool> = (0..ng).map(|g| lam.is_finite() && self.group_is_granular(g)).collect();
-        let mut gk = vec![0.0; ng];
-        let mut ck = vec![0.0; ng];
-        let mut tk = vec![0.0; ng];
-        for c in 0..n {
-            if self.is_solid(c) {
+        // (en parallèle : chaque cellule ne dépend que d'elle-même)
+        let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let tgp: Vec<SyncPtr<f64>> = self.tg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+        let this = &*self;
+        let skip = &skip;
+        for_ranges(n, MIN_HEAVY, |lo, hi| {
+        let mut gk = [0.0f64; super::phases::MAX_PHASES];
+        let mut ck = [0.0f64; super::phases::MAX_PHASES];
+        let mut tk = [0.0f64; super::phases::MAX_PHASES];
+        for c in lo..hi {
+            if this.is_solid(c) {
                 continue;
             }
             let mut present = 0;
             for g in 0..ng {
-                if self.group_mass(g, c) > 0.0 && !skip[g] {
+                if this.group_mass(g, c) > 0.0 && !skip[g] {
                     present += 1;
                 }
             }
@@ -289,16 +333,16 @@ impl MultiphaseSim {
             for g in 0..ng {
                 ck[g] = 0.0;
                 gk[g] = 0.0;
-                if self.group_mass(g, c) <= 0.0 || skip[g] {
+                if this.group_mass(g, c) <= 0.0 || skip[g] {
                     continue;
                 }
-                let t = self.tg[g][c];
+                let t = this.tg[g][c];
                 tk[g] = t;
-                ck[g] = self.group_cap_at(g, c, t).max(1e-300);
+                ck[g] = this.group_cap_at(g, c, t).max(1e-300);
                 ce += ck[g] * t;
                 cs += ck[g];
                 if lam.is_finite() {
-                    gk[g] = self.exchange_conductance(g, c);
+                    gk[g] = this.exchange_conductance(g, c);
                     // G/(1+a) avec a = dt G / C : → C/dt pour un couplage parfait (G = ∞)
                     let b = if gk[g].is_finite() { gk[g] / (1.0 + dt * gk[g] / ck[g]) } else { ck[g] / dt };
                     num += b * t;
@@ -314,7 +358,7 @@ impl MultiphaseSim {
                 ce / cs
             };
             for g in 0..ng {
-                if ck[g] <= 0.0 || self.group_mass(g, c) <= 0.0 {
+                if ck[g] <= 0.0 || this.group_mass(g, c) <= 0.0 {
                     continue;
                 }
                 let tn = if lam.is_finite() && gk[g].is_finite() {
@@ -323,9 +367,13 @@ impl MultiphaseSim {
                 } else {
                     ti
                 };
-                self.eg[g][c] += ck[g] * (tn - tk[g]);
-                self.tg[g][c] = tn;
+                // SAFETY : la cellule c n'est écrite que par sa tranche (et lue avant)
+                unsafe {
+                    *egp[g].at(c) += ck[g] * (tn - tk[g]);
+                    *tgp[g].at(c) = tn;
+                }
             }
         }
+        });
     }
 }

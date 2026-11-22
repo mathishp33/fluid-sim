@@ -7,15 +7,12 @@
 //!    (Helmholtz κ/dt, bords ouverts, voisins épinglés) sommé sur l'agrégat ; lignes identité (solides, cellules épinglées) exclues ;
 //!  * lisseur Gauss–Seidel rouge-noir (rouge puis noir avant la correction grossière, noir puis rouge après) : le V-cycle est un opérateur
 //!    linéaire SYMÉTRIQUE défini positif, condition pour préconditionner un gradient conjugué ;
-//!  * lissage, résidus, restriction et prolongation parallélisés (rayon) par lignes sur les grilles assez grandes.
+//!  * lissage, résidus, restriction et prolongation parallélisés par tranches de lignes (`mp_par`) sur les grilles assez grandes ;
+//!    chaque cellule est calculée exactement comme en séquentiel (résultat identique quel que soit le nombre de fils).
 //! Nombre d'itérations du gradient conjugué : ~10–30, presque indépendant de la taille de grille et du rapport de densités eau/air.
 
-use rayon::prelude::*;
-
-/// en dessous de ce nombre de cellules, une grille est traitée séquentiellement (le coût de la répartition dépasse le gain)
-pub(crate) const PAR_MIN: usize = PAR_MIN_CELLS;
-/// seuil de parallélisation (cellules)
-pub const PAR_MIN_CELLS: usize = 16384;
+use super::mp_par::{for_rows, MIN_LIGHT};
+use super::multiphase::SyncPtr;
 
 /// Matrice 5 points symétrique : (A x)_c = diag_c x_c − ae_c x_{c+1} − ae_{c−1} x_{c−1} − an_c x_{c+nx} − an_{c−nx} x_{c−nx}
 #[derive(Clone)]
@@ -28,11 +25,6 @@ pub(crate) struct Level {
     /// ligne active (sinon identité, découplée)
     pub active: Vec<bool>,
 }
-
-#[derive(Clone, Copy)]
-struct Ptr(*mut f64);
-unsafe impl Send for Ptr {}
-unsafe impl Sync for Ptr {}
 
 impl Level {
     /// Σ couplages × x des voisins de la cellule (i, j) (sans modulo : i, j connus)
@@ -57,55 +49,61 @@ impl Level {
     /// out = A x
     pub fn apply(&self, x: &[f64], out: &mut [f64]) {
         let nx = self.nx;
-        let f = |(j, row): (usize, &mut [f64])| {
+        let o = SyncPtr(out.as_mut_ptr());
+        for_rows(self.ny, nx, MIN_LIGHT, |j| {
             let base = j * nx;
             for i in 0..nx {
                 let c = base + i;
-                row[i] = self.diag[c] * x[c] - self.off(i, j, c, x);
+                // SAFETY : la ligne j n'écrit que ses cellules
+                unsafe { *o.at(c) = self.diag[c] * x[c] - self.off(i, j, c, x) }
             }
-        };
-        if x.len() >= PAR_MIN {
-            out.par_chunks_mut(nx).enumerate().for_each(f);
-        } else {
-            out.chunks_mut(nx).enumerate().for_each(f);
-        }
+        });
     }
     /// une demi-passe de Gauss–Seidel sur la couleur `color` ((i + j) % 2)
     fn gs_color(&self, b: &[f64], x: &mut [f64], color: usize) {
         let (nx, ny) = (self.nx, self.ny);
-        let n = x.len();
-        let row = |xs: &mut [f64], j: usize| {
+        let p = SyncPtr(x.as_mut_ptr());
+        for_rows(ny, nx, MIN_LIGHT, |j| {
             let mut i = (color + j) % 2;
             let base = j * nx;
             while i < nx {
                 let c = base + i;
-                xs[c] = if self.active[c] { (b[c] + self.off(i, j, c, xs)) / self.diag[c] } else { b[c] / self.diag[c] };
+                // SAFETY : chaque ligne j n'écrit que ses cellules de la couleur `color` ; les voisins lus sont de l'autre couleur (non
+                // écrits pendant cette demi-passe) : aucune course de données. Mêmes opérations, dans le même ordre, que `off`.
+                unsafe {
+                    let xr = |q: usize| *p.at(q);
+                    let mut s = 0.0;
+                    if i + 1 < nx {
+                        s += self.ae[c] * xr(c + 1);
+                    }
+                    if i > 0 {
+                        s += self.ae[c - 1] * xr(c - 1);
+                    }
+                    if j + 1 < ny {
+                        s += self.an[c] * xr(c + nx);
+                    }
+                    if j > 0 {
+                        s += self.an[c - nx] * xr(c - nx);
+                    }
+                    *p.at(c) = if self.active[c] { (b[c] + s) / self.diag[c] } else { b[c] / self.diag[c] };
+                }
                 i += 2;
             }
-        };
-        if n >= PAR_MIN {
-            let ptr = Ptr(x.as_mut_ptr());
-            (0..ny).into_par_iter().for_each(|j| {
-                let p = ptr;
-                // SAFETY : chaque ligne j n'écrit que ses cellules de la couleur `color` ; les voisins lus sont de l'autre couleur (non
-                // écrits pendant cette demi-passe) : aucune course de données.
-                let xs = unsafe { std::slice::from_raw_parts_mut(p.0, n) };
-                row(xs, j);
-            });
-        } else {
-            for j in 0..ny {
-                row(x, j);
-            }
-        }
+        });
     }
+    /// r = b − A x
     fn residual(&self, b: &[f64], x: &[f64], r: &mut [f64]) {
-        self.apply(x, r);
-        let f = |(rr, bb): (&mut f64, &f64)| *rr = bb - *rr;
-        if r.len() >= PAR_MIN {
-            r.par_iter_mut().zip(b.par_iter()).for_each(f);
-        } else {
-            r.iter_mut().zip(b.iter()).for_each(f);
-        }
+        let nx = self.nx;
+        let o = SyncPtr(r.as_mut_ptr());
+        for_rows(self.ny, nx, MIN_LIGHT, |j| {
+            let base = j * nx;
+            for i in 0..nx {
+                let c = base + i;
+                let ax = self.diag[c] * x[c] - self.off(i, j, c, x);
+                // SAFETY : la ligne j n'écrit que ses cellules
+                unsafe { *o.at(c) = b[c] - ax }
+            }
+        });
     }
     /// grille grossière (agrégats 2×2)
     fn coarsen(&self) -> Level {
@@ -242,18 +240,27 @@ impl Multigrid {
         self.levels[l].residual(b, x, &mut r);
         let mut bc = std::mem::take(&mut self.work[l + 1].1);
         let mut xc = std::mem::take(&mut self.work[l + 1].2);
-        bc.iter_mut().for_each(|v| *v = 0.0);
         xc.iter_mut().for_each(|v| *v = 0.0);
         {
+            // somme sur l'agrégat 2×2, dans l'ordre des lignes fines (celui de l'ancienne accumulation)
             let (f, c) = (&self.levels[l], &self.levels[l + 1]);
-            for j in 0..f.ny {
-                for i in 0..f.nx {
-                    let k = j * f.nx + i;
-                    if f.active[k] {
-                        bc[(j / 2) * c.nx + i / 2] += r[k];
+            let o = SyncPtr(bc.as_mut_ptr());
+            let r = &r;
+            for_rows(c.ny, c.nx, MIN_LIGHT / 4, |gj| {
+                for gi in 0..c.nx {
+                    let mut s = 0.0;
+                    for j in 2 * gj..(2 * gj + 2).min(f.ny) {
+                        for i in 2 * gi..(2 * gi + 2).min(f.nx) {
+                            let k = j * f.nx + i;
+                            if f.active[k] {
+                                s += r[k];
+                            }
+                        }
                     }
+                    // SAFETY : une cellule grossière par (gi, gj)
+                    unsafe { *o.at(gj * c.nx + gi) = s }
                 }
-            }
+            });
         }
         self.vcycle(l + 1, &bc, &mut xc);
         // prolongation constante par agrégat
@@ -261,18 +268,17 @@ impl Multigrid {
             let (f, c) = (&self.levels[l], &self.levels[l + 1]);
             let nxf = f.nx;
             let cnx = c.nx;
-            let add = |(j, row): (usize, &mut [f64])| {
+            let o = SyncPtr(x.as_mut_ptr());
+            let xc = &xc;
+            for_rows(f.ny, nxf, MIN_LIGHT, |j| {
                 for i in 0..nxf {
-                    if f.active[j * nxf + i] {
-                        row[i] += xc[(j / 2) * cnx + i / 2];
+                    let k = j * nxf + i;
+                    if f.active[k] {
+                        // SAFETY : la ligne j n'écrit que ses cellules
+                        unsafe { *o.at(k) += xc[(j / 2) * cnx + i / 2] }
                     }
                 }
-            };
-            if x.len() >= PAR_MIN {
-                x.par_chunks_mut(nxf).enumerate().for_each(add);
-            } else {
-                x.chunks_mut(nxf).enumerate().for_each(add);
-            }
+            });
         }
         self.work[l].0 = r;
         self.work[l + 1].1 = bc;
@@ -285,11 +291,3 @@ impl Multigrid {
     }
 }
 
-/// produit scalaire (parallèle sur les grands vecteurs)
-pub(crate) fn dot(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() >= PAR_MIN {
-        a.par_iter().zip(b.par_iter()).map(|(x, y)| x * y).sum()
-    } else {
-        a.iter().zip(b).map(|(x, y)| x * y).sum()
-    }
-}

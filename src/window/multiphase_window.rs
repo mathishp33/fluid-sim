@@ -250,6 +250,8 @@ impl MultiphaseWindow {
             frames: 0,
             last_fps: Instant::now(),
         };
+        // solveur CPU : nombre de fils réglé automatiquement (voir mp_par)
+        crate::simulation::mp_par::set_auto(true);
         w.refresh_warnings();
         w.apply_boundaries();
         w.stats = compute_stats(&w.sim);
@@ -1061,9 +1063,30 @@ impl MultiphaseWindow {
                             ui.end_row();
                         }
                     });
+                    {
+                        use crate::simulation::mp_par;
+                        ui.horizontal(|ui| {
+                            let mut auto = mp_par::auto_threads();
+                            if ui
+                                .checkbox(&mut auto, "Fils CPU automatiques")
+                                .on_hover_text(
+                                    "Le solveur CPU essaie de temps en temps la moitié ou le double de fils et garde le plus rapide \
+                                     (le bon nombre dépend de la grille et de l'état de la machine). Les résultats ne dépendent pas \
+                                     du nombre de fils.",
+                                )
+                                .changed()
+                            {
+                                mp_par::set_auto(auto);
+                            }
+                            let mut t = mp_par::threads();
+                            if ui.add_enabled(!auto, egui::Slider::new(&mut t, 1..=mp_par::max_threads()).text("fils")).changed() {
+                                mp_par::set_threads(t);
+                            }
+                        });
+                    }
                     ui.label(format!(
                         "{} fil(s) ; dernier pas : {} PCG, {} Newton{}",
-                        rayon::current_num_threads(),
+                        crate::simulation::mp_par::threads(),
                         self.sim.last_pressure_iters,
                         self.sim.last_newton_iters,
                         if self.sim.has_friction() { format!(", {} frottement", self.sim.last_friction_iters) } else { String::new() }

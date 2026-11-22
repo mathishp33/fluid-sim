@@ -195,7 +195,15 @@ impl MultiphaseSim {
     /// Un pas de temps protégé : si l'état obtenu est invalide (NaN, T aberrante, masse négative, vitesse > speed_limit) le pas est
     /// annulé et refait avec dt/4, dt/16, … (jusqu'à dt/1024). Si rien ne passe, l'état est restauré, `diverged` passe à true et
     /// 0.0 est retourné : l'appelant doit s'arrêter (au lieu de propager des NaN dans tout le domaine). Retourne dt.
+    /// Sa durée nourrit le réglage automatique du nombre de fils (`mp_par`).
     pub fn step(&mut self) -> f64 {
+        let t0 = Instant::now();
+        let dt = self.step_guarded();
+        super::mp_par::record_step(t0.elapsed().as_secs_f64());
+        dt
+    }
+
+    fn step_guarded(&mut self) -> f64 {
         if self.diverged {
             return 0.0;
         }
@@ -280,9 +288,9 @@ impl MultiphaseSim {
         let dt = self.dt_force.unwrap_or_else(|| self.choose_dt());
         // erreur de fermeture héritée (Σ m/ρ(p, T) − 1 avec les masses du début du pas), sous-relaxée dans l'équation de pression
         let n = self.nx * self.ny;
-        let err0: Vec<f64> = (0..n)
-            .map(|c| if self.is_solid(c) || self.pinned(c) { 0.0 } else { self.cell_volume(c, self.p[c]) - 1.0 })
-            .collect();
+        let err0: Vec<f64> = super::mp_par::collect(n, super::mp_par::MIN_HEAVY, |c| {
+            if self.is_solid(c) || self.pinned(c) { 0.0 } else { self.cell_volume(c, self.p[c]) - 1.0 }
+        });
         self.probe("début");
         lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());

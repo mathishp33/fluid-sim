@@ -272,9 +272,9 @@ impl MultiphaseSim {
             let dloc: Vec<Vec<f64>> = g
                 .iter()
                 .map(|&k| {
-                    (0..n)
-                        .map(|c| if self.is_solid(c) { 0.0 } else { self.reg.phases[k].diffusivity_at(self.tg[gt][c], self.p[c]).max(0.0) * self.flame_factor[c].max(1.0) })
-                        .collect()
+                    super::mp_par::collect(n, super::mp_par::MIN_HEAVY, |c| {
+                        if self.is_solid(c) { 0.0 } else { self.reg.phases[k].diffusivity_at(self.tg[gt][c], self.p[c]).max(0.0) * self.flame_factor[c].max(1.0) }
+                    })
                 })
                 .collect();
             let dmax = dloc.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, &b| a.max(b));
@@ -284,18 +284,30 @@ impl MultiphaseSim {
             let nsub = ((dt * dmax / (0.2 * dx * dx)).ceil() as usize).clamp(1, 500);
             let ds = dt / nsub as f64;
             let ng = g.len();
-            let par = n >= 2048 && rayon::current_num_threads() > 2;
+            // (choix de la forme selon la taille seulement : le résultat ne dépend pas du nombre de fils)
+            let par = n >= 2048;
             let mut mg = vec![0.0; n];
             let mut y: Vec<Vec<f64>> = vec![vec![0.0; n]; ng];
             let mut new_m: Vec<Vec<f64>> = vec![vec![0.0; n]; ng];
             let mut new_e = vec![0.0; n];
             for _ in 0..nsub {
                 // masse du groupe et fractions massiques
-                for c in 0..n {
-                    mg[c] = if self.is_solid(c) { 0.0 } else { g.iter().map(|&k| self.mass[k][c].max(0.0)).sum() };
-                    for (q, &k) in g.iter().enumerate() {
-                        y[q][c] = if mg[c] > 0.0 { self.mass[k][c].max(0.0) / mg[c] } else { 0.0 };
-                    }
+                {
+                    let mp = super::multiphase::SyncPtr(mg.as_mut_ptr());
+                    let yp: Vec<super::multiphase::SyncPtr<f64>> = y.iter_mut().map(|v| super::multiphase::SyncPtr(v.as_mut_ptr())).collect();
+                    let this = &*self;
+                    super::mp_par::for_ranges(n, super::mp_par::MIN_HEAVY, |lo, hi| {
+                        for c in lo..hi {
+                            let m: f64 = if this.is_solid(c) { 0.0 } else { g.iter().map(|&k| this.mass[k][c].max(0.0)).sum() };
+                            // SAFETY : la cellule c n'est écrite que par sa tranche
+                            unsafe {
+                                *mp.at(c) = m;
+                                for (q, &k) in g.iter().enumerate() {
+                                    *yp[q].at(c) = if m > 0.0 { this.mass[k][c].max(0.0) / m } else { 0.0 };
+                                }
+                            }
+                        }
+                    });
                 }
                 // flux à travers la face (a, b), a < b, de a vers b : même calcul vu des deux cellules ⇒ conservation exacte
                 let this = &*self;
@@ -358,9 +370,9 @@ impl MultiphaseSim {
                     }
                 };
                 if par {
-                    // parallèle : chaque cellule rassemble les flux de ses 4 faces (chaque face calculée deux fois, identiquement)
-                    use rayon::prelude::*;
-                    (0..ny).into_par_iter().for_each(row);
+                    // grandes grilles : chaque cellule rassemble les flux de ses 4 faces (chaque face calculée deux fois, identiquement),
+                    // par tranches de lignes en parallèle
+                    super::mp_par::for_rows(ny, nx, super::mp_par::MIN_HEAVY, row);
                 } else {
                     // séquentiel : chaque face une seule fois, répartie sur ses deux cellules
                     for (q, &k) in g.iter().enumerate() {
@@ -394,11 +406,7 @@ impl MultiphaseSim {
                     std::mem::swap(&mut self.mass[k], &mut new_m[q]);
                 }
                 std::mem::swap(&mut self.eg[gt], &mut new_e);
-                for c in 0..n {
-                    if !self.is_solid(c) {
-                        self.cell_sync(c);
-                    }
-                }
+                self.sync_cells(|_| true);
             }
         }
     }
@@ -516,15 +524,13 @@ impl MultiphaseSim {
             }
         }
         let reactive = self.reactive_groups();
-        // intégration indépendante cellule par cellule : en parallèle, puis application séquentielle des résultats
+        // intégration indépendante cellule par cellule : en parallèle, puis application des résultats dans l'ordre des cellules (sommes
+        // globales inchangées) ; températures recalculées ensuite, en parallèle
         let this = &*self;
         let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &surf, &reactive) } else { None };
-        let out: Vec<ChemOut> = if n >= super::mp_mg::PAR_MIN_CELLS / 4 {
-            use rayon::prelude::*;
-            (0..n).into_par_iter().filter_map(cell).collect()
-        } else {
-            (0..n).filter_map(cell).collect()
-        };
+        let out: Vec<ChemOut> =
+            super::mp_par::map_ranges(n, super::mp_par::MIN_HEAVY, |lo, hi| (lo..hi).filter_map(cell).collect::<Vec<ChemOut>>()).into_iter().flatten().collect();
+        let mut touched = vec![false; n];
         let mut dt_next = f64::INFINITY;
         for o in out {
             let c = o.c;
@@ -553,7 +559,7 @@ impl MultiphaseSim {
                 }
                 self.eg[main][c] = e_r - acc;
             }
-            self.cell_sync(c);
+            touched[c] = true;
             self.heat_release[c] = o.q / dt;
             self.chem_heat += o.q * a2;
             for j in 0..nre {
@@ -561,6 +567,7 @@ impl MultiphaseSim {
             }
             dt_next = dt_next.min(o.dt_cell);
         }
+        self.sync_cells(|c| touched[c]);
         let v = if dt_next.is_finite() { dt_next.max(1e-8) } else { f64::INFINITY };
         self.dt_chem = if first { v } else { self.dt_chem.min(v) };
     }
