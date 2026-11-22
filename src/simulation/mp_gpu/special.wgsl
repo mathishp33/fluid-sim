@@ -46,10 +46,15 @@ fn k_pin_reset(@builtin(global_invocation_id) g: vec3<u32>) {
     for (var k = 0u; k < P.np; k++) { S[O_bflux + k * n + c] += (mass(k, c) - before[k]) * a2; }
 }
 
-// composition absorbée par chaque source de téléporteur (un seul fil : dans l'ordre des cellules, la dernière source l'emporte)
+// composition absorbée par chaque GROUPE de téléporteurs (toutes les sources d'une même destination : masses, énergie, capacité et
+// p·masse additionnées, puis composition et température du mélange ; miroir de absorb_teleporters). Un seul fil.
 @compute @workgroup_size(1)
 fn k_tp_absorb() {
     let np = P.np;
+    let st = np + 4u;   // [m_0 … m_np−1, ε, capacité, pente, Σ p_rel·m]
+    for (var s = 0u; s < P.ntd; s++) {
+        for (var q = 0u; q < st; q++) { S[O_tpacc + s * st + q] = 0.0; }
+    }
     for (var q = 0u; q < P.ntp; q++) {
         let c = u32(T[T_TP + 2u * q]);
         let slot = u32(T[T_TP + 2u * q + 1u]);
@@ -70,14 +75,23 @@ fn k_tp_absorb() {
             cap += ma[k] * ce_k(k); sl += ma[k] * slope_k(k);
         }
         if (tot < 1e-9) { continue; }
-        let t = clamp(P.t0 + tau_from(cap, sl, eps), 100.0, 3000.0);
+        let b = O_tpacc + slot * st;
+        for (var k = 0u; k < np; k++) { S[b + k] += ma[k]; }
+        S[b + np] += eps; S[b + np + 1u] += cap; S[b + np + 2u] += sl; S[b + np + 3u] += pr * tot;
+    }
+    for (var s = 0u; s < P.ntd; s++) {
+        let b = O_tpacc + s * st;
+        var tot = 0.0;
+        for (var k = 0u; k < np; k++) { tot += S[b + k]; }
+        if (tot < 1e-9) { continue; }
+        let t = clamp(P.t0 + tau_from(S[b + np + 1u], S[b + np + 2u], S[b + np]), 100.0, 3000.0);
+        let pr = S[b + np + 3u] / tot;
         var vs = 0.0;
-        var vk: array<f32, NPMAX>;
-        for (var k = 0u; k < np; k++) { vk[k] = ma[k] / rho_k(k, pr, t); vs += vk[k]; }
+        for (var k = 0u; k < np; k++) { vs += S[b + k] / rho_k(k, pr, t); }
         if (vs > 0.0) {
-            let b = O_tpmix + slot * (np + 2u);
-            S[b] = 1.0; S[b + 1u] = t;
-            for (var k = 0u; k < np; k++) { S[b + 2u + k] = vk[k] / vs; }
+            let m = O_tpmix + s * (np + 2u);
+            S[m] = 1.0; S[m + 1u] = t;
+            for (var k = 0u; k < np; k++) { S[m + 2u + k] = S[b + k] / rho_k(k, pr, t) / vs; }
         }
     }
 }

@@ -19,7 +19,7 @@ use super::multiphase::MultiphaseSim;
 /// en-tête d'un fichier d'état complet
 pub const MAGIC: &[u8; 8] = b"FSIMMPST";
 /// version du format (voir l'en-tête du module)
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2; // 2 : rayon de la destination des téléporteurs
 
 /// Contenu d'un fichier d'état complet.
 #[derive(Serialize, Deserialize)]

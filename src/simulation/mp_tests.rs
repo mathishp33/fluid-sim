@@ -555,7 +555,7 @@ fn accelerator_drives_a_tube_with_the_force_balance_a_times_length_ratio() {
 fn teleporter_moves_the_absorbed_fluid_to_its_destination() {
     let (mut s, _air, eau) = open_tank(24, 24, 0.12);
     let (src, dst) = (s.idx(5, 4), s.idx(18, 18)); // source dans l'eau, destination dans l'air
-    s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3 }));
+    s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3, radius: 0 }));
     let m0 = s.total_mass(eau);
     run_for(&mut s, 0.4);
     // de l'eau est apparue autour de la destination (dans l'air au départ)
@@ -567,6 +567,62 @@ fn teleporter_moves_the_absorbed_fluid_to_its_destination() {
     // le débit volumique émis est proche du débit aspiré : la masse d'eau nette change peu devant la masse aspirée
     let sucked = 998.2 * 4.0 * 0.3 * 0.01 * s.time;
     assert!(dm.abs() < 0.6 * sucked, "Δm = {dm} (aspiré ≈ {sucked})");
+}
+
+#[test]
+fn teleporter_group_reemits_all_sources_over_its_destination_zone() {
+    // bloc de 3×3 sources dans l'eau, une rangée d'huile juste au-dessus, vers une même destination de rayon 2 dans l'air. Avant : une seule source
+    // servie (les autres « destination déjà prise »), l'aspiration des autres détruisait le fluide, et le mélange émis était celui
+    // de la dernière source
+    let mut r = Registry::new();
+    let air = r.add_phase(Phase::air());
+    let eau = r.add_phase(Phase::water());
+    let huile = r.add_phase(Phase::oil());
+    let mut s = MultiphaseSim::new(30, 30, 0.01, r, air);
+    // eau jusqu'à 12 cm, sauf une rangée d'huile au-dessus du bloc de sources (cellules (4..7, 6) : aspirée par les sources du haut)
+    s.paint_phase(move |x, y| if y >= 0.12 { Some(air) } else if (0.04..0.07).contains(&x) && (0.06..0.07).contains(&y) { Some(huile) } else { Some(eau) });
+    s.bc[3] = Bc::Open { p: P_ATM };
+    s.finalize_init(|_, _| 293.15);
+    let dst = s.idx(20, 22);
+    let mut sources = vec![];
+    for j in 3..6 {
+        for i in 4..7 {
+            let c = s.idx(i, j);
+            s.set_effect(c, Some(MpEffect::Teleporter { dest: dst, speed: 0.2, radius: 2 }));
+            sources.push(c);
+        }
+    }
+    s.refresh();
+    s.prepare_special();
+    // zone de destination : tout le disque de rayon 2 (13 cellules) est épinglé en sortie de ce groupe
+    let zone = s.tp_dest_cells(dst, 2);
+    assert_eq!(zone.len(), 13);
+    assert!(zone.iter().all(|&d| matches!(s.pin[d], Some(super::mp_cells::PinInfo { kind: 2, tp_dest: Some(k), .. }) if k == dst)));
+    // débit volumique sortant des faces fixées : la zone réémet exactement ce que les sources aspirent
+    let out = |c: usize| {
+        let (i, j) = (c % s.nx, c / s.nx);
+        let f = |x: f64| if x.is_nan() { 0.0 } else { x };
+        f(s.pf_u[s.uidx(i + 1, j)]) - f(s.pf_u[s.uidx(i, j)]) + f(s.pf_v[s.vidx(i, j + 1)]) - f(s.pf_v[s.vidx(i, j)])
+    };
+    let q_in: f64 = sources.iter().map(|&c| -out(c)).sum();
+    let q_out: f64 = zone.iter().map(|&c| out(c)).sum();
+    assert!(q_in > 0.0 && (q_out / q_in - 1.0).abs() < 1e-12, "aspiré {q_in}, réémis {q_out}");
+    // le bloc n'aspire que par son pourtour (12 faces, faces internes fermées)
+    assert!((q_in - 0.2 * 12.0).abs() < 1e-12, "q_in = {q_in}");
+    let (m_eau0, m_huile0) = (s.total_mass(eau), s.total_mass(huile));
+    run_for(&mut s, 0.3);
+    // eau ET huile arrivent dans la zone (mélange de toutes les sources, plus seulement la dernière)
+    let around = |k: usize| -> f64 { (16..25).flat_map(|j| (16..25).map(move |i| (i, j))).map(|(i, j)| s.mass[k][s.idx(i, j)]).sum() };
+    assert!(around(eau) > 1e-3 && around(huile) > 1e-4, "eau {} huile {}", around(eau), around(huile));
+    // bilans exacts (masse créée / détruite par les cellules épinglées comptée dans boundary_flux)
+    for (k, m0) in [(eau, m_eau0), (huile, m_huile0)] {
+        let dm = s.total_mass(k) - m0;
+        assert!((dm - s.boundary_flux[k]).abs() < 1e-9 * m_eau0, "bilan {k} : {dm} vs {}", s.boundary_flux[k]);
+    }
+    // ce qui est aspiré réapparaît : le liquide net change peu devant le liquide aspiré
+    let sucked = 998.2 * 0.2 * 12.0 * s.dx * s.time;
+    let dm = s.total_mass(eau) + s.total_mass(huile) - m_eau0 - m_huile0;
+    assert!(dm.abs() < 0.5 * sucked, "Δm liquide = {dm} (aspiré ≈ {sucked})");
 }
 
 #[test]

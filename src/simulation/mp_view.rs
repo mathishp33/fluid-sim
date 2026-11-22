@@ -676,10 +676,12 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                 Some(MpEffect::Sink { .. }) => put(c, [0xff, 0x00, 0x00]),
                 Some(MpEffect::Emitter { .. }) => put(c, [0x00, 0xff, 0x00]),
                 Some(MpEffect::Accelerator { .. }) => put(c, [0xff, 0x00, 0xff]),
-                Some(MpEffect::Teleporter { dest, .. }) => {
+                Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     put(c, [0x00, 0x00, 0xff]);
-                    if dest < nx * ny && !sim.is_solid(dest) && sim.special[dest].is_none() {
-                        put(dest, [0x00, 0xff, 0xff]);
+                    if dest < nx * ny {
+                        for d in sim.tp_dest_cells(dest, radius) {
+                            put(d, [0x00, 0xff, 0xff]);
+                        }
                     }
                 }
                 None => {}
@@ -794,9 +796,10 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
             format!("émetteur {} à {temp:.1} K, v = ({vx:.2}, {vy:.2}) m/s", sim.reg.phases.get(phase).map_or("?", |p| p.name.as_str())),
         )),
         Some(MpEffect::Accelerator { ax, ay }) => v.push(("Cellule spéciale".into(), format!("accélérateur ({ax:.2}, {ay:.2}) m/s²"))),
-        Some(MpEffect::Teleporter { dest, speed }) => {
-            v.push(("Cellule spéciale".into(), format!("téléporteur → ({}, {}), {speed:.2} m/s", dest % sim.nx, dest / sim.nx)))
-        }
+        Some(MpEffect::Teleporter { dest, speed, radius }) => v.push((
+            "Cellule spéciale".into(),
+            format!("téléporteur → ({}, {}), rayon {radius}, {speed:.2} m/s", dest % sim.nx, dest / sim.nx),
+        )),
         None => {}
     }
     let (vx, vy) = cell_velocity(sim, i, j);
@@ -860,7 +863,13 @@ pub enum EffectFile {
     Sink { rate: f64 },
     Emitter { vx: f64, vy: f64, phase: String, temp: f64 },
     Accelerator { ax: f64, ay: f64 },
-    Teleporter { dest: usize, speed: f64 },
+    Teleporter {
+        dest: usize,
+        speed: f64,
+        /// rayon de la zone de destination (absent des scènes enregistrées avant son ajout : 0, une cellule)
+        #[serde(default)]
+        radius: usize,
+    },
 }
 
 /// Scène = solides (par nom de matériau) + comportements thermiques + cellules spéciales. Équivalent du fichier `.fsf` du mono-fluide
@@ -889,7 +898,7 @@ pub fn scene_to_json(sim: &MultiphaseSim) -> Result<String, String> {
             Some(MpEffect::Sink { rate }) => f.effects.push((c, EffectFile::Sink { rate })),
             Some(MpEffect::Emitter { vx, vy, phase, temp }) => f.effects.push((c, EffectFile::Emitter { vx, vy, phase: name(phase), temp })),
             Some(MpEffect::Accelerator { ax, ay }) => f.effects.push((c, EffectFile::Accelerator { ax, ay })),
-            Some(MpEffect::Teleporter { dest, speed }) => f.effects.push((c, EffectFile::Teleporter { dest, speed })),
+            Some(MpEffect::Teleporter { dest, speed, radius }) => f.effects.push((c, EffectFile::Teleporter { dest, speed, radius })),
             None => {}
         }
     }
@@ -930,7 +939,7 @@ pub fn scene_from_json(sim: &mut MultiphaseSim, json: &str) -> Result<Vec<String
         let eff = match e {
             EffectFile::Sink { rate } => Some(MpEffect::Sink { rate: *rate }),
             EffectFile::Accelerator { ax, ay } => Some(MpEffect::Accelerator { ax: *ax, ay: *ay }),
-            EffectFile::Teleporter { dest, speed } => Some(MpEffect::Teleporter { dest: *dest, speed: *speed }),
+            EffectFile::Teleporter { dest, speed, radius } => Some(MpEffect::Teleporter { dest: *dest, speed: *speed, radius: *radius }),
             EffectFile::Emitter { vx, vy, phase, temp } => match sim.reg.phases.iter().position(|p| &p.name == phase) {
                 Some(k) => Some(MpEffect::Emitter { vx: *vx, vy: *vy, phase: k, temp: *temp }),
                 None => {
@@ -1026,7 +1035,7 @@ mod tests {
         apply_tool_with(&mut s, MpTool::Solid(ACIER), &brush_cells(30, 20, 5, 5, 2, false), &ToolOpts { temp: 293.15, cursor: (0.0, 0.0), dt: 0.0, thermal: MpThermal::Heater(1e6) });
         apply_tool(&mut s, MpTool::Effect(MpEffect::Emitter { vx: 0.0, vy: 1.0, phase: EAU, temp: 300.0 }), &[(20, 3)], 293.15, (0.0, 0.0), 0.0);
         let dest = s.idx(25, 15);
-        apply_tool(&mut s, MpTool::Effect(MpEffect::Teleporter { dest, speed: 0.4 }), &[(10, 10)], 293.15, (0.0, 0.0), 0.0);
+        apply_tool(&mut s, MpTool::Effect(MpEffect::Teleporter { dest, speed: 0.4, radius: 2 }), &[(10, 10)], 293.15, (0.0, 0.0), 0.0);
         let json = scene_to_json(&s).unwrap();
         let mut t = build_scenario(MpScenario::Empty, 30, 20, 0.01, 9.81);
         let w = scene_from_json(&mut t, &json).unwrap();

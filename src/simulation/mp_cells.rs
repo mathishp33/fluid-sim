@@ -28,8 +28,10 @@ pub enum MpEffect {
     Emitter { vx: f64, vy: f64, phase: usize, temp: f64 },
     /// accélération de volume
     Accelerator { ax: f64, ay: f64 },
-    /// aspire à `speed` m/s ; le fluide absorbé (composition, T) réapparaît en `dest` (indice de cellule) avec le même débit volumique
-    Teleporter { dest: usize, speed: f64 },
+    /// aspire à `speed` m/s ; le fluide absorbé (composition, T) réapparaît autour de `dest` (indice de cellule), sur un disque de
+    /// `radius` mailles (0 = la seule cellule `dest`), avec le même débit volumique. Toutes les sources qui visent la même `dest`
+    /// forment un groupe : leurs débits s'additionnent et leurs fluides se mélangent (rayon du groupe : le plus grand).
+    Teleporter { dest: usize, speed: f64, radius: usize },
 }
 
 impl MpEffect {
@@ -174,6 +176,26 @@ impl MultiphaseSim {
         dest < self.nx * self.ny && dest != c && !self.is_solid(dest) && self.special[dest].is_none()
     }
 
+    /// cellules de la zone de destination d'un téléporteur : disque de `radius` mailles autour de `dest`, fluides et sans effet
+    pub(crate) fn tp_dest_cells(&self, dest: usize, radius: usize) -> Vec<usize> {
+        let (nx, ny) = (self.nx, self.ny);
+        let (ci, cj, r) = ((dest % nx) as isize, (dest / nx) as isize, radius as isize);
+        let mut v = vec![];
+        for dj in -r..=r {
+            for di in -r..=r {
+                let (i, j) = (ci + di, cj + dj);
+                if di * di + dj * dj > r * r || i < 0 || j < 0 || i >= nx as isize || j >= ny as isize {
+                    continue;
+                }
+                let d = j as usize * nx + i as usize;
+                if !self.is_solid(d) && self.special[d].is_none() {
+                    v.push(d);
+                }
+            }
+        }
+        v
+    }
+
     // ---------------------------------------------------------------- préparation d'un pas
     /// Reconstruit `pin`, `pf_u`, `pf_v` depuis les effets et les entrées de bord. Appelé au début de chaque pas.
     pub(crate) fn prepare_special(&mut self) {
@@ -192,8 +214,8 @@ impl MultiphaseSim {
         if !self.has_extras() {
             return (pin, fx.pf_u, fx.pf_v);
         }
-        // 1. cellules épinglées + vitesses de leurs faces
-        let mut tp_dst: Vec<(usize, f64, usize)> = vec![]; // (dest, vitesse de sortie, source)
+        // 1. cellules épinglées + vitesses de leurs faces (téléporteurs : faces fixées une fois TOUTES les cellules épinglées connues)
+        let mut tp_groups: Vec<(usize, usize, Vec<(usize, f64)>)> = vec![]; // (dest, rayon, [(source, vitesse)])
         for c in 0..n {
             if self.is_solid(c) {
                 continue;
@@ -208,23 +230,51 @@ impl MultiphaseSim {
                     pin[c] = Some(PinInfo { kind: 2, phase: phase.min(self.reg.phases.len() - 1), temp, tp_dest: None });
                     fx.fix_nozzle(i, j, vx, vy);
                 }
-                Some(MpEffect::Teleporter { dest, speed }) if self.tp_dest_ok(c, dest) => {
+                Some(MpEffect::Teleporter { dest, speed, radius }) if self.tp_dest_ok(c, dest) => {
                     pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
-                    fx.fix_faces(i, j, -speed.abs());
-                    let n_src = self.open_faces(i, j);
-                    tp_dst.push((dest, speed.abs() * n_src as f64, c));
+                    match tp_groups.iter_mut().find(|g| g.0 == dest) {
+                        Some(g) => {
+                            g.1 = g.1.max(radius);
+                            g.2.push((c, speed.abs()));
+                        }
+                        None => tp_groups.push((dest, radius, vec![(c, speed.abs())])),
+                    }
                 }
                 _ => {}
             }
         }
-        for (dest, flux, _src) in tp_dst {
-            if pin[dest].is_some() {
-                continue; // destination déjà prise par un autre téléporteur : ignorée
+        // zones de destination (cellules encore libres ; une cellule déjà prise par un autre groupe ou un autre effet est sautée)
+        let mut tp_zones: Vec<Vec<usize>> = vec![];
+        for (dest, radius, _) in &tp_groups {
+            let zone: Vec<usize> = self.tp_dest_cells(*dest, *radius).into_iter().filter(|&d| pin[d].is_none()).collect();
+            for &d in &zone {
+                pin[d] = Some(PinInfo { kind: 2, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(*dest) });
             }
-            let (i, j) = (dest % nx, dest / nx);
-            let n_dst = self.open_faces(i, j).max(1);
-            pin[dest] = Some(PinInfo { kind: 2, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: None });
-            fx.fix_faces(i, j, flux / n_dst as f64);
+            tp_zones.push(zone);
+        }
+        // débits : seules les faces donnant sur du fluide NON épinglé comptent (les faces entre deux cellules épinglées sont fermées
+        // à l'étape 3) — volume aspiré par le groupe = volume réémis par sa zone
+        let free_faces = |c: usize| {
+            let (i, j) = ((c % nx) as isize, (c / nx) as isize);
+            [(i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)]
+                .iter()
+                .filter(|&&(a, b)| a >= 0 && b >= 0 && (a as usize) < nx && (b as usize) < ny)
+                .map(|&(a, b)| b as usize * nx + a as usize)
+                .filter(|&d| !self.is_solid(d) && pin[d].is_none())
+                .count()
+        };
+        for ((_, _, sources), zone) in tp_groups.iter().zip(&tp_zones) {
+            let mut q = 0.0;
+            for &(src, speed) in sources {
+                fx.fix_faces(src % nx, src / nx, -speed);
+                q += speed * free_faces(src) as f64;
+            }
+            let n_out: usize = zone.iter().map(|&d| free_faces(d)).sum();
+            if n_out > 0 {
+                for &d in zone {
+                    fx.fix_faces(d % nx, d / nx, q / n_out as f64);
+                }
+            }
         }
         // 2. entrées de bord (uniquement sur un bord fermé)
         for side in 0..4 {
@@ -304,7 +354,7 @@ impl MultiphaseSim {
         for c in 0..self.nx * self.ny {
             let Some(pin) = self.pin[c] else { continue };
             let before: Vec<f64> = (0..np).map(|k| self.mass[k][c]).collect();
-            match (pin.kind, self.tp_mix.get(&c)) {
+            match (pin.kind, pin.tp_dest.and_then(|k| self.tp_mix.get(&k))) {
                 (2, Some((alpha, t))) => {
                     let (alpha, t) = (alpha.clone(), *t);
                     self.fill_mixture(c, &alpha, t);
@@ -318,14 +368,16 @@ impl MultiphaseSim {
         }
     }
 
-    /// Après l'advection : enregistre la composition absorbée par chaque source de téléporteur (réémise à la destination).
+    /// Après l'advection : enregistre la composition absorbée par chaque GROUPE de téléporteurs (toutes les sources d'une même
+    /// destination : masses et énergies additionnées, puis composition et température du mélange), réémise dans sa zone.
     pub(crate) fn absorb_teleporters(&mut self) {
         let np = self.reg.phases.len();
+        let amb = self.ambient_alpha();
+        let mut acc: Vec<(usize, Vec<f64>, f64, f64)> = vec![]; // (dest, Σ masses absorbées, Σ énergie absorbée, p moyenne pondérée)
         for c in 0..self.nx * self.ny {
             let Some(PinInfo { kind: 1, tp_dest: Some(dest), .. }) = self.pin[c] else { continue };
             let (p, ta) = (self.p[c], self.t_ambient);
             // contenu de remplissage (fluide ambiant) à soustraire
-            let amb = self.ambient_alpha();
             let base: Vec<f64> = (0..np).map(|k| amb[k] * self.reg.phases[k].rho(p, ta)).collect();
             let e_base: f64 = (0..np).map(|k| base[k] * self.reg.phases[k].e_int(ta)).sum();
             let ma: Vec<f64> = (0..np).map(|k| (self.mass[k][c] - base[k]).max(0.0)).collect();
@@ -334,6 +386,22 @@ impl MultiphaseSim {
                 continue;
             }
             let e_abs = self.e[c] - e_base;
+            let g = match acc.iter().position(|g| g.0 == dest) {
+                Some(g) => g,
+                None => {
+                    acc.push((dest, vec![0.0; np], 0.0, 0.0));
+                    acc.len() - 1
+                }
+            };
+            for k in 0..np {
+                acc[g].1[k] += ma[k];
+            }
+            acc[g].2 += e_abs;
+            acc[g].3 += p * tot;
+        }
+        for (dest, ma, e_abs, pw) in acc {
+            let tot: f64 = ma.iter().sum();
+            let p = pw / tot;
             let t = super::multiphase::temp_from_masses(&self.reg.phases, ma.iter().copied(), e_abs).clamp(100.0, 3000.0);
             let vols: Vec<f64> = (0..np).map(|k| ma[k] / self.reg.phases[k].rho(p, t)).collect();
             let vsum: f64 = vols.iter().sum();

@@ -21,7 +21,7 @@ struct Params {
     fmax: f32, dil_r: u32, chem_max_sub: u32, rd_mode: u32,
     rd_flags: u32, rd_tscale: f32, rd_pscale: f32, lvp_safe: u32,   // lvp_safe : contournements pour lavapipe (pilote logiciel)
     closure_relax: f32, cfl_reject: f32, closure_small_scale: f32, phase_exch: f32,   // fermeture héritée (r, échelle) ; Courant de refus ; λ (≥ 1e37 : ∞)
-    cfl_flame: f32, flame_u_floor: f32, thermo_k: u32, pad0: u32,   // borne de pas des flammes ; sous-pas du bloc thermique (correcteur)
+    cfl_flame: f32, flame_u_floor: f32, thermo_k: u32, ntd: u32,   // borne de pas des flammes ; sous-pas du bloc thermique (correcteur) ; groupes de téléporteurs
 };
 // drapeaux (Params.flags)
 const F_ST: u32 = 1u;        // tension de surface

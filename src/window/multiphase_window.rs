@@ -147,6 +147,8 @@ pub struct MultiphaseWindow {
     acc_ay: f64,
     tp_dest: Option<usize>,
     tp_speed: f64,
+    /// rayon (mailles) de la zone de destination des téléporteurs posés
+    tp_radius: usize,
     picking_destination: bool,
 
     // bords modifiables en direct (gauche, droite, bas, haut)
@@ -228,6 +230,7 @@ impl MultiphaseWindow {
             acc_ay: 0.0,
             tp_dest: None,
             tp_speed: 0.5,
+            tp_radius: 2,
             picking_destination: false,
             boundaries,
             stats: MpStats::default(),
@@ -876,7 +879,10 @@ impl MultiphaseWindow {
                     }
                 }
                 ui.add(egui::Slider::new(&mut self.tp_speed, 0.0..=10.0).text("Aspiration (m/s)"));
-                ui.weak("Le fluide absorbé (composition, température) réapparaît à la destination avec le même débit volumique.");
+                ui.add(egui::Slider::new(&mut self.tp_radius, 0..=20).text("Rayon de la destination")).on_hover_text(
+                    "Zone de sortie : disque de ce rayon (mailles) autour de la destination choisie (0 = une seule cellule)",
+                );
+                ui.weak("Le fluide absorbé par toutes les sources d'une même destination (composition, température) y réapparaît, mélangé, avec le même débit volumique.");
             }
         }
     }
@@ -1141,7 +1147,7 @@ impl MultiphaseWindow {
                 MpThermal::Passive,
             )),
             CellKind::Accelerator => Some((MpTool::Effect(MpEffect::Accelerator { ax: self.acc_ax, ay: self.acc_ay }), MpThermal::Passive)),
-            CellKind::Teleporter => self.tp_dest.map(|d| (MpTool::Effect(MpEffect::Teleporter { dest: d, speed: self.tp_speed }), MpThermal::Passive)),
+            CellKind::Teleporter => self.tp_dest.map(|d| (MpTool::Effect(MpEffect::Teleporter { dest: d, speed: self.tp_speed, radius: self.tp_radius }), MpThermal::Passive)),
         }
     }
 
@@ -1314,13 +1320,15 @@ impl MultiphaseWindow {
         }
         // destination du téléporteur en cours de réglage
         if self.show_effects && self.cell_kind == CellKind::Teleporter {
-            if let Some(d) = self.tp_dest {
-                let (i, j) = (d % self.sim.nx, d / self.sim.nx);
-                let p = ((self.sim.ny - 1 - j) * self.sim.nx + i) * 4;
-                if p + 2 < self.rgba.len() && !self.sim.is_solid(d) {
-                    self.rgba[p] = 0x00;
-                    self.rgba[p + 1] = 0xff;
-                    self.rgba[p + 2] = 0xff;
+            if let Some(d) = self.tp_dest.filter(|&d| d < self.sim.nx * self.sim.ny) {
+                for c in self.sim.tp_dest_cells(d, self.tp_radius) {
+                    let (i, j) = (c % self.sim.nx, c / self.sim.nx);
+                    let p = ((self.sim.ny - 1 - j) * self.sim.nx + i) * 4;
+                    if p + 2 < self.rgba.len() {
+                        self.rgba[p] = 0x00;
+                        self.rgba[p + 1] = 0xff;
+                        self.rgba[p + 2] = 0xff;
+                    }
                 }
             }
         }

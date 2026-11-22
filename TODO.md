@@ -39,7 +39,6 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - **[M] Encodeur de conditions initiales / fenêtre d'expérience séparée** (l'état complet s'enregistre maintenant : `mp_state`, voir « Fait » — point de départ des expériences) pour des expériences précises pas à pas, avec sauvegarde. Exemple : « de la température ici, puis j'accélère là, puis je simule 5 s, j'arrête et je sauvegarde des statistiques ». → trouver l'interface (script d'actions ? timeline ?).
 
 ### Bugs / manques des cellules spéciales
-- [M] Téléporteur partiellement cassé : la taille de la destination n'est pas réglable (une seule cellule de destination).
 - [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), compresseur, autres…
 
 ---
@@ -104,6 +103,7 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - Pas de temps capillaire seulement pour les liquides présents. [M]
 
 ### Fonctionnalités
+- **Téléporteur réparé, destination de taille réglable** (CPU et GPU) : une destination devient un disque de `radius` mailles (curseur « Rayon de la destination », 2 par défaut). Les sources qui visent la même destination forment un groupe : débits additionnés et réémis sur toute la zone (volume réémis = volume aspiré, faces internes des blocs fermées), fluides absorbés MÉLANGÉS (masses et énergies sommées). Avant : seule la première source d'un bloc peint au pinceau était servie (« destination déjà prise »), les autres aspiraient et détruisaient le fluide, la composition émise était celle de la dernière source, et le GPU plafonnait à 256 sources. Format d'état complet : version 2 ; scènes JSON antérieures lisibles (rayon 0). Test `teleporter_group_reemits_all_sources_over_its_destination_zone` + accord CPU / GPU avec un bloc de sources. [M]
 - **Sauvegarde de l'ÉTAT COMPLET** (`mp_state`, bouton « Sauver l'état complet (S) ») : tous les champs du solveur (masses, énergies et températures par groupe, pression, vitesses, solides, comportements thermiques, cellules spéciales et cellules épinglées, bords et entrées, chauffage au pinceau, facteur de flamme, réglages numériques et physiques, compteurs et bilans), le registre des matériaux tel qu'utilisé, la bibliothèque de matériaux, le scénario et les bords de la fenêtre. Format binaire bincode avec en-tête et version (`MAGIC`, `VERSION`), exact au bit près : une simulation rechargée continue identiquement (tests d'aller-retour : barrage, flamme, ébullition chauffée ; d'une fenêtre à l'autre). `MultiphaseSim` dérive serde : tout nouveau champ est enregistré d'office (penser à incrémenter `VERSION`). « Géométrie seule » garde l'ancien format JSON ; « Charger (L) » reconnaît les deux. [M]
 - Toutes les fonctionnalités de `main_window.rs` portées dans `multiphase_window.rs` : cellules spéciales (puits, émetteur, accélérateur, téléporteur), solides chauffants / isothermes, bords modifiables en direct, raccourcis, sauvegarde/chargement de scène. [M]
 - Matériaux solides, liquides et gazeux ajoutables et personnalisables (défauts supprimables et restaurables), miscibilité par paire, export/import JSON. [M]

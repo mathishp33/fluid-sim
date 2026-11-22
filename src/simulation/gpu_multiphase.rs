@@ -219,6 +219,8 @@ pub struct MultiphaseGpu {
     has_accel: bool,
     has_thermal: bool,
     ntp: usize,
+    /// groupes de téléporteurs (destinations)
+    ntd: usize,
     slots_of_dest: Vec<usize>,
     heat_on: bool,
     // budgets adaptatifs (lancements préparés ; les noyaux en trop ne font rien)
@@ -306,6 +308,8 @@ impl MultiphaseGpu {
         sl.add("pcs", pers_end - pers_start);
         sl.add("pcd", D_LEN);
         sl.add("pcf", 8);
+        // téléporteurs : sommes par groupe (masses absorbées, ε, capacité, pente, p·masse) pendant k_tp_absorb
+        sl.add("tpacc", TP_CAP * (np + 4));
         for name in ["Un", "Us", "Fx", "ust"] {
             sl.add(name, nfu);
         }
@@ -365,7 +369,7 @@ impl MultiphaseGpu {
         tl.add("LEV", levels.len() * LEV_STRIDE);
         tl.add("RX", nre.max(1) * RX_STRIDE);
         tl.add("KC", nrev.max(1) * KC_N);
-        tl.add("TP", TP_CAP * 2);
+        tl.add("TP", n.max(1) * 2); // paires (source, groupe) : toutes les sources possibles
 
         // ---------------------------------------------------------------- source WGSL
         let mut header = String::from("// ---- constantes générées par gpu_multiphase.rs ----\n");
@@ -567,6 +571,7 @@ impl MultiphaseGpu {
             has_accel: false,
             has_thermal: false,
             ntp: 0,
+            ntd: 0,
             slots_of_dest: vec![],
             heat_on: false,
             newton_budget: 3,
@@ -771,6 +776,7 @@ impl MultiphaseGpu {
         }
         // ---------------- cellules spéciales (comme prepare_special)
         let (pin, pf_u, pf_v) = sim.special_tables();
+        // groupes de téléporteurs (miroir de special_tables / absorb_teleporters) : un groupe par destination, clé = `dest`
         let mut dests: Vec<usize> = vec![];
         let mut pairs: Vec<(usize, usize)> = vec![];
         for c in 0..n {
@@ -786,17 +792,19 @@ impl MultiphaseGpu {
             }
         }
         for &d in sim.tp_mix.keys() {
-            if d < n && matches!(pin[d], Some(PinInfo { kind: 2, .. })) && !dests.contains(&d) {
+            let used = pin.iter().any(|p| matches!(p, Some(PinInfo { kind: 2, tp_dest: Some(k), .. }) if *k == d));
+            if used && !dests.contains(&d) {
                 dests.push(d);
             }
         }
         dests.truncate(TP_CAP);
         pairs.retain(|&(_, s)| s < TP_CAP);
-        for (q, &(c, s)) in pairs.iter().enumerate().take(TP_CAP) {
+        for (q, &(c, s)) in pairs.iter().enumerate() {
             t[self.tl.o("TP") + 2 * q] = c as f32;
             t[self.tl.o("TP") + 2 * q + 1] = s as f32;
         }
-        self.ntp = pairs.len().min(TP_CAP);
+        self.ntp = pairs.len();
+        self.ntd = dests.len();
         self.slots_of_dest = dests.clone();
         self.has_extras = sim.has_extras();
         self.queue.write_buffer(&self.t_buf, 0, bytemuck::cast_slice(&t));
@@ -816,8 +824,8 @@ impl MultiphaseGpu {
                 s[o_pk + c] = pi.kind as f32;
                 s[o_pp + c] = if pi.phase == sim.ambient_phase { -1.0 } else { pi.phase as f32 };
                 s[o_pt + c] = pi.temp as f32;
-                if pi.kind == 2 {
-                    if let Some(sl) = dests.iter().position(|&d| d == c) {
+                if let (2, Some(key)) = (pi.kind, pi.tp_dest) {
+                    if let Some(sl) = dests.iter().position(|&d| d == key) {
                         s[o_ptp + c] = sl as f32;
                     }
                 }
@@ -852,10 +860,12 @@ impl MultiphaseGpu {
                 Some(MpEffect::Sink { .. }) => ovl[c] = col(0xff, 0, 0) + 1,
                 Some(MpEffect::Emitter { .. }) => ovl[c] = col(0, 0xff, 0) + 1,
                 Some(MpEffect::Accelerator { .. }) => ovl[c] = col(0xff, 0, 0xff) + 1,
-                Some(MpEffect::Teleporter { dest, .. }) => {
+                Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     ovl[c] = col(0, 0, 0xff) + 1;
-                    if dest < n && !sim.is_solid(dest) && sim.special[dest].is_none() {
-                        ovl[dest] = col(0, 0xff, 0xff) + 1;
+                    if dest < n {
+                        for d in sim.tp_dest_cells(dest, radius) {
+                            ovl[d] = col(0, 0xff, 0xff) + 1;
+                        }
                     }
                 }
                 None => {}
@@ -1168,6 +1178,7 @@ impl MultiphaseGpu {
         w[60] = f(sim.cfl_flame);
         w[61] = f(sim.flame_speed_floor);
         w[62] = self.thermo_k(sim) as u32;
+        w[63] = self.ntd as u32;
         w
     }
 

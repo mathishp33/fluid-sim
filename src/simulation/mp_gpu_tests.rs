@@ -515,9 +515,12 @@ fn extras_scene() -> MultiphaseSim {
         let c = s.idx(15, j);
         s.set_effect(c, Some(MpEffect::Accelerator { ax: 30.0, ay: 0.0 }));
     }
-    let src = s.idx(5, 2);
+    // bloc de 2×2 sources vers une même destination de rayon 2 (groupe : débits additionnés, fluides mélangés)
     let dst = s.idx(30, 22);
-    s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3 }));
+    for (i, j) in [(5, 2), (6, 2), (5, 3), (6, 3)] {
+        let src = s.idx(i, j);
+        s.set_effect(src, Some(MpEffect::Teleporter { dest: dst, speed: 0.3, radius: 2 }));
+    }
     s.inlet[0] = Some(MpInlet { vx: 0.3, vy: 0.0, phase: s.ambient_phase, temp: t_amb + 20.0, offset: 0 });
     s.bc[0] = Bc::Wall;
     s.bc[3] = Bc::Open { p: 101325.0 };
