@@ -108,7 +108,7 @@ impl MultiphaseSim {
         let (nx, ny) = (self.nx, self.ny);
         // gravité oblique : deux familles de faces, chacune limitée à la moitié des stocks
         let share = if gx != 0.0 && gy != 0.0 { 0.5 } else { 1.0 };
-        let movable = |s: &Self, c: usize| !s.is_solid(c) && !s.pinned(c);
+        let movable = |s: &Self, c: usize| !s.is_solid(c) && !s.pinned(c) && !s.is_grille(c);
         for &s in &grains {
             let gs = self.group_of[s];
             let amax = self.reg.phases[s].alpha_max;

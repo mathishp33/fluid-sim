@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::mp_cells::{MpEffect, MpThermal};
-use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, MIX_CH4_AIR, MIX_H2_AIR};
+use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, H2O_G, MIX_CH4_AIR, MIX_H2_AIR};
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Phase, Registry};
 
@@ -47,7 +47,7 @@ pub enum MpScenario {
     Sedimentation,
     /// colonne de sable sec tassé qui s'effondre en un tas (frottement des grains)
     SandColumn,
-    /// tas de charbon allumé au cœur dans l'air : combustion de surface des grains (C + O2 → CO2), tirage naturel
+    /// braséro : charbon en morceaux sur une grille, allumé par le bas, tirage naturel à travers le lit, flamme de CO au-dessus
     CoalFire,
 }
 
@@ -101,7 +101,7 @@ impl MpScenario {
             Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
             Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
             Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
-            Self::CoalFire => "Feu de charbon (combustion à la surface des grains)",
+            Self::CoalFire => "Feu de charbon sur grille (braséro : percolation, flamme de CO)",
         }
     }
 }
@@ -171,24 +171,53 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             s.paint_mixture(move |x, y| if x > x0 && x < x1 && y < h { Some(packed.clone()) } else { None });
         }
         MpScenario::CoalFire => {
-            // tas de charbon tassé (α_max de grains, air dans les pores) au fond, allumé en surface (couche de braises à 1200 K) : un tas
-            // brûle par sa surface, là où l'air arrive (le modèle à une vitesse ne fait pas traverser un lit tassé par l'air) ; l'oxygène
-            // apporté par le tirage naturel (haut ouvert) brûle à la surface des grains (C + O2 → CO2), les fumées montent
+            // braséro : grille d'acier (trous 1 cm, 60 % ouverte) entre deux parois, chargée d'un lit de charbon en MORCEAUX (1.2 cm :
+            // le lit respire) de 0.25 ly, entièrement en braises (1450 K, feu établi de forge). L'air frais entre par le haut ouvert, descend le
+            // long des parois, passe sous la grille et traverse le lit par percolation (tirage naturel : le gaz chaud du lit est léger) ;
+            // il brûle à la surface des morceaux (C + ½O2 → CO surtout, C + O2 → CO2 ; zone d'oxydation au-dessus de la grille), le CO
+            // brûle dans les pores tant qu'il y reste de l'oxygène ; plus haut, sans oxygène, le CO2 est réduit en CO (Boudouard), qui
+            // brûle au-dessus des braises au contact de l'air (petite flamme bleue ; l'humidité de l'air, 1 %, catalyse son oxydation)
             let coal = need(roles.coal, "une phase granulaire combustible (charbon) et sa réaction de surface")?;
-            let air = mix(AIR_SEC)?;
+            let plate = need(roles.plate, "un solide (parois et grille du braséro)")?;
+            s.reg.phases[coal].grain_diameter = s.reg.phases[coal].grain_diameter.max(0.012);
+            let dry = mix(AIR_SEC)?;
+            let h2o = built_index(&s, H2O_G);
+            let mut air = dry.iter().map(|a| a * if h2o.is_some() { 0.99 } else { 1.0 }).collect::<Vec<f64>>();
+            if let Some(w) = h2o {
+                air[w] += 0.01;
+            }
+            s.ambient_mix = air.clone();
             let amax = s.reg.phases[coal].alpha_max;
             let mut bed = air.iter().map(|a| a * (1.0 - amax)).collect::<Vec<f64>>();
             bed[coal] = amax;
-            let (cx, w, h) = (0.5 * lx, 0.30 * lx, 0.22 * ly);
-            // tas trapézoïdal, flancs à ~30°
-            let pile = move |x: f64, y: f64| y < h && (x - cx).abs() < w - y / 30f64.to_radians().tan();
-            s.paint_mixture(move |x, y| Some(if pile(x, y) { bed.clone() } else { air.clone() }));
+            let wall = (0.025 * lx).max(dx);
+            let (x0, x1) = (0.3 * lx, 0.7 * lx);
+            let yg = 0.15 * ly;
+            let bed_h = 0.25;
+            let (yb0, yb1) = (yg + dx, yg + dx + bed_h * ly);
+            let ytop = yg + (0.3f64).max(bed_h + 0.1) * ly;
+            let grate = move |x: f64, y: f64| x > x0 && x < x1 && y >= yg && y < yg + dx;
+            let in_bed = move |x: f64, y: f64| x > x0 && x < x1 && y >= yb0 && y < yb1;
+            let walls = move |x: f64, y: f64| y >= yg && y < ytop && ((x > x0 - wall && x <= x0) || (x >= x1 && x < x1 + wall));
+            s.paint_mixture(move |x, y| Some(if in_bed(x, y) { bed.clone() } else { air.clone() }));
+            s.paint_solid(move |x, y| if walls(x, y) { Some(plate) } else { None });
             s.bc[3] = Bc::Open { p: P_ATM };
             s.dt_max = 2e-3;
-            // braises : couche extérieure du tas (≈ 2 mailles), sur le dessus et le haut des flancs
-            let skin = 2.5 * dx;
-            let ember = move |x: f64, y: f64| pile(x, y) && (!pile(x - skin, y + skin) || !pile(x + skin, y + skin)) && y > 0.3 * h;
-            t_fn = Box::new(move |x, y| if ember(x, y) { 1200.0 } else { 293.15 });
+            // feu établi : tout le lit est en braises
+            let ember = in_bed;
+            t_fn = Box::new(move |x, y| if ember(x, y) { 1450.0 } else { 293.15 });
+            s.finalize_init(&*t_fn);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (x, y) = s.center(i, j);
+                    if grate(x, y) {
+                        let c = s.idx(i, j);
+                        s.set_effect(c, Some(MpEffect::Grille { hole: 0.01, open: 0.6 }));
+                    }
+                }
+            }
+            s.refresh();
+            return Ok(s);
         }
         MpScenario::DamBreak => {
             let eau = need(roles.water, "un liquide")?;
@@ -742,6 +771,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                 Some(MpEffect::Sink { .. }) => put(c, [0xff, 0x00, 0x00]),
                 Some(MpEffect::Emitter { .. }) => put(c, [0x00, 0xff, 0x00]),
                 Some(MpEffect::Accelerator { .. }) => put(c, [0xff, 0x00, 0xff]),
+                Some(MpEffect::Grille { .. }) => put(c, [0x9a, 0x9a, 0xa0]),
                 Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     put(c, [0x00, 0x00, 0xff]);
                     if dest < nx * ny {
@@ -862,6 +892,7 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
             format!("émetteur {} à {temp:.1} K, v = ({vx:.2}, {vy:.2}) m/s", sim.reg.phases.get(phase).map_or("?", |p| p.name.as_str())),
         )),
         Some(MpEffect::Accelerator { ax, ay }) => v.push(("Cellule spéciale".into(), format!("accélérateur ({ax:.2}, {ay:.2}) m/s²"))),
+        Some(MpEffect::Grille { hole, open }) => v.push(("Cellule spéciale".into(), format!("grille, trous de {:.1} mm, {:.0} % ouverte", hole * 1e3, open * 100.0))),
         Some(MpEffect::Teleporter { dest, speed, radius }) => v.push((
             "Cellule spéciale".into(),
             format!("téléporteur → ({}, {}), rayon {radius}, {speed:.2} m/s", dest % sim.nx, dest / sim.nx),
@@ -929,6 +960,7 @@ pub enum EffectFile {
     Sink { rate: f64 },
     Emitter { vx: f64, vy: f64, phase: String, temp: f64 },
     Accelerator { ax: f64, ay: f64 },
+    Grille { hole: f64, open: f64 },
     Teleporter {
         dest: usize,
         speed: f64,
@@ -964,6 +996,7 @@ pub fn scene_to_json(sim: &MultiphaseSim) -> Result<String, String> {
             Some(MpEffect::Sink { rate }) => f.effects.push((c, EffectFile::Sink { rate })),
             Some(MpEffect::Emitter { vx, vy, phase, temp }) => f.effects.push((c, EffectFile::Emitter { vx, vy, phase: name(phase), temp })),
             Some(MpEffect::Accelerator { ax, ay }) => f.effects.push((c, EffectFile::Accelerator { ax, ay })),
+            Some(MpEffect::Grille { hole, open }) => f.effects.push((c, EffectFile::Grille { hole, open })),
             Some(MpEffect::Teleporter { dest, speed, radius }) => f.effects.push((c, EffectFile::Teleporter { dest, speed, radius })),
             None => {}
         }
@@ -1005,6 +1038,7 @@ pub fn scene_from_json(sim: &mut MultiphaseSim, json: &str) -> Result<Vec<String
         let eff = match e {
             EffectFile::Sink { rate } => Some(MpEffect::Sink { rate: *rate }),
             EffectFile::Accelerator { ax, ay } => Some(MpEffect::Accelerator { ax: *ax, ay: *ay }),
+            EffectFile::Grille { hole, open } => Some(MpEffect::Grille { hole: *hole, open: *open }),
             EffectFile::Teleporter { dest, speed, radius } => Some(MpEffect::Teleporter { dest: *dest, speed: *speed, radius: *radius }),
             EffectFile::Emitter { vx, vy, phase, temp } => match sim.reg.phases.iter().position(|p| &p.name == phase) {
                 Some(k) => Some(MpEffect::Emitter { vx: *vx, vy: *vy, phase: k, temp: *temp }),

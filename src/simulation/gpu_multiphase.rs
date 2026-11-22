@@ -21,11 +21,12 @@ use super::mp_step::P_GPU;
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Eos, Radiator, Thermal, MAX_PHASES, T_STD};
 
-const SHADERS: [&str; 10] = [
+const SHADERS: [&str; 11] = [
     include_str!("mp_gpu/common.wgsl"),
     include_str!("mp_gpu/flow.wgsl"),
     include_str!("mp_gpu/granular.wgsl"),
     include_str!("mp_gpu/friction.wgsl"),
+    include_str!("mp_gpu/percolation.wgsl"),
     include_str!("mp_gpu/mg.wgsl"),
     include_str!("mp_gpu/thermo.wgsl"),
     include_str!("mp_gpu/species.wgsl"),
@@ -102,6 +103,7 @@ const F_MACC: u32 = 1024;
 const F_GRAN: u32 = 2048;
 const F_IMPVISC: u32 = 4096;
 const F_FRIC: u32 = 8192;
+const F_PERC: u32 = 16384;
 
 const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
@@ -123,6 +125,13 @@ fn implicit_viscosity_needed(sim: &MultiphaseSim, _nx: usize) -> bool {
             let rho = p.rho(101325.0, p.t_ref).max(1e-3);
             100.0 * p.mu_ref > 0.2 * rho * sim.dx * sim.dx / sim.dt_max.max(1e-12)
         })
+}
+
+/// La scène peut-elle percoler (miroir de `darcy_faces`) : grilles, ou phases granulaires de grains d'au moins 1 mm
+fn percolation_possible(sim: &MultiphaseSim) -> bool {
+    sim.percolation
+        && (sim.special.iter().any(|s| matches!(s, Some(MpEffect::Grille { .. })))
+            || sim.reg.phases.iter().any(|p| p.is_granular() && p.grain_diameter >= 1e-3))
 }
 
 /// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
@@ -296,7 +305,7 @@ impl MultiphaseGpu {
 
         // ---------------------------------------------------------------- disposition de S
         let mut sl = Layout::default();
-        for name in ["solid", "pin_kind", "pin_phase", "pin_temp", "pin_tp"] {
+        for name in ["solid", "pin_kind", "pin_phase", "pin_temp", "pin_tp", "grl_d", "grl_e"] {
             sl.add(name, n);
         }
         sl.add("pfu_on", nfu);
@@ -314,6 +323,9 @@ impl MultiphaseGpu {
         sl.add("prel", n);
         sl.add("U", nfu);
         sl.add("V", nfv);
+        // flux de percolation (Darcy) de la dernière projection, transportés au pas suivant
+        sl.add("qu", nfu);
+        sl.add("qv", nfv);
         sl.add("temp", n);
         sl.add("alpha", np * n);
         for name in ["rho_mix", "mu_cell", "k_cell", "clamped", "flame", "heat_rel"] {
@@ -360,6 +372,16 @@ impl MultiphaseGpu {
         }
         for name in ["fr_mu", "fr_mv", "fr_ps", "fr_frac"] {
             sl.add(name, n);
+        }
+        // percolation : milieu poreux des cellules, pression de contact, conductances et termes moteurs des faces, transport
+        for name in ["dc_k", "dc_e", "dc_d", "dc_rf", "dc_mu", "dc_ps", "dc_ct", "pq_s", "pq_a"] {
+            sl.add(name, n);
+        }
+        for name in ["dcu", "ddu"] {
+            sl.add(name, nfu);
+        }
+        for name in ["dcv", "ddv"] {
+            sl.add(name, nfv);
         }
         sl.add("scale", np * n);
         sl.add("fl_vol", nf * np);
@@ -872,12 +894,17 @@ impl MultiphaseGpu {
         let o = |name: &str| self.sl.o(name);
         let (o_solid, o_pk, o_pp, o_pt, o_ptp) = (o("solid"), o("pin_kind"), o("pin_phase"), o("pin_temp"), o("pin_tp"));
         let (o_acc_on, o_ax, o_ay, o_thk, o_thv, o_ht, o_ovl) = (o("acc_on"), o("acc_x"), o("acc_y"), o("th_kind"), o("th_val"), o("heat_t"), o("ovl"));
+        let (o_grd, o_gre) = (o("grl_d"), o("grl_e"));
         self.has_accel = false;
         self.has_thermal = false;
         let mut ovl = vec![0u32; n];
         for c in 0..n {
             s[o_solid + c] = sim.solid[c] as f32;
             s[o_ptp + c] = -1.0;
+            if let Some(MpEffect::Grille { hole, open }) = sim.special[c] {
+                s[o_grd + c] = hole.max(1e-5) as f32;
+                s[o_gre + c] = open as f32;
+            }
             if let Some(pi) = pin[c] {
                 s[o_pk + c] = pi.kind as f32;
                 s[o_pp + c] = if pi.phase == sim.ambient_phase { -1.0 } else { pi.phase as f32 };
@@ -918,6 +945,7 @@ impl MultiphaseGpu {
                 Some(MpEffect::Sink { .. }) => ovl[c] = col(0xff, 0, 0) + 1,
                 Some(MpEffect::Emitter { .. }) => ovl[c] = col(0, 0xff, 0) + 1,
                 Some(MpEffect::Accelerator { .. }) => ovl[c] = col(0xff, 0, 0xff) + 1,
+                Some(MpEffect::Grille { .. }) => ovl[c] = col(0x9a, 0x9a, 0xa0) + 1,
                 Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     ovl[c] = col(0, 0, 0xff) + 1;
                     if dest < n {
@@ -985,10 +1013,13 @@ impl MultiphaseGpu {
             s[o_fl + c] = sim.flame_factor.get(c).copied().unwrap_or(1.0) as f32;
             s[o_hr + c] = sim.heat_release.get(c).copied().unwrap_or(0.0) as f32;
         }
+        let (o_qu, o_qv) = (o("qu"), o("qv"));
         for f in 0..nfu {
             s[o_u + f] = sim.u[f] as f32;
+            s[o_qu + f] = sim.q_u.get(f).copied().unwrap_or(0.0) as f32;
         }
         for f in 0..nfv {
+            s[o_qv + f] = sim.q_v.get(f).copied().unwrap_or(0.0) as f32;
             s[o_v + f] = sim.v[f] as f32;
         }
         for (slot, &d) in dests.iter().enumerate() {
@@ -1093,10 +1124,17 @@ impl MultiphaseGpu {
             sim.flame_factor[c] = data[o_fl + c] as f64;
             sim.heat_release[c] = data[o_hr + c] as f64;
         }
+        let (o_qu, o_qv) = (o("qu"), o("qv"));
+        if sim.q_u.len() != nfu || sim.q_v.len() != nfv {
+            sim.q_u = vec![0.0; nfu];
+            sim.q_v = vec![0.0; nfv];
+        }
         for f in 0..nfu {
             sim.u[f] = data[o_u + f] as f64;
+            sim.q_u[f] = data[o_qu + f] as f64;
         }
         for f in 0..nfv {
+            sim.q_v[f] = data[o_qv + f] as f64;
             sim.v[f] = data[o_v + f] as f64;
         }
         let o_tpm = o("tpmix");
@@ -1189,6 +1227,9 @@ impl MultiphaseGpu {
         }
         if sim.has_friction() {
             flags |= F_FRIC;
+        }
+        if percolation_possible(sim) {
+            flags |= F_PERC;
         }
         w[0] = self.nx as u32;
         w[1] = self.ny as u32;
@@ -1381,6 +1422,13 @@ impl MultiphaseGpu {
         if sim.conservative_momentum {
             v.push(face("k_mom"));
         }
+        // percolation : transport du fluide par les flux de Darcy de la dernière projection (miroir de percolate)
+        let perc = percolation_possible(sim);
+        if perc {
+            v.push(cell("k_perc_out"));
+            v.push(cell("k_perc_delta"));
+            v.push(cell("k_settle_apply"));
+        }
         if extras {
             if self.ntp > 0 {
                 v.push(one("k_tp_absorb"));
@@ -1494,6 +1542,13 @@ impl MultiphaseGpu {
             }
             v.push(Op { k: "k_fr_apply", wg: wuv, slot: 0 });
         }
+        // percolation : milieu poreux, pression de contact, conductances de Darcy (Ergun sur la pression du pas précédent)
+        if perc {
+            let vert = sim.gravity[1].abs() >= sim.gravity[0].abs();
+            v.push(cell("k_dc_cell"));
+            v.push(Op { k: "k_dc_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
+            v.push(face("k_dc_faces"));
+        }
         v.push(cell("k_save_p"));
         let last = self.levels.len() - 1;
         for _ in 0..self.newton_budget {
@@ -1524,6 +1579,9 @@ impl MultiphaseGpu {
             v.push(one("k_newton_check"));
         }
         v.push(face("k_face_final"));
+        if perc {
+            v.push(face("k_dc_final"));
+        }
         v.push(cell("k_pressure_work"));
         v.push(cell("k_fill_cav"));
         v.push(cell("k_refresh"));

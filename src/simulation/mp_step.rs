@@ -62,6 +62,7 @@ impl StepProfile {
 
 struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
+    q_u: Vec<f64>, q_v: Vec<f64>,
     eg: Vec<Vec<f64>>, tg: Vec<Vec<f64>>,
     rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
@@ -83,12 +84,10 @@ impl MultiphaseSim {
             dt = dt.min((self.heat_tau * 20.0 / gap).max(1e-6));
         }
         dt = dt.min(self.cfl * dx / umax.max(1e-9));
-        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas
-        if self.has_granular() {
-            let w = self.max_settling_speed();
-            if w > 0.0 {
-                dt = dt.min(0.5 * dx / w);
-            }
+        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas ; percolation : |q| dt ≤ 0.4 du fluide amont
+        let w = if self.has_granular() { self.max_settling_speed() } else { 0.0 }.max(self.max_darcy_speed());
+        if w > 0.0 {
+            dt = dt.min(0.5 * dx / w);
         }
         // flamme présente (facteur d'épaississement du pas précédent) : borne de pas propre aux flammes
         if self.flames_active() && self.flame_factor.iter().any(|&f| f > 1.0) {
@@ -167,6 +166,7 @@ impl MultiphaseSim {
             mass: self.mass.clone(), alpha: self.alpha.clone(), e: self.e.clone(), temp: self.temp.clone(), p: self.p.clone(),
             eg: self.eg.clone(), tg: self.tg.clone(),
             u: self.u.clone(), v: self.v.clone(), rho_mix: self.rho_mix.clone(), mu_cell: self.mu_cell.clone(), k_cell: self.k_cell.clone(),
+            q_u: self.q_u.clone(), q_v: self.q_v.clone(),
             boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(),
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
             flame_factor: self.flame_factor.clone(), heat_release: self.heat_release.clone(), chem_heat: self.chem_heat,
@@ -181,6 +181,7 @@ impl MultiphaseSim {
         self.mass.clone_from(&s.mass); self.alpha.clone_from(&s.alpha); self.e.clone_from(&s.e); self.temp.clone_from(&s.temp);
         self.eg.clone_from(&s.eg); self.tg.clone_from(&s.tg);
         self.p.clone_from(&s.p); self.u.clone_from(&s.u); self.v.clone_from(&s.v); self.rho_mix.clone_from(&s.rho_mix);
+        self.q_u.clone_from(&s.q_u); self.q_v.clone_from(&s.q_v);
         self.mu_cell.clone_from(&s.mu_cell); self.k_cell.clone_from(&s.k_cell);
         self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred);
         self.energy_input = s.energy_input; self.tp_mix.clone_from(&s.tp_mix);
@@ -311,6 +312,8 @@ impl MultiphaseSim {
             us = a;
             vs = b;
         }
+        // percolation : le fluide traverse les lits tassés et les grilles avec les flux de Darcy de la dernière projection
+        self.percolate(dt);
         // sources / puits : composition absorbée par les téléporteurs, puis remise à zéro des cellules épinglées
         if self.has_extras() {
             self.absorb_teleporters();

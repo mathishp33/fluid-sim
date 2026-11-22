@@ -297,36 +297,46 @@ fn coal_dust(t: f64, a0: f64, d: f64) -> (MultiphaseSim, usize, usize, usize) {
 }
 
 /// vitesse initiale (mol/(m³·s)) de C + O2 → CO2 mesurée sur un appel de la chimie, et celle de la loi de surface
-fn coal_rates(t: f64, d: f64) -> (f64, f64) {
+/// vitesse initiale de consommation du carbone (mol/(m³·s)) et rapport CO/CO2 produits, mesurés sur un appel de la chimie, et ceux de
+/// la loi : C + ½O2 → CO (k_CO, Field) et C + O2 → CO2 (k_CO / R, R = 2500 e^(−6240/T)), oxygène partagé D / (K_O2 + D)
+fn coal_rates(t: f64, d: f64) -> (f64, f64, f64, f64) {
     let (mut s, c, o2, co2) = coal_dust(t, 1e-5, d);
+    let co = idx(&s.reg, CO);
     let q = s.idx(1, 1);
-    let r = s.reg.reactions.iter().find(|r| r.name == super::mp_materials::RX_COAL).unwrap().clone();
+    let rx_of = |n: &str| s.reg.reactions.iter().find(|r| r.name == n).unwrap().clone();
+    let (r_co, r_co2) = (rx_of(super::mp_materials::RX_COAL_CO), rx_of(super::mp_materials::RX_COAL));
     let (tc, p) = (s.tg[s.group_of[o2]][q], s.p[q]);
-    let a_s = s.alpha[c][q];
-    let sv = 6.0 * a_s / d;
-    let ks = r.k_forward(tc);
-    let kd = 2.0 * s.reg.phases[o2].diffusivity_at(tc, p) / d;
+    let sv = 6.0 * s.alpha[c][q] / d;
     let c_o2 = s.mass[o2][q] / s.reg.phases[o2].molar_mass;
-    let expect = sv * c_o2 / (1.0 / ks + 1.0 / kd);
-    let m0 = s.mass[co2][q];
+    let (k_co, k_co2) = (r_co.k_forward(tc), r_co2.k_forward(tc));
+    let kd = 2.0 * s.reg.phases[o2].diffusivity_at(tc, p) / d;
+    let (rk_co, rk_co2) = (sv * k_co * c_o2, sv * k_co2 * c_o2);
+    let d_sup = sv * kd * c_o2;
+    let lam = d_sup / (0.5 * rk_co + rk_co2 + d_sup);
+    let expect = (rk_co + rk_co2) * lam;
+    let (mc0, mco0, mco20) = (s.mass[c][q], s.mass[co][q], s.mass[co2][q]);
     let dt = 1e-4;
     s.react_step(dt);
-    let got = (s.mass[co2][q] - m0) / s.reg.phases[co2].molar_mass / dt;
-    (got, expect)
+    let got = (mc0 - s.mass[c][q]) / 0.012011 / dt;
+    let n_co = (s.mass[co][q] - mco0) / s.reg.phases[co].molar_mass;
+    let n_co2 = (s.mass[co2][q] - mco20) / s.reg.phases[co2].molar_mass;
+    (got, expect, n_co / n_co2.max(1e-300), 2500.0 * (-6240.0 / tc).exp())
 }
 
 #[test]
 fn coal_burns_at_the_grain_surface_kinetic_then_diffusion_limited() {
-    // 1000 K : régime cinétique (k_s ≈ 0.01 m/s ≪ k_d ≈ 1 m/s), vitesse ∝ 1/d ; 1800 K : régime diffusionnel (k_s ≫ k_d), ∝ 1/d²
+    // 1000 K : régime cinétique (k_s ≈ 0.01 m/s ≪ k_d ≈ 1 m/s), vitesse ∝ 1/d ; 1800 K : régime diffusionnel (k_s ≫ k_d), ∝ 1/d² ;
+    // produits : CO/CO2 = 2500 e^(−6240/T) (Arthur 1951)
     for (t, ratio) in [(1000.0, 2.0), (1800.0, 4.0)] {
-        let (g1, e1) = coal_rates(t, 3e-4);
-        let (g2, e2) = coal_rates(t, 1.5e-4);
-        eprintln!("T = {t} K : d = 0.3 mm {g1:.4e} (loi {e1:.4e}) ; d = 0.15 mm {g2:.4e} (loi {e2:.4e}) ; rapport {:.2}", g2 / g1);
+        let (g1, e1, co1, cox) = coal_rates(t, 3e-4);
+        let (g2, e2, _, _) = coal_rates(t, 1.5e-4);
+        eprintln!("T = {t} K : d = 0.3 mm {g1:.4e} (loi {e1:.4e}) ; d = 0.15 mm {g2:.4e} (loi {e2:.4e}) ; rapport {:.2} ; CO/CO2 {co1:.3} (loi {cox:.3})", g2 / g1);
         assert!((g1 / e1 - 1.0).abs() < 0.02 && (g2 / e2 - 1.0).abs() < 0.02, "vitesse de surface : {g1} vs {e1}, {g2} vs {e2}");
         assert!((g2 / g1 / ratio - 1.0).abs() < 0.12, "effet du diamètre à {t} K : {} (attendu ≈ {ratio})", g2 / g1);
+        assert!((co1 / cox - 1.0).abs() < 0.01, "CO/CO2 {co1} (loi {cox})");
     }
     // froid : rien ne brûle
-    let (g, _) = coal_rates(300.0, 3e-4);
+    let (g, _, _, _) = coal_rates(300.0, 3e-4);
     assert!(g < 1e-20, "le charbon ne brûle pas à 300 K : {g}");
 }
 
@@ -335,8 +345,9 @@ fn a_coal_fire_keeps_burning_and_conserves_carbon() {
     let lib = MaterialLibrary::default();
     let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
     let k = |n: &str| idx(&s.reg, n);
-    let (c, co2, o2) = (k(super::mp_materials::COAL), k(CO2), k(O2));
-    let carbon = |s: &MultiphaseSim| s.total_mass(c) / 0.012011 + (s.total_mass(co2) - s.boundary_flux[co2]) / s.reg.phases[co2].molar_mass;
+    let (c, co2, o2, co) = (k(super::mp_materials::COAL), k(CO2), k(O2), k(CO));
+    let gas_c = |s: &MultiphaseSim, q: usize| (s.total_mass(q) - s.boundary_flux[q]) / s.reg.phases[q].molar_mass;
+    let carbon = |s: &MultiphaseSim| s.total_mass(c) / 0.012011 + gas_c(s, co2) + gas_c(s, co);
     let (m_c0, n_c0) = (s.total_mass(c), carbon(&s));
     let t_start = std::time::Instant::now();
     let mut t_hot = vec![];
@@ -351,10 +362,72 @@ fn a_coal_fire_keeps_burning_and_conserves_carbon() {
     assert!(!s.diverged && s.state_is_sane());
     let burnt = m_c0 - s.total_mass(c);
     let tmax = t_hot.last().map_or(0.0, |x| x.1);
-    eprintln!("feu de charbon : {} pas en {:.1} s ; charbon brûlé {:.3e} kg/m ({:.2} %), CO2 {:.3e} kg/m, O2 {:.3e} ; T max des braises {:?}",
-        s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(o2),
+    eprintln!("feu de charbon : {} pas en {:.1} s ; charbon brûlé {:.3e} kg/m ({:.2} %), CO2 {:.3e} kg/m, CO {:.3e}, O2 {:.3e} ; T max des braises {:?}",
+        s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(co), s.total_mass(o2),
         t_hot.iter().map(|(t, x)| format!("{t:.1}s:{x:.0}K")).collect::<Vec<_>>());
     assert!(burnt > 1e-5 * m_c0, "le charbon n'a pas brûlé");
     assert!(tmax > 1000.0, "le feu s'est éteint : braises à {tmax} K");
-    assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + CO2 + sorties) : {} → {}", n_c0, carbon(&s));
+    // tirage naturel : l'air monte à travers la grille (percolation)
+    let gj = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
+    let draft: f64 = (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
+    eprintln!("tirage à travers la grille : {draft:.4} m²/s");
+    assert!(draft > 1e-3, "pas de tirage à travers la grille : {draft}");
+    assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + CO + CO2 + sorties) : {} → {}", n_c0, carbon(&s));
+}
+
+/// diagnostic : braséro, débits de percolation à travers la grille et le lit, températures, oxygène (MP_COAL_T s, défaut 1)
+#[test]
+#[ignore]
+fn coal_brasero_diag() {
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
+    let k = |n: &str| idx(&s.reg, n);
+    let (c, o2) = (k(super::mp_materials::COAL), k(O2));
+    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f64);
+    let grate_j = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
+    let column = |s: &MultiphaseSim, tag: &str| {
+        let ps = s.grain_overburden();
+        let i = s.nx / 2;
+        let p0 = s.p[s.idx(i, grate_j + 8)];
+        eprintln!("-- {tag} : colonne centrale (j, p − p(j+8), p_s, p − p_s − p(j+8), ρ_f, T)");
+        for j in (grate_j.saturating_sub(3)..grate_j + 9).rev() {
+            let q = s.idx(i, j);
+            let rf: f64 = (0..s.reg.phases.len()).filter(|&k| !s.reg.phases[k].is_granular()).map(|k| s.mass[k][q]).sum::<f64>()
+                / (0..s.reg.phases.len()).filter(|&k| !s.reg.phases[k].is_granular()).map(|k| s.alpha[k][q]).sum::<f64>().max(1e-12);
+            eprintln!("   j {j:2} {}{:9.3} {:9.3} {:9.3} {:6.3} {:6.0}", if s.is_grille(q) { "G " } else { "  " }, s.p[q] - p0, ps[q], s.p[q] - ps[q] - p0, rf, s.temp[q]);
+        }
+    };
+    column(&s, "départ");
+    let mut shown = false;
+    let names: Vec<String> = s.reg.reactions.iter().map(|r| r.name.clone()).collect();
+    let (co, co2) = (k(CO), k(CO2));
+    while s.time < t_end && !s.diverged {
+        if s.step_count % 300 == 0 && s.step_count > 0 {
+            let reacted: Vec<String> = names.iter().zip(&s.reacted).map(|(n, x)| format!("{}: {:.3e}", n.chars().take(18).collect::<String>(), x)).collect();
+            let tgas = (0..s.nx * s.ny).filter(|&q| !s.is_solid(q) && s.mass[c][q] < 1e-3).map(|q| s.temp[q]).fold(0.0f64, f64::max);
+            // CO au-dessus du lit (fraction molaire max hors du lit)
+            let xco = (0..s.nx * s.ny).filter(|&q| !s.is_solid(q) && s.mass[c][q] < 1e-3).map(|q| s.alpha[co][q]).fold(0.0f64, f64::max);
+            eprintln!("   fraction de CO max hors du lit {xco:.4}");
+            eprintln!("   CO {:.3e} CO2 {:.3e} kg/m (sorties CO {:.3e} CO2 {:.3e}) ; T max du gaz hors du lit {tgas:.0} K ; avancements {:?}",
+                s.total_mass(co), s.total_mass(co2), -s.boundary_flux[co], -s.boundary_flux[co2], reacted);
+        }
+        if !shown && s.step_count == 50 {
+            column(&s, "pas 50");
+            shown = true;
+        }
+        s.step();
+        if s.step_count % 150 == 0 {
+            let (nx, ny) = (s.nx, s.ny);
+            let row_q = |j: usize| (0..nx).filter(|&i| s.is_grille(s.idx(i, grate_j))).map(|i| s.q_v[j * nx + i]).sum::<f64>();
+            let tmax = (0..nx * ny).filter(|&q| !s.is_solid(q)).map(|q| s.temp[q]).fold(0.0f64, f64::max);
+            let bed_o2: Vec<String> = (grate_j + 1..grate_j + 6).map(|j| {
+                let q = s.idx(nx / 2, j);
+                format!("{:.3}", s.alpha[o2][q] / (1.0 - s.alpha[c][q]).max(1e-9))
+            }).collect();
+            let tb: Vec<String> = (grate_j + 1..grate_j + 7).map(|j| format!("{:.0}", s.tg[s.group_of[c]][s.idx(nx / 2, j)])).collect();
+            let top_j = (grate_j + 1..ny).find(|&j| s.alpha[c][s.idx(nx / 2, j)] < 0.3).unwrap_or(ny - 1);
+            eprintln!("t {:.2} dt {:.1e} : Σq grille→lit {:.4} ; dessus du lit {:.4} m²/s ; T max {tmax:.0} K ; O2 pores {:?} ; T grains {:?} ; |u|max {:.2} ; brûlé {:.3e}",
+                s.time, s.last_dt, row_q(grate_j + 1) * s.dx, row_q(top_j) * s.dx, bed_o2, tb, s.max_speed(), s.reacted.iter().sum::<f64>());
+        }
+    }
 }

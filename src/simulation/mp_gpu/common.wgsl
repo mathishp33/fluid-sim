@@ -38,6 +38,7 @@ const F_MACC: u32 = 1024u;   // MacCormack (advection semi-lagrangienne)
 const F_GRAN: u32 = 2048u;   // au moins une phase granulaire (granular.wgsl)
 const F_IMPVISC: u32 = 4096u; // viscosité implicite au-delà de la borne explicite (friction.wgsl)
 const F_FRIC: u32 = 8192u;   // frottement des grains (friction.wgsl)
+const F_PERC: u32 = 16384u;  // percolation : lits de grains tassés de 1 mm et plus, grilles (percolation.wgsl)
 
 // paramètres par lancement (décalage dynamique, groupe 1)
 struct Disp { a: u32, b: u32, c: u32, d: u32 };

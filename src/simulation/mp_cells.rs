@@ -32,16 +32,20 @@ pub enum MpEffect {
     /// `radius` mailles (0 = la seule cellule `dest`), avec le même débit volumique. Toutes les sources qui visent la même `dest`
     /// forment un groupe : leurs débits s'additionnent et leurs fluides se mélangent (rayon du groupe : le plus grand).
     Teleporter { dest: usize, speed: f64, radius: usize },
+    /// grille : arrête les grains (un tas y repose, comme sur un solide) et laisse passer le fluide par percolation (trous de `hole` m,
+    /// fraction ouverte `open` ; loi d'Ergun, voir mp_percolation.rs). Ses faces sont fermées à l'écoulement du mélange.
+    Grille { hole: f64, open: f64 },
 }
 
 impl MpEffect {
-    pub const KINDS: [&'static str; 4] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur"];
+    pub const KINDS: [&'static str; 5] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille"];
     pub fn kind_name(&self) -> &'static str {
         match self {
             MpEffect::Sink { .. } => "Puits",
             MpEffect::Emitter { .. } => "Émetteur",
             MpEffect::Accelerator { .. } => "Accélérateur",
             MpEffect::Teleporter { .. } => "Téléporteur",
+            MpEffect::Grille { .. } => "Grille",
         }
     }
 }
@@ -230,6 +234,8 @@ impl MultiphaseSim {
                     pin[c] = Some(PinInfo { kind: 2, phase: phase.min(self.reg.phases.len() - 1), temp, tp_dest: None });
                     fx.fix_nozzle(i, j, vx, vy);
                 }
+                // grille : faces fermées au mélange (le fluide passe par percolation, les grains ne passent pas)
+                Some(MpEffect::Grille { .. }) => fx.fix_faces(i, j, 0.0),
                 Some(MpEffect::Teleporter { dest, speed, radius }) if self.tp_dest_ok(c, dest) => {
                     pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
                     match tp_groups.iter_mut().find(|g| g.0 == dest) {

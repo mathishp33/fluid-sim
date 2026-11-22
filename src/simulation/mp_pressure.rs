@@ -204,10 +204,14 @@ impl MultiphaseSim {
         }
     }
 
-    fn build_stencil(&self, kappa: &[f64], dt: f64) -> Stencil {
+    /// matrice de la correction de pression ; `darcy` : conductances de percolation (C/dx² ajouté au couplage des faces des milieux
+    /// poreux, y compris des faces fermées au mélange — grilles)
+    fn build_stencil(&self, kappa: &[f64], dt: f64, darcy: Option<&super::mp_percolation::DarcyFaces>) -> Stencil {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let n = nx * ny;
         let mut s = Stencil { diag: vec![1.0; n], ae: vec![0.0; n], an: vec![0.0; n] };
+        let dcu = |f: usize| darcy.map_or(0.0, |d| d.cu[f] / (dx * dx));
+        let dcv = |f: usize| darcy.map_or(0.0, |d| d.cv[f] / (dx * dx));
         for j in 0..ny {
             for i in 0..nx {
                 let c = j * nx + i;
@@ -218,12 +222,16 @@ impl MultiphaseSim {
                 // est
                 if i + 1 < nx {
                     let k = self.link(c, c + 1, self.face_u_fixed(self.uidx(i + 1, j)));
+                    let td = dcu(self.uidx(i + 1, j));
                     if k > 0 {
-                        let t = dt / (self.face_rho_x(i + 1, j) * dx * dx);
+                        let t = dt / (self.face_rho_x(i + 1, j) * dx * dx) + td;
                         if k == 1 {
                             s.ae[c] = t;
                         }
                         d += t;
+                    } else if td > 0.0 {
+                        s.ae[c] = td;
+                        d += td;
                     }
                 } else if let Bc::Open { .. } = self.bc[1] {
                     d += 2.0 * dt / (self.rho_mix[c] * dx * dx);
@@ -233,18 +241,23 @@ impl MultiphaseSim {
                     if self.link(c - 1, c, self.face_u_fixed(self.uidx(i, j))) > 0 {
                         d += dt / (self.face_rho_x(i, j) * dx * dx);
                     }
+                    d += dcu(self.uidx(i, j));
                 } else if let Bc::Open { .. } = self.bc[0] {
                     d += 2.0 * dt / (self.rho_mix[c] * dx * dx);
                 }
                 // nord
                 if j + 1 < ny {
                     let k = self.link(c, c + nx, self.face_v_fixed(self.vidx(i, j + 1)));
+                    let td = dcv(self.vidx(i, j + 1));
                     if k > 0 {
-                        let t = dt / (self.face_rho_y(i, j + 1) * dx * dx);
+                        let t = dt / (self.face_rho_y(i, j + 1) * dx * dx) + td;
                         if k == 1 {
                             s.an[c] = t;
                         }
                         d += t;
+                    } else if td > 0.0 {
+                        s.an[c] = td;
+                        d += td;
                     }
                 } else if let Bc::Open { .. } = self.bc[3] {
                     d += 2.0 * dt / (self.rho_mix[c] * dx * dx);
@@ -254,6 +267,7 @@ impl MultiphaseSim {
                     if self.link(c - nx, c, self.face_v_fixed(self.vidx(i, j))) > 0 {
                         d += dt / (self.face_rho_y(i, j) * dx * dx);
                     }
+                    d += dcv(self.vidx(i, j));
                 } else if let Bc::Open { .. } = self.bc[2] {
                     d += 2.0 * dt / (self.rho_mix[c] * dx * dx);
                 }
@@ -475,6 +489,9 @@ impl MultiphaseSim {
         let mut clamped = vec![false; n];
         let mut tkv = t_star.clone();
         let mut newton = 0;
+        // percolation : conductances de Darcy (Ergun évalué sur p du pas précédent) ; divergence du flux de Darcy qui a servi à ce pas
+        let darcy = self.darcy_faces();
+        let (q_old_u, q_old_v) = (self.q_u.clone(), self.q_v.clone());
         let (mut tc, mut ga, mut ks) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
         for _newton in 0..4 {
             newton += 1;
@@ -495,8 +512,9 @@ impl MultiphaseSim {
                 vol[c] = v;
                 kappa[c] = kap.max(1e-30);
             }
-            let st = self.build_stencil(&kappa, dt);
+            let st = self.build_stencil(&kappa, dt, darcy.as_ref());
             let (ut, vt) = self.face_velocities(us, vs, &pk, dt);
+            let qt = darcy.as_ref().map(|df| self.darcy_flux(df, &pk));
             let mut b = vec![0.0; n];
             for j in 0..ny {
                 for i in 0..nx {
@@ -504,8 +522,14 @@ impl MultiphaseSim {
                     if self.is_solid(c) || self.pinned(c) {
                         continue;
                     }
-                    let d_new = self.divergence_of(&ut, &vt, i, j);
-                    let d_old = self.divergence_of(un, vn, i, j);
+                    let mut d_new = self.divergence_of(&ut, &vt, i, j);
+                    let mut d_old = self.divergence_of(un, vn, i, j);
+                    if let Some((qu, qv)) = &qt {
+                        d_new += self.divergence_of(qu, qv, i, j);
+                    }
+                    if self.percolation {
+                        d_old += self.divergence_of(&q_old_u, &q_old_v, i, j);
+                    }
                     // erreur qui restera APRÈS l'advection de ce pas (u^n, dont la divergence est la correction décidée au pas
                     // précédent) : corriger err0 lui-même recorrigeait cette part déjà en route — e_{n+2} = e_{n+1} − e_n, oscillateur
                     // neutre de période 6 pas (barrage : ε jusqu'à 45 % dans l'eau pure, pression de 1.9 kPa à 93 bar, vapeur à
@@ -549,6 +573,16 @@ impl MultiphaseSim {
         let (uf, vf) = self.face_velocities(us, vs, &pk, dt);
         self.u = uf;
         self.v = vf;
+        // flux de Darcy de la pression finale : transportés au pas suivant (`percolate`)
+        match &darcy {
+            Some(df) => (self.q_u, self.q_v) = self.darcy_flux(df, &pk),
+            None => {
+                if self.q_u.iter().chain(self.q_v.iter()).any(|&q| q != 0.0) {
+                    self.q_u.iter_mut().for_each(|q| *q = 0.0);
+                    self.q_v.iter_mut().for_each(|q| *q = 0.0);
+                }
+            }
+        }
         self.p = pk;
         total_it
     }

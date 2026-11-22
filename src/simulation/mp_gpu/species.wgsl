@@ -196,14 +196,18 @@ fn cc_sensor_rate(j: u32, t: f32) -> f32 {
     if (r.x <= 0.0) { return 0.0; }
     return max(r.x - r.y, 0.0) * clamp(1.0 - r.y / r.x, 0.0, 1.0);
 }
-// réaction de surface (miroir de CellChem::surface_rate) : S_v k_s Π c^o (réactifs non granulaires), limitée par la diffusion de
-// l'oxydant jusqu'aux grains (somme harmonique avec S_v k_d C_ox, k_d = Sh D_ox / d, Sh = 2)
-fn cc_surface_rate(j: u32, t: f32) -> f32 {
-    let s = u32(rxv(j, 49u)); let d = rxv(j, 50u); let ox = rxv(j, 51u);
+// surface des grains d'une réaction de surface (m²/m³) : 6 α_s / d
+fn cc_surface_area(j: u32, t: f32) -> f32 {
+    let s = u32(rxv(j, 49u));
     let ms = chm(s);
-    if (ms <= 0.0 || rxv(j, 5u) < -1e29) { return 0.0; }
-    let pr = S[O_prel + cc_c];
-    let sv = 6.0 * ms / rho_k(s, pr, t) / d;
+    if (ms <= 0.0) { return 0.0; }
+    return 6.0 * ms / rho_k(s, S[O_prel + cc_c], t) / rxv(j, 50u);
+}
+// vitesse cinétique d'une réaction de surface (miroir de CellChem::surface_kinetic) : S_v k_s Π c^o (réactifs non granulaires)
+fn cc_surface_kin(j: u32, t: f32) -> f32 {
+    let s = u32(rxv(j, 49u));
+    let sv = cc_surface_area(j, t);
+    if (sv <= 0.0 || rxv(j, 5u) < -1e29) { return 0.0; }
     var lrk = ln_kf(j, t) + log(sv);
     var zero = false;
     for (var i = 0u; i < rx_nm(j); i++) {
@@ -223,11 +227,31 @@ fn cc_surface_rate(j: u32, t: f32) -> f32 {
         }
     }
     if (zero) { return 0.0; }
-    let rk = exp(min(lrk, 80.0));
+    return exp(min(lrk, 80.0));
+}
+// coefficient de l'oxydant `ox` parmi les réactifs de la réaction j (1 s'il n'y figure pas)
+fn rx_nu_of(j: u32, ox: u32) -> f32 {
+    var nu = 1.0;
+    for (var i = 0u; i < rx_nr(j); i++) { nu = select(nu, rx_rnu(j, i), rx_rs(j, i) == ox); }
+    return nu;
+}
+// vitesse d'une réaction de surface (miroir de CellChem::surface_rate) : cinétique, limitée par l'apport d'oxydant S_v k_d C_ox (k_d =
+// Sh D_ox / d, Sh = 2) partagé entre les réactions de surface du même couple (grain, oxydant)
+fn cc_surface_rate(j: u32, t: f32) -> f32 {
+    let rk = cc_surface_kin(j, t);
+    let ox = rxv(j, 51u);
     if (ox < 0.0) { return rk; }
+    if (rk <= 0.0) { return 0.0; }
     let oi = u32(ox);
-    let rd = sv * 2.0 * diff_at(oi, t, pr + P.p0) / d * cc_conc(oi);
-    return select(0.0, rk * rd / (rk + rd), rk + rd > 0.0);
+    let s = rxv(j, 49u);
+    var k_ox = 0.0;
+    for (var i = 0u; i < P.nre; i++) {
+        let same = rxv(i, 48u) > 0.5 && rxv(i, 49u) == s && rxv(i, 51u) == ox;
+        let ki = select(cc_surface_kin(i, t), rk, i == j);
+        k_ox += select(0.0, rx_nu_of(i, oi) * ki, same);
+    }
+    let d_sup = cc_surface_area(j, t) * 2.0 * diff_at(oi, t, S[O_prel + cc_c] + P.p0) / rxv(j, 50u) * cc_conc(oi);
+    return select(0.0, rk * d_sup / (k_ox + d_sup), k_ox + d_sup > 0.0);
 }
 // (débit direct, débit inverse) (miroir de CellChem::rate_parts)
 fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
@@ -534,11 +558,18 @@ fn k_chem(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation
             dt_cell = 0.5 * P.chem_vol_lim * span / dv;
         }
         // groupes réactifs : nouvelles masses, énergie relative du sous-système répartie (un seul groupe : tout ; plusieurs :
-        // température commune tn, le dernier reçoit le reste exact)
+        // température commune tn, le groupe de plus grande capacité reçoit le reste exact — miroir du CPU : une trace qui le recevait
+        // prenait l'arrondi f32 de toute l'énergie du sous-système)
         for (var k = 0u; k < P.np; k++) { if (reactive_k(k)) { S[O_mass + k * n + c] = chm(k); } }
         // (sélections, sans « continue » : lavapipe)
-        var last = 9999u;
-        for (var gq = 0u; gq < P.ng; gq++) { last = select(last, gq, reactive_k(gmember(gq, 0u)) && group_mass(gq, c) > 0.0); }
+        var last = 9999u; var cmax = -1.0;
+        for (var gq = 0u; gq < P.ng; gq++) {
+            let ok = reactive_k(gmember(gq, 0u)) && group_mass(gq, c) > 0.0;
+            let cg = group_cap_at(gq, c, tn);
+            let better = ok && cg > cmax;
+            last = select(last, gq, better);
+            cmax = select(cmax, cg, better);
+        }
         var acc = 0.0;
         for (var gq = 0u; gq < P.ng; gq++) {
             let r = reactive_k(gmember(gq, 0u));

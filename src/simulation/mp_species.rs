@@ -142,16 +142,19 @@ impl CellChem<'_> {
         }
         (rf, ln_rr.min(700.0).exp())
     }
-    /// vitesse d'une réaction de surface (voir `phases::Reaction`) : S_v · k_s · Π c^o (réactifs non granulaires), limitée par la
-    /// diffusion de l'oxydant jusqu'aux grains (somme harmonique avec S_v · k_d · C_ox)
-    fn surface_rate(&self, j: usize, sr: SurfaceRx, t: f64) -> f64 {
+    /// surface des grains de la réaction de surface (m²/m³ de cellule) : 6 α_s / d
+    fn surface_area(&self, sr: SurfaceRx, t: f64) -> f64 {
+        let ms = self.m[sr.solid];
+        if ms <= 0.0 { 0.0 } else { 6.0 * ms / self.phases[sr.solid].rho(self.p, t) / sr.d }
+    }
+    /// vitesse CINÉTIQUE d'une réaction de surface : S_v · k_s · Π c^o (réactifs non granulaires) · modulateurs
+    fn surface_kinetic(&self, j: usize, sr: SurfaceRx, t: f64) -> f64 {
         let r = &self.rx[j];
         let ks = r.k_forward(t);
-        let ms = self.m[sr.solid];
-        if ks <= 0.0 || ms <= 0.0 {
+        let sv = self.surface_area(sr, t);
+        if ks <= 0.0 || sv <= 0.0 {
             return 0.0;
         }
-        let sv = 6.0 * ms / self.phases[sr.solid].rho(self.p, t) / sr.d;
         let mut rk = sv * ks;
         for &(s, o) in &r.modifiers {
             let c = self.conc(s);
@@ -165,13 +168,29 @@ impl CellChem<'_> {
             let c = self.conc(s);
             rk *= if c <= 0.0 { 0.0 } else if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { 1.0 } else { c.powf(o) };
         }
-        match sr.ox {
-            Some(ox) => {
-                let rd = sv * SHERWOOD * self.phases[ox].diffusivity_at(t, self.p) / sr.d * self.conc(ox);
-                if rk + rd > 0.0 { rk * rd / (rk + rd) } else { 0.0 }
-            }
-            None => rk,
+        rk
+    }
+    /// vitesse d'une réaction de surface (voir `phases::Reaction`) : la cinétique, limitée par l'apport d'oxydant jusqu'aux grains
+    /// S_v · k_d · C_ox, PARTAGÉ entre toutes les réactions de surface du même couple (grain, oxydant) — C + ½O2 → CO et C + O2 → CO2
+    /// puisent dans le même flux d'oxygène : consommation d'oxydant K = Σ ν_ox r_cin, facteur commun D / (K + D) (pour une seule
+    /// réaction d'ordre 1 : somme harmonique 1/(1/k_s + 1/k_d))
+    fn surface_rate(&self, j: usize, sr: SurfaceRx, t: f64) -> f64 {
+        let rk = self.surface_kinetic(j, sr, t);
+        let Some(ox) = sr.ox else { return rk };
+        if rk <= 0.0 {
+            return 0.0;
         }
+        let nu_ox = |i: usize| self.rx[i].reactants.iter().find(|&&(k, _)| k == ox).map_or(1.0, |&(_, nu)| nu);
+        let mut k_ox = 0.0;
+        for (i, s2) in self.surf.iter().enumerate() {
+            if let Some(s2) = *s2 {
+                if s2.solid == sr.solid && s2.ox == Some(ox) {
+                    k_ox += nu_ox(i) * if i == j { rk } else { self.surface_kinetic(i, s2, t) };
+                }
+            }
+        }
+        let d_sup = self.surface_area(sr, t) * SHERWOOD * self.phases[ox].diffusivity_at(t, self.p) / sr.d * self.conc(ox);
+        if k_ox + d_sup > 0.0 { rk * d_sup / (k_ox + d_sup) } else { 0.0 }
     }
     /// avancement maximal (mol/m³) dans le sens direct (> 0) et inverse (< 0) permis par les masses disponibles
     fn bounds(&self, j: usize) -> (f64, f64) {
@@ -524,13 +543,15 @@ impl MultiphaseSim {
                     self.eg[g][c] = 0.0;
                 }
             }
-            if let Some((&last, rest)) = rg.split_last() {
+            // le reste exact va au groupe de plus grande capacité calorifique (une trace — grain de charbon dans le gaz — qui le recevait
+            // prenait l'arrondi de toute l'énergie du sous-système : 7000 K sur le GPU f32)
+            if let Some(&main) = rg.iter().max_by(|&&a, &&b| self.group_cap_at(a, c, o.temp).total_cmp(&self.group_cap_at(b, c, o.temp))) {
                 let mut acc = 0.0;
-                for &g in rest {
+                for &g in rg.iter().filter(|&&g| g != main) {
                     self.eg[g][c] = self.group_energy_at(g, c, o.temp);
                     acc += self.eg[g][c];
                 }
-                self.eg[last][c] = e_r - acc;
+                self.eg[main][c] = e_r - acc;
             }
             self.cell_sync(c);
             self.heat_release[c] = o.q / dt;

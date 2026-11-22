@@ -49,6 +49,9 @@ pub struct MultiphaseSim {
     pub p: Vec<f64>,
     pub u: Vec<f64>,
     pub v: Vec<f64>,
+    /// flux de percolation (Darcy, m/s) de la dernière projection, transportés au pas suivant (fluide seul ; voir mp_percolation.rs)
+    pub q_u: Vec<f64>,
+    pub q_v: Vec<f64>,
     pub solid: Vec<i32>, // −1 = fluide, sinon indice dans reg.solids
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
@@ -71,6 +74,8 @@ pub struct MultiphaseSim {
     pub friction_max_iter: usize,
     /// viscosité au-delà de la borne explicite (0.2 ρ dx²/dt) traitée implicitement : un fluide très visqueux ne réduit plus le pas
     pub implicit_viscosity: bool,
+    /// percolation : le fluide traverse les lits de grains tassés et les grilles (mp_percolation.rs)
+    pub percolation: bool,
     /// préconditionneur de la pression : multigrille (défaut, parallèle) ou Cholesky incomplet IC(0) (historique)
     pub multigrid: bool,
     // changement de phase
@@ -281,6 +286,8 @@ impl MultiphaseSim {
             p: vec![101325.0; n],
             u: vec![0.0; (nx + 1) * ny],
             v: vec![0.0; nx * (ny + 1)],
+            q_u: vec![0.0; (nx + 1) * ny],
+            q_v: vec![0.0; nx * (ny + 1)],
             solid: vec![-1; n],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
@@ -297,6 +304,7 @@ impl MultiphaseSim {
             pressure_max_iter: 600,
             friction_max_iter: 3000,
             implicit_viscosity: true,
+            percolation: true,
             multigrid: true,
             nucleation_superheat: 4.0,
             nucleation_alpha: 1e-3,

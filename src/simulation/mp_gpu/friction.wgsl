@@ -12,10 +12,12 @@ fn tanphi_k(k: u32) -> f32 { return ph(k, 35u); }
 // propriétés granulaires d'une cellule : fraction de grains, poids déjaugé (Pa), tan φ moyen, montée de compaction, α_max moyen,
 // masse volumique du fluide des pores
 struct FrCell { as_: f32, w: f32, tp: f32, ramp: f32, amx: f32, rhof: f32 };
+// cellule qui bloque les grains pour le frottement : solide ou grille (miroir de fr_blocked)
+fn fr_blocked(c: u32) -> bool { return is_solid(c) || is_grille(c); }
 fn fr_cell(c: u32) -> FrCell {
     var r: FrCell;
     r.as_ = 0.0; r.w = 0.0; r.tp = 0.0; r.ramp = 0.0; r.amx = 1.0; r.rhof = 0.0;
-    if (is_solid(c)) { return r; }
+    if (fr_blocked(c)) { return r; }
     var as_ = 0.0; var ms = 0.0; var af = 0.0; var mf = 0.0; var tp = 0.0; var am = 0.0;
     for (var k = 0u; k < P.np; k++) {
         let a = max(alpha(k, c), 0.0);
@@ -50,10 +52,10 @@ fn fr_below(c: u32) -> i32 {
 }
 // part de la cellule en contact (tassée, ou posée sur une cellule tassée) : α_s / α_max ; 0 sinon
 fn fr_frac(c: u32, fc: FrCell) -> f32 {
-    if (fc.as_ <= 1e-9 || is_solid(c)) { return 0.0; }
+    if (fc.as_ <= 1e-9 || fr_blocked(c)) { return 0.0; }
     let b = fr_below(c);
     var rest = true;
-    if (b >= 0) { let bb = u32(b); rest = is_solid(bb) || fr_cell(bb).ramp > 0.0; }
+    if (b >= 0) { let bb = u32(b); rest = fr_blocked(bb) || fr_cell(bb).ramp > 0.0; }
     if (fc.ramp > 0.0 || rest) { return clamp(fc.as_ / fc.amx, 0.0, 1.0); }
     return 0.0;
 }
@@ -78,9 +80,9 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
         let fr = fr_frac(c, fc);
         S[O_fr_frac + c] = fr;
         S[O_fr_ps + c] = 0.0;
-        if (is_solid(c) || fr <= 0.0) {
+        if (fr_blocked(c) || fr <= 0.0) {
             have_pf = false;
-            prev = select(i32(c), -1, is_solid(c));
+            prev = select(i32(c), -1, fr_blocked(c));
             prev_rhof = fc.rhof;
         } else {
             let pc = S[O_prel + c];
@@ -105,7 +107,7 @@ fn k_fr_mu(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= ncell()) { return; }
     S[O_fr_mu + c] = 0.0;
     S[O_fr_mv + c] = 0.0;
-    if (is_solid(c)) { return; }
+    if (fr_blocked(c)) { return; }
     let dx = P.dx;
     if (has(F_IMPVISC)) { S[O_fr_mv + c] = max(S[O_mu_cell + c] - mu_exp_cap(c), 0.0); }
     if (!has(F_FRIC)) { return; }
@@ -143,7 +145,7 @@ fn fr_kind(i: u32, j: u32) -> u32 {
         let out = ci < 0 || cj < 0 || ci >= nx || cj >= ny;
         open = open || (ci < 0 && P.bc_l != 0u) || (ci >= nx && P.bc_r != 0u) || (cj < 0 && P.bc_b != 0u) || (cj >= ny && P.bc_t != 0u);
         let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
-        let b = out || is_solid(c);
+        let b = out || fr_blocked(c);
         bits = bits | select(0u, 1u << q, b);
     }
     if (open) { return NK_NONE; }
@@ -163,7 +165,7 @@ fn fr_node_cnt(i: u32, j: u32) -> f32 {
         let ci = i32(i) - 1 + i32(q & 1u); let cj = i32(j) - 1 + i32(q >> 1u);
         let inside = ci >= 0 && cj >= 0 && ci < nx && cj < ny;
         let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
-        cnt += select(0.0, 1.0, inside && !is_solid(c));
+        cnt += select(0.0, 1.0, inside && !fr_blocked(c));
     }
     return cnt;
 }
@@ -174,7 +176,7 @@ fn fr_node_avg(o: u32, i: u32, j: u32) -> f32 {
         let ci = i32(i) - 1 + i32(q & 1u); let cj = i32(j) - 1 + i32(q >> 1u);
         let inside = ci >= 0 && cj >= 0 && ci < nx && cj < ny;
         let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
-        let ok = inside && !is_solid(c);
+        let ok = inside && !fr_blocked(c);
         s += select(0.0, S[o + c], ok);
         cnt += select(0.0, 1.0, ok);
     }
@@ -215,11 +217,11 @@ fn fr_nodec(i: u32, j: u32, wall: u32) -> f32 {
 fn fr_unknown(f: u32) -> bool {
     if (f < nfu()) {
         let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
-        return i > 0u && i < P.nx && !is_solid(cidx(i - 1u, j)) && !is_solid(cidx(i, j));
+        return i > 0u && i < P.nx && !fr_blocked(cidx(i - 1u, j)) && !fr_blocked(cidx(i, j));
     }
     let fv = f - nfu();
     let i = fv % P.nx; let j = fv / P.nx;
-    return j > 0u && j < P.ny && !is_solid(cidx(i, j - 1u)) && !is_solid(cidx(i, j));
+    return j > 0u && j < P.ny && !fr_blocked(cidx(i, j - 1u)) && !fr_blocked(cidx(i, j));
 }
 fn fr_rho(f: u32) -> f32 {
     if (f < nfu()) { return frho_x(f % (P.nx + 1u), f / (P.nx + 1u)); }
@@ -282,14 +284,14 @@ fn k_fr_uf(@builtin(global_invocation_id) g: vec3<u32>) {
         us = S[O_Us + f];
         let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
         if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i - 1u, j)]; }
-        let solid_side = (i > 0u && is_solid(cidx(i - 1u, j))) || (i < P.nx && is_solid(cidx(i, j)));
+        let solid_side = (i > 0u && fr_blocked(cidx(i - 1u, j))) || (i < P.nx && fr_blocked(cidx(i, j)));
         fixed = (i == 0u && P.bc_l == 0u) || (i == P.nx && P.bc_r == 0u) || (i > 0u && i < P.nx && !fr_unknown(f)) || solid_side;
     } else {
         let fv = f - nfu();
         us = S[O_Vs + fv];
         let i = fv % P.nx; let j = fv / P.nx;
         if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i, j - 1u)]; }
-        let solid_side = (j > 0u && is_solid(cidx(i, j - 1u))) || (j < P.ny && is_solid(cidx(i, j)));
+        let solid_side = (j > 0u && fr_blocked(cidx(i, j - 1u))) || (j < P.ny && fr_blocked(cidx(i, j)));
         fixed = (j == 0u && P.bc_b == 0u) || (j == P.ny && P.bc_t == 0u) || (j > 0u && j < P.ny && !fr_unknown(f)) || solid_side;
     }
     let w = select(us, us - D[D_DT] / fr_rho(f) * dp / P.dx, fr_unknown(f));
@@ -384,7 +386,7 @@ fn k_fr_w(@builtin(global_invocation_id) g: vec3<u32>) {
 @compute @workgroup_size(64)
 fn k_fr_heat(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
-    if (c >= ncell() || is_solid(c)) { return; }
+    if (c >= ncell() || fr_blocked(c)) { return; }
     let mg = S[O_fr_mu + c];
     if (mg <= 0.0) { return; }
     let o = O_fr_ap;

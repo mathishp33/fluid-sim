@@ -563,7 +563,9 @@ impl MultiphaseSim {
                 }
                 // dt·∇·u = variation relative de volume du pas : au-delà de ±50 % la cellule est quasi vide / en cavitation violente,
                 // où p·∇·u n'a plus de sens physique (et divise par une capacité calorifique qui tend vers 0)
-                let d = (dt * self.divergence_of(&self.u, &self.v, i, j)).clamp(-0.5, 0.5) / dt;
+                // (+ divergence du flux de percolation : le fluide des pores se détend ou se comprime aussi)
+                let dq = if self.percolation { self.divergence_of(&self.q_u, &self.q_v, i, j) } else { 0.0 };
+                let d = (dt * (self.divergence_of(&self.u, &self.v, i, j) + dq)).clamp(-0.5, 0.5) / dt;
                 // au plus −50 % / +100 % de T par pas, et pas de refroidissement sous T_PW_MIN : une cellule presque vide (liquide
                 // arraché, poche de gaz raréfiée par un écoulement violent) a une capacité calorifique quasi nulle et p·∇·u y donnerait des
                 // températures absurdes (< 50 K → pas refusé à tout dt). L'énergie ainsi écrêtée est négligeable (capacité ~0).

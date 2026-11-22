@@ -146,6 +146,10 @@ fn clone_sim(s: &MultiphaseSim) -> MultiphaseSim {
     c.p = s.p.clone();
     c.u = s.u.clone();
     c.v = s.v.clone();
+    c.q_u = s.q_u.clone();
+    c.q_v = s.q_v.clone();
+    c.percolation = s.percolation;
+    c.implicit_viscosity = s.implicit_viscosity;
     c.solid = s.solid.clone();
     c.rho_mix = s.rho_mix.clone();
     c.mu_cell = s.mu_cell.clone();
@@ -1380,10 +1384,37 @@ fn gpu_burns_coal_like_the_cpu() {
     let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
     one_step_agreement("feu de charbon", mk(), 20, 3, 1e-3, 0.5);
     let Some((cpu, gs, _)) = compare("feu de charbon", &mk, 1.0) else { return };
-    let co2 = cpu.reg.phases.iter().position(|p| p.name == super::mp_materials::CO2).unwrap();
-    let made = |s: &MultiphaseSim| s.total_mass(co2) - s.boundary_flux[co2];
-    eprintln!(" CO2 produit : CPU {:.4e} GPU {:.4e} kg/m", made(&cpu), made(&gs));
-    assert!(made(&cpu) > 0.0 && rel(made(&cpu), made(&gs)) < 0.1, "CO2 CPU {} GPU {}", made(&cpu), made(&gs));
+    let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
+    let (co2, co) = (pos(super::mp_materials::CO2), pos(super::mp_materials::CO));
+    // carbone passé dans le gaz (CO + CO2, sorties comprises), mol/m
+    let made = |s: &MultiphaseSim| (s.total_mass(co2) - s.boundary_flux[co2]) / 0.044009 + (s.total_mass(co) - s.boundary_flux[co]) / 0.02801;
+    eprintln!(" carbone brûlé : CPU {:.4e} GPU {:.4e} mol/m", made(&cpu), made(&gs));
+    assert!(made(&cpu) > 0.0 && rel(made(&cpu), made(&gs)) < 0.1, "carbone CPU {} GPU {}", made(&cpu), made(&gs));
+}
+
+#[test]
+fn gpu_percolates_air_through_a_coal_bed_like_the_cpu() {
+    // percolation (Darcy–Ergun dans la projection) à travers une grille et un lit de charbon en morceaux d'1 cm, air soufflé à 0.3 m/s
+    use super::mp_percolation::tests::bed_on_grille;
+    let mk = || bed_on_grille(0.01, 0.3).0;
+    one_step_agreement("lit percolé", mk(), 30, 3, 1e-4, 0.01);
+    let Some((cpu, gs, _)) = compare("lit percolé", &mk, 0.6) else { return };
+    let qmean = |s: &MultiphaseSim| {
+        let mut a = vec![];
+        for j in 8..22 {
+            for i in 2..s.nx - 2 {
+                a.push(s.q_v[j * s.nx + i]);
+            }
+        }
+        a.iter().sum::<f64>() / a.len() as f64
+    };
+    let dp = |s: &MultiphaseSim| (2..s.nx - 2).map(|i| s.p[s.idx(i, 8)] - s.p[s.idx(i, 20)]).sum::<f64>() / (s.nx - 4) as f64;
+    eprintln!(" débit dans le lit : CPU {:.4} GPU {:.4} m/s ; Δp (rangées 8 → 20) CPU {:.2} GPU {:.2} Pa", qmean(&cpu), qmean(&gs), dp(&cpu), dp(&gs));
+    assert!((qmean(&gs) / 0.3 - 1.0).abs() < 0.1 && rel(qmean(&cpu), qmean(&gs)) < 0.02);
+    assert!(rel(dp(&cpu), dp(&gs)) < 0.02, "Δp CPU {} GPU {}", dp(&cpu), dp(&gs));
+    let c = 1;
+    let moved = (0..gs.nx * gs.ny).map(|q| (gs.alpha[c][q] - cpu.alpha[c][q]).abs()).fold(0.0f64, f64::max);
+    assert!(moved < 0.01, "lits différents : {moved}");
 }
 
 #[test]
@@ -1548,6 +1579,77 @@ fn gpu_closed_water_box_trace() {
             g.download(&mut s);
             let pmax = s.p.iter().fold(0f64, |a, &b| a.max(b));
             eprintln!("pas {k} t {:.4} dt {:.2e} essais {} m {:.6e} pmax {:.0} umax {:.2e} {:?}", s.time, g.last.dt, g.last.retries, s.total_mass(0), pmax, s.max_speed(), g.last);
+        }
+    }
+}
+
+/// diagnostic : braséro sur le GPU, pas par pas jusqu'à la divergence (retours arrière, T, p, cellules invalides)
+#[test]
+#[ignore]
+fn gpu_brasero_trace() {
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mut s = super::mp_view::build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
+    let Some(mut g) = gpu_or_skip(&s) else { return };
+    let mut k = 0;
+    let stop_at = std::env::var("MP_STOPAT").ok().and_then(|v| v.parse::<usize>().ok());
+    while s.time < 1.0 && !s.diverged && k < 6000 {
+        if Some(k) == stop_at {
+            // pas brut depuis l'état GPU courant : cellules invalides, vitesse maximale
+            g.download(&mut s);
+            let mut probe = clone_sim(&s);
+            let (refused, dt) = g.debug_raw_step(&mut probe, s.dt_max, 1.0);
+            let um = probe.max_speed();
+            eprintln!("pas brut {k} : refusé {refused}, dt {dt:.3e}, |u| max {um:.3} (Courant {:.2})", um * dt / probe.dx);
+            let mut worst: Vec<(f64, usize)> = (0..probe.nx * probe.ny).filter(|&c| !probe.is_solid(c)).map(|c| {
+                let (i, j) = (c % probe.nx, c / probe.nx);
+                let uc = (probe.u[probe.uidx(i, j)].abs()).max(probe.u[probe.uidx(i + 1, j)].abs()).max(probe.v[probe.vidx(i, j)].abs()).max(probe.v[probe.vidx(i, j + 1)].abs());
+                (uc, c)
+            }).collect();
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for &(uc, c) in worst.iter().take(4) {
+                let ms: Vec<String> = (0..probe.mass.len()).map(|q| format!("{:.2e}", probe.mass[q][c])).collect();
+                eprintln!("  ({}, {}) |u| {uc:.3} T {:.0} p {:.0} grille {} m {:?} ; avant : T {:.0} p {:.0}", c % probe.nx, c / probe.nx, probe.temp[c], probe.p[c], probe.is_grille(c), ms, s.temp[c], s.p[c]);
+            }
+            for c in 0..probe.nx * probe.ny {
+                if probe.is_solid(c) {
+                    continue;
+                }
+                for gq in 0..probe.groups.len() {
+                    let mg = probe.group_mass(gq, c);
+                    let tq = probe.tg[gq][c];
+                    if mg > 0.0 && !(tq > 50.0 && tq < 5000.0) {
+                        eprintln!("  groupe {gq} invalide ({}, {}) : T_g {tq:.1}, masse {mg:.3e} (T cellule {:.1}) ; avant T_g {:.1} masse {:.3e}", c % probe.nx, c / probe.nx, probe.temp[c], s.tg[gq][c], s.group_mass(gq, c));
+                    }
+                }
+            }
+            for c in 0..probe.nx * probe.ny {
+                let bad = !(probe.temp[c] > 50.0 && probe.temp[c] < 5000.0) || !probe.p[c].is_finite() || (0..probe.mass.len()).any(|q| !(probe.mass[q][c] >= -1e-6));
+                if bad {
+                    let ms: Vec<String> = (0..probe.mass.len()).map(|q| format!("{:.2e}", probe.mass[q][c])).collect();
+                    eprintln!("  invalide ({}, {}) T {:.1} p {:.0} m {:?}", c % probe.nx, c / probe.nx, probe.temp[c], probe.p[c], ms);
+                }
+            }
+            return;
+        }
+        g.step(&mut s);
+        k += 1;
+        if k % 100 == 0 || g.last.retries > 0 || s.diverged {
+            g.download(&mut s);
+            let fl: Vec<usize> = (0..s.nx * s.ny).filter(|&c| !s.is_solid(c)).collect();
+            let tmax = fl.iter().map(|&c| s.temp[c]).fold(0.0f64, f64::max);
+            let tmin = fl.iter().map(|&c| s.temp[c]).fold(1e9f64, f64::min);
+            let (pmin, pmax) = fl.iter().fold((1e30f64, 0.0f64), |(a, b), &c| (a.min(s.p[c]), b.max(s.p[c])));
+            let qmax = s.q_u.iter().chain(s.q_v.iter()).fold(0.0f64, |a, &b| a.max(b.abs()));
+            eprintln!("pas {k} t {:.4} dt {:.2e} essais {} T {tmin:.0}–{tmax:.0} p {pmin:.0}–{pmax:.0} |u| {:.2} |q| {qmax:.3} ; {:?}", s.time, g.last.dt, g.last.retries, s.max_speed(), g.last);
+            if s.diverged {
+                for c in 0..s.nx * s.ny {
+                    let bad = !(s.temp[c] > 50.0 && s.temp[c] < 5000.0) || !s.p[c].is_finite() || (0..s.mass.len()).any(|q| !(s.mass[q][c] >= -1e-6));
+                    if bad {
+                        eprintln!("  invalide ({}, {}) T {:.1} p {:.0}", c % s.nx, c / s.nx, s.temp[c], s.p[c]);
+                    }
+                }
+                break;
+            }
         }
     }
 }

@@ -73,10 +73,11 @@ enum CellKind {
     Emitter,
     Accelerator,
     Teleporter,
+    Grille,
 }
 
 impl CellKind {
-    const ALL: [CellKind; 5] = [CellKind::Wall, CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Teleporter];
+    const ALL: [CellKind; 6] = [CellKind::Wall, CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Teleporter, CellKind::Grille];
     fn name(self) -> &'static str {
         match self {
             CellKind::Wall => "Solide (mur)",
@@ -84,6 +85,7 @@ impl CellKind {
             CellKind::Emitter => "Émetteur",
             CellKind::Accelerator => "Accélérateur",
             CellKind::Teleporter => "Téléporteur",
+            CellKind::Grille => "Grille (arrête les grains)",
         }
     }
 }
@@ -144,6 +146,9 @@ pub struct MultiphaseWindow {
     emit_phase: usize,
     emit_temp: f64,
     acc_ax: f64,
+    /// grille : taille des trous (mm), fraction ouverte
+    grille_hole_mm: f64,
+    grille_open: f64,
     acc_ay: f64,
     tp_dest: Option<usize>,
     tp_speed: f64,
@@ -227,6 +232,8 @@ impl MultiphaseWindow {
             emit_phase: roles.water.unwrap_or(0),
             emit_temp: 293.15,
             acc_ax: 5.0,
+            grille_hole_mm: 10.0,
+            grille_open: 0.6,
             acc_ay: 0.0,
             tp_dest: None,
             tp_speed: 0.5,
@@ -751,6 +758,9 @@ impl MultiphaseWindow {
                         ui.checkbox(&mut self.sim.implicit_viscosity, "  Viscosité implicite (fluides très visqueux)")
                             .on_hover_text("La part de la viscosité qui imposerait un pas de temps minuscule (miel, huiles épaisses) est résolue implicitement");
                     }
+                    ui.checkbox(&mut self.sim.percolation, "Percolation (gaz à travers les tas de gros grains, grilles)").on_hover_text(
+                        "Le fluide traverse les pores d'un lit de grains tassés (1 mm et plus) et les grilles : tirage d'un feu de charbon, air soufflé sous une grille",
+                    );
                     ui.checkbox(&mut self.sim.conduction, "Conduction thermique");
                     ui.checkbox(&mut self.sim.phase_change, "Changement de phase").on_hover_text("Ébullition, condensation, cavitation, évaporation");
                     if !self.sim.reg.reactions.is_empty() {
@@ -867,6 +877,11 @@ impl MultiphaseWindow {
             CellKind::Accelerator => {
                 ui.add(egui::Slider::new(&mut self.acc_ax, -50.0..=50.0).text("Accélération X (m/s²)"));
                 ui.add(egui::Slider::new(&mut self.acc_ay, -50.0..=50.0).text("Accélération Y (m/s²)"));
+            }
+            CellKind::Grille => {
+                ui.add(egui::Slider::new(&mut self.grille_hole_mm, 0.5..=50.0).logarithmic(true).text("Trous (mm)"));
+                ui.add(egui::Slider::new(&mut self.grille_open, 0.1..=0.9).text("Fraction ouverte"));
+                ui.weak("Arrête les grains (un tas y repose) et laisse passer l'air ou l'eau par percolation : une grille de foyer, un tamis.");
             }
             CellKind::Teleporter => {
                 ui.label("1. Choisir une destination\n2. Ctrl + clic gauche pour poser des téléporteurs");
@@ -1152,6 +1167,7 @@ impl MultiphaseWindow {
                 MpThermal::Passive,
             )),
             CellKind::Accelerator => Some((MpTool::Effect(MpEffect::Accelerator { ax: self.acc_ax, ay: self.acc_ay }), MpThermal::Passive)),
+            CellKind::Grille => Some((MpTool::Effect(MpEffect::Grille { hole: self.grille_hole_mm * 1e-3, open: self.grille_open }), MpThermal::Passive)),
             CellKind::Teleporter => self.tp_dest.map(|d| (MpTool::Effect(MpEffect::Teleporter { dest: d, speed: self.tp_speed, radius: self.tp_radius }), MpThermal::Passive)),
         }
     }

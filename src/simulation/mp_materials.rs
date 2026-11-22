@@ -424,6 +424,8 @@ pub const RX_H2: &str = "combustion de l'hydrogène ⇌ dissociation de H2O";
 pub const RX_CO: &str = "oxydation de CO ⇌ dissociation de CO2";
 pub const COAL: &str = "charbon";
 pub const RX_COAL: &str = "combustion du charbon (C + O2 → CO2, surface des grains)";
+pub const RX_COAL_CO: &str = "gazéification du charbon (C + ½O2 → CO, surface des grains)";
+pub const RX_BOUDOUARD: &str = "réduction de CO2 par le charbon (C + CO2 → 2 CO, Boudouard)";
 
 /// Gaz parfait de combustion. cp(T) = cp + pente·(T − 298.15) : les deux coefficients sont ajustés pour reproduire EXACTEMENT
 /// h(2000 K) − h(298 K) et s°(2000 K) des tables NIST-JANAF (donc la température de flamme et les équilibres de dissociation vers
@@ -518,21 +520,51 @@ pub fn combustion_reactions() -> Vec<ReactionDef> {
     ]
 }
 
-/// Combustion du charbon à la surface des grains (réaction de surface, voir `phases::Reaction`) : C + O2 → CO2, cinétique du char de
-/// Field (1969), 8 710 exp(−17 967/T) g/(cm²·s·atm O2), convertie en vitesse de surface k_s = A·T·exp(−Ea/RT) m/s par p_O2 = C_O2 R T :
-/// A = 87 100 R / (M_C · 101 325) = 596 m/(s·K), Ea = 149.4 kJ/mol. À 1500 K, k_s ≈ 5.7 m/s contre k_d = 2 D_O2/d ≈ 2.3 m/s pour des grains
-/// de 0.3 mm : la combustion vive est limitée par l'apport d'oxygène (régime III) ; elle démarre vers 800–900 K.
-pub fn coal_reaction() -> ReactionDef {
-    ReactionDef {
-        name: RX_COAL.into(),
-        reactants: vec![(COAL.into(), 1.0), (O2.into(), 1.0)],
-        products: vec![(CO2.into(), 1.0)],
-        pre_exp: 87100.0 * R_GAS / (0.012011 * 101325.0),
-        activation_energy: 17967.0 * R_GAS,
-        orders: vec![0.0, 1.0],
-        temp_exponent: 1.0,
-        ..Default::default()
-    }
+/// Combustion du charbon à la surface des grains (réactions de surface, voir `phases::Reaction`). Cinétique du char de Field (1969),
+/// 8 710 exp(−17 967/T) g/(cm²·s·atm O2), convertie en vitesse de surface k_s = A·T·exp(−Ea/RT) m/s par p_O2 = C_O2 R T :
+/// A = 87 100 R / (M_C · 101 325) = 596 m/(s·K), Ea = 149.4 kJ/mol. Le carbone part en CO et en CO2 dans le rapport d'Arthur (1951),
+/// CO/CO2 = 2500 exp(−6240/T) (1 vers 800 K, 14 à 1200 K) : C + ½O2 → CO porte la cinétique de Field, C + O2 → CO2 la même divisée par
+/// le rapport (A/2500, Ea − 6240 R). Le CO brûle ensuite dans le gaz au-dessus des braises (CO + ½O2 ⇌ CO2, flamme bleue ; l'humidité
+/// de l'air la catalyse). Les deux réactions partagent l'oxygène qui diffuse jusqu'aux grains (k_d = 2 D_O2/d) : à 1500 K, k_s ≈ 5.7 m/s
+/// contre k_d ≈ 2.3 m/s pour des grains de 0.3 mm, la combustion vive est limitée par l'apport d'oxygène (régime III) ; elle démarre
+/// vers 800–900 K.
+pub fn coal_reactions() -> Vec<ReactionDef> {
+    let a = 87100.0 * R_GAS / (0.012011 * 101325.0);
+    vec![
+        ReactionDef {
+            name: RX_COAL_CO.into(),
+            reactants: vec![(COAL.into(), 1.0), (O2.into(), 0.5)],
+            products: vec![(CO.into(), 1.0)],
+            pre_exp: a,
+            activation_energy: 17967.0 * R_GAS,
+            orders: vec![0.0, 1.0],
+            temp_exponent: 1.0,
+            ..Default::default()
+        },
+        ReactionDef {
+            name: RX_COAL.into(),
+            reactants: vec![(COAL.into(), 1.0), (O2.into(), 1.0)],
+            products: vec![(CO2.into(), 1.0)],
+            pre_exp: a / 2500.0,
+            activation_energy: (17967.0 - 6240.0) * R_GAS,
+            orders: vec![0.0, 1.0],
+            temp_exponent: 1.0,
+            ..Default::default()
+        },
+        // Boudouard (endothermique, +172.5 kJ/mol) : dans la zone chaude d'un lit où l'oxygène est épuisé, le CO2 est réduit en CO, qui
+        // brûle au-dessus des braises au contact de l'air (flamme bleue). Ea = 250 kJ/mol, A tel que C–CO2 soit 1e5 fois plus lent que
+        // C–O2 à 1073 K (Laurendeau 1978) : négligeable sous 1100 K, k_s ≈ 3e-4 m/s à 1400 K, 1.4e-3 m/s à 1500 K
+        ReactionDef {
+            name: RX_BOUDOUARD.into(),
+            reactants: vec![(COAL.into(), 1.0), (CO2.into(), 1.0)],
+            products: vec![(CO.into(), 2.0)],
+            pre_exp: 470.0,
+            activation_energy: 250.0e3,
+            orders: vec![0.0, 1.0],
+            temp_exponent: 1.0,
+            ..Default::default()
+        },
+    ]
 }
 
 /// fractions molaires de l'air sec : O2 20.95 %, N2 + Ar 79.05 %
@@ -627,8 +659,10 @@ impl MaterialLibrary {
         if l.fluid_index(COAL).is_none() {
             l.fluids.push(Phase::coal());
         }
-        if !l.reactions.iter().any(|q| q.name == RX_COAL) {
-            l.reactions.push(coal_reaction());
+        for r in coal_reactions() {
+            if !l.reactions.iter().any(|q| q.name == r.name) {
+                l.reactions.push(r);
+            }
         }
         l
     }

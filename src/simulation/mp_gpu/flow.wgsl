@@ -74,6 +74,18 @@ fn k_red_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
         }
         if (S[O_flame + i] > 1.0) { v[6] = 1.0; }
         if (has(F_GRAN)) { v[7] = max_settling_at(i); }
+        // percolation : |q| dt ≤ 0.4 du fluide de la cellule amont (faces droite et haut de la cellule ; miroir de max_darcy_speed)
+        if (perc_on()) {
+            let ci = i % P.nx; let cj = i / P.nx;
+            if (ci + 1u < P.nx) {
+                let q = S[O_qu + uidx(ci + 1u, cj)];
+                if (q != 0.0) { let dn = select(i + 1u, i, q > 0.0); v[7] = max(v[7], 1.25 * abs(q) / max(fluid_frac(dn), 0.05)); }
+            }
+            if (cj + 1u < P.ny) {
+                let q = S[O_qv + vidx(ci, cj + 1u)];
+                if (q != 0.0) { let dn = select(i + P.nx, i, q > 0.0); v[7] = max(v[7], 1.25 * abs(q) / max(fluid_frac(dn), 0.05)); }
+            }
+        }
     }
     wg_reduce(v, 8u, 1u, l.x, w.x, 0u);
 }
@@ -92,8 +104,8 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
         var dt = min(min(P.dt_max, D[D_DTCHEM]), min(D[D_DTPHASE], P.dt_cap));
         if (gap > 0.0) { dt = min(dt, max(P.heat_tau * 20.0 / gap, 1e-6)); }
         dt = min(dt, P.cfl * P.dx / max(umax, 1e-9));
-        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas
-        if (has(F_GRAN) && wset > 0.0) { dt = min(dt, 0.5 * P.dx / wset); }
+        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas ; percolation : |q| dt ≤ 0.4 du fluide amont
+        if ((has(F_GRAN) || has(F_PERC)) && wset > 0.0) { dt = min(dt, 0.5 * P.dx / wset); }
         // flamme présente (miroir de choose_dt)
         if (has(F_FLAME) && flame > 0.5) { dt = min(dt, P.cfl_flame * P.dx / P.flame_u_floor); }
         let gg = sqrt(P.gx * P.gx + P.gy * P.gy);
@@ -988,8 +1000,10 @@ fn k_rhs(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= ncell() || newton_done()) { return; }
     if (is_solid(c) || pinned(c)) { S[O_rhs + c] = 0.0; return; }
     let i = c % P.nx; let j = c / P.nx;
-    let dn = (S[O_Fx + uidx(i + 1u, j)] - S[O_Fx + uidx(i, j)] + S[O_Fy + vidx(i, j + 1u)] - S[O_Fy + vidx(i, j)]) / P.dx;
-    let d0 = (S[O_Un + uidx(i + 1u, j)] - S[O_Un + uidx(i, j)] + S[O_Vn + vidx(i, j + 1u)] - S[O_Vn + vidx(i, j)]) / P.dx;
+    var dn = (S[O_Fx + uidx(i + 1u, j)] - S[O_Fx + uidx(i, j)] + S[O_Fy + vidx(i, j + 1u)] - S[O_Fy + vidx(i, j)]) / P.dx;
+    var d0 = (S[O_Un + uidx(i + 1u, j)] - S[O_Un + uidx(i, j)] + S[O_Vn + vidx(i, j + 1u)] - S[O_Vn + vidx(i, j)]) / P.dx;
+    // percolation : flux de Darcy à la pression courante, et celui qui a servi au transport de ce pas (miroir de solve_pressure)
+    if (perc_on()) { dn += darcy_div_now(i, j); d0 += darcy_div_old(i, j); }
     // part corrigée de l'erreur héritée (miroir de mp_pressure::closure_correction)
     var ag = 0.0;
     for (var k = 0u; k < P.np; k++) { if (is_gas(k)) { ag += alpha(k, c); } }
@@ -1021,19 +1035,27 @@ fn k_stencil(@builtin(global_invocation_id) g: vec3<u32>) {
     let dx2 = P.dx * P.dx;
     let dt = dtv();
     var d = S[O_kappa + c] / dt;
+    // percolation : conductance de Darcy C/dx² ajoutée au couplage (y compris des faces fermées au mélange : grilles)
+    let pc = perc_on();
     if (i + 1u < P.nx) {
         let k = link(c, c + 1u, S[O_pfu_on + uidx(i + 1u, j)] > 0.5);
-        if (k > 0u) { let t = dt / (frho_x(i + 1u, j) * dx2); if (k == 1u) { S[O_sae + c] = t; } d += t; }
+        let td = select(0.0, S[O_dcu + uidx(i + 1u, j)] / dx2, pc);
+        if (k > 0u) { let t = dt / (frho_x(i + 1u, j) * dx2) + td; if (k == 1u) { S[O_sae + c] = t; } d += t; }
+        else if (td > 0.0) { S[O_sae + c] = td; d += td; }
     } else if (P.bc_r == 1u) { d += 2.0 * dt / (S[O_rho_mix + c] * dx2); }
     if (i > 0u) {
         if (link(c - 1u, c, S[O_pfu_on + uidx(i, j)] > 0.5) > 0u) { d += dt / (frho_x(i, j) * dx2); }
+        d += select(0.0, S[O_dcu + uidx(i, j)] / dx2, pc);
     } else if (P.bc_l == 1u) { d += 2.0 * dt / (S[O_rho_mix + c] * dx2); }
     if (j + 1u < P.ny) {
         let k = link(c, c + P.nx, S[O_pfv_on + vidx(i, j + 1u)] > 0.5);
-        if (k > 0u) { let t = dt / (frho_y(i, j + 1u) * dx2); if (k == 1u) { S[O_san + c] = t; } d += t; }
+        let td = select(0.0, S[O_dcv + vidx(i, j + 1u)] / dx2, pc);
+        if (k > 0u) { let t = dt / (frho_y(i, j + 1u) * dx2) + td; if (k == 1u) { S[O_san + c] = t; } d += t; }
+        else if (td > 0.0) { S[O_san + c] = td; d += td; }
     } else if (P.bc_t == 1u) { d += 2.0 * dt / (S[O_rho_mix + c] * dx2); }
     if (j > 0u) {
         if (link(c - P.nx, c, S[O_pfv_on + vidx(i, j)] > 0.5) > 0u) { d += dt / (frho_y(i, j) * dx2); }
+        d += select(0.0, S[O_dcv + vidx(i, j)] / dx2, pc);
     } else if (P.bc_b == 1u) { d += 2.0 * dt / (S[O_rho_mix + c] * dx2); }
     S[O_sd + c] = d;
 }
@@ -1101,7 +1123,10 @@ fn k_pressure_work(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= ncell() || is_solid(c) || pinned(c)) { return; }
     let i = c % P.nx; let j = c / P.nx;
     let dt = dtv();
-    let d = clamp(dt * div_uv(i, j), -0.5, 0.5) / dt;
+    // (+ divergence du flux de percolation : le fluide des pores se détend ou se comprime aussi)
+    var dq = 0.0;
+    if (perc_on()) { dq = darcy_div_old(i, j); }
+    let d = clamp(dt * (div_uv(i, j) + dq), -0.5, 0.5) / dt;
     // répartition entre groupes comme dans la fermeture (C_g dT_g/dp, couplage χ) ; par groupe : au plus −50 % / +100 % de T et pas
     // de refroidissement sous T_PW_MIN (miroir de pressure_work)
     let n = ncell();

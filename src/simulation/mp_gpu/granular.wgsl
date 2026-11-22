@@ -56,7 +56,7 @@ fn settle_vol(s: u32, c0: u32, c1: u32, ga: f32, share: f32, dt: f32) -> f32 {
     let down = ga < 0.0;
     let a = select(c0, c1, down);
     let b = select(c1, c0, down);
-    let movable = !is_solid(a) && !pinned(a) && !is_solid(b) && !pinned(b);
+    let movable = !is_solid(a) && !pinned(a) && !is_grille(a) && !is_solid(b) && !pinned(b) && !is_grille(b);
     let wa = settling_w(s, a);
     let wb = settling_w(s, b);
     // grains lourds : de a vers b ; grains légers (w < 0) : de b vers a (vitesse évaluée dans la donneuse)

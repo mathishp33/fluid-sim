@@ -59,6 +59,12 @@ impl MultiphaseSim {
         self.viscous && self.reg.phases.iter().any(|p| p.is_granular() && p.friction_angle > 0.0) && self.gravity.iter().any(|&g| g != 0.0)
     }
 
+    /// cellule qui bloque les grains pour le frottement : solide, ou grille (le tas y repose, non-glissement)
+    #[inline]
+    pub(crate) fn fr_blocked(&self, c: usize) -> bool {
+        self.is_solid(c) || self.is_grille(c)
+    }
+
     /// plafond de la viscosité traitée explicitement dans la cellule c (le reste est implicite) ; ∞ sans viscosité implicite
     pub(crate) fn explicit_mu_cap(&self, c: usize, dt: f64) -> f64 {
         if self.implicit_viscosity && dt > 0.0 { VISC_EXPLICIT * self.rho_mix[c] * self.dx * self.dx / dt } else { f64::INFINITY }
@@ -84,7 +90,7 @@ impl MultiphaseSim {
                 }
                 blocked[q] = true;
             } else {
-                blocked[q] = self.is_solid(self.idx(ci as usize, cj as usize));
+                blocked[q] = self.fr_blocked(self.idx(ci as usize, cj as usize));
             }
         }
         match blocked {
@@ -104,7 +110,7 @@ impl MultiphaseSim {
             let (ci, cj) = (i as isize + di, j as isize + dj);
             if ci >= 0 && cj >= 0 && (ci as usize) < self.nx && (cj as usize) < self.ny {
                 let c = self.idx(ci as usize, cj as usize);
-                if !self.is_solid(c) {
+                if !self.fr_blocked(c) {
                     v.push(c);
                 }
             }
@@ -128,7 +134,7 @@ impl MultiphaseSim {
         let mut amx = vec![1.0; n];
         let mut rhof = vec![0.0; n];
         for c in 0..n {
-            if self.is_solid(c) {
+            if self.fr_blocked(c) {
                 continue;
             }
             let (mut as_, mut ms, mut af, mut mf, mut tp, mut am) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -174,10 +180,10 @@ impl MultiphaseSim {
             }
         };
         for c in 0..n {
-            if a_s[c] <= 1e-9 || self.is_solid(c) {
+            if a_s[c] <= 1e-9 || self.fr_blocked(c) {
                 continue;
             }
-            let rest = below(c).map_or(true, |b| self.is_solid(b) || ramp[b] > 0.0);
+            let rest = below(c).map_or(true, |b| self.fr_blocked(b) || ramp[b] > 0.0);
             if ramp[c] > 0.0 || rest {
                 g.frac[c] = (a_s[c] / amx[c]).clamp(0.0, 1.0);
             }
@@ -191,9 +197,9 @@ impl MultiphaseSim {
             for t in 0..len {
                 let s_ = if down { len - 1 - t } else { t };
                 let c = if vertical { self.idx(l, s_) } else { self.idx(s_, l) };
-                if self.is_solid(c) || g.frac[c] <= 0.0 {
+                if self.fr_blocked(c) || g.frac[c] <= 0.0 {
                     pf = f64::NAN;
-                    prev = if self.is_solid(c) { None } else { Some(c) };
+                    prev = if self.fr_blocked(c) { None } else { Some(c) };
                     continue;
                 }
                 if pf.is_nan() {
@@ -231,7 +237,7 @@ impl MultiphaseSim {
         for j in 0..ny {
             for i in 0..nx {
                 let c = self.idx(i, j);
-                if g.frac[c] <= 0.0 || self.is_solid(c) {
+                if g.frac[c] <= 0.0 || self.fr_blocked(c) {
                     continue;
                 }
                 let d2 = self.strain_rate2(u, v, i, j);
@@ -245,7 +251,7 @@ impl MultiphaseSim {
     /// part implicite de la viscosité des fluides : μ − plafond explicite (0 sans viscosité implicite)
     pub(crate) fn implicit_fluid_mu(&self, dt: f64) -> Vec<f64> {
         let n = self.nx * self.ny;
-        (0..n).map(|c| if self.is_solid(c) || !self.implicit_viscosity { 0.0 } else { (self.mu_cell[c] - self.explicit_mu_cap(c, dt)).max(0.0) }).collect()
+        (0..n).map(|c| if self.fr_blocked(c) || !self.implicit_viscosity { 0.0 } else { (self.mu_cell[c] - self.explicit_mu_cap(c, dt)).max(0.0) }).collect()
     }
 
     /// Viscosité implicite (frottement des grains + excès de viscosité des fluides) sur la vitesse prédite (us, vs) pendant dt (voir
@@ -273,7 +279,7 @@ impl MultiphaseSim {
         for j in 0..ny {
             for i in 1..nx {
                 let (a, b) = (self.idx(i - 1, j), self.idx(i, j));
-                if !self.is_solid(a) && !self.is_solid(b) {
+                if !self.fr_blocked(a) && !self.fr_blocked(b) {
                     let f = j * (nx + 1) + i;
                     ku[f] = true;
                     rho_u[f] = self.face_rho_x(i, j);
@@ -285,7 +291,7 @@ impl MultiphaseSim {
         for j in 1..ny {
             for i in 0..nx {
                 let (a, b) = (self.idx(i, j - 1), self.idx(i, j));
-                if !self.is_solid(a) && !self.is_solid(b) {
+                if !self.fr_blocked(a) && !self.fr_blocked(b) {
                     let f = j * nx + i;
                     kv[f] = true;
                     rho_v[f] = self.face_rho_y(i, j);
@@ -300,7 +306,7 @@ impl MultiphaseSim {
             for i in 0..=nx {
                 let f = j * (nx + 1) + i;
                 let fixed = if i == 0 { matches!(self.bc[0], Bc::Wall) } else if i == nx { matches!(self.bc[1], Bc::Wall) } else { !ku[f] };
-                let solid_side = (i > 0 && self.is_solid(self.idx(i - 1, j))) || (i < nx && self.is_solid(self.idx(i, j)));
+                let solid_side = (i > 0 && self.fr_blocked(self.idx(i - 1, j))) || (i < nx && self.fr_blocked(self.idx(i, j)));
                 if fixed || solid_side {
                     uf[f] = 0.0;
                 }
@@ -310,7 +316,7 @@ impl MultiphaseSim {
             for i in 0..nx {
                 let f = j * nx + i;
                 let fixed = if j == 0 { matches!(self.bc[2], Bc::Wall) } else if j == ny { matches!(self.bc[3], Bc::Wall) } else { !kv[f] };
-                let solid_side = (j > 0 && self.is_solid(self.idx(i, j - 1))) || (j < ny && self.is_solid(self.idx(i, j)));
+                let solid_side = (j > 0 && self.fr_blocked(self.idx(i, j - 1))) || (j < ny && self.fr_blocked(self.idx(i, j)));
                 if fixed || solid_side {
                     vf[f] = 0.0;
                 }
