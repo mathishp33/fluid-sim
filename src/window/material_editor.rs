@@ -184,6 +184,12 @@ impl MaterialEditor {
                 self.sel_fluid = lib.fluids.len() - 1;
                 changed = true;
             }
+            if ui.button("+ Grains").on_hover_text("Phase granulaire (sable, poudre…) : sans interface, sédimente, calcul CPU").clicked() {
+                let p = lib.template_fluid(PhaseKind::Granular);
+                lib.fluids.push(p);
+                self.sel_fluid = lib.fluids.len() - 1;
+                changed = true;
+            }
             if ui.add_enabled(!lib.fluids.is_empty(), egui::Button::new("Supprimer")).clicked() {
                 let i = self.sel_fluid.min(lib.fluids.len().saturating_sub(1));
                 lib.remove_fluid(i);
@@ -652,6 +658,18 @@ fn fluid_props_ui(ui: &mut Ui, p: &mut Phase) -> bool {
         ui.label("Couleur");
         ch |= ui.color_edit_button_rgb(&mut p.color).changed();
         ui.end_row();
+        if p.is_granular() {
+            ui.label("Diamètre des grains (mm)");
+            let mut d_mm = p.grain_diameter * 1e3;
+            if ui.add(DragValue::new(&mut d_mm).speed(0.01).range(0.001..=20.0)).on_hover_text("Vitesse de chute et surface d'échange thermique").changed() {
+                p.grain_diameter = d_mm * 1e-3;
+                ch = true;
+            }
+            ui.end_row();
+            ui.label("Compaction maximale");
+            ch |= ui.add(DragValue::new(&mut p.alpha_max).speed(0.005).range(0.3..=0.74)).on_hover_text("Fraction volumique des grains tassés (empilement aléatoire ≈ 0.6)").changed();
+            ui.end_row();
+        }
         match &mut p.eos {
             Eos::IdealGas { r_spec } => {
                 ui.label("R spécifique (J/(kg·K))");

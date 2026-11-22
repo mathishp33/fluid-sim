@@ -8,7 +8,7 @@ Pression thermodynamique uniforme : l’effet de la stratification hydrostatique
 
 
 - REACTION AVEC SOLIDES (mobile) & POUDRES (carbones, bois)
-- AJOUTER POUDRES (poudre a canon, carbone)
+- AJOUTER POUDRES (poudre a canon, carbone) — en cours : phase granulaire, voir GRANULAIRE.md (étape 1 faite : grains, chute, thermique)
 - TRANSFORMATION LIQUIDE -> SOLIDE (mobile)
 
 
@@ -103,6 +103,7 @@ Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux
 - Pas de temps capillaire seulement pour les liquides présents. [M]
 
 ### Fonctionnalités
+- **Phase granulaire, étape 1** (CPU ; voir GRANULAIRE.md) : `PhaseKind::Granular` (diamètre des grains, compaction maximale), transport sans interface (groupes dispersés servis en premier dans le balayage PLIC, interfaces des autres groupes sur leurs fractions renormalisées hors grains), sédimentation conservative (Ferguson–Church + Richardson–Zaki, volume de grains ↔ même volume de fluide, arrêt à α_max), échange thermique par la surface des grains (Nu = 2), borne de pas w·dt ≤ dx/2. Matériau « sable », scénario « Sable qui tombe dans l'eau (sédimentation) », « + Grains » dans l'éditeur. Le GPU refuse ces scènes (repli CPU) jusqu'au portage (étape 2). Sans grains, le calcul est inchangé au bit près. [M]
 - **Téléporteur réparé, destination de taille réglable** (CPU et GPU) : une destination devient un disque de `radius` mailles (curseur « Rayon de la destination », 2 par défaut). Les sources qui visent la même destination forment un groupe : débits additionnés et réémis sur toute la zone (volume réémis = volume aspiré, faces internes des blocs fermées), fluides absorbés MÉLANGÉS (masses et énergies sommées). Avant : seule la première source d'un bloc peint au pinceau était servie (« destination déjà prise »), les autres aspiraient et détruisaient le fluide, la composition émise était celle de la dernière source, et le GPU plafonnait à 256 sources. Format d'état complet : version 2 ; scènes JSON antérieures lisibles (rayon 0). Test `teleporter_group_reemits_all_sources_over_its_destination_zone` + accord CPU / GPU avec un bloc de sources. [M]
 - **Sauvegarde de l'ÉTAT COMPLET** (`mp_state`, bouton « Sauver l'état complet (S) ») : tous les champs du solveur (masses, énergies et températures par groupe, pression, vitesses, solides, comportements thermiques, cellules spéciales et cellules épinglées, bords et entrées, chauffage au pinceau, facteur de flamme, réglages numériques et physiques, compteurs et bilans), le registre des matériaux tel qu'utilisé, la bibliothèque de matériaux, le scénario et les bords de la fenêtre. Format binaire bincode avec en-tête et version (`MAGIC`, `VERSION`), exact au bit près : une simulation rechargée continue identiquement (tests d'aller-retour : barrage, flamme, ébullition chauffée ; d'une fenêtre à l'autre). `MultiphaseSim` dérive serde : tout nouveau champ est enregistré d'office (penser à incrémenter `VERSION`). « Géométrie seule » garde l'ancien format JSON ; « Charger (L) » reconnaît les deux. [M]
 - Toutes les fonctionnalités de `main_window.rs` portées dans `multiphase_window.rs` : cellules spéciales (puits, émetteur, accélérateur, téléporteur), solides chauffants / isothermes, bords modifiables en direct, raccourcis, sauvegarde/chargement de scène. [M]

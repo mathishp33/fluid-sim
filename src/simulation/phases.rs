@@ -54,6 +54,8 @@ pub const MAX_PHASES: usize = 32;
 pub enum PhaseKind {
     Gas,
     Liquid,
+    /// grains (sable, poudre, charbon…) : phase dispersée sans interface, qui sédimente (voir GRANULAIRE.md et `mp_granular`)
+    Granular,
 }
 
 /// Masse volumique d'un liquide à la pression de référence p0, en fonction de T.
@@ -131,6 +133,16 @@ pub struct Phase {
     /// rayonnement thermique (gaz de combustion)
     #[serde(default)]
     pub radiator: Radiator,
+    /// phase granulaire : diamètre des grains (m) — vitesse de chute, surface d'échange thermique (6 α / d)
+    #[serde(default)]
+    pub grain_diameter: f64,
+    /// phase granulaire : fraction volumique maximale des grains tassés (empilement aléatoire ≈ 0.6)
+    #[serde(default = "default_alpha_max")]
+    pub alpha_max: f64,
+}
+
+fn default_alpha_max() -> f64 {
+    0.6
 }
 
 fn default_color() -> [f32; 3] {
@@ -143,6 +155,9 @@ fn default_molar_mass() -> f64 {
 impl Phase {
     pub fn is_gas(&self) -> bool {
         self.kind == PhaseKind::Gas
+    }
+    pub fn is_granular(&self) -> bool {
+        self.kind == PhaseKind::Granular
     }
     /// Chaleur massique pour l'énergie interne e = c·T + e0 (cv pour un gaz ; cp ≈ cv pour un liquide, écart < 1 % pour l'eau)
     pub fn c_e(&self) -> f64 {
@@ -252,6 +267,8 @@ impl Phase {
             s_standard: 0.0,
             cp_slope: 0.0,
             radiator: Radiator::None,
+            grain_diameter: 0.0,
+            alpha_max: 0.6,
         }
     }
     pub fn water() -> Phase {
@@ -274,6 +291,8 @@ impl Phase {
             s_standard: 69.95,
             cp_slope: 0.0,
             radiator: Radiator::None,
+            grain_diameter: 0.0,
+            alpha_max: 0.6,
         }
     }
     /// Vapeur d'eau (gaz parfait, R = 461.5 J/(kg·K))
@@ -297,6 +316,34 @@ impl Phase {
             s_standard: 188.84,
             cp_slope: 0.0,
             radiator: Radiator::Water,
+            grain_diameter: 0.0,
+            alpha_max: 0.6,
+        }
+    }
+    /// Sable de quartz (grains de 0.3 mm) : phase granulaire. Grains incompressibles (Tait très raide, K ≈ 37 GPa), dilatation du
+    /// quartz ; viscosité de mélange de l'ordre de celle de l'eau (la friction des tas viendra d'un modèle dédié, étape 3)
+    pub fn sand() -> Phase {
+        Phase {
+            name: "sable".into(),
+            kind: PhaseKind::Granular,
+            eos: Eos::Tait { p0: 101325.0, b: 5.3e9, n: 7.0, thermal: Thermal::Beta { rho0: 2650.0, t0: 293.15, beta: 3.5e-5 } },
+            cp: 830.0,
+            conductivity: 1.4,
+            mu_ref: 1.0e-3,
+            mu_law: PropertyLaw::Constant,
+            k_law: PropertyLaw::Constant,
+            t_ref: 293.15,
+            e0: 0.0,
+            sigma: 0.0,
+            color: [0.86, 0.74, 0.47],
+            molar_mass: 0.06008,
+            diffusivity: 0.0,
+            h_formation: 0.0,
+            s_standard: 0.0,
+            cp_slope: 0.0,
+            radiator: Radiator::None,
+            grain_diameter: 3.0e-4,
+            alpha_max: 0.6,
         }
     }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
@@ -325,6 +372,8 @@ impl Phase {
             s_standard: 0.0,
             cp_slope: 0.0,
             radiator: Radiator::None,
+            grain_diameter: 0.0,
+            alpha_max: 0.6,
         }
     }
 }

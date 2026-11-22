@@ -137,14 +137,41 @@ impl MultiphaseSim {
             }
         }
         let ag: Vec<Vec<f64>> = groups.iter().map(|g| (0..n).map(|c| g.iter().map(|&k| an[k][c]).sum::<f64>().min(1.0)).collect()).collect();
+        // groupes DISPERSÉS (phases granulaires : poudre, sable) : jamais d'interface, répartis uniformément dans la cellule (voir
+        // GRANULAIRE.md). Les autres groupes ont leur interface reconstruite sur leurs fractions RENORMALISÉES hors grains (du sable dans
+        // l'eau n'y crée pas de fausse interface eau / « vide ») ; sans grains, tout est identique à l'algorithme d'origine.
+        let disp: Vec<bool> = groups.iter().map(|g| g.iter().all(|&k| self.reg.phases[k].is_granular())).collect();
+        let any_disp = disp.iter().any(|&d| d);
+        let ad: Vec<f64> = if any_disp {
+            (0..n).map(|c| (0..ng).filter(|&g| disp[g]).map(|g| ag[g][c]).sum::<f64>().min(1.0)).collect()
+        } else {
+            vec![0.0; n]
+        };
+        let agn: Vec<Vec<f64>> = if any_disp {
+            (0..ng)
+                .map(|g| {
+                    (0..n)
+                        .map(|c| {
+                            let r = 1.0 - ad[c];
+                            if disp[g] || r <= 1e-10 { 0.0 } else { (ag[g][c] / r).min(1.0) }
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            ag.clone()
+        };
         let mut plic: Vec<Vec<Option<Plic>>> = vec![vec![None; n]; ng];
         for g in 0..ng {
+            if disp[g] {
+                continue;
+            }
             for j in 0..ny {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    let a = ag[g][c];
+                    let a = agn[g][c];
                     if a > 1e-10 && a < 1.0 - 1e-10 && !self.is_solid(c) {
-                        let (gx, gy) = self.youngs_grad(&ag[g], i, j);
+                        let (gx, gy) = self.youngs_grad(&agn[g], i, j);
                         plic[g][c] = Some(Plic::new(a, gx, gy));
                     }
                 }
@@ -164,8 +191,8 @@ impl MultiphaseSim {
         let mut face_g = vec![usize::MAX; nf];
         let t_old = self.tg.clone();
         let van_leer = |a: f64, b: f64| if a * b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
-        // cellule fluide sans interface (un seul groupe présent à 99 %) : la reconstruction d'ordre 2 y est sûre
-        let single = |c: usize| -> Option<usize> { (0..ng).find(|&g| ag[g][c] > 0.99) };
+        // cellule fluide sans interface (un seul groupe non dispersé présent à 99 % hors grains) : la reconstruction d'ordre 2 y est sûre
+        let single = |c: usize| -> Option<usize> { (0..ng).find(|&g| !disp[g] && agn[g][c] > 0.99) };
         for fj_ in 0..fj {
             for fi_ in 0..fi {
                 let f = fj_ * fi + fi_;
@@ -196,36 +223,6 @@ impl MultiphaseSim {
                     Some(dc) => {
                         // bande balayée dans la cellule donneuse (coordonnées unité)
                         let (s0, s1) = if uf > 0.0 { (1.0 - xi, 1.0) } else { (0.0, xi) };
-                        let mut rem = xi;
-                        let mut spare = vec![0.0; ng];
-                        let mut fg = vec![0.0; ng];
-                        let pure = (0..ng).find(|&g| ag[g][dc] >= 1.0 - 1e-10);
-                        if let Some(gp) = pure {
-                            fg[gp] = xi;
-                        } else {
-                            for (pos, &g) in gorder.iter().enumerate() {
-                                let a = ag[g][dc];
-                                let want = if pos == ng - 1 {
-                                    rem
-                                } else if let Some(pl) = plic[g][dc] {
-                                    if dir == 0 { pl.area(s0, s1, 0.0, 1.0) } else { pl.area(0.0, 1.0, s0, s1) }
-                                } else {
-                                    0.0
-                                };
-                                let fk = want.min(rem).min(a).max(0.0);
-                                fg[g] = fk;
-                                rem -= fk;
-                                spare[g] = a - fk;
-                            }
-                            if rem > 1e-14 {
-                                let tot: f64 = spare.iter().map(|s| s.max(0.0)).sum();
-                                if tot > 0.0 {
-                                    for g in 0..ng {
-                                        fg[g] += rem * spare[g].max(0.0) / tot;
-                                    }
-                                }
-                            }
-                        }
                         // cellule en amont de la donneuse (pour la pente) et receveuse, si fluides
                         let up = if dir == 0 {
                             if uf > 0.0 { (fi_ >= 2).then(|| self.idx(fi_ - 2, fj_)) } else { (fi_ + 1 < nx).then(|| self.idx(fi_ + 1, fj_)) }
@@ -236,6 +233,57 @@ impl MultiphaseSim {
                         };
                         let up = up.filter(|&c| !self.is_solid(c));
                         let rc = r.filter(|&c| !self.is_solid(c));
+                        let mut rem = xi;
+                        let mut spare = vec![0.0; ng];
+                        let mut fg = vec![0.0; ng];
+                        // groupes dispersés d'abord : part ξ·α de la bande (α reconstruit à la face, MUSCL / van Leer)
+                        if any_disp {
+                            for g in 0..ng {
+                                let a = ag[g][dc];
+                                if !disp[g] || a <= 0.0 {
+                                    continue;
+                                }
+                                let af = match (up, rc) {
+                                    (Some(uc), Some(rcv)) => (a + 0.5 * (1.0 - xi) * van_leer(a - ag[g][uc], ag[g][rcv] - a)).clamp(0.0, 1.0),
+                                    _ => a,
+                                };
+                                let fk = (xi * af).min(a).min(rem).max(0.0);
+                                fg[g] = fk;
+                                rem -= fk;
+                                spare[g] = a - fk;
+                            }
+                        }
+                        // reste de la bande : groupes non dispersés, par la géométrie PLIC (renormalisée hors grains)
+                        let scale = rem / xi;
+                        let pure = (0..ng).find(|&g| !disp[g] && agn[g][dc] >= 1.0 - 1e-10);
+                        if let Some(gp) = pure {
+                            fg[gp] = rem;
+                            rem = 0.0;
+                        } else {
+                            let nd: Vec<usize> = gorder.iter().copied().filter(|&g| !disp[g]).collect();
+                            for (pos, &g) in nd.iter().enumerate() {
+                                let a = ag[g][dc];
+                                let want = if pos == nd.len() - 1 {
+                                    rem
+                                } else if let Some(pl) = plic[g][dc] {
+                                    scale * if dir == 0 { pl.area(s0, s1, 0.0, 1.0) } else { pl.area(0.0, 1.0, s0, s1) }
+                                } else {
+                                    0.0
+                                };
+                                let fk = want.min(rem).min(a).max(0.0);
+                                fg[g] = fk;
+                                rem -= fk;
+                                spare[g] = a - fk;
+                            }
+                        }
+                        if rem > 1e-14 {
+                            let tot: f64 = spare.iter().map(|s| s.max(0.0)).sum();
+                            if tot > 0.0 {
+                                for g in 0..ng {
+                                    fg[g] += rem * spare[g].max(0.0) / tot;
+                                }
+                            }
+                        }
                         // reconstruction MUSCL (ordre 2, TVD) de la composition d'un groupe miscible et de la température, hors interfaces :
                         // sans elle la diffusion numérique du schéma décentré (≈ u·dx/2) dépasse la diffusion moléculaire des mélanges
                         let smooth = match (up, rc) {

@@ -265,6 +265,9 @@ impl MultiphaseSim {
         }
         let n = self.nx * self.ny;
         let lam = self.phase_heat_exchange;
+        // groupes granulaires : échange par la surface des grains (`exchange_grains`), pas par l'interface plane du nœud commun
+        // (λ = ∞, une seule température par cellule : ils y participent comme les autres)
+        let skip: Vec<bool> = (0..ng).map(|g| lam.is_finite() && self.group_is_granular(g)).collect();
         let mut gk = vec![0.0; ng];
         let mut ck = vec![0.0; ng];
         let mut tk = vec![0.0; ng];
@@ -274,7 +277,7 @@ impl MultiphaseSim {
             }
             let mut present = 0;
             for g in 0..ng {
-                if self.group_mass(g, c) > 0.0 {
+                if self.group_mass(g, c) > 0.0 && !skip[g] {
                     present += 1;
                 }
             }
@@ -286,7 +289,7 @@ impl MultiphaseSim {
             for g in 0..ng {
                 ck[g] = 0.0;
                 gk[g] = 0.0;
-                if self.group_mass(g, c) <= 0.0 {
+                if self.group_mass(g, c) <= 0.0 || skip[g] {
                     continue;
                 }
                 let t = self.tg[g][c];

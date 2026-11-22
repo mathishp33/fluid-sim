@@ -10,6 +10,7 @@ pub mod mp_thermo;
 pub mod mp_species;
 pub mod mp_mg;
 pub mod mp_groups;
+pub mod mp_granular;
 #[cfg(test)]
 mod mp_chem_tests;
 #[cfg(test)]

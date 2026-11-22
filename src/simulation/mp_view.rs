@@ -43,6 +43,8 @@ pub enum MpScenario {
     ConfinedExplosion,
     VentedExplosion,
     DiffusionFlame,
+    /// nuage de sable dans l'air qui tombe dans de l'eau et s'y dépose (phase granulaire)
+    Sedimentation,
 }
 
 impl Default for MpScenario {
@@ -52,7 +54,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 10] = [
+    pub const ALL: [MpScenario; 11] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -63,8 +65,13 @@ impl MpScenario {
         Self::ConfinedExplosion,
         Self::VentedExplosion,
         Self::DiffusionFlame,
+        Self::Sedimentation,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
+    /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
+    pub fn is_granular(self) -> bool {
+        matches!(self, Self::Sedimentation)
+    }
     pub fn is_combustion(self) -> bool {
         matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame)
     }
@@ -86,6 +93,7 @@ impl MpScenario {
             Self::ConfinedExplosion => "Explosion confinée (hydrogène–air)",
             Self::VentedExplosion => "Explosion de gaz avec évent (méthane–air)",
             Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
+            Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
         }
     }
 }
@@ -102,6 +110,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
     let lib_c;
     let lib = if sc.is_combustion() {
         lib_c = lib.with_combustion();
+        &lib_c
+    } else if sc.is_granular() {
+        lib_c = lib.with_granular();
         &lib_c
     } else {
         lib
@@ -124,6 +135,18 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
     let burnt = |a: &Vec<f64>| super::mp_species::complete_combustion(&s.reg, a);
     let mut t_fn: Box<dyn Fn(f64, f64) -> f64> = Box::new(|_, _| 293.15);
     match sc {
+        MpScenario::Sedimentation => {
+            // eau en bas ; au-dessus, un nuage de sable dans l'air (30 % de grains) qui tombe, traverse la surface et se dépose au fond
+            let eau = need(roles.water, "un liquide")?;
+            let air = need(roles.air, "un gaz")?;
+            let sable = need(roles.grains, "une phase granulaire (sable)")?;
+            let mut cloud = vec![0.0; s.reg.phases.len()];
+            cloud[air] = 0.7;
+            cloud[sable] = 0.3;
+            let (x0, x1, y0, y1) = (0.3 * lx, 0.7 * lx, 0.6 * ly, 0.85 * ly);
+            s.paint_phase(move |_, y| if y < 0.4 * ly { Some(eau) } else { None });
+            s.paint_mixture(move |x, y| if x > x0 && x < x1 && y > y0 && y < y1 { Some(cloud.clone()) } else { None });
+        }
         MpScenario::DamBreak => {
             let eau = need(roles.water, "un liquide")?;
             s.paint_phase(move |x, y| if x < 0.25 * lx && y < 0.5 * ly { Some(eau) } else { None });

@@ -104,6 +104,9 @@ const RX_STRIDE: usize = 48;
 
 /// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
 pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
+    if let Some(p) = sim.reg.phases.iter().find(|p| p.is_granular()) {
+        return Some(format!("phase granulaire « {} » : calcul CPU seulement pour l'instant", p.name));
+    }
     if sim.reg.phases.len() > GPU_MAX_PHASES {
         return Some(format!("{} fluides (le GPU en gère {GPU_MAX_PHASES} au maximum)", sim.reg.phases.len()));
     }

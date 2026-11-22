@@ -83,6 +83,13 @@ impl MultiphaseSim {
             dt = dt.min((self.heat_tau * 20.0 / gap).max(1e-6));
         }
         dt = dt.min(self.cfl * dx / umax.max(1e-9));
+        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas
+        if self.has_granular() {
+            let w = self.max_settling_speed();
+            if w > 0.0 {
+                dt = dt.min(0.5 * dx / w);
+            }
+        }
         // flamme présente (facteur d'épaississement du pas précédent) : borne de pas propre aux flammes
         if self.flames_active() && self.flame_factor.iter().any(|&f| f > 1.0) {
             dt = dt.min(self.cfl_flame * dx / self.flame_speed_floor);
@@ -311,6 +318,11 @@ impl MultiphaseSim {
         // 4. conduction + changement de phase sur l'état advecté
         self.probe("advection");
         self.refresh();
+        // grains : sédimentation (dérive par rapport au fluide) sur l'état advecté
+        if self.has_granular() {
+            self.settle_grains(dt);
+            self.refresh();
+        }
         self.apply_thermal_sources(dt);
         self.probe("refresh + sources");
         lap(&mut prof, P_REFRESH);
@@ -343,6 +355,7 @@ impl MultiphaseSim {
         // échange entre groupes d'une cellule mixte : en dernier, juste avant la projection, qui voit ainsi l'état qu'il produit
         // (son couplage χ entre dans la fermeture et la répartition du travail de pression)
         self.exchange_heat(dt);
+        self.exchange_grains(dt);
         self.probe("échange entre groupes");
         lap(&mut prof, P_PHASE);
         // 5-6. pression

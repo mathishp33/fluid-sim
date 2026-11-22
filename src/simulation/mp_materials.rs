@@ -108,6 +108,8 @@ pub struct Roles {
     pub vapor: Option<usize>,
     pub oil: Option<usize>,
     pub plate: Option<usize>,
+    /// première phase granulaire (sable, poudre…)
+    pub grains: Option<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -133,7 +135,8 @@ impl Roles {
             .or_else(|| by_name(&["vapeur", "vapor", "vapour", "steam"], Some(PhaseKind::Gas)));
         let oil = by_name(&["huile", "oil"], Some(PhaseKind::Liquid)).or_else(|| (0..reg.phases.len()).find(|&k| reg.phases[k].kind == PhaseKind::Liquid && Some(k) != water));
         let plate = reg.solids.iter().position(|s| ["acier", "steel"].contains(&lower(&s.name).as_str())).or(if reg.solids.is_empty() { None } else { Some(0) });
-        Roles { air, water, vapor, oil, plate }
+        let grains = by_name(&["sable", "sand"], Some(PhaseKind::Granular)).or_else(|| (0..reg.phases.len()).find(|&k| reg.phases[k].is_granular()));
+        Roles { air, water, vapor, oil, plate, grains }
     }
 }
 
@@ -177,6 +180,8 @@ impl MaterialLibrary {
                 s_standard: 0.0,
                 cp_slope: 0.0,
                 radiator: Radiator::None,
+                grain_diameter: 0.0,
+                alpha_max: 0.6,
             },
             PhaseKind::Liquid => Phase {
                 name: self.unique_name("liquide"),
@@ -197,7 +202,10 @@ impl MaterialLibrary {
                 s_standard: 0.0,
                 cp_slope: 0.0,
                 radiator: Radiator::None,
+                grain_diameter: 0.0,
+                alpha_max: 0.6,
             },
+            PhaseKind::Granular => Phase { name: self.unique_name("grains"), ..Phase::sand() },
         }
     }
     pub fn template_solid(&self) -> Solid {
@@ -432,6 +440,8 @@ fn gas(name: &str, m: f64, cp: f64, slope: f64, mu: f64, s_mu: f64, k: f64, d: f
         s_standard: s0,
         cp_slope: slope,
         radiator: rad,
+        grain_diameter: 0.0,
+        alpha_max: 0.6,
     }
 }
 
@@ -566,6 +576,17 @@ impl MaterialLibrary {
         }
     }
     /// Copie avec le préréglage combustion et l'air sec (O2 + N2) comme fluide ambiant (scénarios de flammes / explosions).
+    /// Bibliothèque avec au moins une phase granulaire (ajoute le sable s'il n'y en a aucune) : scénarios à grains
+    pub fn with_granular(&self) -> MaterialLibrary {
+        let mut l = self.clone();
+        if !l.fluids.iter().any(|p| p.is_granular()) {
+            let mut sand = Phase::sand();
+            sand.name = l.unique_name("sable");
+            l.fluids.push(sand);
+        }
+        l
+    }
+
     pub fn with_combustion(&self) -> MaterialLibrary {
         let mut l = self.clone();
         l.add_combustion_preset();
