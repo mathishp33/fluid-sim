@@ -21,9 +21,10 @@ use super::mp_step::P_GPU;
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Eos, Radiator, Thermal, MAX_PHASES, T_STD};
 
-const SHADERS: [&str; 8] = [
+const SHADERS: [&str; 9] = [
     include_str!("mp_gpu/common.wgsl"),
     include_str!("mp_gpu/flow.wgsl"),
+    include_str!("mp_gpu/granular.wgsl"),
     include_str!("mp_gpu/mg.wgsl"),
     include_str!("mp_gpu/thermo.wgsl"),
     include_str!("mp_gpu/species.wgsl"),
@@ -95,8 +96,9 @@ const F_HEAT: u32 = 128;
 const F_MISC: u32 = 256;
 const F_FLAME: u32 = 512;
 const F_MACC: u32 = 1024;
+const F_GRAN: u32 = 2048;
 
-const PH_STRIDE: usize = 32;
+const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
 const PC_STRIDE: usize = 8;
 const LEV_STRIDE: usize = 8;
@@ -104,9 +106,6 @@ const RX_STRIDE: usize = 48;
 
 /// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
 pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
-    if let Some(p) = sim.reg.phases.iter().find(|p| p.is_granular()) {
-        return Some(format!("phase granulaire « {} » : calcul CPU seulement pour l'instant", p.name));
-    }
     if sim.reg.phases.len() > GPU_MAX_PHASES {
         return Some(format!("{} fluides (le GPU en gère {GPU_MAX_PHASES} au maximum)", sim.reg.phases.len()));
     }
@@ -326,6 +325,11 @@ impl MultiphaseGpu {
         sl.add("aw", np * n);
         sl.add("an", np * n);
         sl.add("ag", ng * n);
+        // phases granulaires : fractions des groupes renormalisées hors grains (interfaces), incréments de la sédimentation
+        // (masses par phase + drapeau « cellule touchée », énergies par groupe)
+        sl.add("agn", ng * n);
+        sl.add("sdm", (np + 1) * n);
+        sl.add("sde", ng.max(1) * n);
         sl.add("scale", np * n);
         sl.add("fl_vol", nf * np);
         for name in ["fdon", "frcv", "fghost", "ftf", "ftg"] {
@@ -367,6 +371,7 @@ impl MultiphaseGpu {
         tl.add("PC", npc.max(1) * PC_STRIDE);
         tl.add("GRP", ng.max(1) * (1 + npmax));
         tl.add("GORD", ng.max(1));
+        tl.add("GDISP", ng.max(1)); // groupe dispersé (uniquement des phases granulaires)
         tl.add("AMB", np);
         tl.add("INL", 16);
         tl.add("LEV", levels.len() * LEV_STRIDE);
@@ -684,6 +689,10 @@ impl MultiphaseGpu {
             r[27] = p.color[0] as f64;
             r[28] = p.color[1] as f64;
             r[29] = p.color[2] as f64;
+            // grains : phase granulaire, diamètre, compaction maximale
+            r[32] = if p.is_granular() { 1.0 } else { 0.0 };
+            r[33] = p.grain_diameter;
+            r[34] = p.alpha_max;
             for q in 0..PH_STRIDE {
                 t[b + q] = r[q] as f32;
             }
@@ -710,6 +719,9 @@ impl MultiphaseGpu {
         }
         for (pos, g) in sim.group_order(&groups).into_iter().enumerate() {
             t[self.tl.o("GORD") + pos] = g as f32;
+        }
+        for (g, m) in groups.iter().enumerate() {
+            t[self.tl.o("GDISP") + g] = if m.iter().all(|&k| ph[k].is_granular()) { 1.0 } else { 0.0 };
         }
         let amb = sim.ambient_alpha();
         for k in 0..np {
@@ -1126,6 +1138,9 @@ impl MultiphaseGpu {
         if sim.maccormack {
             flags |= F_MACC;
         }
+        if sim.has_granular() {
+            flags |= F_GRAN;
+        }
         w[0] = self.nx as u32;
         w[1] = self.ny as u32;
         w[2] = self.np as u32;
@@ -1325,6 +1340,14 @@ impl MultiphaseGpu {
         }
         // thermique, espèces, chimie, changement de phase sur l'état advecté
         v.push(cell("k_refresh"));
+        // grains : sédimentation sur l'état advecté, une phase granulaire après l'autre (miroir de settle_grains), puis refresh
+        if sim.has_granular() {
+            for s in (0..self.np).filter(|&k| sim.reg.phases[k].is_granular()) {
+                v.push(Op { k: "k_settle_delta", wg: wn, slot: self.slot(s, 0) });
+                v.push(Op { k: "k_settle_apply", wg: wn, slot: self.slot(s, 0) });
+            }
+            v.push(cell("k_refresh"));
+        }
         if sim.heat_active || self.has_thermal {
             v.push(cell("k_thermal_sources"));
         }
@@ -1393,6 +1416,9 @@ impl MultiphaseGpu {
         // échange entre groupes d'une cellule mixte, en dernier avant la projection (comme le CPU)
         if self.ng > 1 {
             v.push(cell("k_exchange"));
+            if sim.has_granular() {
+                v.push(cell("k_exch_grains"));
+            }
         }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));
@@ -1577,6 +1603,22 @@ impl MultiphaseGpu {
         self.queue.submit(Some(enc.finish()));
         self.device.poll(wgpu::Maintain::Wait);
         self.host_stale = true;
+    }
+
+    /// Diagnostic : relit la tranche `name` du tampon d'état S (tous les champs, persistants ou de travail)
+    #[cfg(test)]
+    pub(crate) fn debug_read_slice(&self, name: &str) -> Vec<f32> {
+        let (off, len) = self.sl.map[name];
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug slice"),
+            size: ((len * 4) as u64).max(16),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("debug slice") });
+        enc.copy_buffer_to_buffer(&self.s_buf, (off * 4) as u64, &buf, 0, (len * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        read_buffer(&self.device, &buf)
     }
 
     /// Diagnostic : un pas BRUT (sans retour arrière) avec dt ≤ `dt_cap` et la fermeture héritée à `relax_scale` ; l'état obtenu est

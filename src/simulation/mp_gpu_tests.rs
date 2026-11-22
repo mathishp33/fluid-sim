@@ -472,9 +472,22 @@ fn gpu_advection_only_diffs() {
     let mut gs = mk();
     let Some(mut g) = gpu_or_skip(&gs) else { return };
     cpu.refresh();
+    let before = (cpu.mass.clone(), cpu.alpha.clone(), cpu.u.clone(), cpu.v.clone());
     let dt = cpu.choose_dt();
-    cpu.advect_mass_energy(dt);
-    g.debug_partial_step(&gs, "k_temp_update", 2);
+    if std::env::var("MP_ONE").is_ok() {
+        // un seul balayage (le premier du pas)
+        let mut aw: Vec<Vec<f64>> = cpu.alpha.clone();
+        cpu.mfx.iter_mut().for_each(|v| *v = 0.0);
+        cpu.mfy.iter_mut().for_each(|v| *v = 0.0);
+        cpu.m_tot_old = (0..cpu.nx * cpu.ny).map(|c| (0..cpu.mass.len()).map(|k| cpu.mass[k][c]).sum()).collect();
+        let first = cpu.step_count % 2;
+        eprintln!("premier balayage : direction {first}");
+        cpu.plic_sweep(first, dt, &mut aw);
+        g.debug_partial_step(&gs, "k_temp_update", 1);
+    } else {
+        cpu.advect_mass_energy(dt);
+        g.debug_partial_step(&gs, "k_temp_update", 2);
+    }
     g.download(&mut gs);
     eprintln!("dt {dt:.6e}");
     for (name, d, at) in field_diff(&cpu, &gs) {
@@ -485,6 +498,44 @@ fn gpu_advection_only_diffs() {
     let j = cpu.ny / 2;
     let row: Vec<String> = (0..cpu.nx).map(|i| { let c = cpu.idx(i, j); format!("{:+.0}", 1e4 * (gs.mass[k][c] - cpu.mass[k][c]) / sc) }).collect();
     eprintln!("   m{k} j={j} {}", row.join(" "));
+    // détail autour d'une cellule (MP_CELL)
+    if let Some(c0) = std::env::var("MP_CELL").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let nx = cpu.nx;
+        let (i0, j0) = (c0 % nx, c0 / nx);
+        for (di, dj) in [(0i64, 0i64), (-1, 0), (1, 0), (0, -1), (0, 1), (0, -2), (0, 2)] {
+            let (i, jj) = (i0 as i64 + di, j0 as i64 + dj);
+            if i < 0 || jj < 0 || i >= nx as i64 || jj >= cpu.ny as i64 { continue; }
+            let c = jj as usize * nx + i as usize;
+            let np = cpu.mass.len();
+            let a0: Vec<String> = (0..np).map(|q| format!("{:.6e}", before.1[q][c])).collect();
+            let dm: Vec<String> = (0..np).map(|q| format!("{:+.3e}/{:+.3e}", cpu.mass[q][c] - before.0[q][c], gs.mass[q][c] - before.0[q][c])).collect();
+            eprintln!("  ({i},{jj}) α {:?}
+      Δm cpu/gpu {:?}", a0, dm);
+        }
+        let (i, jj) = (i0, j0);
+        eprintln!("  u g {:.4e} d {:.4e} ; v b {:.4e} h {:.4e}", before.2[cpu.uidx(i, jj)], before.2[cpu.uidx(i + 1, jj)], before.3[cpu.vidx(i, jj)], before.3[cpu.vidx(i, jj + 1)]);
+        // flux de volume par phase du dernier balayage GPU (faces gauche / droite si balayage x)
+        let fl = g.debug_read_slice("fl_vol");
+        let np = cpu.mass.len();
+        for f in [cpu.uidx(i, jj), cpu.uidx(i + 1, jj), cpu.vidx(i, jj), cpu.vidx(i, jj + 1)] {
+            let v: Vec<String> = (0..np).map(|k| format!("{:.6e}", fl[f * np + k])).collect();
+            eprintln!("  face {f} : {:?}", v);
+        }
+        let agn = g.debug_read_slice("agn");
+        let n = cpu.nx * cpu.ny;
+        for dj in [1i64, 0, -1] {
+            let mut row = String::new();
+            for di in [-1i64, 0, 1] {
+                let c = ((j0 as i64 + dj) as usize) * nx + (i0 as i64 + di) as usize;
+                // eau (groupe 1) : GPU / attendu depuis α de début (somme normalisée, hors grains)
+                let tot: f64 = (0..np).map(|q| before.1[q][c].clamp(0.0, 1.0)).sum();
+                let ad = before.1[4][c].clamp(0.0, 1.0) / tot;
+                let exp = (before.1[1][c].clamp(0.0, 1.0) / tot) / (1.0 - ad);
+                row += &format!("  {:.6}/{:.6}", agn[n + c], exp);
+            }
+            eprintln!("  agn eau {row}");
+        }
+    }
 }
 
 /// scène de test des extras : cuve d'eau avec émetteur, puits, accélérateur, téléporteur, entrée de bord, solides isotherme et chauffant
@@ -1177,6 +1228,263 @@ fn dam_break_vapor_cpu() {
             let nv = s.mass[vap].iter().filter(|&&m| m > 1e-9).count();
             eprintln!("t={:.3} pas {} m_v {:.3e} cellules vapeur {} p min {:.0} T min {:.2} umax {:.2} retours {}", s.time, s.step_count, mv, nv, pmin, tmin, s.max_speed(), s.rollbacks);
             next += 0.05;
+        }
+    }
+}
+
+/// boîte fermée de liquide (eau) contenant une suspension uniforme de sable (fraction a0, grains de diamètre d)
+fn sand_suspension(nx: usize, ny: usize, dx: f64, a0: f64, d: f64) -> MultiphaseSim {
+    use super::phases::{Phase, Registry};
+    let mut r = Registry::new();
+    let eau = r.add_phase(Phase::water());
+    let mut sand = Phase::sand();
+    sand.grain_diameter = d;
+    let sable = r.add_phase(sand);
+    let mut s = MultiphaseSim::new(nx, ny, dx, r, eau);
+    s.surface_tension = false;
+    let mut mix = vec![0.0; 2];
+    mix[eau] = 1.0 - a0;
+    mix[sable] = a0;
+    s.paint_mixture(move |_, _| Some(mix.clone()));
+    s.finalize_init(|_, _| 293.15);
+    s
+}
+
+/// même suspension sous une couche d'air (`air_rows` rangées du haut) : récipient ouvert, plus proche des scènes réelles
+fn sand_suspension_under_air(nx: usize, ny: usize, dx: f64, a0: f64, d: f64, air_rows: usize) -> MultiphaseSim {
+    use super::phases::{Phase, Registry};
+    let mut r = Registry::new();
+    let air = r.add_phase(Phase::air());
+    let eau = r.add_phase(Phase::water());
+    let mut sand = Phase::sand();
+    sand.grain_diameter = d;
+    let sable = r.add_phase(sand);
+    let mut s = MultiphaseSim::new(nx, ny, dx, r, air);
+    s.surface_tension = false;
+    let h = (ny - air_rows) as f64 * dx;
+    s.paint_mixture(move |_, y| {
+        let mut mix = vec![0.0; 3];
+        if y < h {
+            mix[eau] = 1.0 - a0;
+            mix[sable] = a0;
+        } else {
+            mix[air] = 1.0;
+        }
+        Some(mix)
+    });
+    s.finalize_init(|_, _| 293.15);
+    s
+}
+
+#[test]
+fn gpu_matches_cpu_sand_cloud_falling_into_water() {
+    // phase granulaire : transport dispersé (à travers la surface de l'eau), sédimentation, borne de pas — accord d'un pas, puis 1 s
+    let mk = || build_scenario(MpScenario::Sedimentation, 40, 30, 0.01, 9.81);
+    assert!(super::gpu_multiphase::gpu_unsupported_reason(&mk()).is_none());
+    one_step_agreement("nuage de sable", mk(), 40, 3, 1e-4, 0.02);
+    let Some((cpu, gs, _)) = compare("nuage de sable", &mk, 1.0) else { return };
+    let (a, b) = (metrics(&cpu), metrics(&gs));
+    let sable = cpu.reg.phases.iter().position(|p| p.is_granular()).unwrap();
+    let below = |s: &MultiphaseSim| {
+        let surface = 0.4 * s.ny as f64;
+        (0..s.nx * s.ny).filter(|&c| ((c / s.nx) as f64) < surface).map(|c| s.mass[sable][c]).sum::<f64>() * s.dx * s.dx / s.total_mass(sable)
+    };
+    eprintln!(" sable sous la surface : CPU {:.3} GPU {:.3}", below(&cpu), below(&gs));
+    for k in 0..a.mass.len() {
+        assert!(rel(a.mass[k], b.mass[k]) < 1e-4, "masse {k} : {} vs {}", a.mass[k], b.mass[k]);
+    }
+    assert!(com_dist(&a, &b, sable) < 0.01, "centre de masse du sable : CPU {:?} GPU {:?}", a.com[sable], b.com[sable]);
+    assert!((below(&cpu) - below(&gs)).abs() < 0.05);
+}
+
+#[test]
+fn gpu_forms_the_same_packed_sand_layer_as_the_cpu() {
+    // grains de 0.5 mm à 10 % dans 6 cm d'eau sous 1 cm d'air : en 3 s tout est au fond, couche tassée à α_max (miroir du test CPU).
+    // (Récipient ouvert : une boîte FERMÉE entièrement liquide est instable sur le GPU f32, grains ou non — voir TODO.)
+    let (ny, a0) = (70, 0.1);
+    let mk = || sand_suspension_under_air(6, ny, 1e-3, a0, 5e-4, 10);
+    one_step_agreement("suspension de sable", mk(), 20, 3, 1e-4, 0.01);
+    let Some((cpu, gs, _)) = compare("couche tassée", &mk, 3.0) else { return };
+    let sable = 2;
+    let amax = gs.reg.phases[sable].alpha_max;
+    let col = |s: &MultiphaseSim| (0..ny).map(|j| s.alpha[sable][s.idx(3, j)]).collect::<Vec<f64>>();
+    let (cc, cg) = (col(&cpu), col(&gs));
+    let show = |c: &[f64]| c[..14].iter().map(|a| (a * 1000.0).round() / 1000.0).collect::<Vec<_>>();
+    eprintln!(" colonne CPU {:?}
+ colonne GPU {:?}", show(&cc), show(&cg));
+    let bottom: f64 = cg[..8].iter().sum::<f64>() / 8.0;
+    let top = cg[14..].iter().fold(0.0f64, |a, &b| a.max(b));
+    assert!(bottom > 0.95 * amax && bottom <= amax + 1e-4, "fond {bottom}");
+    assert!(top < 1e-2, "grains restés en suspension : {top}");
+    for k in 0..3 {
+        assert!(rel(cpu.total_mass(k), gs.total_mass(k)) < 1e-5, "masse {k}");
+    }
+    for j in 0..ny {
+        assert!((cc[j] - cg[j]).abs() < 0.02, "rangée {j} : CPU {} GPU {}", cc[j], cg[j]);
+    }
+}
+
+#[test]
+fn gpu_matches_cpu_hot_powder_cooling_in_air() {
+    // poudre de 0.3 mm à 5 %, à 600 K dans de l'air à 300 K, sans gravité : échange par la surface des grains (k_exch_grains).
+    // Comparé à t = τ (écart divisé par e), là où l'échange est en cours, pas une fois l'équilibre atteint
+    use super::phases::{Phase, Registry};
+    let mk = || {
+        let mut r = Registry::new();
+        let air = r.add_phase(Phase::air());
+        let sable = r.add_phase(Phase::sand());
+        let mut s = MultiphaseSim::new(6, 6, 0.01, r, air);
+        s.gravity = [0.0, 0.0];
+        s.paint_mixture(move |_, _| Some(vec![0.95, 0.05]));
+        s.finalize_init(|_, _| 300.0);
+        let gs = s.group_of[sable];
+        for c in 0..36 {
+            s.set_group_temperature(c, gs, 600.0);
+        }
+        s.refresh();
+        s
+    };
+    let s0 = mk();
+    let (ga, gsand) = (s0.group_of[0], s0.group_of[1]);
+    let c = s0.idx(3, 3);
+    let g = 12.0 * s0.group_alpha(gsand, c) * s0.group_k(ga, c) / (3e-4f64).powi(2);
+    let tau = 1.0 / (g * (1.0 / s0.group_cap_at(gsand, c, 600.0) + 1.0 / s0.group_cap_at(ga, c, 300.0)));
+    let mk_tau = || {
+        let mut s = mk();
+        s.dt_max = tau / 50.0;
+        s
+    };
+    one_step_agreement("poudre chaude", mk_tau(), 5, 3, 1e-5, 0.05);
+    let Some((cpu, gs, _)) = compare("poudre chaude", &mk_tau, tau) else { return };
+    let gap = |s: &MultiphaseSim| s.tg[gsand][c] - s.tg[ga][c];
+    eprintln!(" τ = {tau:.3e} s ; écart grains − air à t = τ : CPU {:.3} K GPU {:.3} K (e^-1 × 300 = {:.1})", gap(&cpu), gap(&gs), 300.0 / std::f64::consts::E);
+    assert!(gap(&cpu) > 60.0 && gap(&cpu) < 160.0, "écart CPU {}", gap(&cpu));
+    assert!((gap(&cpu) - gap(&gs)).abs() < 0.01 * gap(&cpu), "écart CPU {} GPU {}", gap(&cpu), gap(&gs));
+    assert!(rel(cpu.total_internal_energy(), gs.total_internal_energy()) < 1e-5);
+}
+
+/// diagnostic : pas GPU BRUT du nuage de sable jusqu'au noyau MP_STOP (défaut k_sanity_final), après MP_WARM pas CPU ; cellules
+/// invalides et plus grands écarts de masse au CPU
+#[test]
+#[ignore]
+fn gpu_sand_raw_step_diag() {
+    let mut s = build_scenario(MpScenario::Sedimentation, 40, 30, 0.01, 9.81);
+    let warm = std::env::var("MP_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(40usize);
+    for _ in 0..warm {
+        s.step();
+    }
+    let stop = std::env::var("MP_STOP").unwrap_or("k_sanity_final".into());
+    let occ = std::env::var("MP_OCC").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize);
+    let mut gs = clone_sim(&s);
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    g.debug_partial_step(&gs, &stop, occ);
+    g.download(&mut gs);
+    let np = gs.mass.len();
+    let mut shown = 0;
+    for c in 0..gs.nx * gs.ny {
+        let tg: Vec<f64> = (0..gs.groups.len()).map(|q| gs.tg[q][c]).collect();
+        let bad = !(gs.temp[c] > 50.0 && gs.temp[c] < 5000.0) || tg.iter().any(|t| !(*t > 50.0 && *t < 5000.0)) || !gs.e[c].is_finite()
+            || (0..np).any(|k| !(gs.mass[k][c] >= -1e-6)) || !gs.p[c].is_finite();
+        if bad && shown < 8 {
+            shown += 1;
+            let ms: Vec<String> = (0..np).map(|k| format!("{:.3e}", gs.mass[k][c])).collect();
+            eprintln!("({}, {}) T {:.1} T_g {:?} p {:.0} m {:?}", c % gs.nx, c / gs.nx, gs.temp[c], tg, gs.p[c], ms);
+        }
+    }
+    let umax = gs.u.iter().chain(gs.v.iter()).fold(0f64, |a, x| a.max(x.abs()));
+    let mut cpu = s;
+    cpu.step();
+    eprintln!("cellules invalides {shown} ; |u|max GPU {umax:.3} CPU {:.3} ; dt CPU {:.3e}", cpu.max_speed(), cpu.last_dt);
+    for k in 0..np {
+        let (mut dmax, mut at) = (0f64, 0usize);
+        for c in 0..gs.nx * gs.ny {
+            let d = (gs.mass[k][c] - cpu.mass[k][c]).abs();
+            if d > dmax { dmax = d; at = c; }
+        }
+        eprintln!(" m{k} : écart max {dmax:.3e} en ({}, {}) gpu {:.4e} cpu {:.4e}", at % gs.nx, at / gs.nx, gs.mass[k][at], cpu.mass[k][at]);
+    }
+}
+
+/// diagnostic : suspension de sable sur le GPU, grandeurs tous les MP_EVERY pas (masses, p, colonne du fond)
+#[test]
+#[ignore]
+fn gpu_sand_layer_trace() {
+    let mut s = if std::env::var("MP_AIR").is_ok() { sand_suspension_under_air(6, 70, 1e-3, 0.1, 5e-4, 10) } else { sand_suspension(6, 60, 1e-3, std::env::var("MP_A0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1), 5e-4) };
+    let sable = s.reg.phases.len() - 1;
+    let Some(mut g) = gpu_or_skip(&s) else { return };
+    let every = std::env::var("MP_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(20usize);
+    let t_end = std::env::var("MP_T").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f64);
+    let mut k = 0;
+    while s.time < t_end && !s.diverged {
+        g.step(&mut s);
+        k += 1;
+        if k % every == 0 || g.last.retries > 0 {
+            g.download(&mut s);
+            let col: Vec<f64> = (0..8).map(|j| (s.alpha[sable][s.idx(3, j)] * 1000.0).round() / 1000.0).collect();
+            let pmax = s.p.iter().fold(0f64, |a, &b| a.max(b));
+            eprintln!("{:?}", g.last);
+            eprintln!("pas {k} t {:.4} dt {:.2e} essais {} m_eau {:.6e} m_sable {:.6e} pmax {:.0} umax {:.2e} col {:?}", s.time, g.last.dt, g.last.retries,
+                s.total_mass(sable - 1), s.total_mass(sable), pmax, s.max_speed(), col);
+        }
+    }
+}
+
+/// diagnostic : accord d'un pas de la suspension après MP_WARM pas CPU, et pas GPU brut (cellules invalides)
+#[test]
+#[ignore]
+fn gpu_sand_layer_step_diag() {
+    let warm = std::env::var("MP_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(94usize);
+    let mut s = sand_suspension(6, 60, 1e-3, 0.1, 5e-4);
+    if std::env::var("MP_GPUWARM").is_ok() {
+        // préchauffage sur le GPU (sa propre trajectoire)
+        let Some(mut g0) = gpu_or_skip(&s) else { return };
+        for _ in 0..warm {
+            g0.step(&mut s);
+        }
+        g0.download(&mut s);
+        eprintln!("GPU préchauffé : t {:.4} essais du dernier pas {}", s.time, g0.last.retries);
+    } else {
+        for _ in 0..warm {
+            s.step();
+        }
+    }
+    let mut gs = clone_sim(&s);
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    let stop = std::env::var("MP_STOP").unwrap_or("k_sanity_final".into());
+    let occ = std::env::var("MP_OCC").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize);
+    g.debug_partial_step(&gs, &stop, occ);
+    g.download(&mut gs);
+    let mut cpu = clone_sim(&s);
+    cpu.step();
+    eprintln!("dt CPU {:.3e} ; |u| GPU {:.3e} CPU {:.3e}", cpu.last_dt, gs.max_speed(), cpu.max_speed());
+    for j in 0..10 {
+        let c = s.idx(3, j);
+        let sa: f64 = (0..2).map(|k| gs.alpha[k][c]).sum();
+        eprintln!(" j {j} : α_s avant {:.5} ; GPU m {:.5e} {:.5e} p {:.0} Σα {:.6} T {:.3} | CPU m {:.5e} {:.5e} p {:.0}", s.alpha[1][c], gs.mass[0][c], gs.mass[1][c], gs.p[c], sa, gs.temp[c],
+            cpu.mass[0][c], cpu.mass[1][c], cpu.p[c]);
+    }
+}
+
+/// diagnostic : boîte fermée d'eau pure (sans phase granulaire) sur le GPU
+#[test]
+#[ignore]
+fn gpu_closed_water_box_trace() {
+    use super::phases::{Phase, Registry};
+    let mut r = Registry::new();
+    let eau = r.add_phase(Phase::water());
+    let mut s = MultiphaseSim::new(6, 60, 1e-3, r, eau);
+    s.surface_tension = false;
+    s.paint_mixture(move |_, _| Some(vec![1.0]));
+    s.finalize_init(|_, _| 293.15);
+    let Some(mut g) = gpu_or_skip(&s) else { return };
+    let mut k = 0;
+    while s.time < 2.0 && !s.diverged && k < 3000 {
+        g.step(&mut s);
+        k += 1;
+        if k % 50 == 0 || g.last.retries > 0 {
+            g.download(&mut s);
+            let pmax = s.p.iter().fold(0f64, |a, &b| a.max(b));
+            eprintln!("pas {k} t {:.4} dt {:.2e} essais {} m {:.6e} pmax {:.0} umax {:.2e} {:?}", s.time, g.last.dt, g.last.retries, s.total_mass(0), pmax, s.max_speed(), g.last);
         }
     }
 }

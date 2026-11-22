@@ -68,8 +68,12 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
    l'éditeur). Tests : vitesse de chute (Stokes à 20 µm, Newton à 3 mm, grain léger qui remonte), front d'eau claire d'une suspension
    à 10 % (1.00 cm descendu pour 0.97 prédit), couche tassée exactement à α_max = 0.6 (10 mailles, rien au-dessus), masses exactes et
    énergie à 1e-6, poudre chaude → τ de l'échange par la surface des grains, suspension uniforme qui le reste sous un tourbillon,
-   nuage de sable : 99.4 % sous la surface de l'eau en 1.5 s. Le GPU refuse proprement ces scènes (repli CPU).
-2. Portage GPU de l'étape 1 (accord pas à pas avec le CPU).
+   nuage de sable : 99.4 % sous la surface de l'eau en 1.5 s.
+2. **FAIT (2026-11-22) — Portage GPU de l'étape 1** (`mp_gpu/granular.wgsl`, `k_sweep_flux`, `k_an`, `k_exchange`, `k_red_dt`) :
+   sédimentation en deux passes (incréments puis application, sans conflit d'écriture), mêmes formules et mêmes plafonds que le CPU.
+   Accord d'un pas : 1e-5 (nuage de sable), 5e-8 (suspension), 1e-7 (poudre chaude) ; 1 s de nuage : 92 % du sable sous la surface
+   des deux côtés ; 3 s de suspension : mêmes colonnes. Corrigé en route (aussi utile sans grains) : aire PLIC f32 stable,
+   relaxation thermique d'une trace sans débordement. Limite f32 connue (pas propre aux grains) : boîte fermée sans aucun gaz.
 3. Viscosité implicite + friction (tas).
 4. Réactions hétérogènes et matériaux (charbon, poudre à canon, bois).
 5. Solidification.

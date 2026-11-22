@@ -406,7 +406,6 @@ mod tests {
         let sable = s.reg.phases.iter().position(|p| p.is_granular()).unwrap();
         let m0 = s.total_mass(sable);
         assert!(m0 > 0.0);
-        assert!(super::super::gpu_multiphase::gpu_unsupported_reason(&s).is_some(), "le GPU doit refuser les grains (étape 1)");
         while s.time < 1.5 && !s.diverged {
             s.step();
         }

@@ -190,9 +190,10 @@ fn k_exchange(@builtin(global_invocation_id) g: vec3<u32>) {
     // pas de sortie anticipée « un seul groupe présent » (lavapipe plante sur les boucles qu'aucun fil d'un groupe de travail ne
     // parcourt) : avec un seul groupe, T_i = T_g et rien ne change. Pas de tableaux privés : C_g et G_g recalculés au second
     // passage (ils ne dépendent que des masses et de T_g, lue avant d'être écrite)
+    // groupes granulaires : échange par la surface des grains (k_exch_grains), pas par ce nœud (λ = ∞ : ils y participent)
     var num = 0.0; var den = 0.0; var ce = 0.0; var cs = 0.0;
     for (var gq = 0u; gq < P.ng; gq++) {
-        let pres = group_mass(gq, c) > 0.0;
+        let pres = group_mass(gq, c) > 0.0 && !(has(F_GRAN) && !lam_inf() && gdisp(gq));
         let t = tgrp(gq, c);
         let ck = select(0.0, max(group_cap_at(gq, c, t), 1e-30), pres);
         ce += ck * t; cs += ck;
@@ -204,12 +205,14 @@ fn k_exchange(@builtin(global_invocation_id) g: vec3<u32>) {
     if (lam_inf()) { ti = ce / max(cs, 1e-30); } else { ti = num / max(den, 1e-30); }
     let ok = select(den > 0.0, cs > 0.0, lam_inf());
     for (var gq = 0u; gq < P.ng; gq++) {
-        let pres = group_mass(gq, c) > 0.0 && ok;
+        let pres = group_mass(gq, c) > 0.0 && ok && !(has(F_GRAN) && !lam_inf() && gdisp(gq));
         let t = tgrp(gq, c);
         let ck = max(group_cap_at(gq, c, t), 1e-30);
         let gk = exch_g(gq, c);
+        // T + (T_i − T)·a/(1 + a) : sans débordement f32 pour une trace (C ~ 1e-29 J/K, a ~ 1e36), contrairement à (T + a T_i)/(1 + a)
         let a2 = dt * min(gk, 1e29) / ck;
-        let tn = select(ti, (t + a2 * ti) / (1.0 + a2), !lam_inf() && gk < 1e29);
+        let x2 = select(a2 / (1.0 + a2), 1.0, a2 > 1e30);
+        let tn = select(ti, t + x2 * (ti - t), !lam_inf() && gk < 1e29);
         S[O_epsg + gq * n + c] += select(0.0, ck * (tn - t), pres);
         S[O_tg + gq * n + c] = select(t, tn, pres);
     }

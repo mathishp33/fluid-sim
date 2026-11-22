@@ -35,6 +35,7 @@ const F_HEAT: u32 = 128u;    // cibles de chauffage actives
 const F_MISC: u32 = 256u;    // au moins un groupe miscible (≥ 2 membres)
 const F_FLAME: u32 = 512u;   // au moins une réaction de flamme (TFM)
 const F_MACC: u32 = 1024u;   // MacCormack (advection semi-lagrangienne)
+const F_GRAN: u32 = 2048u;   // au moins une phase granulaire (granular.wgsl)
 
 // paramètres par lancement (décalage dynamique, groupe 1)
 struct Disp { a: u32, b: u32, c: u32, d: u32 };

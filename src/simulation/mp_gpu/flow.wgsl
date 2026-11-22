@@ -73,8 +73,9 @@ fn k_red_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
             }
         }
         if (S[O_flame + i] > 1.0) { v[6] = 1.0; }
+        if (has(F_GRAN)) { v[7] = max_settling_at(i); }
     }
-    wg_reduce(v, 7u, 1u, l.x, w.x, 0u);
+    wg_reduce(v, 8u, 1u, l.x, w.x, 0u);
 }
 @compute @workgroup_size(256)
 fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
@@ -86,10 +87,13 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
     let sig = final_reduce(4u, nw, 1u, l.x);
     let gap = final_reduce(5u, nw, 1u, l.x);
     let flame = final_reduce(6u, nw, 1u, l.x);
+    let wset = final_reduce(7u, nw, 1u, l.x);
     if (l.x == 0u) {
         var dt = min(min(P.dt_max, D[D_DTCHEM]), min(D[D_DTPHASE], P.dt_cap));
         if (gap > 0.0) { dt = min(dt, max(P.heat_tau * 20.0 / gap, 1e-6)); }
         dt = min(dt, P.cfl * P.dx / max(umax, 1e-9));
+        // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas
+        if (has(F_GRAN) && wset > 0.0) { dt = min(dt, 0.5 * P.dx / wset); }
         // flamme présente (miroir de choose_dt)
         if (has(F_FLAME) && flame > 0.5) { dt = min(dt, P.cfl_flame * P.dx / P.flame_u_floor); }
         let gg = sqrt(P.gx * P.gx + P.gy * P.gy);
@@ -390,6 +394,20 @@ fn k_an(@builtin(global_invocation_id) g: vec3<u32>) {
         S[O_ag + group_k(k) * n + c] += a;
     }
     for (var gi = 0u; gi < P.ng; gi++) { S[O_ag + gi * n + c] = min(S[O_ag + gi * n + c], 1.0); }
+    // grains : fractions des groupes non dispersés RENORMALISÉES hors grains (leurs interfaces), 0 pour les groupes dispersés
+    if (has(F_GRAN)) {
+        var ad = 0.0;
+        for (var gi = 0u; gi < P.ng; gi++) { ad += select(0.0, S[O_ag + gi * n + c], gdisp(gi)); }
+        let rr = 1.0 - min(ad, 1.0);
+        for (var gi = 0u; gi < P.ng; gi++) {
+            S[O_agn + gi * n + c] = select(min(S[O_ag + gi * n + c] / max(rr, 1e-30), 1.0), 0.0, gdisp(gi) || rr <= 1e-10);
+        }
+    }
+}
+// fraction du groupe vue par la reconstruction d'interface : renormalisée hors grains s'il y a des phases granulaires
+fn agr(gi: u32, c: u32) -> f32 {
+    if (has(F_GRAN)) { return S[O_agn + gi * ncell() + c]; }
+    return ag(gi, c);
 }
 
 fn a_from_vol(m1: f32, m2: f32, v: f32) -> f32 {
@@ -408,7 +426,6 @@ fn plic_new(a: f32, gx: f32, gy: f32) -> vec3<f32> {
     let aa = a_from_vol(min(ax, ay), max(ax, ay), a);
     return vec3<f32>(nx, ny, aa + min(nx, 0.0) + min(ny, 0.0));
 }
-fn tri(s: f32, d: f32) -> f32 { if (s > 0.0) { return s * s / d; } return 0.0; }
 fn plic_area(pl: vec3<f32>, x0i: f32, x1i: f32, y0i: f32, y1i: f32) -> f32 {
     var x0 = x0i; var x1 = x1i; var y0 = y0i; var y1 = y1i;
     let neg = min(pl.x, 0.0) + min(pl.y, 0.0);
@@ -418,19 +435,25 @@ fn plic_area(pl: vec3<f32>, x0i: f32, x1i: f32, y0i: f32, y1i: f32) -> f32 {
     let mx = abs(pl.x); let my = abs(pl.y);
     if (mx < 1e-4) { return (x1 - x0) * (clamp(a / my, y0, y1) - y0); }
     if (my < 1e-4) { return (y1 - y0) * (clamp(a / mx, x0, x1) - x0); }
-    let d = 2.0 * mx * my;
-    let F00 = tri(a, d) - tri(a - mx * x0, d) - tri(a - my * y0, d) + tri(a - mx * x0 - my * y0, d);
-    let F10 = tri(a, d) - tri(a - mx * x1, d) - tri(a - my * y0, d) + tri(a - mx * x1 - my * y0, d);
-    let F01 = tri(a, d) - tri(a - mx * x0, d) - tri(a - my * y1, d) + tri(a - mx * x0 - my * y1, d);
-    let F11 = tri(a, d) - tri(a - mx * x1, d) - tri(a - my * y1, d) + tri(a - mx * x1 - my * y1, d);
-    return max(F11 - F01 - F10 + F00, 0.0);
+    // intégrale de la hauteur de la droite le long de l'axe de plus petite composante normale (pente ≤ 1) : exacte et stable en
+    // f32. L'inclusion-exclusion des triangles (Σ ± s²/(2 m_x m_y), celle du CPU en f64) perd ~1 % sur une bande étroite quand
+    // l'interface est presque parallèle à un axe (m ~ 1e-3 : termes ~ 400 pour une aire ~ 1e-3)
+    if (mx <= my) { return band_area(a, mx, my, x0, x1, y0, y1); }
+    return band_area(a, my, mx, y0, y1, x0, x1);
+}
+// aire de {mu·u + mv·v ≤ a} ∩ [u0, u1] × [v0, v1] (mu, mv > 0) = ∫ (clamp((a − mu u)/mv, v0, v1) − v0) du
+fn band_area(a: f32, mu: f32, mv: f32, u0: f32, u1: f32, v0: f32, v1: f32) -> f32 {
+    let l = clamp((a - mv * v1) / mu, u0, u1);   // u < l : hauteur pleine
+    let r = clamp((a - mv * v0) / mu, u0, u1);   // u > r : rien
+    let lin = (r - l) * ((a - mu * 0.5 * (l + r)) / mv - v0);
+    return max((l - u0) * (v1 - v0) + lin, 0.0);
 }
 fn ag_at(gi: u32, i: i32, j: i32, ci_: u32, cj_: u32) -> f32 {
     let ii = u32(clamp(i, 0, i32(P.nx) - 1));
     let jj = u32(clamp(j, 0, i32(P.ny) - 1));
     let c = cidx(ii, jj);
-    if (is_solid(c)) { return ag(gi, cidx(ci_, cj_)); }
-    return ag(gi, c);
+    if (is_solid(c)) { return agr(gi, cidx(ci_, cj_)); }
+    return agr(gi, c);
 }
 fn youngs_g(gi: u32, i: u32, j: u32) -> vec2<f32> {
     let I = i32(i); let J = i32(j);
@@ -441,8 +464,12 @@ fn youngs_g(gi: u32, i: u32, j: u32) -> vec2<f32> {
     return vec2<f32>(gx, gy);
 }
 fn van_leer(a: f32, b: f32) -> f32 { if (a * b > 0.0) { return 2.0 * a * b / (a + b); } return 0.0; }
-// groupe présent à 99 % dans la cellule (sinon ng = aucun)
+// groupe présent à 99 % dans la cellule (sinon ng = aucun) ; avec des grains : groupe non dispersé à 99 % hors grains
 fn single_g(c: u32) -> u32 {
+    if (has(F_GRAN)) {
+        for (var gi = 0u; gi < P.ng; gi++) { if (!gdisp(gi) && agr(gi, c) > 0.99) { return gi; } }
+        return 9999u;
+    }
     for (var gi = 0u; gi < P.ng; gi++) { if (ag(gi, c) > 0.99) { return gi; } }
     return 9999u;
 }
@@ -509,9 +536,69 @@ fn k_sweep_flux(@builtin(global_invocation_id) g: vec3<u32>) {
     }
     let dc = u32(d);
     var s0 = 0.0; var s1 = xi; if (info.uf > 0.0) { s0 = 1.0 - xi; s1 = 1.0; }
+    // cellule amont de la donneuse (pentes MUSCL)
+    var up = -1;
+    if (dir == 0u) {
+        if (info.uf > 0.0) { if (info.fi >= 2u) { up = i32(cidx(info.fi - 2u, info.fj)); } }
+        else { if (info.fi + 1u < P.nx) { up = i32(cidx(info.fi + 1u, info.fj)); } }
+    } else {
+        if (info.uf > 0.0) { if (info.fj >= 2u) { up = i32(cidx(info.fi, info.fj - 2u)); } }
+        else { if (info.fj + 1u < P.ny) { up = i32(cidx(info.fi, info.fj + 1u)); } }
+    }
     var fg: array<f32, NPMAX>;
     var spare: array<f32, NPMAX>;
     for (var gi = 0u; gi < ng; gi++) { fg[gi] = 0.0; spare[gi] = 0.0; }
+    if (has(F_GRAN)) {
+        // groupes DISPERSÉS d'abord (miroir de plic_sweep) : part ξ·α de la bande, α reconstruit à la face (MUSCL / van Leer)
+        let ci_ = dc % P.nx; let cj_ = dc / P.nx;
+        var rem = xi;
+        let edge = up >= 0 && r >= 0 && !is_solid(u32(max(up, 0))) && !is_solid(u32(max(r, 0)));
+        for (var gi = 0u; gi < ng; gi++) {
+            let a = ag(gi, dc);
+            if (gdisp(gi) && a > 0.0) {
+                var af = a;
+                if (edge) { af = clamp(a + 0.5 * (1.0 - xi) * van_leer(a - ag(gi, u32(up)), ag(gi, u32(r)) - a), 0.0, 1.0); }
+                let fk = max(min(min(xi * af, a), rem), 0.0);
+                fg[gi] = fk;
+                rem -= fk;
+                spare[gi] = a - fk;
+            }
+        }
+        // reste de la bande : groupes non dispersés, géométrie PLIC renormalisée hors grains
+        let scale = rem / xi;
+        var pure = 9999u;
+        for (var gi = 0u; gi < ng; gi++) { if (!gdisp(gi) && agr(gi, dc) >= 1.0 - 1e-6) { pure = gi; break; } }
+        if (pure < 9999u) {
+            fg[pure] = rem;
+            rem = 0.0;
+        } else {
+            var last = 9999u;
+            for (var pos = 0u; pos < ng; pos++) { if (!gdisp(gorder(pos))) { last = pos; } }
+            for (var pos = 0u; pos < ng; pos++) {
+                let gi = gorder(pos);
+                if (!gdisp(gi)) {
+                    let a = ag(gi, dc);
+                    let an_ = agr(gi, dc);
+                    var want = 0.0;
+                    if (pos == last) { want = rem; }
+                    else if (an_ > 1e-6 && an_ < 1.0 - 1e-6) {
+                        let gr = youngs_g(gi, ci_, cj_);
+                        let pl = plic_new(an_, gr.x, gr.y);
+                        if (dir == 0u) { want = scale * plic_area(pl, s0, s1, 0.0, 1.0); } else { want = scale * plic_area(pl, 0.0, 1.0, s0, s1); }
+                    }
+                    let fk = max(min(min(want, rem), a), 0.0);
+                    fg[gi] = fk;
+                    rem -= fk;
+                    spare[gi] = a - fk;
+                }
+            }
+        }
+        if (rem > 1e-9) {
+            var tot = 0.0;
+            for (var gi = 0u; gi < ng; gi++) { tot += max(spare[gi], 0.0); }
+            if (tot > 0.0) { for (var gi = 0u; gi < ng; gi++) { fg[gi] += rem * max(spare[gi], 0.0) / tot; } }
+        }
+    } else {
     var pure = 9999u;
     for (var gi = 0u; gi < ng; gi++) { if (ag(gi, dc) >= 1.0 - 1e-6) { pure = gi; break; } }
     if (pure < 9999u) {
@@ -540,15 +627,8 @@ fn k_sweep_flux(@builtin(global_invocation_id) g: vec3<u32>) {
             if (tot > 0.0) { for (var gi = 0u; gi < ng; gi++) { fg[gi] += rem * max(spare[gi], 0.0) / tot; } }
         }
     }
-    // MUSCL : cellule amont de la donneuse et receveuse, toutes trois dans un même groupe à 99 %
-    var up = -1;
-    if (dir == 0u) {
-        if (info.uf > 0.0) { if (info.fi >= 2u) { up = i32(cidx(info.fi - 2u, info.fj)); } }
-        else { if (info.fi + 1u < P.nx) { up = i32(cidx(info.fi + 1u, info.fj)); } }
-    } else {
-        if (info.uf > 0.0) { if (info.fj >= 2u) { up = i32(cidx(info.fi, info.fj - 2u)); } }
-        else { if (info.fj + 1u < P.ny) { up = i32(cidx(info.fi, info.fj + 1u)); } }
     }
+    // MUSCL : cellule amont de la donneuse et receveuse, toutes trois dans un même groupe à 99 %
     var musc = false; var gs = 9999u;
     var uc = 0u; var rc = 0u;
     if (up >= 0 && r >= 0) {

@@ -1,0 +1,184 @@
+// ===== Phases granulaires (sable, poudre) : sédimentation et échange thermique grains ↔ fluide (miroir de mp_granular.rs) =====
+// Écrit sans tableaux privés ni boucles dans des branches divergentes (sélections), comme le reste du solveur (lavapipe).
+
+fn gran_k(k: u32) -> bool { return ph(k, 32u) > 0.5; }
+fn grain_d(k: u32) -> f32 { return ph(k, 33u); }
+fn grain_amax(k: u32) -> f32 { return ph(k, 34u); }
+// groupe dispersé : uniquement des phases granulaires (table)
+fn gdisp(g: u32) -> bool { return T[T_GDISP + g] > 0.5; }
+// fraction volumique de grains (toutes phases granulaires) et de fluide (le reste) de la cellule c
+fn grain_fraction(c: u32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(0.0, alpha(k, c), gran_k(k)); }
+    return s;
+}
+fn fluid_fraction(c: u32) -> f32 {
+    var s = 0.0;
+    for (var k = 0u; k < P.np; k++) { s += select(alpha(k, c), 0.0, gran_k(k)); }
+    return s;
+}
+fn grav_norm() -> f32 { return sqrt(P.gx * P.gx + P.gy * P.gy); }
+
+// vitesse de chute ENTRAVÉE de la phase granulaire s dans la cellule c (> 0 dans le sens de la gravité, < 0 : le grain remonte) :
+// Ferguson–Church (C1 = 18, C2 = 0.4), Richardson–Zaki avec l'exposant de Rowe. 0 sans gravité, sans fluide ou sans grains.
+fn settling_w(s: u32, c: u32) -> f32 {
+    let gn = grav_norm();
+    var a = 0.0; var m = 0.0; var mu = 0.0;
+    for (var q = 0u; q < P.np; q++) {
+        let aq = alpha(q, c);
+        let use_ = !gran_k(q) && aq > 0.0;
+        a += select(0.0, aq, use_);
+        m += select(0.0, max(mass(q, c), 0.0), use_);
+        mu += select(0.0, aq * mu_k(q, ptemp(q, c)), use_);
+    }
+    let d = grain_d(s);
+    let rho_f = m / max(a, 1e-30);
+    let mu_f = mu / max(a, 1e-30);
+    let ok = gn > 0.0 && alpha(s, c) > 0.0 && a > 1e-12 && m > 0.0 && d > 0.0 && mu_f > 0.0;
+    let rf = max(rho_f, 1e-30);
+    let rho_s = rho_k(s, S[O_prel + c], ptemp(s, c));
+    let r = (rho_s - rf) / rf;
+    let nu = max(mu_f, 1e-30) / rf;
+    let wt = r * gn * d * d / max(18.0 * nu + sqrt(0.75 * 0.4 * abs(r) * gn * d * d * d), 1e-30);
+    let x = abs(wt) * d / nu;
+    let re = select(0.0, pow(max(x, 1e-30), 0.75), x > 0.0);
+    let nn = (4.7 + 0.1175 * re) / (1.0 + 0.0175 * re);
+    let b = clamp(1.0 - grain_fraction(c), 0.0, 1.0);
+    let h = select(0.0, pow(max(b, 1e-30), nn), b > 0.0);
+    return select(0.0, wt * h, ok);
+}
+
+// volume de grains s qui traverse la face (c0 | c1) (c1 : voisine d'indice supérieur le long de l'axe, composante de gravité ga)
+// pendant dt, évalué sur l'état d'avant l'opérateur : > 0 de c0 vers c1, < 0 de c1 vers c0 (miroir de settle_grains)
+fn settle_vol(s: u32, c0: u32, c1: u32, ga: f32, share: f32, dt: f32) -> f32 {
+    let gn = grav_norm();
+    // a : cellule « amont » au sens de la gravité, b : « aval »
+    let down = ga < 0.0;
+    let a = select(c0, c1, down);
+    let b = select(c1, c0, down);
+    let movable = !is_solid(a) && !pinned(a) && !is_solid(b) && !pinned(b);
+    let wa = settling_w(s, a);
+    let wb = settling_w(s, b);
+    // grains lourds : de a vers b ; grains légers (w < 0) : de b vers a (vitesse évaluée dans la donneuse)
+    let heavy = wa > 0.0;
+    let light = !heavy && wb < 0.0;
+    let d = select(b, a, heavy);
+    let r = select(a, b, heavy);
+    let w = select(-wb, wa, heavy);
+    let ad = alpha(s, d);
+    var vol = ad * w * (abs(ga) / max(gn, 1e-30)) * dt / P.dx;
+    vol = min(vol, share * ad);
+    vol = min(vol, share * max(grain_amax(s) - grain_fraction(r), 0.0));
+    vol = min(vol, share * fluid_fraction(r));
+    let ok = movable && (heavy || light) && ad > 1e-12 && vol > 1e-14;
+    return select(0.0, select(-vol, vol, d == c0), ok);
+}
+
+// incréments de masse (par phase) et d'énergie (par groupe) de la cellule c dus à la sédimentation de la phase s (= Q.a) : à travers
+// chaque face, un volume de grains passe de la donneuse à la receveuse et le même volume de fluide de la receveuse (sa composition,
+// ses températures) remonte. Lit l'état sans l'écrire : les incréments sont appliqués par k_settle_apply.
+@compute @workgroup_size(64)
+fn k_settle_delta(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell(); let np = P.np;
+    if (c >= n) { return; }
+    let s = Q.a;
+    let gs = group_k(s);
+    for (var k = 0u; k <= np; k++) { S[O_sdm + k * n + c] = 0.0; }
+    for (var gq = 0u; gq < P.ng; gq++) { S[O_sde + gq * n + c] = 0.0; }
+    if (is_solid(c)) { return; }
+    // gravité oblique : deux familles de faces, chacune limitée à la moitié des stocks
+    let share = select(1.0, 0.5, P.gx != 0.0 && P.gy != 0.0);
+    let dt = dtv();
+    let i = c % P.nx; let j = c / P.nx;
+    var touched = false;
+    for (var q = 0u; q < 4u; q++) {
+        // faces : gauche, droite, bas, haut ; voisine hors domaine → cellule elle-même (face ignorée)
+        var nb = c; var ga = P.gx; var lo = false; var ok = false;
+        if (q == 0u) { ok = i > 0u; nb = select(c, c - 1u, ok); lo = true; }
+        else if (q == 1u) { ok = i + 1u < P.nx; nb = select(c, c + 1u, ok); }
+        else if (q == 2u) { ok = j > 0u; nb = select(c, c - P.nx, ok); lo = true; ga = P.gy; }
+        else { ok = j + 1u < P.ny; nb = select(c, c + P.nx, ok); ga = P.gy; }
+        ok = ok && ga != 0.0;
+        let c0 = select(c, nb, lo);
+        let c1 = select(nb, c, lo);
+        let v = select(0.0, settle_vol(s, c0, c1, ga, share, dt), ok);
+        let vol = abs(v);
+        let dn = select(c1, c0, v > 0.0);   // donneuse de grains
+        let rc = select(c0, c1, v > 0.0);   // receveuse
+        let out = dn == c;                  // les grains quittent c (sinon ils y entrent)
+        let live = vol > 0.0;
+        touched = touched || live;
+        // grains : masse volumique des grains de la donneuse (m/α), énergie à la température de leur groupe
+        let ms = max(mass(s, dn), 0.0);
+        let dm = select(0.0, min(vol * mass(s, dn) / max(alpha(s, dn), 1e-30), ms), live);
+        let de = dm * erel_k(s, tgrp(gs, dn));
+        S[O_sdm + s * n + c] += select(dm, -dm, out);
+        S[O_sde + gs * n + c] += select(de, -de, out);
+        // le même volume de fluide de la receveuse remonte (composition et températures de la receveuse)
+        let fr = max(fluid_fraction(rc), 1e-30);
+        for (var k = 0u; k < np; k++) {
+            let use_ = live && !gran_k(k) && alpha(k, rc) > 0.0;
+            let mk = max(mass(k, rc), 0.0);
+            let dmk = select(0.0, min(vol * mass(k, rc) / fr, mk), use_);
+            let gk = group_k(k);
+            let dek = dmk * erel_k(k, tgrp(gk, rc));
+            S[O_sdm + k * n + c] += select(-dmk, dmk, out);
+            S[O_sde + gk * n + c] += select(-dek, dek, out);
+        }
+    }
+    S[O_sdm + np * n + c] = select(0.0, 1.0, touched);
+}
+@compute @workgroup_size(64)
+fn k_settle_apply(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell(); let np = P.np;
+    if (c >= n || S[O_sdm + np * n + c] < 0.5) { return; }
+    for (var k = 0u; k < np; k++) { S[O_mass + k * n + c] += S[O_sdm + k * n + c]; }
+    for (var gq = 0u; gq < P.ng; gq++) { S[O_epsg + gq * n + c] += S[O_sde + gq * n + c]; }
+    cell_sync(c);
+}
+
+// plus grande vitesse de chute dans la cellule c (borne de pas w·dt ≤ 0.5·dx, miroir de max_settling_speed)
+fn max_settling_at(c: u32) -> f32 {
+    var w = 0.0;
+    for (var s = 0u; s < P.np; s++) {
+        let on = gran_k(s) && alpha(s, c) > 1e-9;
+        w = max(w, select(0.0, abs(settling_w(s, c)), on));
+    }
+    return w;
+}
+
+// échange thermique grains ↔ fluides par la surface des grains (miroir de exchange_grains) : G = λ 12 α_s k_f / d² au prorata du
+// volume de chaque fluide ; implicite à deux corps, énergie conservée. λ = ∞ : k_exchange égalise déjà tout.
+@compute @workgroup_size(64)
+fn k_exch_grains(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n || is_solid(c) || P.phase_exch <= 0.0 || P.phase_exch >= 1e37) { return; }
+    var af = 0.0; var gr = false; var fl = false;
+    for (var gq = 0u; gq < P.ng; gq++) {
+        let disp = gdisp(gq);
+        let present = group_mass(gq, c) > 0.0;
+        af += select(group_alpha(gq, c), 0.0, disp);
+        gr = gr || (disp && present);
+        fl = fl || (!disp && present);
+    }
+    if (af <= 1e-12 || !gr || !fl) { return; }
+    let dt = dtv();
+    // températures et capacités d'avant l'échange (T_g n'est pas modifiée avant cell_sync)
+    for (var s = 0u; s < P.ng; s++) {
+        let sok = gdisp(s) && group_mass(s, c) > 0.0;
+        let d = max(grain_d(gmember(s, 0u)), 1e-6);
+        let as_ = group_alpha(s, c);
+        let ts = tgrp(s, c);
+        let cs = max(group_cap_at(s, c, ts), 1e-30);
+        for (var f = 0u; f < P.ng; f++) {
+            let fok = sok && !gdisp(f) && group_mass(f, c) > 0.0;
+            let tf = tgrp(f, c);
+            let gg = P.phase_exch * 12.0 * as_ * group_kcond(f, c) / (d * d) * group_alpha(f, c) / af;
+            let cf = max(group_cap_at(f, c, tf), 1e-30);
+            let q = select(0.0, gg * dt * (tf - ts) / (1.0 + gg * dt * (1.0 / cs + 1.0 / cf)), fok);
+            S[O_epsg + s * n + c] += q;
+            S[O_epsg + f * n + c] -= q;
+        }
+    }
+    cell_sync(c);
+}

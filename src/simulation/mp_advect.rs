@@ -120,7 +120,7 @@ impl MultiphaseSim {
     }
 
     /// Balayage PLIC dans la direction `dir` (0 = x, 1 = y) avec les vitesses de face courantes. `aw` : α de travail.
-    fn plic_sweep(&mut self, dir: usize, dt: f64, aw: &mut Vec<Vec<f64>>) {
+    pub(crate) fn plic_sweep(&mut self, dir: usize, dt: f64, aw: &mut Vec<Vec<f64>>) {
         let (nx, ny) = (self.nx, self.ny);
         let np = self.reg.phases.len();
         // groupes de phases miscibles : un groupe se comporte comme UNE phase pour l'interface (pas d'interface entre membres miscibles)
