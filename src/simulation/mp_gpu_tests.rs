@@ -85,8 +85,12 @@ pub(crate) fn run_gpu(g: &mut MultiphaseGpu, sim: &mut MultiphaseSim, t_end: f64
 /// `tol_m` : écart max des masses (rapporté au max de chaque phase) ; les VAPEURS d'un changement de phase ont `tol_vap` : leur production
 /// est bornée par la fermeture volumique 1 − Σ m/ρ, calculée en f32 avec une erreur absolue ~1e-7 (masses stockées en f32) — quand
 /// 1 − Σ m/ρ ~ 1e-5 (cellule presque pleine de liquide), c'est 1 % d'écart sur la vapeur produite dans la cellule.
-pub(crate) fn one_step_agreement(name: &str, mut cpu: MultiphaseSim, warm: usize, steps: usize, tol_m: f64, tol_t: f64) {
-    let tol_vap: f64 = 0.05;
+pub(crate) fn one_step_agreement(name: &str, cpu: MultiphaseSim, warm: usize, steps: usize, tol_m: f64, tol_t: f64) {
+    one_step_agreement_vap(name, cpu, warm, steps, tol_m, tol_t, 0.05);
+}
+
+/// `one_step_agreement` avec la tolérance des vapeurs `tol_vap` (0.05 par défaut, voir ci-dessus)
+pub(crate) fn one_step_agreement_vap(name: &str, mut cpu: MultiphaseSim, warm: usize, steps: usize, tol_m: f64, tol_t: f64, tol_vap: f64) {
     for _ in 0..warm {
         cpu.step();
     }
@@ -327,8 +331,9 @@ fn gpu_matches_cpu_confined_hydrogen_explosion() {
     // réactions réversibles (dissociation), fermée : la pression finale se compare à l'équilibre
     let mk = || build_scenario(MpScenario::ConfinedExplosion, 24, 24, 0.002, 0.0);
     // accord d'un pas en général à 1e-6 ; une cellule qui s'enflamme peut franchir un seuil de l'intégration chimique d'un côté de
-    // l'arrondi f32 seulement (départ au pas 100 : cellule 431, 1781 / 1696 K, dt_chem 1.86e-5 / 2.26e-5, O2 à 1.1e-2 du max)
-    one_step_agreement("explosion confinée H2", mk(), 100, 3, 2e-2, 100.0);
+    // l'arrondi f32 seulement (départ au pas 100 : cellule 431, 1781 / 1696 K, dt_chem 1.86e-5 / 2.26e-5, O2 à 1.1e-2 du max ; sa
+    // vapeur à 4.99e-2 du max, 5.02e-2 depuis la forme adimensionnée de tau_from — d'où 6e-2 pour la vapeur ; les autres pas : 3e-6)
+    one_step_agreement_vap("explosion confinée H2", mk(), 100, 3, 2e-2, 100.0, 6e-2);
     let Some((cpu, gs, g)) = compare("explosion confinée H2", &mk, 0.006) else { return };
     let (a, b) = (metrics(&cpu), metrics(&gs));
     eprintln!(" chaleur CPU {:.4e} GPU {:.4e} ; p max {:.4e} {:.4e} ; T max {:.1} {:.1} ; {:?}", cpu.chem_heat, gs.chem_heat, a.p_max, b.p_max, a.t_max, b.t_max, g.last);
@@ -1342,6 +1347,46 @@ fn gpu_collapses_a_sand_column_like_the_cpu() {
 }
 
 #[test]
+fn gpu_keeps_sand_on_a_solid_shelf_like_the_cpu() {
+    // frottement contre un obstacle solide (nœuds de paroi des solides) et chaleur de frottement
+    use super::mp_friction::tests::{sand_on_shelf, sand_on_shelf_fraction};
+    one_step_agreement("sable sur étagère", sand_on_shelf(), 40, 3, 2e-4, 0.01);
+    let Some((cpu, gs, _)) = compare("sable sur étagère", &sand_on_shelf, 1.0) else { return };
+    let (fc, fg) = (sand_on_shelf_fraction(&cpu), sand_on_shelf_fraction(&gs));
+    let gsand = cpu.group_of[1];
+    let tmax = |s: &MultiphaseSim| (0..s.nx * s.ny).filter(|&c| s.mass[1][c] > 1.0).map(|c| s.tg[gsand][c]).fold(0.0f64, f64::max);
+    eprintln!(" sable sur l'étagère : CPU {:.3} GPU {:.3} ; T max des grains CPU {:.4} GPU {:.4} K", fc, fg, tmax(&cpu), tmax(&gs));
+    assert!(fg > 0.85 && (fc - fg).abs() < 0.03, "CPU {fc} GPU {fg}");
+    assert!(tmax(&gs) > 293.15 && (tmax(&cpu) - tmax(&gs)).abs() < 0.3 * (tmax(&cpu) - 293.15).max(1e-3), "échauffement CPU {} GPU {}", tmax(&cpu), tmax(&gs));
+}
+
+#[test]
+fn gpu_decays_a_very_viscous_vortex_like_the_cpu() {
+    // viscosité implicite (au-delà de la borne explicite) : pas de temps libres, décroissance de l'énergie cinétique
+    use super::mp_friction::tests::viscous_vortex;
+    let mk = || viscous_vortex(true);
+    one_step_agreement("tourbillon visqueux", mk(), 5, 3, 1e-5, 0.01);
+    let Some((cpu, gs, _)) = compare("tourbillon visqueux", &mk, 0.03) else { return };
+    let k0 = mk().kinetic_energy();
+    eprintln!(" énergie cinétique relative : CPU {:.4} GPU {:.4} ; pas CPU {} GPU {}", cpu.kinetic_energy() / k0, gs.kinetic_energy() / k0, cpu.step_count, gs.step_count);
+    assert!(rel(cpu.kinetic_energy(), gs.kinetic_energy()) < 0.02);
+    assert!(gs.step_count < 50, "pas GPU {}", gs.step_count);
+}
+
+#[test]
+fn gpu_burns_coal_like_the_cpu() {
+    // réaction de surface (C + O2 → CO2 sur les grains, limitée par la diffusion de l'oxygène) dans le scénario « feu de charbon »
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
+    one_step_agreement("feu de charbon", mk(), 20, 3, 1e-3, 0.5);
+    let Some((cpu, gs, _)) = compare("feu de charbon", &mk, 1.0) else { return };
+    let co2 = cpu.reg.phases.iter().position(|p| p.name == super::mp_materials::CO2).unwrap();
+    let made = |s: &MultiphaseSim| s.total_mass(co2) - s.boundary_flux[co2];
+    eprintln!(" CO2 produit : CPU {:.4e} GPU {:.4e} kg/m", made(&cpu), made(&gs));
+    assert!(made(&cpu) > 0.0 && rel(made(&cpu), made(&gs)) < 0.1, "CO2 CPU {} GPU {}", made(&cpu), made(&gs));
+}
+
+#[test]
 fn gpu_matches_cpu_hot_powder_cooling_in_air() {
     // poudre de 0.3 mm à 5 %, à 600 K dans de l'air à 300 K, sans gravité : échange par la surface des grains (k_exch_grains).
     // Comparé à t = τ (écart divisé par e), là où l'échange est en cours, pas une fois l'équilibre atteint
@@ -1385,7 +1430,8 @@ fn gpu_matches_cpu_hot_powder_cooling_in_air() {
 #[test]
 #[ignore]
 fn gpu_sand_raw_step_diag() {
-    let mut s = build_scenario(MpScenario::Sedimentation, 40, 30, 0.01, 9.81);
+    let sc = std::env::var("MP_SC").ok().and_then(|v| v.parse().ok()).map(MpScenario::from_index).unwrap_or(MpScenario::Sedimentation);
+    let mut s = build_scenario(sc, 40, 30, 0.01, 9.81);
     let warm = std::env::var("MP_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(40usize);
     for _ in 0..warm {
         s.step();

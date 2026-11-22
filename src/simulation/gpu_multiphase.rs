@@ -100,12 +100,30 @@ const F_MISC: u32 = 256;
 const F_FLAME: u32 = 512;
 const F_MACC: u32 = 1024;
 const F_GRAN: u32 = 2048;
+const F_IMPVISC: u32 = 4096;
+const F_FRIC: u32 = 8192;
 
 const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
 const PC_STRIDE: usize = 8;
 const LEV_STRIDE: usize = 8;
-const RX_STRIDE: usize = 48;
+const RX_STRIDE: usize = 52;
+
+/// Le pas doit-il passer par le solveur de viscosité implicite ? Frottement des grains, ou un fluide dont la viscosité (jusqu'à 100 × μ_ref
+/// selon sa loi en T) dépasserait la borne explicite 0.2 ρ dx²/dt au pas maximal (le gradient conjugué s'arrête sinon tout de suite)
+fn implicit_viscosity_needed(sim: &MultiphaseSim, _nx: usize) -> bool {
+    if !sim.viscous {
+        return false;
+    }
+    if sim.has_friction() {
+        return true;
+    }
+    sim.implicit_viscosity
+        && sim.reg.phases.iter().any(|p| {
+            let rho = p.rho(101325.0, p.t_ref).max(1e-3);
+            100.0 * p.mu_ref > 0.2 * rho * sim.dx * sim.dx / sim.dt_max.max(1e-12)
+        })
+}
 
 /// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
 pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
@@ -340,7 +358,7 @@ impl MultiphaseGpu {
         for name in ["fr_uf", "fr_r", "fr_z", "fr_p", "fr_ap", "fr_x"] {
             sl.add(name, nfu + nfv);
         }
-        for name in ["fr_mu", "fr_ps", "fr_frac"] {
+        for name in ["fr_mu", "fr_mv", "fr_ps", "fr_frac"] {
             sl.add(name, n);
         }
         sl.add("scale", np * n);
@@ -597,7 +615,7 @@ impl MultiphaseGpu {
             heat_on: false,
             newton_budget: 3,
             pcg_budget: 30,
-            fr_budget: 40,
+            fr_budget: 100,
             cond_budget: 8,
             sp_budget: 8,
             base: Baselines::default(),
@@ -792,7 +810,17 @@ impl MultiphaseGpu {
                 row[40 + i] = s as f64;
                 row[44 + i] = o;
             }
-            if r.reversible {
+            // réaction de surface (réactif granulaire) : 48 drapeau, 49 réactif granulaire, 50 diamètre, 51 oxydant (−1 : aucun) ;
+            // irréversible (miroir de CellChem)
+            let surf = r.surface(ph);
+            if let Some(sr) = surf {
+                row[3] = 0.0;
+                row[48] = 1.0;
+                row[49] = sr.solid as f64;
+                row[50] = sr.d;
+                row[51] = sr.ox.map_or(-1.0, |o| o as f64);
+            }
+            if r.reversible && surf.is_none() {
                 row[9] = kc_next as f64;
                 for i in 0..KC_N {
                     let tt = KC_T0 + KC_DT * i as f64;
@@ -1156,6 +1184,12 @@ impl MultiphaseGpu {
         if sim.has_granular() {
             flags |= F_GRAN;
         }
+        if sim.viscous && sim.implicit_viscosity {
+            flags |= F_IMPVISC;
+        }
+        if sim.has_friction() {
+            flags |= F_FRIC;
+        }
         w[0] = self.nx as u32;
         w[1] = self.ny as u32;
         w[2] = self.np as u32;
@@ -1437,10 +1471,13 @@ impl MultiphaseGpu {
         }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));
-        // frottement des grains tassés (implicite, gradient conjugué) sur u*, avant la projection (miroir de apply_friction)
-        if sim.has_friction() {
+        // viscosité implicite (frottement des grains tassés, fluides très visqueux) sur u*, avant la projection (miroir de
+        // apply_implicit_viscosity)
+        if implicit_viscosity_needed(sim, self.nx) {
             let (vert, wuv) = (sim.gravity[1].abs() >= sim.gravity[0].abs(), wg(nfu + nfv));
-            v.push(Op { k: "k_fr_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
+            if sim.has_friction() {
+                v.push(Op { k: "k_fr_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
+            }
             v.push(cell("k_fr_mu"));
             v.push(Op { k: "k_fr_uf", wg: wuv, slot: 0 });
             v.push(Op { k: "k_fr_r0", wg: wuv, slot: 0 });
@@ -1450,6 +1487,10 @@ impl MultiphaseGpu {
                 v.push(Op { k: "k_fr_ap", wg: wuv, slot: sl });
                 v.push(Op { k: "k_fr_upd", wg: wuv, slot: sl });
                 v.push(Op { k: "k_fr_dir", wg: wuv, slot: sl });
+            }
+            if sim.has_friction() {
+                v.push(Op { k: "k_fr_w", wg: wuv, slot: 0 });
+                v.push(cell("k_fr_heat"));
             }
             v.push(Op { k: "k_fr_apply", wg: wuv, slot: 0 });
         }
@@ -1604,8 +1645,8 @@ impl MultiphaseGpu {
             sim.dt_phase = if d[D_DTPHASE] < 1e37 { d[D_DTPHASE] as f64 } else { f64::INFINITY };
             let (need_c, need_s) = (d[D_SUB_C] as usize, d[D_NSUB_S_MAX] as usize);
             self.update_budgets(sim, newton, pcg_max, d[D_PCG_UNCONV] > 0.5, need_c, need_s);
-            if sim.has_friction() {
-                // frottement : budget = itérations du pas × 1.3 (doublé si le gradient conjugué s'est arrêté sur le budget)
+            if implicit_viscosity_needed(sim, self.nx) {
+                // viscosité implicite : budget = itérations du pas × 1.3 (doublé si le gradient conjugué s'est arrêté sur le budget)
                 let it = d[D_FR_IT] as usize;
                 sim.last_friction_iters = it;
                 let mut fb = (it as f64 * 1.3).ceil() as usize + 4;

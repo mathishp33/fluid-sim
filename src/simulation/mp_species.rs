@@ -24,7 +24,7 @@
 //!   Planck de H2O et CO2. Pertes des gaz brûlés (refroidissement des fumées) ; surestime les pertes des très grandes flammes (opaques).
 
 use super::multiphase::{clampf, temp_from_masses, MultiphaseSim};
-use super::phases::{Phase, Reaction, Radiator};
+use super::phases::{Phase, Radiator, Reaction, SurfaceRx, SHERWOOD};
 
 /// cellules traitées par un appel de la chimie
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,6 +65,9 @@ struct CellChem<'a> {
     f_eff: f64,
     /// rapport (masse des réactifs / masse des produits) stœchiométrique par réaction : impose la conservation exacte de la masse
     scale: Vec<f64>,
+    /// réactions de surface (réactif granulaire) ; pression de la cellule (masse volumique des grains, diffusivité de l'oxydant)
+    surf: &'a [Option<SurfaceRx>],
+    p: f64,
 }
 
 impl CellChem<'_> {
@@ -95,6 +98,9 @@ impl CellChem<'_> {
     }
     /// (débit direct, débit inverse) en mol/(m³·s) ; inverse nul pour une réaction irréversible
     fn rate_parts(&self, j: usize, t: f64) -> (f64, f64) {
+        if let Some(sr) = self.surf[j] {
+            return (self.surface_rate(j, sr, t), 0.0);
+        }
         let r = &self.rx[j];
         let k = r.k_forward(t) / if r.flame_thickness > 0.0 { self.f_eff } else { 1.0 };
         if k <= 0.0 {
@@ -136,11 +142,42 @@ impl CellChem<'_> {
         }
         (rf, ln_rr.min(700.0).exp())
     }
+    /// vitesse d'une réaction de surface (voir `phases::Reaction`) : S_v · k_s · Π c^o (réactifs non granulaires), limitée par la
+    /// diffusion de l'oxydant jusqu'aux grains (somme harmonique avec S_v · k_d · C_ox)
+    fn surface_rate(&self, j: usize, sr: SurfaceRx, t: f64) -> f64 {
+        let r = &self.rx[j];
+        let ks = r.k_forward(t);
+        let ms = self.m[sr.solid];
+        if ks <= 0.0 || ms <= 0.0 {
+            return 0.0;
+        }
+        let sv = 6.0 * ms / self.phases[sr.solid].rho(self.p, t) / sr.d;
+        let mut rk = sv * ks;
+        for &(s, o) in &r.modifiers {
+            let c = self.conc(s);
+            rk *= if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { 1.0 } else { c.powf(o) };
+        }
+        for (i, &(s, _)) in r.reactants.iter().enumerate() {
+            if s == sr.solid {
+                continue;
+            }
+            let o = r.order(i);
+            let c = self.conc(s);
+            rk *= if c <= 0.0 { 0.0 } else if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { 1.0 } else { c.powf(o) };
+        }
+        match sr.ox {
+            Some(ox) => {
+                let rd = sv * SHERWOOD * self.phases[ox].diffusivity_at(t, self.p) / sr.d * self.conc(ox);
+                if rk + rd > 0.0 { rk * rd / (rk + rd) } else { 0.0 }
+            }
+            None => rk,
+        }
+    }
     /// avancement maximal (mol/m³) dans le sens direct (> 0) et inverse (< 0) permis par les masses disponibles
     fn bounds(&self, j: usize) -> (f64, f64) {
         let r = &self.rx[j];
         let fwd = r.reactants.iter().map(|&(s, nu)| self.m[s].max(0.0) / (nu * self.phases[s].molar_mass)).fold(f64::INFINITY, f64::min);
-        let rev = if r.reversible {
+        let rev = if r.reversible && self.surf[j].is_none() {
             r.products.iter().map(|&(s, nu)| self.m[s].max(0.0) / (nu * self.phases[s].molar_mass * self.scale[j])).fold(f64::INFINITY, f64::min)
         } else {
             0.0
@@ -366,11 +403,21 @@ impl MultiphaseSim {
         let phases = &self.reg.phases;
         let np = phases.len();
         let mut omega = vec![0.0f64; n];
+        let surf: Vec<Option<SurfaceRx>> = rx.iter().map(|r| r.surface(phases)).collect();
         for c in 0..n {
             if self.is_solid(c) {
                 continue;
             }
-            let cc = CellChem { phases, rx, m: (0..np).map(|k| self.mass[k][c]).collect(), e: self.e[c], f_eff: 1.0, scale: vec![1.0; rx.len()] };
+            let cc = CellChem {
+                phases,
+                rx,
+                m: (0..np).map(|k| self.mass[k][c]).collect(),
+                e: self.e[c],
+                f_eff: 1.0,
+                scale: vec![1.0; rx.len()],
+                surf: &surf,
+                p: self.p[c],
+            };
             let mut w = 0.0;
             for &j in &flames {
                 if rx[j].reactants.iter().any(|&(s, _)| self.mass[s][c] <= 1e-12) {
@@ -437,6 +484,7 @@ impl MultiphaseSim {
         if self.reacted.len() != nre {
             self.reacted = vec![0.0; nre];
         }
+        let surf: Vec<Option<SurfaceRx>> = rx.iter().map(|r| r.surface(&phases)).collect();
         let target = 0.5 * self.chem_volume_limit;
         let selected = |s: &Self, c: usize| match sel {
             ChemSel::All => true,
@@ -451,7 +499,7 @@ impl MultiphaseSim {
         let reactive = self.reactive_groups();
         // intégration indépendante cellule par cellule : en parallèle, puis application séquentielle des résultats
         let this = &*self;
-        let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &reactive) } else { None };
+        let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &surf, &reactive) } else { None };
         let out: Vec<ChemOut> = if n >= super::mp_mg::PAR_MIN_CELLS / 4 {
             use rayon::prelude::*;
             (0..n).into_par_iter().filter_map(cell).collect()
@@ -510,7 +558,10 @@ impl MultiphaseSim {
 
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir. Seuls les groupes
     /// réactifs participent (masses et énergie) : de l'eau liquide voisine ne sert pas de puits de chaleur instantané à une flamme.
-    fn integrate_cell(&self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64], reactive: &[bool]) -> Option<ChemOut> {
+    #[allow(clippy::too_many_arguments)]
+    fn integrate_cell(
+        &self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64], surf: &[Option<SurfaceRx>], reactive: &[bool],
+    ) -> Option<ChemOut> {
         let np = phases.len();
         let nre = rx.len();
         {
@@ -527,7 +578,7 @@ impl MultiphaseSim {
             }
             let m_r: Vec<f64> = (0..np).map(|k| if reactive[self.group_of[k]] { self.mass[k][c] } else { 0.0 }).collect();
             let e_r: f64 = (0..self.groups.len()).filter(|&g| reactive[g]).map(|g| self.eg[g][c]).sum();
-            let mut cc = CellChem { phases, rx, m: m_r, e: e_r, f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec() };
+            let mut cc = CellChem { phases, rx, m: m_r, e: e_r, f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec(), surf, p: self.p[c] };
             let t0 = cc.temp();
             // cellule « gelée » ou déjà à l'équilibre ? (aucune réaction n'avancerait de 1e-7 de sa masse disponible pendant dt)
             let active = (0..nre).any(|j| {
@@ -556,7 +607,7 @@ impl MultiphaseSim {
                 let mut dtdt = 0.0;
                 let mut cons = vec![0.0; np];
                 for j in 0..nre {
-                    if rx[j].reversible {
+                    if rx[j].reversible && surf[j].is_none() {
                         continue;
                     }
                     // réaction dont tout l'avancement possible chaufferait de moins de TRACE_DT : trace (réactif résiduel, mélange
@@ -586,7 +637,7 @@ impl MultiphaseSim {
                     if hi <= 0.0 && lo >= 0.0 {
                         continue;
                     }
-                    let xi = if rx[j].reversible {
+                    let xi = if rx[j].reversible && surf[j].is_none() {
                         // Euler implicite : ξ = h·r(ξ), Newton avec dérivée numérique (T recalculée : rétroaction thermique comprise)
                         let base = cc.m.clone();
                         let eval = |cc: &mut CellChem, x: f64| -> f64 {

@@ -98,7 +98,7 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
         if (has(F_FLAME) && flame > 0.5) { dt = min(dt, P.cfl_flame * P.dx / P.flame_u_floor); }
         let gg = sqrt(P.gx * P.gx + P.gy * P.gy);
         if (gg > 0.0) { dt = min(dt, 0.5 * sqrt(P.dx / gg)); }
-        if (dtvis > 0.0 && dtvis < 1e37) { dt = min(dt, dtvis); }
+        if (dtvis > 0.0 && dtvis < 1e37 && !has(F_IMPVISC)) { dt = min(dt, dtvis); }
         if (has(F_ST) && sig > 0.0 && rmax > 0.0) {
             dt = min(dt, P.cap_safety * sqrt((rmin + rmax) * P.dx * P.dx * P.dx / (4.0 * PI * sig)));
         }
@@ -313,13 +313,19 @@ fn k_force_st(@builtin(global_invocation_id) g: vec3<u32>) {
     }
 }
 // viscosité : w2 = τxx, w3 = τyy (centres), w5 = τxy (nœuds)
+// plafond de la viscosité traitée explicitement (au-delà : implicite, friction.wgsl), miroir de explicit_mu_cap
+fn mu_exp_cap(c: u32) -> f32 {
+    if (has(F_IMPVISC)) { return 0.2 * S[O_rho_mix + c] * P.dx * P.dx / D[D_DT]; }
+    return 3.0e38;
+}
+fn mu_exp(c: u32) -> f32 { return min(S[O_mu_cell + c], mu_exp_cap(c)); }
 @compute @workgroup_size(64)
 fn k_visc_diag(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
     if (c >= ncell()) { return; }
     let i = c % P.nx; let j = c / P.nx;
-    S[O_w2 + c] = 2.0 * S[O_mu_cell + c] * (S[O_U + uidx(i + 1u, j)] - S[O_U + uidx(i, j)]) / P.dx;
-    S[O_w3 + c] = 2.0 * S[O_mu_cell + c] * (S[O_V + vidx(i, j + 1u)] - S[O_V + vidx(i, j)]) / P.dx;
+    S[O_w2 + c] = 2.0 * mu_exp(c) * (S[O_U + uidx(i + 1u, j)] - S[O_U + uidx(i, j)]) / P.dx;
+    S[O_w3 + c] = 2.0 * mu_exp(c) * (S[O_V + vidx(i, j + 1u)] - S[O_V + vidx(i, j)]) / P.dx;
 }
 @compute @workgroup_size(64)
 fn k_visc_xy(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -331,7 +337,7 @@ fn k_visc_xy(@builtin(global_invocation_id) g: vec3<u32>) {
     if (i >= 1u && i < P.nx && j >= 1u && j < P.ny) {
         let c0 = cidx(i - 1u, j - 1u); let c1 = cidx(i, j - 1u); let c2 = cidx(i - 1u, j); let c3 = cidx(i, j);
         if (!(is_solid(c0) || is_solid(c1) || is_solid(c2) || is_solid(c3))) {
-            let mu = 0.25 * (S[O_mu_cell + c0] + S[O_mu_cell + c1] + S[O_mu_cell + c2] + S[O_mu_cell + c3]);
+            let mu = 0.25 * (mu_exp(c0) + mu_exp(c1) + mu_exp(c2) + mu_exp(c3));
             t = mu * ((S[O_U + uidx(i, j)] - S[O_U + uidx(i, j - 1u)]) / P.dx + (S[O_V + vidx(i, j)] - S[O_V + vidx(i - 1u, j)]) / P.dx);
         }
     }

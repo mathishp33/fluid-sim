@@ -129,7 +129,8 @@ fn k_sp_commit(@builtin(global_invocation_id) g: vec3<u32>) {
 // ---------------------------------------------------------------- réactions : tables
 // T_RX + j·RX_STRIDE : 0 nréactifs, 1 nproduits, 2 nmodulateurs, 3 réversible, 4 flamme, 5 ln A (−1e30 : A ≤ 0), 6 b, 7 Ea/R,
 //   8 échelle de masse (réactifs/produits), 9 début de la table ln Kc dans T, 10–15 réactifs, 16–21 ν, 22–27 ordres,
-//   28–33 produits, 34–39 ν, 40–43 modulateurs, 44–47 ordres.
+//   28–33 produits, 34–39 ν, 40–43 modulateurs, 44–47 ordres, 48 réaction de surface, 49 réactif granulaire, 50 diamètre des grains,
+//   51 oxydant (−1 : aucun).
 fn rxv(j: u32, q: u32) -> f32 { return T[T_RX + j * RX_STRIDE + q]; }
 fn rx_nr(j: u32) -> u32 { return u32(rxv(j, 0u)); }
 fn rx_np(j: u32) -> u32 { return u32(rxv(j, 1u)); }
@@ -195,8 +196,42 @@ fn cc_sensor_rate(j: u32, t: f32) -> f32 {
     if (r.x <= 0.0) { return 0.0; }
     return max(r.x - r.y, 0.0) * clamp(1.0 - r.y / r.x, 0.0, 1.0);
 }
+// réaction de surface (miroir de CellChem::surface_rate) : S_v k_s Π c^o (réactifs non granulaires), limitée par la diffusion de
+// l'oxydant jusqu'aux grains (somme harmonique avec S_v k_d C_ox, k_d = Sh D_ox / d, Sh = 2)
+fn cc_surface_rate(j: u32, t: f32) -> f32 {
+    let s = u32(rxv(j, 49u)); let d = rxv(j, 50u); let ox = rxv(j, 51u);
+    let ms = chm(s);
+    if (ms <= 0.0 || rxv(j, 5u) < -1e29) { return 0.0; }
+    let pr = S[O_prel + cc_c];
+    let sv = 6.0 * ms / rho_k(s, pr, t) / d;
+    var lrk = ln_kf(j, t) + log(sv);
+    var zero = false;
+    for (var i = 0u; i < rx_nm(j); i++) {
+        let o = rx_mord(j, i);
+        let c = cc_conc(rx_ms(j, i));
+        if (o < 0.0) { lrk += o * log(max(c, C_FLOOR)); }
+        else if (o > 0.0) { if (c <= 0.0) { zero = true; } else { lrk += o * log(c); } }
+    }
+    for (var i = 0u; i < rx_nr(j); i++) {
+        let k = rx_rs(j, i);
+        if (k != s) {
+            let o = rx_rord(j, i);
+            let c = cc_conc(k);
+            if (c <= 0.0) { zero = true; }
+            else if (o < 0.0) { lrk += o * log(max(c, C_FLOOR)); }
+            else if (o > 0.0) { lrk += o * log(c); }
+        }
+    }
+    if (zero) { return 0.0; }
+    let rk = exp(min(lrk, 80.0));
+    if (ox < 0.0) { return rk; }
+    let oi = u32(ox);
+    let rd = sv * 2.0 * diff_at(oi, t, pr + P.p0) / d * cc_conc(oi);
+    return select(0.0, rk * rd / (rk + rd), rk + rd > 0.0);
+}
 // (débit direct, débit inverse) (miroir de CellChem::rate_parts)
 fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
+    if (rxv(j, 48u) > 0.5) { return vec2<f32>(cc_surface_rate(j, t), 0.0); }
     if (rxv(j, 5u) < -1e29) { return vec2<f32>(0.0, 0.0); }
     var lk = ln_kf(j, t);
     if (rx_flame(j)) { lk -= log(cfe); }

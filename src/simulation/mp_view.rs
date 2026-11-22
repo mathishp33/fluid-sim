@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::mp_cells::{MpEffect, MpThermal};
-use super::mp_materials::{MaterialLibrary, Roles, CH4, MIX_CH4_AIR, MIX_H2_AIR};
+use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, MIX_CH4_AIR, MIX_H2_AIR};
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Phase, Registry};
 
@@ -47,6 +47,8 @@ pub enum MpScenario {
     Sedimentation,
     /// colonne de sable sec tassé qui s'effondre en un tas (frottement des grains)
     SandColumn,
+    /// tas de charbon allumé au cœur dans l'air : combustion de surface des grains (C + O2 → CO2), tirage naturel
+    CoalFire,
 }
 
 impl Default for MpScenario {
@@ -56,7 +58,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 12] = [
+    pub const ALL: [MpScenario; 13] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -69,14 +71,15 @@ impl MpScenario {
         Self::DiffusionFlame,
         Self::Sedimentation,
         Self::SandColumn,
+        Self::CoalFire,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation | Self::SandColumn)
+        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire)
     }
     pub fn is_combustion(self) -> bool {
-        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame)
+        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame | Self::CoalFire)
     }
     pub fn from_index(i: usize) -> Self {
         Self::ALL[i.min(Self::ALL.len() - 1)]
@@ -98,6 +101,7 @@ impl MpScenario {
             Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
             Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
             Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
+            Self::CoalFire => "Feu de charbon (combustion à la surface des grains)",
         }
     }
 }
@@ -112,7 +116,10 @@ pub fn build_scenario(sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f6
 /// matériau nécessaire manque, l'erreur dit lequel.
 pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny: usize, dx: f64, gravity: f64) -> Result<MultiphaseSim, String> {
     let lib_c;
-    let lib = if sc.is_combustion() {
+    let lib = if sc == MpScenario::CoalFire {
+        lib_c = lib.with_coal();
+        &lib_c
+    } else if sc.is_combustion() {
         lib_c = lib.with_combustion();
         &lib_c
     } else if sc.is_granular() {
@@ -162,6 +169,26 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             packed[sable] = amax;
             let (x0, x1, h) = (0.42 * lx, 0.58 * lx, 0.65 * ly);
             s.paint_mixture(move |x, y| if x > x0 && x < x1 && y < h { Some(packed.clone()) } else { None });
+        }
+        MpScenario::CoalFire => {
+            // tas de charbon tassé (α_max de grains, air dans les pores) au fond, allumé en surface (couche de braises à 1200 K) : un tas
+            // brûle par sa surface, là où l'air arrive (le modèle à une vitesse ne fait pas traverser un lit tassé par l'air) ; l'oxygène
+            // apporté par le tirage naturel (haut ouvert) brûle à la surface des grains (C + O2 → CO2), les fumées montent
+            let coal = need(roles.coal, "une phase granulaire combustible (charbon) et sa réaction de surface")?;
+            let air = mix(AIR_SEC)?;
+            let amax = s.reg.phases[coal].alpha_max;
+            let mut bed = air.iter().map(|a| a * (1.0 - amax)).collect::<Vec<f64>>();
+            bed[coal] = amax;
+            let (cx, w, h) = (0.5 * lx, 0.30 * lx, 0.22 * ly);
+            // tas trapézoïdal, flancs à ~30°
+            let pile = move |x: f64, y: f64| y < h && (x - cx).abs() < w - y / 30f64.to_radians().tan();
+            s.paint_mixture(move |x, y| Some(if pile(x, y) { bed.clone() } else { air.clone() }));
+            s.bc[3] = Bc::Open { p: P_ATM };
+            s.dt_max = 2e-3;
+            // braises : couche extérieure du tas (≈ 2 mailles), sur le dessus et le haut des flancs
+            let skin = 2.5 * dx;
+            let ember = move |x: f64, y: f64| pile(x, y) && (!pile(x - skin, y + skin) || !pile(x + skin, y + skin)) && y > 0.3 * h;
+            t_fn = Box::new(move |x, y| if ember(x, y) { 1200.0 } else { 293.15 });
         }
         MpScenario::DamBreak => {
             let eau = need(roles.water, "un liquide")?;

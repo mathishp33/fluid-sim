@@ -1,5 +1,6 @@
-// ===== Frottement des grains tassés (miroir de mp_friction.rs) : viscosité de Drucker–Prager régularisée, implicite, gradient
-// conjugué préconditionné (Jacobi) sur les faces. Vecteurs de faces « combinés » : u dans [0, nfu), v dans [nfu, nfu + nfv).
+// ===== Viscosité implicite (miroir de mp_friction.rs) : frottement des grains tassés (Drucker–Prager régularisé, non-glissement aux
+// parois et aux solides, chaleur de frottement) et part des fluides au-delà de la borne explicite ; gradient conjugué préconditionné
+// (Jacobi) sur les faces. Vecteurs de faces « combinés » : u dans [0, nfu), v dans [nfu, nfu + nfv).
 
 const FR_DELTA: f32 = 1e-3;     // taux de déformation de régularisation (1/s)
 const FR_KMAX: f32 = 1000.0;    // plafond de μ_g dt / (ρ dx²)
@@ -96,16 +97,22 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
 }
-// viscosité de frottement μ_g par cellule (taux de déformation des vitesses du début du pas)
+// viscosités implicites par cellule : frottement μ_g (taux de déformation des vitesses du début du pas) et part des fluides au-delà de
+// la borne explicite μ_v = μ − 0.2 ρ dx²/dt (viscosité implicite)
 @compute @workgroup_size(64)
 fn k_fr_mu(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
     if (c >= ncell()) { return; }
     S[O_fr_mu + c] = 0.0;
+    S[O_fr_mv + c] = 0.0;
+    if (is_solid(c)) { return; }
+    let dx = P.dx;
+    if (has(F_IMPVISC)) { S[O_fr_mv + c] = max(S[O_mu_cell + c] - mu_exp_cap(c), 0.0); }
+    if (!has(F_FRIC)) { return; }
     let fr = S[O_fr_frac + c];
-    if (fr <= 0.0 || is_solid(c)) { return; }
+    if (fr <= 0.0) { return; }
     let fc = fr_cell(c);
-    let nx = P.nx; let ny = P.ny; let dx = P.dx;
+    let nx = P.nx; let ny = P.ny;
     let i = c % nx; let j = c / nx;
     let dxx = (S[O_Un + uidx(i + 1u, j)] - S[O_Un + uidx(i, j)]) / dx;
     let dyy = (S[O_Vn + vidx(i, j + 1u)] - S[O_Vn + vidx(i, j)]) / dx;
@@ -119,40 +126,90 @@ fn k_fr_mu(@builtin(global_invocation_id) g: vec3<u32>) {
     S[O_fr_mu + c] = min(m, FR_KMAX * S[O_rho_mix + c] * dx * dx / D[D_DT]);
 }
 
-// viscosité au nœud (i, j) : moyenne des cellules voisines ; 0 contre un solide, aux coins et sur un bord ouvert
-fn fr_mn(i: u32, j: u32) -> f32 {
-    let nx = P.nx; let ny = P.ny;
-    let on_l = i == 0u; let on_r = i == nx; let on_b = j == 0u; let on_t = j == ny;
-    if ((on_l || on_r) && (on_b || on_t)) { return 0.0; }
-    if ((on_l && P.bc_l != 0u) || (on_r && P.bc_r != 0u) || (on_b && P.bc_b != 0u) || (on_t && P.bc_t != 0u)) { return 0.0; }
-    var s = 0.0; var cnt = 0.0; var solid = false;
+// genre du nœud (i, j) (miroir de NodeKind) : 0 intérieur, 1 paroi dessous, 2 dessus, 3 gauche, 4 droite, 5 aucun (coin, bord ouvert,
+// une ou trois cellules bloquées) ; cellule bloquée = solide, ou hors d'un bord fermé
+const NK_IN: u32 = 0u;
+const NK_FLOOR: u32 = 1u;
+const NK_CEIL: u32 = 2u;
+const NK_LEFT: u32 = 3u;
+const NK_RIGHT: u32 = 4u;
+const NK_NONE: u32 = 5u;
+fn fr_kind(i: u32, j: u32) -> u32 {
+    let nx = i32(P.nx); let ny = i32(P.ny);
+    var bits = 0u;
+    var open = false;
     for (var q = 0u; q < 4u; q++) {
         let ci = i32(i) - 1 + i32(q & 1u); let cj = i32(j) - 1 + i32(q >> 1u);
-        let inside = ci >= 0 && cj >= 0 && ci < i32(nx) && cj < i32(ny);
-        let c = cidx(u32(clamp(ci, 0, i32(nx) - 1)), u32(clamp(cj, 0, i32(ny) - 1)));
-        solid = solid || (inside && is_solid(c));
-        s += select(0.0, S[O_fr_mu + c], inside);
-        cnt += select(0.0, 1.0, inside);
+        let out = ci < 0 || cj < 0 || ci >= nx || cj >= ny;
+        open = open || (ci < 0 && P.bc_l != 0u) || (ci >= nx && P.bc_r != 0u) || (cj < 0 && P.bc_b != 0u) || (cj >= ny && P.bc_t != 0u);
+        let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
+        let b = out || is_solid(c);
+        bits = bits | select(0u, 1u << q, b);
     }
-    if (solid) { return 0.0; }
+    if (open) { return NK_NONE; }
+    // bits : 1 = SO, 2 = SE, 4 = NO, 8 = NE
+    if (bits == 0u) { return NK_IN; }
+    if (bits == 3u) { return NK_FLOOR; }
+    if (bits == 12u) { return NK_CEIL; }
+    if (bits == 5u) { return NK_LEFT; }
+    if (bits == 10u) { return NK_RIGHT; }
+    return NK_NONE;
+}
+// nombre de cellules non bloquées autour du nœud, et moyenne d'une viscosité par cellule (tranche o) sur elles
+fn fr_node_cnt(i: u32, j: u32) -> f32 {
+    let nx = i32(P.nx); let ny = i32(P.ny);
+    var cnt = 0.0;
+    for (var q = 0u; q < 4u; q++) {
+        let ci = i32(i) - 1 + i32(q & 1u); let cj = i32(j) - 1 + i32(q >> 1u);
+        let inside = ci >= 0 && cj >= 0 && ci < nx && cj < ny;
+        let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
+        cnt += select(0.0, 1.0, inside && !is_solid(c));
+    }
+    return cnt;
+}
+fn fr_node_avg(o: u32, i: u32, j: u32) -> f32 {
+    let nx = i32(P.nx); let ny = i32(P.ny);
+    var s = 0.0; var cnt = 0.0;
+    for (var q = 0u; q < 4u; q++) {
+        let ci = i32(i) - 1 + i32(q & 1u); let cj = i32(j) - 1 + i32(q >> 1u);
+        let inside = ci >= 0 && cj >= 0 && ci < nx && cj < ny;
+        let c = cidx(u32(clamp(ci, 0, nx - 1)), u32(clamp(cj, 0, ny - 1)));
+        let ok = inside && !is_solid(c);
+        s += select(0.0, S[o + c], ok);
+        cnt += select(0.0, 1.0, ok);
+    }
     return s / max(cnt, 1.0);
 }
 fn fr_wu(o: u32, i: u32, j: u32) -> f32 { return S[o + uidx(i, j)]; }
 fn fr_wv(o: u32, i: u32, j: u32) -> f32 { return S[o + nfu() + vidx(i, j)]; }
-fn fr_txx(o: u32, i: u32, j: u32) -> f32 { let c = cidx(i, j); return 2.0 * S[O_fr_mu + c] * (fr_wu(o, i + 1u, j) - fr_wu(o, i, j)) / P.dx; }
-fn fr_tyy(o: u32, i: u32, j: u32) -> f32 { let c = cidx(i, j); return 2.0 * S[O_fr_mu + c] * (fr_wv(o, i, j + 1u) - fr_wv(o, i, j)) / P.dx; }
+fn fr_mu_c(c: u32) -> f32 { return S[O_fr_mu + c] + S[O_fr_mv + c]; }
+fn fr_txx(o: u32, i: u32, j: u32) -> f32 { let c = cidx(i, j); return 2.0 * fr_mu_c(c) * (fr_wu(o, i + 1u, j) - fr_wu(o, i, j)) / P.dx; }
+fn fr_tyy(o: u32, i: u32, j: u32) -> f32 { let c = cidx(i, j); return 2.0 * fr_mu_c(c) * (fr_wv(o, i, j + 1u) - fr_wv(o, i, j)) / P.dx; }
+// cisaillement γ au nœud (genre k) : non-glissement aux parois (∂u/∂y = ±2u/dx, ∂v/∂x = ±2v/dx)
+fn fr_gamma(o: u32, i: u32, j: u32, k: u32) -> f32 {
+    let dx = P.dx;
+    if (k == NK_IN) { return ((fr_wu(o, i, j) - fr_wu(o, i, j - 1u)) + (fr_wv(o, i, j) - fr_wv(o, i - 1u, j))) / dx; }
+    if (k == NK_FLOOR) { return 2.0 * fr_wu(o, i, j) / dx; }
+    if (k == NK_CEIL) { return -2.0 * fr_wu(o, i, j - 1u) / dx; }
+    if (k == NK_LEFT) { return 2.0 * fr_wv(o, i, j) / dx; }
+    if (k == NK_RIGHT) { return -2.0 * fr_wv(o, i - 1u, j) / dx; }
+    return 0.0;
+}
+// contrainte de cisaillement au nœud : μ_g (parois comprises) + μ_v des fluides (nœuds intérieurs seulement, comme l'explicite)
 fn fr_txy(o: u32, i: u32, j: u32) -> f32 {
-    let m = fr_mn(i, j);
+    let k = fr_kind(i, j);
+    if (k == NK_NONE) { return 0.0; }
+    var m = fr_node_avg(O_fr_mu, i, j);
+    if (k == NK_IN) { m += fr_node_avg(O_fr_mv, i, j); }
     if (m <= 0.0) { return 0.0; }
-    let nx = P.nx; let ny = P.ny; let dx = P.dx;
-    // vitesse tangentielle nulle à la paroi : ∂u/∂y = ±2u/dx ; ∂v/∂x nul le long d'une paroi horizontale (et inversement)
-    var dudy = 0.0; var dvdx = 0.0;
-    if (j == 0u) { dudy = 2.0 * fr_wu(o, i, 0u) / dx; }
-    else if (j == ny) { dudy = -2.0 * fr_wu(o, i, ny - 1u) / dx; }
-    else if (i == 0u) { dvdx = 2.0 * fr_wv(o, 0u, j) / dx; }
-    else if (i == nx) { dvdx = -2.0 * fr_wv(o, nx - 1u, j) / dx; }
-    else { dudy = (fr_wu(o, i, j) - fr_wu(o, i, j - 1u)) / dx; dvdx = (fr_wv(o, i, j) - fr_wv(o, i - 1u, j)) / dx; }
-    return m * (dudy + dvdx);
+    return m * fr_gamma(o, i, j, k);
+}
+// contribution d'un nœud à la diagonale de la face qu'il cisaille : intérieur μ_g + μ_v, paroi `wall` 2 μ_g
+fn fr_nodec(i: u32, j: u32, wall: u32) -> f32 {
+    let k = fr_kind(i, j);
+    if (k == NK_IN) { return fr_node_avg(O_fr_mu, i, j) + fr_node_avg(O_fr_mv, i, j); }
+    if (k == wall) { return 2.0 * fr_node_avg(O_fr_mu, i, j); }
+    return 0.0;
 }
 // face inconnue (intérieure, entre deux cellules fluides) ; masse volumique de la face
 fn fr_unknown(f: u32) -> bool {
@@ -187,13 +244,11 @@ fn fr_diag(f: u32) -> f32 {
     let r = fr_rho(f) / D[D_DT];
     if (f < nfu()) {
         let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
-        let wt = select(1.0, 2.0, j + 1u == P.ny); let wb = select(1.0, 2.0, j == 0u);
-        return r + 2.0 * (S[O_fr_mu + cidx(i - 1u, j)] + S[O_fr_mu + cidx(i, j)]) / dx2 + (wt * fr_mn(i, j + 1u) + wb * fr_mn(i, j)) / dx2;
+        return r + 2.0 * (fr_mu_c(cidx(i - 1u, j)) + fr_mu_c(cidx(i, j))) / dx2 + (fr_nodec(i, j + 1u, NK_CEIL) + fr_nodec(i, j, NK_FLOOR)) / dx2;
     }
     let fv = f - nfu();
     let i = fv % P.nx; let j = fv / P.nx;
-    let wr = select(1.0, 2.0, i + 1u == P.nx); let wl = select(1.0, 2.0, i == 0u);
-    return r + 2.0 * (S[O_fr_mu + cidx(i, j - 1u)] + S[O_fr_mu + cidx(i, j)]) / dx2 + (wr * fr_mn(i + 1u, j) + wl * fr_mn(i, j)) / dx2;
+    return r + 2.0 * (fr_mu_c(cidx(i, j - 1u)) + fr_mu_c(cidx(i, j))) / dx2 + (fr_nodec(i + 1u, j, NK_RIGHT) + fr_nodec(i, j, NK_LEFT)) / dx2;
 }
 // A w = ρ/dt w − F(w) sur les inconnues
 fn fr_apply(o: u32, f: u32) -> f32 {
@@ -216,23 +271,29 @@ fn fr_wg_total(q: u32, lid: u32) -> f32 {
 }
 fn fr_off() -> bool { return D[D_FR_DONE] > 0.5; }
 
-// u_f = u* − dt ∇pⁿ / ρ_f sur les inconnues (vitesse qui équilibre déjà la pression du pas précédent)
+// u_f = u* − dt ∇pⁿ / ρ_f sur les inconnues (vitesse qui équilibre déjà la pression du pas précédent) ; faces fixes (parois, solides)
+// à 0 : u* y porte encore dt·g (la projection les annule), qui fausserait le cisaillement de la couche voisine
 @compute @workgroup_size(64)
 fn k_fr_uf(@builtin(global_invocation_id) g: vec3<u32>) {
     let f = g.x;
     if (f >= nfuv()) { return; }
-    var us = 0.0; var dp = 0.0;
+    var us = 0.0; var dp = 0.0; var fixed = false;
     if (f < nfu()) {
         us = S[O_Us + f];
         let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
         if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i - 1u, j)]; }
+        let solid_side = (i > 0u && is_solid(cidx(i - 1u, j))) || (i < P.nx && is_solid(cidx(i, j)));
+        fixed = (i == 0u && P.bc_l == 0u) || (i == P.nx && P.bc_r == 0u) || (i > 0u && i < P.nx && !fr_unknown(f)) || solid_side;
     } else {
         let fv = f - nfu();
         us = S[O_Vs + fv];
         let i = fv % P.nx; let j = fv / P.nx;
         if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i, j - 1u)]; }
+        let solid_side = (j > 0u && is_solid(cidx(i, j - 1u))) || (j < P.ny && is_solid(cidx(i, j)));
+        fixed = (j == 0u && P.bc_b == 0u) || (j == P.ny && P.bc_t == 0u) || (j > 0u && j < P.ny && !fr_unknown(f)) || solid_side;
     }
-    S[O_fr_uf + f] = select(us, us - D[D_DT] / fr_rho(f) * dp / P.dx, fr_unknown(f));
+    let w = select(us, us - D[D_DT] / fr_rho(f) * dp / P.dx, fr_unknown(f));
+    S[O_fr_uf + f] = select(w, 0.0, fixed);
 }
 // r = F(u_f), z = r / diag, p = z, x = 0 ; sommes partielles r·z (quantité 0) et r·r (quantité 1)
 @compute @workgroup_size(64)
@@ -310,6 +371,47 @@ fn k_fr_dir(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
     let rz = D[D_FR_RZ + ((Q.a + 1u) & 1u)];
     let be = rz2 / max(rz, 1e-30);
     if (f < nfuv()) { S[O_fr_p + f] = S[O_fr_z + f] + be * S[O_fr_p + f]; }
+}
+// vitesse résolue w = u_f + δ (dans fr_ap, libre après le gradient conjugué) : chaleur de frottement
+@compute @workgroup_size(64)
+fn k_fr_w(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    if (f >= nfuv()) { return; }
+    S[O_fr_ap + f] = S[O_fr_uf + f] + S[O_fr_x + f];
+}
+// chaleur de frottement Φ dt (Φ = τ : D, part des grains ; miroir de friction_dissipation) rendue aux groupes granulaires : 2 μ_g (Dxx² +
+// Dyy²) dans la cellule, plus sa part des nœuds voisins (μ_n γ², poids ½ sur une paroi) au prorata de μ_g des cellules du nœud
+@compute @workgroup_size(64)
+fn k_fr_heat(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell() || is_solid(c)) { return; }
+    let mg = S[O_fr_mu + c];
+    if (mg <= 0.0) { return; }
+    let o = O_fr_ap;
+    let i = c % P.nx; let j = c / P.nx;
+    let dxx = (fr_wu(o, i + 1u, j) - fr_wu(o, i, j)) / P.dx;
+    let dyy = (fr_wv(o, i, j + 1u) - fr_wv(o, i, j)) / P.dx;
+    var phi = 2.0 * mg * (dxx * dxx + dyy * dyy);
+    for (var q = 0u; q < 4u; q++) {
+        let ni = i + (q & 1u); let nj = j + (q >> 1u);
+        let k = fr_kind(ni, nj);
+        let mn = fr_node_avg(O_fr_mu, ni, nj);
+        let gam = fr_gamma(o, ni, nj, k);
+        let wgt = select(0.5, 1.0, k == NK_IN);
+        // Σ μ_g des cellules non bloquées du nœud = moyenne × nombre
+        let tot = mn * fr_node_cnt(ni, nj);
+        phi += select(0.0, wgt * mn * gam * gam * mg / max(tot, 1e-30), k != NK_NONE && tot > 0.0);
+    }
+    var as_ = 0.0;
+    for (var k = 0u; k < P.np; k++) { as_ += select(0.0, max(alpha(k, c), 0.0), gran_k(k)); }
+    if (as_ <= 0.0) { return; }
+    let n = ncell();
+    let q = D[D_DT] * phi;
+    for (var k = 0u; k < P.np; k++) {
+        let a = select(0.0, max(alpha(k, c), 0.0), gran_k(k));
+        S[O_epsg + group_k(k) * n + c] += q * a / as_;
+    }
+    cell_sync(c);
 }
 // u* += δ ; budget insuffisant signalé (l'hôte l'augmente au pas suivant)
 @compute @workgroup_size(64)

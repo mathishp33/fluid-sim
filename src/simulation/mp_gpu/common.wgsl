@@ -36,6 +36,8 @@ const F_MISC: u32 = 256u;    // au moins un groupe miscible (≥ 2 membres)
 const F_FLAME: u32 = 512u;   // au moins une réaction de flamme (TFM)
 const F_MACC: u32 = 1024u;   // MacCormack (advection semi-lagrangienne)
 const F_GRAN: u32 = 2048u;   // au moins une phase granulaire (granular.wgsl)
+const F_IMPVISC: u32 = 4096u; // viscosité implicite au-delà de la borne explicite (friction.wgsl)
+const F_FRIC: u32 = 8192u;   // frottement des grains (friction.wgsl)
 
 // paramètres par lancement (décalage dynamique, groupe 1)
 struct Disp { a: u32, b: u32, c: u32, d: u32 };
@@ -146,11 +148,15 @@ fn solid_k(s: u32) -> f32 { return sol(s, 1u); }
 fn solid_rho(s: u32) -> f32 { return sol(s, 2u); }
 
 // ----- température d'un mélange : Σ m_k (c_e τ + ½ s τ²) = ε (trinôme stable) -----
+// forme adimensionnée τ + ½ a τ² = b (a = s/C, b = ε/C) : C² d'une trace (C ~ 1e-21 J/K) sortait de la plage f32 (discriminant nul,
+// τ = −C/s ≈ −790 K pour une trace de charbon)
 fn tau_from(cap: f32, slope: f32, eps: f32) -> f32 {
-    if (abs(slope) <= 1e-6 * abs(cap) + 1e-30) { return eps / max(cap, 1e-30); }
-    let disc = cap * cap + 2.0 * slope * eps;
-    if (disc <= 0.0) { return -cap / slope; }
-    return 2.0 * eps / max(cap + sqrt(disc), 1e-30);
+    if (abs(slope) <= 1e-6 * abs(cap) + 1e-30 || cap < 1e-35) { return eps / max(cap, 1e-30); }
+    let a = slope / cap;
+    let b = eps / cap;
+    let disc = 1.0 + 2.0 * a * b;
+    if (disc <= 0.0) { return -1.0 / a; }
+    return 2.0 * b / (1.0 + sqrt(disc));
 }
 fn cell_cap0(c: u32) -> vec2<f32> {
     var cap = 0.0; var sl = 0.0;

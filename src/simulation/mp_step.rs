@@ -105,7 +105,8 @@ impl MultiphaseSim {
             }
             rmin = rmin.min(self.rho_mix[c]);
             rmax = rmax.max(self.rho_mix[c]);
-            if self.mu_cell[c] > 0.0 {
+            // (viscosité implicite : la part au-delà de la borne explicite est résolue par `apply_implicit_viscosity`, pas de borne)
+            if self.mu_cell[c] > 0.0 && !(self.viscous && self.implicit_viscosity) {
                 dt = dt.min(0.2 * self.rho_mix[c] * dx * dx / self.mu_cell[c]);
             }
         }
@@ -362,9 +363,9 @@ impl MultiphaseSim {
         self.refresh_after_thermo();
         self.probe("refresh");
         lap(&mut prof, P_REFRESH);
-        // frottement des grains tassés (implicite), sur la vitesse prédite, avant la projection
-        if self.has_friction() {
-            self.apply_friction(dt, &mut us, &mut vs);
+        // viscosité implicite (frottement des grains tassés, fluides très visqueux) sur la vitesse prédite, avant la projection
+        if self.viscous {
+            self.apply_implicit_viscosity(dt, &mut us, &mut vs);
             lap(&mut prof, P_FORCES);
         }
         let (ua, va) = match &self.adv_vel { Some((a, b)) => (a.clone(), b.clone()), None => (un.clone(), vn.clone()) };

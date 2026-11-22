@@ -360,6 +360,34 @@ impl Phase {
             friction_angle: 32.0,
         }
     }
+    /// Charbon (carbone, grains de 0.3 mm) : phase granulaire combustible (C + O2 → CO2 à la surface des grains, voir
+    /// `mp_materials::coal_reaction`). Char de houille : ρ ≈ 1400 kg/m³, c_p du graphite (710 J/(kg·K) à 298 K, ≈ 1800 à 1500 K),
+    /// Δh_f° = 0 (état de référence du carbone), s° = 5.74 J/(mol·K)
+    pub fn coal() -> Phase {
+        Phase {
+            name: "charbon".into(),
+            kind: PhaseKind::Granular,
+            eos: Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 1400.0, t0: 293.15, beta: 1.0e-5 } },
+            cp: 710.0,
+            conductivity: 0.3,
+            mu_ref: 1.0e-3,
+            mu_law: PropertyLaw::Constant,
+            k_law: PropertyLaw::Constant,
+            t_ref: 293.15,
+            e0: 0.0,
+            sigma: 0.0,
+            color: [0.13, 0.12, 0.12],
+            molar_mass: 0.012011,
+            diffusivity: 0.0,
+            h_formation: 0.0,
+            s_standard: 5.74,
+            cp_slope: 0.9,
+            radiator: Radiator::None,
+            grain_diameter: 3.0e-4,
+            alpha_max: 0.6,
+            friction_angle: 35.0,
+        }
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {
@@ -466,6 +494,13 @@ impl PhaseChange {
 /// thermodynamiquement cohérent). Masse : −ν_i M_i ξ pour les réactifs, +ν_j M_j ξ pour les produits (bilan exact imposé).
 /// Énergie : l'énergie interne e de la cellule est INCHANGÉE ; les décalages e0 (fixés par les enthalpies de formation, voir
 /// `Registry::apply_thermochemistry`) portent la chaleur de réaction, comme pour la chaleur latente.
+///
+/// Réaction de SURFACE (un réactif est une phase granulaire : charbon, poudre…) : elle a lieu à la surface des grains,
+///   r = S_v · C_ox / (1/k_s + 1/k_d),   S_v = 6 α_s / d (m² de grains par m³),   k_s = A · T^b · exp(−Ea/(R T)) (m/s),
+///   k_d = Sh · D_ox(T, p) / d (Sh = 2 : apport du réactif gazeux C_ox jusqu'au grain par diffusion) ;
+/// C_ox = premier réactif non granulaire (l'oxydant) ; les autres réactifs non granulaires multiplient k_s par c^o ; l'ordre du réactif
+/// granulaire est ignoré (sa quantité entre par S_v). À basse température la cinétique domine (∝ 1/d), à haute température la diffusion
+/// (∝ 1/d²) — régimes I et III de la combustion des charbons. Irréversible.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Reaction {
     pub name: String,
@@ -534,7 +569,24 @@ impl Reaction {
     pub fn order(&self, i: usize) -> f64 {
         self.orders.get(i).copied().unwrap_or(self.reactants[i].1)
     }
+    /// réaction de surface : (réactif granulaire, diamètre des grains, oxydant = premier réactif non granulaire) ; None sinon
+    pub fn surface(&self, phases: &[Phase]) -> Option<SurfaceRx> {
+        let &(s, _) = self.reactants.iter().find(|&&(k, _)| phases.get(k).is_some_and(|p| p.is_granular()))?;
+        let ox = self.reactants.iter().map(|&(k, _)| k).find(|&k| phases.get(k).is_some_and(|p| !p.is_granular()));
+        Some(SurfaceRx { solid: s, d: phases[s].grain_diameter.max(1e-6), ox })
+    }
 }
+
+/// réaction de surface (voir `Reaction`) : réactif granulaire, diamètre de ses grains, oxydant
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceRx {
+    pub solid: usize,
+    pub d: f64,
+    pub ox: Option<usize>,
+}
+
+/// nombre de Sherwood du transfert de masse vers un grain isolé au repos
+pub const SHERWOOD: f64 = 2.0;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
@@ -731,11 +783,12 @@ impl Registry {
             if r.reversible && r.reactants.iter().chain(r.products.iter()).any(|&(k, _)| self.phases[k].s_standard == 0.0) {
                 w.push(format!("réaction réversible « {} » : entropie standard s° non renseignée pour un des fluides (équilibre faux)", r.name));
             }
-            // réactifs dans des groupes non miscibles : la réaction n'a lieu que dans les cellules d'interface (taux volumique)
+            // réactifs dans des groupes non miscibles : la réaction n'a lieu que dans les cellules d'interface (taux volumique) ; normal
+            // pour une réaction de surface (grains dans un gaz)
             let groups = self.miscible_groups();
             let gid = |k: usize| groups.iter().position(|g| g.contains(&k)).unwrap_or(usize::MAX);
             let g0 = gid(r.reactants[0].0);
-            if r.reactants.iter().any(|&(k, _)| gid(k) != g0) {
+            if r.surface(&self.phases).is_none() && r.reactants.iter().any(|&(k, _)| gid(k) != g0) {
                 w.push(format!("réaction « {} » : réactifs non miscibles entre eux — elle n'aura lieu que dans les cellules où ils se touchent", r.name));
             }
             if r.reactants.iter().chain(r.products.iter()).all(|&(k, _)| self.phases[k].h_formation == 0.0) {

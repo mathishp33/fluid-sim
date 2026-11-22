@@ -53,20 +53,34 @@ Sans friction, un tas s'étale comme un liquide lourd (sable tassé + air : ρ �
 - **pression de contact p_s = pression du mélange (contrainte moyenne) − pression du fluide des pores** (hydrostatique depuis le haut
   du massif ; dans l'eau : poids déjaugé). Le poids des grains au-dessus (contrainte verticale) avait été essayé d'abord : il rend le
   sable cohésif — une falaise verticale tient dès que tan φ > ½ (colonne figée à 68°) ;
-- implicite : (ρ_f/dt)(u − u_f) = ∇·[μ_g(∇u + ∇uᵀ)], gradient conjugué préconditionné (Jacobi), 40–150 itérations ; u_f = u* − dt∇pⁿ/ρ
-  (le frottement équilibre la force NETTE, sinon un tas au repos glisse d'un dt·g par pas) ; parois : non-glissement pour le frottement ;
-- la viscosité des fluides reste explicite (inchangée au bit près sans grains). La viscosité implicite générale (miel) reste à faire.
+- implicite : (ρ_f/dt)(u − u_f) = ∇·[μ(∇u + ∇uᵀ)], gradient conjugué préconditionné (Jacobi), 40–150 itérations ; u_f = u* − dt∇pⁿ/ρ
+  (le frottement équilibre la force NETTE, sinon un tas au repos glisse d'un dt·g par pas), faces fixes (parois, solides) mises à 0 —
+  u* y porte encore dt·g, annulé par la projection : ce défaut cisaillait à tort la couche du fond et faisait fluer les tas ;
+- non-glissement du frottement contre les parois ET les obstacles solides (nœuds « paroi » : deux cellules bloquées alignées) ;
+- chaleur de frottement Φ = τ : D rendue aux grains (54 % de l'énergie mécanique perdue par une colonne qui s'effondre ; le reste part
+  dans la dissipation numérique du transport) ;
+- viscosité implicite des fluides (`implicit_viscosity`, case « Viscosité implicite ») : la part de μ au-delà de 0.2 ρ dx²/dt passe dans
+  le même solveur (glissement libre aux parois, comme l'explicite), la borne de pas visqueuse disparaît — tourbillon de Taylor–Green à
+  μ = 2 Pa·s : 30 pas au lieu de 70, énergie cinétique à 1e-4 de la loi e^(−4νπ²t/L²) ; sans fluide si visqueux, rien ne change.
 
-Validation (φ = 32°) : colonne 4 × 8 cm → tas aux flancs de 24.7° (inertie : un dépôt d'effondrement est sous l'angle de talus),
-hauteur 0.45 H₀, étalement ×4 ; sans frottement : nappe à 5°. Tas à 20° : tient (Δh < 1 mm en 1 s). Tas à 50° : 42° en 0.4 s, puis
-flue jusqu'à 32.6° en 4 s (la fin est plus lente qu'une avalanche réelle : viscosité régularisée retardée d'un pas). Indépendant de δ
-(×10) et du plafond (÷3) à 1° près. GPU : mêmes formules, accord d'un pas 2e-7, tas final 24.8° / 3.58 cm (CPU 24.7° / 3.59 cm).
+Validation (φ = 32°) : colonne 4 × 8 cm → tas aux flancs de 21.4° (inertie : un dépôt d'effondrement est sous l'angle de talus),
+hauteur 0.42 H₀ ; sans frottement : nappe à 5°. Tas à 20° : tient (|u| < 1e-4 m/s). Tas à 50° : **avalanche, 29.8° en 0.35 s**, puis
+immobile. Étagère d'acier : 90 % du sable d'une colonne y reste. GPU : mêmes formules, accord d'un pas 3e-7 (masses), tas 21.7°,
+étagère 90.3 % des deux côtés, tourbillon visqueux identique.
 
-## 6. Réactions hétérogènes (étape 4)
+## 6. Réactions hétérogènes (étape 4, en partie faite : réactions de surface, charbon)
 
-Phases granulaires admises dans les réactions, vitesse proportionnelle à la surface des grains (6 α_s/d) : combustion du charbon
-(C + O2 → CO2), poudre à canon (décomposition KNO3/S/C → gaz chauds, oxydant intégré : brûle sans air), pyrolyse du bois
-(bois → gaz volatils + charbon). Réutilise la cinétique, la thermochimie et les flammes existantes.
+Une réaction dont un réactif est granulaire est une **réaction de surface** (`phases::Reaction`, `CellChem::surface_rate`,
+`cc_surface_rate` sur le GPU) : r = S_v · C_ox / (1/k_s + 1/k_d), S_v = 6 α_s/d, k_s = A T^b e^(−Ea/RT) (m/s), k_d = Sh D_ox/d (Sh = 2).
+Avant, une phase granulaire réagissait comme un gaz dissous (action de masse sur m/M) : ni la surface des grains ni l'apport d'oxygène
+n'y entraient. Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cinétique), ×3.77 à 1800 K (diffusion, 4 à la limite).
+- **charbon** (`Phase::coal`, char de houille, 0.3 mm) et C + O2 → CO2 (cinétique de Field 1969 : A = 596 m/(s·K), Ea = 149 kJ/mol) ;
+  scénario « Feu de charbon » : tas tassé allumé en surface (1200 K), haut ouvert. Il couve à ~1190 K (0.05 g/(m·s), panache de CO2),
+  limité par l'oxygène qui atteint sa surface : le modèle à une vitesse ne fait pas traverser un lit tassé par l'air (pas de grille ni
+  de tirage À TRAVERS le tas). GPU : CO2 produit en 1 s à 0.02 % du CPU.
+- reste : percolation du gaz dans un lit tassé (dérive de Darcy du fluide par rapport aux grains — feux sur grille, lits fluidisés),
+  C + ½O2 → CO à la surface (CO/CO2 ≈ 2500 e^(−6240/T)) puis flamme de CO au-dessus des braises, poudre à canon (KNO3/S/C → gaz chauds,
+  oxydant intégré : brûle sans air), pyrolyse du bois (bois → gaz volatils + charbon).
 
 ## 7. Solidification (étape 5)
 
@@ -86,9 +100,10 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
    Accord d'un pas : 1e-5 (nuage de sable), 5e-8 (suspension), 1e-7 (poudre chaude) ; 1 s de nuage : 92 % du sable sous la surface
    des deux côtés ; 3 s de suspension : mêmes colonnes. Corrigé en route (aussi utile sans grains) : aire PLIC f32 stable,
    relaxation thermique d'une trace sans débordement. Limite f32 connue (pas propre aux grains) : boîte fermée sans aucun gaz.
-3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5). Reste : viscosité implicite générale (miel),
-   frottement contre les obstacles solides (glissement libre aujourd'hui), chaleur de frottement.
-4. Réactions hétérogènes et matériaux (charbon, poudre à canon, bois).
+3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5), puis : avalanche rapide (un défaut des faces de paroi
+   faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
+4. **EN PARTIE (2026-11-22) — Réactions hétérogènes** : réactions de surface, charbon, feu de charbon (§ 6). Reste : percolation,
+   CO puis flamme de CO, poudre à canon, bois.
 5. Solidification.
 
 ## 9. Choix à valider

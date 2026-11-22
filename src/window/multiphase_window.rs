@@ -747,6 +747,10 @@ impl MultiphaseWindow {
                     }
                     ui.checkbox(&mut self.sim.surface_tension, "Tension de surface");
                     ui.checkbox(&mut self.sim.viscous, "Viscosité");
+                    if self.sim.viscous {
+                        ui.checkbox(&mut self.sim.implicit_viscosity, "  Viscosité implicite (fluides très visqueux)")
+                            .on_hover_text("La part de la viscosité qui imposerait un pas de temps minuscule (miel, huiles épaisses) est résolue implicitement");
+                    }
                     ui.checkbox(&mut self.sim.conduction, "Conduction thermique");
                     ui.checkbox(&mut self.sim.phase_change, "Changement de phase").on_hover_text("Ébullition, condensation, cavitation, évaporation");
                     if !self.sim.reg.reactions.is_empty() {

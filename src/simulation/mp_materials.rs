@@ -110,6 +110,8 @@ pub struct Roles {
     pub plate: Option<usize>,
     /// première phase granulaire (sable, poudre…)
     pub grains: Option<usize>,
+    /// phase granulaire combustible (réactif d'une réaction de surface : charbon…)
+    pub coal: Option<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -136,7 +138,10 @@ impl Roles {
         let oil = by_name(&["huile", "oil"], Some(PhaseKind::Liquid)).or_else(|| (0..reg.phases.len()).find(|&k| reg.phases[k].kind == PhaseKind::Liquid && Some(k) != water));
         let plate = reg.solids.iter().position(|s| ["acier", "steel"].contains(&lower(&s.name).as_str())).or(if reg.solids.is_empty() { None } else { Some(0) });
         let grains = by_name(&["sable", "sand"], Some(PhaseKind::Granular)).or_else(|| (0..reg.phases.len()).find(|&k| reg.phases[k].is_granular()));
-        Roles { air, water, vapor, oil, plate, grains }
+        let coal = by_name(&["charbon", "coal", "carbone"], Some(PhaseKind::Granular)).or_else(|| {
+            reg.reactions.iter().find_map(|r| r.surface(&reg.phases).map(|s| s.solid))
+        });
+        Roles { air, water, vapor, oil, plate, grains, coal }
     }
 }
 
@@ -417,6 +422,8 @@ pub const MIX_H2_AIR: &str = "hydrogène–air stœchiométrique";
 pub const RX_CH4: &str = "combustion du méthane (Westbrook–Dryer)";
 pub const RX_H2: &str = "combustion de l'hydrogène ⇌ dissociation de H2O";
 pub const RX_CO: &str = "oxydation de CO ⇌ dissociation de CO2";
+pub const COAL: &str = "charbon";
+pub const RX_COAL: &str = "combustion du charbon (C + O2 → CO2, surface des grains)";
 
 /// Gaz parfait de combustion. cp(T) = cp + pente·(T − 298.15) : les deux coefficients sont ajustés pour reproduire EXACTEMENT
 /// h(2000 K) − h(298 K) et s°(2000 K) des tables NIST-JANAF (donc la température de flamme et les équilibres de dissociation vers
@@ -511,6 +518,23 @@ pub fn combustion_reactions() -> Vec<ReactionDef> {
     ]
 }
 
+/// Combustion du charbon à la surface des grains (réaction de surface, voir `phases::Reaction`) : C + O2 → CO2, cinétique du char de
+/// Field (1969), 8 710 exp(−17 967/T) g/(cm²·s·atm O2), convertie en vitesse de surface k_s = A·T·exp(−Ea/RT) m/s par p_O2 = C_O2 R T :
+/// A = 87 100 R / (M_C · 101 325) = 596 m/(s·K), Ea = 149.4 kJ/mol. À 1500 K, k_s ≈ 5.7 m/s contre k_d = 2 D_O2/d ≈ 2.3 m/s pour des grains
+/// de 0.3 mm : la combustion vive est limitée par l'apport d'oxygène (régime III) ; elle démarre vers 800–900 K.
+pub fn coal_reaction() -> ReactionDef {
+    ReactionDef {
+        name: RX_COAL.into(),
+        reactants: vec![(COAL.into(), 1.0), (O2.into(), 1.0)],
+        products: vec![(CO2.into(), 1.0)],
+        pre_exp: 87100.0 * R_GAS / (0.012011 * 101325.0),
+        activation_energy: 17967.0 * R_GAS,
+        orders: vec![0.0, 1.0],
+        temp_exponent: 1.0,
+        ..Default::default()
+    }
+}
+
 /// fractions molaires de l'air sec : O2 20.95 %, N2 + Ar 79.05 %
 const X_O2_AIR: f64 = 0.2095;
 
@@ -594,6 +618,18 @@ impl MaterialLibrary {
         let mut l = self.clone();
         l.add_combustion_preset();
         l.ambient = AIR_SEC.into();
+        l
+    }
+
+    /// Préréglage combustion + charbon (phase granulaire) et sa combustion de surface (scénario « feu de charbon »)
+    pub fn with_coal(&self) -> MaterialLibrary {
+        let mut l = self.with_combustion();
+        if l.fluid_index(COAL).is_none() {
+            l.fluids.push(Phase::coal());
+        }
+        if !l.reactions.iter().any(|q| q.name == RX_COAL) {
+            l.reactions.push(coal_reaction());
+        }
         l
     }
 }

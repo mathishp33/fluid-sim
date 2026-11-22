@@ -143,8 +143,10 @@ impl MultiphaseSim {
                 }
             }
         }
-        // viscosité : ∇·[μ(∇u + ∇uᵀ)] / ρ_f  (parois : glissement libre)
+        // viscosité : ∇·[μ(∇u + ∇uᵀ)] / ρ_f  (parois : glissement libre) ; au-delà de la borne explicite 0.2 ρ dx²/dt, le reste de μ est
+        // implicite (`apply_implicit_viscosity`)
         if self.viscous {
+            let mue: Vec<f64> = (0..nx * ny).map(|c| self.mu_cell[c].min(self.explicit_mu_cap(c, dt))).collect();
             let (u, v) = (&self.u, &self.v);
             let ui = |i: usize, j: usize| u[j * (nx + 1) + i];
             let vi = |i: usize, j: usize| v[j * nx + i];
@@ -154,8 +156,8 @@ impl MultiphaseSim {
             for j in 0..ny {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    txx[c] = 2.0 * self.mu_cell[c] * (ui(i + 1, j) - ui(i, j)) / dx;
-                    tyy[c] = 2.0 * self.mu_cell[c] * (vi(i, j + 1) - vi(i, j)) / dx;
+                    txx[c] = 2.0 * mue[c] * (ui(i + 1, j) - ui(i, j)) / dx;
+                    tyy[c] = 2.0 * mue[c] * (vi(i, j + 1) - vi(i, j)) / dx;
                 }
             }
             // τxy aux nœuds (i, j) : 0 ≤ i ≤ nx, 0 ≤ j ≤ ny ; nul sur les bords et contre les solides (glissement libre)
@@ -166,7 +168,7 @@ impl MultiphaseSim {
                     if cs.iter().any(|&c| self.is_solid(c)) {
                         continue;
                     }
-                    let mu = cs.iter().map(|&c| self.mu_cell[c]).sum::<f64>() / 4.0;
+                    let mu = cs.iter().map(|&c| mue[c]).sum::<f64>() / 4.0;
                     txy[j * (nx + 1) + i] = mu * ((ui(i, j) - ui(i, j - 1)) / dx + (vi(i, j) - vi(i - 1, j)) / dx);
                 }
             }

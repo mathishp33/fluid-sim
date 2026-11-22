@@ -273,3 +273,88 @@ fn combustion_scenarios_build_and_run_without_diverging() {
     assert!(b.mixtures.iter().any(|m| m.0 == AIR_SEC));
     let _ = MIX_H2_AIR;
 }
+
+// ---------------------------------------------------------------- réactions de surface (poudres, charbon)
+
+/// boîte fermée (4 × 4, sans gravité) d'air sec à T contenant une poussière de charbon uniforme (fraction a0, grains de diamètre d)
+fn coal_dust(t: f64, a0: f64, d: f64) -> (MultiphaseSim, usize, usize, usize) {
+    let mut lib = MaterialLibrary::default().with_coal();
+    let k = lib.fluid_index(super::mp_materials::COAL).unwrap();
+    lib.fluids[k].grain_diameter = d;
+    let b = lib.build().expect("préréglage charbon valide");
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let reg = b.registry;
+    let (c, o2, co2) = (idx(&reg, super::mp_materials::COAL), idx(&reg, O2), idx(&reg, CO2));
+    let mut s = MultiphaseSim::new(4, 4, 0.01, reg, b.ambient);
+    s.ambient_mix = b.ambient_mix.clone();
+    s.gravity = [0.0, 0.0];
+    let mut m = b.ambient_mix.iter().map(|x| x * (1.0 - a0)).collect::<Vec<f64>>();
+    m[c] = a0;
+    s.paint_mixture(move |_, _| Some(m.clone()));
+    s.finalize_init(move |_, _| t);
+    s.refresh();
+    (s, c, o2, co2)
+}
+
+/// vitesse initiale (mol/(m³·s)) de C + O2 → CO2 mesurée sur un appel de la chimie, et celle de la loi de surface
+fn coal_rates(t: f64, d: f64) -> (f64, f64) {
+    let (mut s, c, o2, co2) = coal_dust(t, 1e-5, d);
+    let q = s.idx(1, 1);
+    let r = s.reg.reactions.iter().find(|r| r.name == super::mp_materials::RX_COAL).unwrap().clone();
+    let (tc, p) = (s.tg[s.group_of[o2]][q], s.p[q]);
+    let a_s = s.alpha[c][q];
+    let sv = 6.0 * a_s / d;
+    let ks = r.k_forward(tc);
+    let kd = 2.0 * s.reg.phases[o2].diffusivity_at(tc, p) / d;
+    let c_o2 = s.mass[o2][q] / s.reg.phases[o2].molar_mass;
+    let expect = sv * c_o2 / (1.0 / ks + 1.0 / kd);
+    let m0 = s.mass[co2][q];
+    let dt = 1e-4;
+    s.react_step(dt);
+    let got = (s.mass[co2][q] - m0) / s.reg.phases[co2].molar_mass / dt;
+    (got, expect)
+}
+
+#[test]
+fn coal_burns_at_the_grain_surface_kinetic_then_diffusion_limited() {
+    // 1000 K : régime cinétique (k_s ≈ 0.01 m/s ≪ k_d ≈ 1 m/s), vitesse ∝ 1/d ; 1800 K : régime diffusionnel (k_s ≫ k_d), ∝ 1/d²
+    for (t, ratio) in [(1000.0, 2.0), (1800.0, 4.0)] {
+        let (g1, e1) = coal_rates(t, 3e-4);
+        let (g2, e2) = coal_rates(t, 1.5e-4);
+        eprintln!("T = {t} K : d = 0.3 mm {g1:.4e} (loi {e1:.4e}) ; d = 0.15 mm {g2:.4e} (loi {e2:.4e}) ; rapport {:.2}", g2 / g1);
+        assert!((g1 / e1 - 1.0).abs() < 0.02 && (g2 / e2 - 1.0).abs() < 0.02, "vitesse de surface : {g1} vs {e1}, {g2} vs {e2}");
+        assert!((g2 / g1 / ratio - 1.0).abs() < 0.12, "effet du diamètre à {t} K : {} (attendu ≈ {ratio})", g2 / g1);
+    }
+    // froid : rien ne brûle
+    let (g, _) = coal_rates(300.0, 3e-4);
+    assert!(g < 1e-20, "le charbon ne brûle pas à 300 K : {g}");
+}
+
+#[test]
+fn a_coal_fire_keeps_burning_and_conserves_carbon() {
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
+    let k = |n: &str| idx(&s.reg, n);
+    let (c, co2, o2) = (k(super::mp_materials::COAL), k(CO2), k(O2));
+    let carbon = |s: &MultiphaseSim| s.total_mass(c) / 0.012011 + (s.total_mass(co2) - s.boundary_flux[co2]) / s.reg.phases[co2].molar_mass;
+    let (m_c0, n_c0) = (s.total_mass(c), carbon(&s));
+    let t_start = std::time::Instant::now();
+    let mut t_hot = vec![];
+    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0f64);
+    while s.time < t_end && !s.diverged {
+        s.step();
+        if s.step_count % 250 == 0 {
+            let tmax = (0..s.nx * s.ny).filter(|&q| s.mass[c][q] > 1.0).map(|q| s.tg[s.group_of[c]][q]).fold(0.0f64, f64::max);
+            t_hot.push((s.time, tmax));
+        }
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let burnt = m_c0 - s.total_mass(c);
+    let tmax = t_hot.last().map_or(0.0, |x| x.1);
+    eprintln!("feu de charbon : {} pas en {:.1} s ; charbon brûlé {:.3e} kg/m ({:.2} %), CO2 {:.3e} kg/m, O2 {:.3e} ; T max des braises {:?}",
+        s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(o2),
+        t_hot.iter().map(|(t, x)| format!("{t:.1}s:{x:.0}K")).collect::<Vec<_>>());
+    assert!(burnt > 1e-5 * m_c0, "le charbon n'a pas brûlé");
+    assert!(tmax > 1000.0, "le feu s'est éteint : braises à {tmax} K");
+    assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + CO2 + sorties) : {} → {}", n_c0, carbon(&s));
+}
