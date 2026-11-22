@@ -408,4 +408,10 @@ const D_B_MAXPCG: u32 = 56u;
 const D_B_NEWTON: u32 = 57u;
 const D_B_UNCONV: u32 = 58u;
 const D_DTF: u32 = 59u;   // fraction de dt des noyaux (sous-pas du bloc thermique des flammes ; 1 ailleurs)
-const D_LEN: u32 = 64u;
+// frottement des grains (friction.wgsl) : r·z (deux emplacements alternés), ‖r0‖, convergé, itérations, budget insuffisant
+const D_FR_RZ: u32 = 60u;
+const D_FR_R0: u32 = 62u;
+const D_FR_DONE: u32 = 63u;
+const D_FR_IT: u32 = 64u;
+const D_FR_UNCONV: u32 = 65u;
+const D_LEN: u32 = 72u;

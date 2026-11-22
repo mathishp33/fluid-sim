@@ -669,6 +669,12 @@ fn fluid_props_ui(ui: &mut Ui, p: &mut Phase) -> bool {
             ui.label("Compaction maximale");
             ch |= ui.add(DragValue::new(&mut p.alpha_max).speed(0.005).range(0.3..=0.74)).on_hover_text("Fraction volumique des grains tassés (empilement aléatoire ≈ 0.6)").changed();
             ui.end_row();
+            ui.label("Angle de frottement (°)");
+            ch |= ui
+                .add(DragValue::new(&mut p.friction_angle).speed(0.5).range(0.0..=60.0))
+                .on_hover_text("Frottement de Coulomb des grains tassés : un tas tient jusqu'à cette pente (sable sec ≈ 32°, 0 = coule comme un liquide)")
+                .changed();
+            ui.end_row();
         }
         match &mut p.eos {
             Eos::IdealGas { r_spec } => {

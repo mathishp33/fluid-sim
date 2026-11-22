@@ -109,6 +109,7 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
         D[D_PCG_DONE] = 0.0; D[D_PCG_IT] = 0.0; D[D_PCG_ITN] = 0.0; D[D_MAXPCG_N] = 0.0;
         D[D_DTCHEM_NEW] = 3.0e38; D[D_DTPHASE_NEW] = 3.0e38;
         D[D_REDO] = 0.0; D[D_NSUB_S_MAX] = 0.0; D[D_PCG_UNCONV] = 0.0; D[D_NSUB_C] = 0.0; D[D_NSUB_S] = 0.0;
+        D[D_FR_UNCONV] = 0.0; D[D_FR_IT] = 0.0;
     }
 }
 

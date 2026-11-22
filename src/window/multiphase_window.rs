@@ -1043,10 +1043,11 @@ impl MultiphaseWindow {
                         }
                     });
                     ui.label(format!(
-                        "{} fil(s) ; dernier pas : {} PCG, {} Newton",
+                        "{} fil(s) ; dernier pas : {} PCG, {} Newton{}",
                         rayon::current_num_threads(),
                         self.sim.last_pressure_iters,
-                        self.sim.last_newton_iters
+                        self.sim.last_newton_iters,
+                        if self.sim.has_friction() { format!(", {} frottement", self.sim.last_friction_iters) } else { String::new() }
                     ));
                     if ui.button("Remettre le profil à zéro").clicked() {
                         reset_prof = true;

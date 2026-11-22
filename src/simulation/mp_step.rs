@@ -285,7 +285,7 @@ impl MultiphaseSim {
         lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());
         // 2. prédiction de vitesse
-        let (us, vs);
+        let (mut us, mut vs);
         if self.conservative_momentum {
             // forces évaluées sur l'état n, puis masses/énergie, puis quantité de mouvement avec les MÊMES flux de masse
             let mut fx = vec![0.0; self.u.len()];
@@ -362,6 +362,11 @@ impl MultiphaseSim {
         self.refresh_after_thermo();
         self.probe("refresh");
         lap(&mut prof, P_REFRESH);
+        // frottement des grains tassés (implicite), sur la vitesse prédite, avant la projection
+        if self.has_friction() {
+            self.apply_friction(dt, &mut us, &mut vs);
+            lap(&mut prof, P_FORCES);
+        }
         let (ua, va) = match &self.adv_vel { Some((a, b)) => (a.clone(), b.clone()), None => (un.clone(), vn.clone()) };
         self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &ua, &va, &err0);
         self.probe("pression");

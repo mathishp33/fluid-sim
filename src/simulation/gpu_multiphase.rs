@@ -21,10 +21,11 @@ use super::mp_step::P_GPU;
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Eos, Radiator, Thermal, MAX_PHASES, T_STD};
 
-const SHADERS: [&str; 9] = [
+const SHADERS: [&str; 10] = [
     include_str!("mp_gpu/common.wgsl"),
     include_str!("mp_gpu/flow.wgsl"),
     include_str!("mp_gpu/granular.wgsl"),
+    include_str!("mp_gpu/friction.wgsl"),
     include_str!("mp_gpu/mg.wgsl"),
     include_str!("mp_gpu/thermo.wgsl"),
     include_str!("mp_gpu/species.wgsl"),
@@ -43,7 +44,9 @@ const KC_DT: f64 = 5.0;
 const KC_N: usize = 1161;
 /// niveaux multigrilles de moins de TAIL_CELLS cellules : traités par un seul groupe de travail
 const TAIL_CELLS: usize = 8192;
-const D_LEN: usize = 64;
+const D_LEN: usize = 72;
+const D_FR_IT: usize = 64;
+const D_FR_UNCONV: usize = 65;
 /// emplacements de paramètres de lancement (a, b) : a < SLOT_A pour b = 0, a < SLOT_A_SP pour b = groupe diffusant
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
@@ -228,6 +231,8 @@ pub struct MultiphaseGpu {
     // budgets adaptatifs (lancements préparés ; les noyaux en trop ne font rien)
     newton_budget: usize,
     pcg_budget: usize,
+    /// itérations du gradient conjugué du frottement des grains soumises par pas (adaptées comme celles de la pression)
+    fr_budget: usize,
     cond_budget: usize,
     sp_budget: usize,
     base: Baselines,
@@ -268,7 +273,8 @@ impl MultiphaseGpu {
         }
         let last = levels.len() - 1;
         let mg_tail = levels.iter().position(|&(a, b)| a * b <= TAIL_CELLS).unwrap_or(last).min(last);
-        let nwg = n.max(nf).div_ceil(64).max(1);
+        // (sommes partielles : cellules, faces d'une direction, ou faces u et v ensemble — gradient conjugué du frottement)
+        let nwg = n.max(nf).max(nfu + nfv).div_ceil(64).max(1);
 
         // ---------------------------------------------------------------- disposition de S
         let mut sl = Layout::default();
@@ -330,6 +336,13 @@ impl MultiphaseGpu {
         sl.add("agn", ng * n);
         sl.add("sdm", (np + 1) * n);
         sl.add("sde", ng.max(1) * n);
+        // frottement des grains : vecteurs de faces u et v ensemble (gradient conjugué), viscosité, pression de contact, contact
+        for name in ["fr_uf", "fr_r", "fr_z", "fr_p", "fr_ap", "fr_x"] {
+            sl.add(name, nfu + nfv);
+        }
+        for name in ["fr_mu", "fr_ps", "fr_frac"] {
+            sl.add(name, n);
+        }
         sl.add("scale", np * n);
         sl.add("fl_vol", nf * np);
         for name in ["fdon", "frcv", "fghost", "ftf", "ftg"] {
@@ -584,6 +597,7 @@ impl MultiphaseGpu {
             heat_on: false,
             newton_budget: 3,
             pcg_budget: 30,
+            fr_budget: 40,
             cond_budget: 8,
             sp_budget: 8,
             base: Baselines::default(),
@@ -693,6 +707,7 @@ impl MultiphaseGpu {
             r[32] = if p.is_granular() { 1.0 } else { 0.0 };
             r[33] = p.grain_diameter;
             r[34] = p.alpha_max;
+            r[35] = if p.is_granular() { p.friction_angle.to_radians().tan() } else { 0.0 };
             for q in 0..PH_STRIDE {
                 t[b + q] = r[q] as f32;
             }
@@ -1422,6 +1437,22 @@ impl MultiphaseGpu {
         }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));
+        // frottement des grains tassés (implicite, gradient conjugué) sur u*, avant la projection (miroir de apply_friction)
+        if sim.has_friction() {
+            let (vert, wuv) = (sim.gravity[1].abs() >= sim.gravity[0].abs(), wg(nfu + nfv));
+            v.push(Op { k: "k_fr_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
+            v.push(cell("k_fr_mu"));
+            v.push(Op { k: "k_fr_uf", wg: wuv, slot: 0 });
+            v.push(Op { k: "k_fr_r0", wg: wuv, slot: 0 });
+            v.push(one("k_fr_start"));
+            for it in 0..self.fr_budget {
+                let sl = self.slot(it % 2, 0);
+                v.push(Op { k: "k_fr_ap", wg: wuv, slot: sl });
+                v.push(Op { k: "k_fr_upd", wg: wuv, slot: sl });
+                v.push(Op { k: "k_fr_dir", wg: wuv, slot: sl });
+            }
+            v.push(Op { k: "k_fr_apply", wg: wuv, slot: 0 });
+        }
         v.push(cell("k_save_p"));
         let last = self.levels.len() - 1;
         for _ in 0..self.newton_budget {
@@ -1573,6 +1604,16 @@ impl MultiphaseGpu {
             sim.dt_phase = if d[D_DTPHASE] < 1e37 { d[D_DTPHASE] as f64 } else { f64::INFINITY };
             let (need_c, need_s) = (d[D_SUB_C] as usize, d[D_NSUB_S_MAX] as usize);
             self.update_budgets(sim, newton, pcg_max, d[D_PCG_UNCONV] > 0.5, need_c, need_s);
+            if sim.has_friction() {
+                // frottement : budget = itérations du pas × 1.3 (doublé si le gradient conjugué s'est arrêté sur le budget)
+                let it = d[D_FR_IT] as usize;
+                sim.last_friction_iters = it;
+                let mut fb = (it as f64 * 1.3).ceil() as usize + 4;
+                if d[D_FR_UNCONV] > 0.5 {
+                    fb = fb.max(2 * self.fr_budget);
+                }
+                self.fr_budget = fb.clamp(8, sim.friction_max_iter.max(8));
+            }
             self.last = GpuStepInfo { dt, newton, pcg: d[D_PCG_IT] as usize, pcg_max, cond_sub: need_c, species_sub: need_s, retries: tries, redo: redos, dispatches: n_ops };
             sim.profile.secs[P_GPU] += clk.elapsed().as_secs_f64();
             sim.profile.steps += 1;

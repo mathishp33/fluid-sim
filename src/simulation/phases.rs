@@ -139,10 +139,19 @@ pub struct Phase {
     /// phase granulaire : fraction volumique maximale des grains tassés (empilement aléatoire ≈ 0.6)
     #[serde(default = "default_alpha_max")]
     pub alpha_max: f64,
+    /// phase granulaire : angle de frottement interne φ (degrés) — frottement de Coulomb des grains tassés (angle de talus ≈ φ) ;
+    /// 0 = sans frottement (les grains tassés coulent comme un liquide lourd). Absent d'un fichier de matériaux antérieur : 32° (sable),
+    /// sans effet sur les phases non granulaires
+    #[serde(default = "default_friction_angle")]
+    pub friction_angle: f64,
 }
 
 fn default_alpha_max() -> f64 {
     0.6
+}
+
+fn default_friction_angle() -> f64 {
+    32.0
 }
 
 fn default_color() -> [f32; 3] {
@@ -269,6 +278,7 @@ impl Phase {
             radiator: Radiator::None,
             grain_diameter: 0.0,
             alpha_max: 0.6,
+            friction_angle: 0.0,
         }
     }
     pub fn water() -> Phase {
@@ -293,6 +303,7 @@ impl Phase {
             radiator: Radiator::None,
             grain_diameter: 0.0,
             alpha_max: 0.6,
+            friction_angle: 0.0,
         }
     }
     /// Vapeur d'eau (gaz parfait, R = 461.5 J/(kg·K))
@@ -318,6 +329,7 @@ impl Phase {
             radiator: Radiator::Water,
             grain_diameter: 0.0,
             alpha_max: 0.6,
+            friction_angle: 0.0,
         }
     }
     /// Sable de quartz (grains de 0.3 mm) : phase granulaire. Grains incompressibles (Tait très raide, K ≈ 37 GPa), dilatation du
@@ -344,6 +356,8 @@ impl Phase {
             radiator: Radiator::None,
             grain_diameter: 3.0e-4,
             alpha_max: 0.6,
+            // sable sec : angle de talus ~ 30–35°
+            friction_angle: 32.0,
         }
     }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
@@ -374,6 +388,7 @@ impl Phase {
             radiator: Radiator::None,
             grain_diameter: 0.0,
             alpha_max: 0.6,
+            friction_angle: 0.0,
         }
     }
 }

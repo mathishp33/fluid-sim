@@ -182,6 +182,7 @@ impl MaterialLibrary {
                 radiator: Radiator::None,
                 grain_diameter: 0.0,
                 alpha_max: 0.6,
+                friction_angle: 0.0,
             },
             PhaseKind::Liquid => Phase {
                 name: self.unique_name("liquide"),
@@ -204,6 +205,7 @@ impl MaterialLibrary {
                 radiator: Radiator::None,
                 grain_diameter: 0.0,
                 alpha_max: 0.6,
+                friction_angle: 0.0,
             },
             PhaseKind::Granular => Phase { name: self.unique_name("grains"), ..Phase::sand() },
         }
@@ -442,6 +444,7 @@ fn gas(name: &str, m: f64, cp: f64, slope: f64, mu: f64, s_mu: f64, k: f64, d: f
         radiator: rad,
         grain_diameter: 0.0,
         alpha_max: 0.6,
+        friction_angle: 0.0,
     }
 }
 

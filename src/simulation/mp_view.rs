@@ -45,6 +45,8 @@ pub enum MpScenario {
     DiffusionFlame,
     /// nuage de sable dans l'air qui tombe dans de l'eau et s'y dépose (phase granulaire)
     Sedimentation,
+    /// colonne de sable sec tassé qui s'effondre en un tas (frottement des grains)
+    SandColumn,
 }
 
 impl Default for MpScenario {
@@ -54,7 +56,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 11] = [
+    pub const ALL: [MpScenario; 12] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -66,11 +68,12 @@ impl MpScenario {
         Self::VentedExplosion,
         Self::DiffusionFlame,
         Self::Sedimentation,
+        Self::SandColumn,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation)
+        matches!(self, Self::Sedimentation | Self::SandColumn)
     }
     pub fn is_combustion(self) -> bool {
         matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame)
@@ -94,6 +97,7 @@ impl MpScenario {
             Self::VentedExplosion => "Explosion de gaz avec évent (méthane–air)",
             Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
             Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
+            Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
         }
     }
 }
@@ -146,6 +150,18 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let (x0, x1, y0, y1) = (0.3 * lx, 0.7 * lx, 0.6 * ly, 0.85 * ly);
             s.paint_phase(move |_, y| if y < 0.4 * ly { Some(eau) } else { None });
             s.paint_mixture(move |x, y| if x > x0 && x < x1 && y > y0 && y < y1 { Some(cloud.clone()) } else { None });
+        }
+        MpScenario::SandColumn => {
+            // colonne de sable sec tassé (α_max de grains, le reste d'air) au milieu : elle s'effondre en un tas dont les flancs
+            // tiennent à l'angle de frottement (≈ 25° pour un effondrement, ≈ φ pour un tas qui s'affaisse lentement)
+            let air = need(roles.air, "un gaz")?;
+            let sable = need(roles.grains, "une phase granulaire (sable)")?;
+            let amax = s.reg.phases[sable].alpha_max;
+            let mut packed = vec![0.0; s.reg.phases.len()];
+            packed[air] = 1.0 - amax;
+            packed[sable] = amax;
+            let (x0, x1, h) = (0.42 * lx, 0.58 * lx, 0.65 * ly);
+            s.paint_mixture(move |x, y| if x > x0 && x < x1 && y < h { Some(packed.clone()) } else { None });
         }
         MpScenario::DamBreak => {
             let eau = need(roles.water, "un liquide")?;

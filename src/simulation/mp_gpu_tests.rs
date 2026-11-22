@@ -1325,6 +1325,23 @@ fn gpu_forms_the_same_packed_sand_layer_as_the_cpu() {
 }
 
 #[test]
+fn gpu_collapses_a_sand_column_like_the_cpu() {
+    // frottement des grains (Drucker–Prager implicite, gradient conjugué) : accord d'un pas pendant l'effondrement, puis tas final
+    use super::mp_friction::tests::{flank_angle, pile_heights, sand_column};
+    let mk = || sand_column(60, 30, 0.005, 0.04, 0.08, 32.0);
+    one_step_agreement("colonne de sable", mk(), 60, 3, 2e-4, 0.01);
+    let Some((cpu, gs, g)) = compare("colonne de sable", &mk, 1.5) else { return };
+    let (hc, hg) = (pile_heights(&cpu), pile_heights(&gs));
+    let (hmc, hmg) = (hc.iter().fold(0.0f64, |a, &b| a.max(b)), hg.iter().fold(0.0f64, |a, &b| a.max(b)));
+    eprintln!(" angle des flancs : CPU {:.1}° GPU {:.1}° ; hauteur CPU {hmc:.4} GPU {hmg:.4} ; itérations du frottement GPU {} (CPU {})",
+        flank_angle(&cpu), flank_angle(&gs), gs.last_friction_iters, cpu.last_friction_iters);
+    let _ = g;
+    assert!((flank_angle(&cpu) - flank_angle(&gs)).abs() < 3.0, "angles CPU {} GPU {}", flank_angle(&cpu), flank_angle(&gs));
+    assert!((hmc - hmg).abs() < 0.1 * hmc, "hauteurs CPU {hmc} GPU {hmg}");
+    assert!(rel(cpu.total_mass(1), gs.total_mass(1)) < 1e-5, "masse de sable");
+}
+
+#[test]
 fn gpu_matches_cpu_hot_powder_cooling_in_air() {
     // poudre de 0.3 mm à 5 %, à 600 K dans de l'air à 300 K, sans gravité : échange par la surface des grains (k_exch_grains).
     // Comparé à t = τ (écart divisé par e), là où l'échange est en cours, pas une fois l'équilibre atteint

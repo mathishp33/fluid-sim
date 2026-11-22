@@ -67,6 +67,8 @@ pub struct MultiphaseSim {
     pub phase_change: bool,
     pub pressure_tol: f64,
     pub pressure_max_iter: usize,
+    /// plafond d'itérations du gradient conjugué du frottement des grains (mp_friction.rs)
+    pub friction_max_iter: usize,
     /// préconditionneur de la pression : multigrille (défaut, parallèle) ou Cholesky incomplet IC(0) (historique)
     pub multigrid: bool,
     // changement de phase
@@ -85,6 +87,8 @@ pub struct MultiphaseSim {
     pub(crate) pc_dvol: Vec<Vec<f64>>,
     /// itérations de Newton de la fermeture volumique au dernier pas
     pub last_newton_iters: usize,
+    /// itérations du gradient conjugué du frottement des grains au dernier pas
+    pub last_friction_iters: usize,
     /// masse (kg par m de profondeur) entrée par les bords ouverts, par phase : M_k(t) − M_k(0) = flux_k − (changements de phase)
     pub boundary_flux: Vec<f64>,
     /// masse transformée liquide→vapeur cumulée par paire (kg/m), pour les bilans
@@ -286,6 +290,7 @@ impl MultiphaseSim {
             phase_change: true,
             pressure_tol: 1e-10,
             pressure_max_iter: 600,
+            friction_max_iter: 3000,
             multigrid: true,
             nucleation_superheat: 4.0,
             nucleation_alpha: 1e-3,
@@ -295,6 +300,7 @@ impl MultiphaseSim {
             last_dt: 0.0,
             last_pressure_iters: 0,
             last_newton_iters: 0,
+            last_friction_iters: 0,
             pressure_clamped: vec![false; n],
             pc_dvol: vec![vec![0.0; n]; ng],
             boundary_flux: vec![0.0; np],

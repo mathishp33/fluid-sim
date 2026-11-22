@@ -43,12 +43,24 @@ Groupe propre, échange avec les autres groupes de la cellule par la surface des
 aire volumique A = 6 α_s / d, h = Nu·k_f/d avec Nu = 2 (Ranz–Marshall, petit Reynolds) → G = 12 α_s k_f / d² (W/(m³·K)).
 Fine poudre : équilibre quasi immédiat avec le gaz ; gros grains : retard thermique réel. Conduction entre cellules comme aujourd'hui.
 
-## 5. Friction et tas (étape 3)
+## 5. Friction et tas (étape 3, faite : `mp_friction.rs`, `mp_gpu/friction.wgsl`)
 
-Sans friction, un tas s'étale comme un liquide lourd (le mélange grains + air a ρ ≈ 900 kg/m³). Modèle viscoplastique régularisé
-dans les cellules tassées (α_s > α_c ≈ 0.5) : μ_eff = μ_f + p_s · sin φ / (2|γ̇| + ε), p_s = pression de contact des grains.
-Ces viscosités énormes imposent une **viscosité implicite** (aujourd'hui explicite : dt ≤ 0.2 ρ dx²/μ) — utile aussi au miel et aux
-huiles très visqueuses. Validation : angle de talus d'un tas versé.
+Sans friction, un tas s'étale comme un liquide lourd (sable tassé + air : ρ ≈ 1600 kg/m³, μ ≈ 6e-4 Pa·s). Modèle de Coulomb continu
+(Drucker–Prager régularisé, comme les simulations d'effondrement de colonnes de Lagrée, Staron & Popinet 2011) :
+μ_g = tan φ · p_s / (2 √(|D|² + δ²)), |D| = √(½ D:D), δ = 1e-3 s⁻¹, plafonnée à 1000 ρ dx²/dt (borne des itérations).
+- cellules concernées : tassées (α_s ≥ α_max − 0.1), ou partiellement remplies posées sur une cellule tassée (surface d'un tas), au
+  prorata α_s / α_max — sans cela la surface d'un tas s'écoule comme un liquide et le tas finit à plat ;
+- **pression de contact p_s = pression du mélange (contrainte moyenne) − pression du fluide des pores** (hydrostatique depuis le haut
+  du massif ; dans l'eau : poids déjaugé). Le poids des grains au-dessus (contrainte verticale) avait été essayé d'abord : il rend le
+  sable cohésif — une falaise verticale tient dès que tan φ > ½ (colonne figée à 68°) ;
+- implicite : (ρ_f/dt)(u − u_f) = ∇·[μ_g(∇u + ∇uᵀ)], gradient conjugué préconditionné (Jacobi), 40–150 itérations ; u_f = u* − dt∇pⁿ/ρ
+  (le frottement équilibre la force NETTE, sinon un tas au repos glisse d'un dt·g par pas) ; parois : non-glissement pour le frottement ;
+- la viscosité des fluides reste explicite (inchangée au bit près sans grains). La viscosité implicite générale (miel) reste à faire.
+
+Validation (φ = 32°) : colonne 4 × 8 cm → tas aux flancs de 24.7° (inertie : un dépôt d'effondrement est sous l'angle de talus),
+hauteur 0.45 H₀, étalement ×4 ; sans frottement : nappe à 5°. Tas à 20° : tient (Δh < 1 mm en 1 s). Tas à 50° : 42° en 0.4 s, puis
+flue jusqu'à 32.6° en 4 s (la fin est plus lente qu'une avalanche réelle : viscosité régularisée retardée d'un pas). Indépendant de δ
+(×10) et du plafond (÷3) à 1° près. GPU : mêmes formules, accord d'un pas 2e-7, tas final 24.8° / 3.58 cm (CPU 24.7° / 3.59 cm).
 
 ## 6. Réactions hétérogènes (étape 4)
 
@@ -74,7 +86,8 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
    Accord d'un pas : 1e-5 (nuage de sable), 5e-8 (suspension), 1e-7 (poudre chaude) ; 1 s de nuage : 92 % du sable sous la surface
    des deux côtés ; 3 s de suspension : mêmes colonnes. Corrigé en route (aussi utile sans grains) : aire PLIC f32 stable,
    relaxation thermique d'une trace sans débordement. Limite f32 connue (pas propre aux grains) : boîte fermée sans aucun gaz.
-3. Viscosité implicite + friction (tas).
+3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5). Reste : viscosité implicite générale (miel),
+   frottement contre les obstacles solides (glissement libre aujourd'hui), chaleur de frottement.
 4. Réactions hétérogènes et matériaux (charbon, poudre à canon, bois).
 5. Solidification.
 
