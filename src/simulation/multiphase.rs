@@ -92,6 +92,14 @@ pub struct MultiphaseSim {
     pub(crate) m_tot_old: Vec<f64>,
     /// advection de la quantité de mouvement conservative, cohérente avec les flux de masse du VOF (défaut) ; false = semi-lagrangien
     pub conservative_momentum: bool,
+    /// Prédicteur-correcteur : le pas est d'abord calculé normalement (prédiction de u^{n+1}), puis refait depuis l'état n en
+    /// advectant masses et énergie avec (u^n + u^{n+1})/2. Supprime le retard d'un pas entre la vitesse qui transporte un front et
+    /// celle que produit sa source de volume (flamme, changement de phase) — sans lui, boucle thermoacoustique numérique : flamme
+    /// 14 % trop lente au dt par défaut. Coût : ~2 pas. Désactivé par défaut tant que le GPU ne le fait pas (accord CPU / GPU).
+    pub predictor_corrector: bool,
+    /// vitesses d'advection masse / énergie imposées (correcteur) et pas de temps imposé
+    pub(crate) adv_vel: Option<(Vec<f64>, Vec<f64>)>,
+    pub(crate) dt_force: Option<f64>,
     /// vitesse au-delà de laquelle un pas est jugé aberrant (m/s) — déclenche le retour arrière avec sous-pas
     pub speed_limit: f64,
     /// Fraction r d'une GROSSE erreur de fermeture volumique héritée du pas précédent (Σ m/ρ − 1 au début du pas, > 0.1) que ce
@@ -280,6 +288,9 @@ impl MultiphaseSim {
             mfy: vec![0.0; nx * (ny + 1)],
             m_tot_old: vec![0.0; n],
             conservative_momentum: true,
+            predictor_corrector: false,
+            adv_vel: None,
+            dt_force: None,
             speed_limit: 1000.0,
             closure_relax: 0.25,
             closure_relax_scale: 1.0,

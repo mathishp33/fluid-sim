@@ -68,6 +68,7 @@ struct Snapshot {
     flame_factor: Vec<f64>, heat_release: Vec<f64>, chem_heat: f64, radiated: f64, reacted: Vec<f64>, dt_chem: f64,
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
+    dt_phase: f64, pressure_clamped: Vec<bool>,
 }
 
 impl MultiphaseSim {
@@ -160,6 +161,7 @@ impl MultiphaseSim {
             radiated: self.radiated, reacted: self.reacted.clone(), dt_chem: self.dt_chem,
             mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(),
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
+            dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
         }
     }
 
@@ -174,6 +176,7 @@ impl MultiphaseSim {
         self.radiated = s.radiated; self.reacted.clone_from(&s.reacted); self.dt_chem = s.dt_chem;
         self.mfx.clone_from(&s.mfx); self.mfy.clone_from(&s.mfy); self.m_tot_old.clone_from(&s.m_tot_old);
         self.time = s.time; self.last_dt = s.last_dt; self.last_pressure_iters = s.last_pressure_iters; self.step_count = s.step_count;
+        self.dt_phase = s.dt_phase; self.pressure_clamped.clone_from(&s.pressure_clamped);
     }
 
     /// Un pas de temps protégé : si l'état obtenu est invalide (NaN, T aberrante, masse négative, vitesse > speed_limit) le pas est
@@ -185,7 +188,7 @@ impl MultiphaseSim {
         }
         let snap = self.snapshot();
         let dt_max0 = self.dt_max;
-        let dt = self.step_raw();
+        let dt = self.step_pc();
         if self.state_is_sane() && self.courant_ok(dt) {
             return dt;
         }
@@ -196,7 +199,7 @@ impl MultiphaseSim {
             self.dt_max = dt_max0.min(dt_try);
             self.closure_relax_scale *= 0.25;
             self.rollbacks += 1;
-            let dt = self.step_raw();
+            let dt = self.step_pc();
             if self.state_is_sane() && self.courant_ok(dt) {
                 self.dt_max = dt_max0;
                 self.closure_relax_scale = 1.0;
@@ -208,6 +211,33 @@ impl MultiphaseSim {
         self.closure_relax_scale = 1.0;
         self.diverged = true;
         0.0
+    }
+
+    /// Pas brut, en prédicteur-correcteur si `predictor_corrector` (voir le champ). La prédiction invalide (NaN, T aberrante…) est
+    /// rendue telle quelle : le filet de sécurité de `step` la refait avec dt/4.
+    pub(crate) fn step_pc(&mut self) -> f64 {
+        if !self.predictor_corrector {
+            return self.step_raw();
+        }
+        let snap = self.snapshot();
+        let dt = self.step_raw();
+        if !self.state_is_sane() {
+            return dt;
+        }
+        let (up, vp) = (std::mem::take(&mut self.u), std::mem::take(&mut self.v));
+        let (ua, va): (Vec<f64>, Vec<f64>) = (
+            snap.u.iter().zip(&up).map(|(a, b)| 0.5 * (a + b)).collect(),
+            snap.v.iter().zip(&vp).map(|(a, b)| 0.5 * (a + b)).collect(),
+        );
+        let rollbacks = self.rollbacks;
+        self.restore(&snap);
+        self.rollbacks = rollbacks;
+        self.adv_vel = Some((ua, va));
+        self.dt_force = Some(dt);
+        let dt = self.step_raw();
+        self.adv_vel = None;
+        self.dt_force = None;
+        dt
     }
 
     /// Un pas de temps sans protection. Retourne dt.
@@ -232,7 +262,7 @@ impl MultiphaseSim {
             self.pin_reset();
             self.refresh();
         }
-        let dt = self.choose_dt();
+        let dt = self.dt_force.unwrap_or_else(|| self.choose_dt());
         // erreur de fermeture héritée (Σ m/ρ(p, T) − 1 avec les masses du début du pas), sous-relaxée dans l'équation de pression
         let n = self.nx * self.ny;
         let err0: Vec<f64> = (0..n)
@@ -249,7 +279,7 @@ impl MultiphaseSim {
             let mut fy = vec![0.0; self.v.len()];
             self.add_forces(dt, &mut fx, &mut fy);
             lap(&mut prof, P_FORCES);
-            self.advect_mass_energy(dt);
+            self.advect_mass_energy_with(dt);
             lap(&mut prof, P_ADVECT_MASS);
             let (mut ua, mut va) = self.advect_momentum();
             for (a, f) in ua.iter_mut().zip(&fx) { *a += *f; }
@@ -262,7 +292,7 @@ impl MultiphaseSim {
             lap(&mut prof, P_ADVECT_MOM);
             self.add_forces(dt, &mut a, &mut b);
             lap(&mut prof, P_FORCES);
-            self.advect_mass_energy(dt);
+            self.advect_mass_energy_with(dt);
             lap(&mut prof, P_ADVECT_MASS);
             us = a;
             vs = b;
@@ -300,7 +330,8 @@ impl MultiphaseSim {
         self.refresh_after_thermo();
         self.probe("refresh");
         lap(&mut prof, P_REFRESH);
-        self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &un, &vn, &err0);
+        let (ua, va) = match &self.adv_vel { Some((a, b)) => (a.clone(), b.clone()), None => (un.clone(), vn.clone()) };
+        self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &ua, &va, &err0);
         self.probe("pression");
         lap(&mut prof, P_PRESSURE);
         // 7. travail de pression et état final
@@ -336,6 +367,20 @@ impl MultiphaseSim {
     fn face_speed(&self, c: usize) -> f64 {
         let (i, j) = (c % self.nx, c / self.nx);
         [self.u[self.uidx(i, j)], self.u[self.uidx(i + 1, j)], self.v[self.vidx(i, j)], self.v[self.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()))
+    }
+
+    /// advection masse / énergie avec la vitesse imposée par le correcteur (sinon la vitesse courante u^n)
+    fn advect_mass_energy_with(&mut self, dt: f64) {
+        if let Some((ua, va)) = self.adv_vel.take() {
+            let un = std::mem::replace(&mut self.u, ua);
+            let vn = std::mem::replace(&mut self.v, va);
+            self.advect_mass_energy(dt);
+            let ua = std::mem::replace(&mut self.u, un);
+            let va = std::mem::replace(&mut self.v, vn);
+            self.adv_vel = Some((ua, va));
+        } else {
+            self.advect_mass_energy(dt);
+        }
     }
 
     /// Met à jour ρ, α, μ, k à partir des masses courantes SANS recalculer T depuis e (T déjà à jour après conduction).
