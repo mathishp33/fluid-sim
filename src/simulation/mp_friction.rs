@@ -66,9 +66,34 @@ impl MultiphaseSim {
         self.is_solid(c) || self.is_grille(c)
     }
 
-    /// plafond de la viscosité traitée explicitement dans la cellule c (le reste est implicite) ; ∞ sans viscosité implicite
+    /// plafond de la viscosité traitée explicitement dans la cellule c (le reste est implicite) ; ∞ sans viscosité implicite. Borné par la
+    /// masse volumique de ses faces, ½ (ρ_c + ρ_voisine) : la contrainte τxx d'une lave contre l'air agit sur une face deux fois plus
+    /// légère que la lave
     pub(crate) fn explicit_mu_cap(&self, c: usize, dt: f64) -> f64 {
-        if self.implicit_viscosity && dt > 0.0 { VISC_EXPLICIT * self.rho_mix[c] * self.dx * self.dx / dt } else { f64::INFINITY }
+        if !(self.implicit_viscosity && dt > 0.0) {
+            return f64::INFINITY;
+        }
+        let (i, j) = (c % self.nx, c / self.nx);
+        let rc = self.rho_mix[c];
+        let mut rn = rc;
+        for (ok, q) in [(i > 0, c.wrapping_sub(1)), (i + 1 < self.nx, c + 1), (j > 0, c.wrapping_sub(self.nx)), (j + 1 < self.ny, c + self.nx)] {
+            if ok && !self.is_solid(q) {
+                rn = rn.min(self.rho_mix[q]);
+            }
+        }
+        VISC_EXPLICIT * 0.5 * (rc + rn) * self.dx * self.dx / dt
+    }
+
+    /// plafond de la viscosité explicite d'un nœud (contrainte τxy) : VISC_EXPLICIT ρ_min dx² / dt, ρ_min la plus petite masse
+    /// volumique des quatre cellules du nœud — τxy agit sur les faces voisines, que la moyenne des viscosités rendait instables quand
+    /// une lave (50 Pa·s) touche l'air (faces d'air 600 fois plus légères : 100 m/s en quelques pas) ; à une surface libre, le
+    /// cisaillement est d'ailleurs presque nul. ∞ sans viscosité implicite
+    pub(crate) fn explicit_node_mu_cap(&self, cells: [usize; 4], dt: f64) -> f64 {
+        if !(self.implicit_viscosity && dt > 0.0) {
+            return f64::INFINITY;
+        }
+        let rmin = cells.iter().map(|&c| self.rho_mix[c]).fold(f64::INFINITY, f64::min);
+        VISC_EXPLICIT * rmin * self.dx * self.dx / dt
     }
 
     /// genre du nœud (i, j), 0 ≤ i ≤ nx, 0 ≤ j ≤ ny

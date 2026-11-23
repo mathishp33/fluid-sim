@@ -667,7 +667,7 @@ fn k_pyrolysis(@builtin(global_invocation_id) g: vec3<u32>) {
 fn k_burn_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
     let c = g.x;
     var m = 3.0e38;
-    if (c < ncell() && !is_solid(c) && !pinned(c)) {
+    if (c < ncell() && !is_solid(c) && !pinned(c) && has(F_CHEM)) {
         let pc = max(S[O_prel + c] + P.p0, 1.0);
         let tcon = fluid_contact_temp(c);
         for (var j = 0u; j < P.nre; j++) {
@@ -678,6 +678,17 @@ fn k_burn_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocat
             let kb = 6.0 * rxv(j, 52u) * pow(pc / 101325.0, rxv(j, 53u)) / max(grain_d(s), 1e-9);
             let rate = ms * kb * rxv(j, 55u) / pc;
             m = select(m, min(m, 1.0 / max(rate, 1e-30)), burn && ms > 1e-12 && near && rate > 0.0);
+        }
+    }
+    // fronts de dendrites (surfusion, miroir de front_dt_bound) : dt ≤ dx / v(ΔT) dans les cellules de liquide surfondu sans germe
+    // voisines d'un germe
+    if (c < ncell() && !is_solid(c) && !pinned(c) && has(F_FUS)) {
+        for (var q = 0u; q < NFU; q++) {
+            let l = u32(fuq(q, 0u)); let s = u32(fuq(q, 1u)); let dtn = fuq(q, 4u);
+            let dT = fuq(q, 2u) - tgrp(group_k(l), c);
+            let act = dtn > 0.0 && mass(l, c) > 1e-12 && dT > 0.0 && dT <= dtn && !fu_is_germ(q, s, c);
+            let nb = fu_seeds(q, s, c, false);
+            m = select(m, min(m, P.dx / max(fu_speed(q, dT), 1e-30)), act && (nb.x > 0.5 || nb.y > 0.5));
         }
     }
     var v: array<f32, 8>;

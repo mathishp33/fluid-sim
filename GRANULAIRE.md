@@ -33,6 +33,10 @@ Opérateur séparé après l'advection (comme la diffusion des espèces), explic
 - vitesse terminale d'un grain isolé, Stokes → Newton en une formule (Ferguson & Church 2004) :
   w_t = R g d² / (18 ν + √(0.75 · 0.4 · R g d³)), R = (ρ_s − ρ_f)/ρ_f, fluide = contenu non granulaire de la cellule ;
   signe : un grain plus léger que le fluide (glace dans l'eau) remonte ;
+- grain qui flotte : un grain léger qui remonte ne passe pas dans une cellule dont le fluide est moins dense que lui (l'air au-dessus
+  de l'eau, où il retomberait aussitôt) ; il reste dans la dernière cellule d'eau. Un grain qui tombe de l'air dans l'eau y entre
+  et y flotte. Avant, ce va-et-vient à chaque pas brassait la surface (air chargé de cristaux qui s'étalait à 0.4 m/s) et bornait
+  le pas à 1.5 ms ;
 - entravement (Richardson–Zaki) : w = w_t (1 − α_s)^n, n ≈ 4.65 (bas Reynolds) → 2.4 (haut) ; flux borné par la place restante
   dans la cellule receveuse (α_max − α_s) : la poudre s'arrête en couche tassée ;
 - pas de temps : w·dt ≤ 0.5·dx (ajouté à `choose_dt`).
@@ -62,6 +66,10 @@ Sans friction, un tas s'étale comme un liquide lourd (sable tassé + air : ρ �
 - viscosité implicite des fluides (`implicit_viscosity`, case « Viscosité implicite ») : la part de μ au-delà de 0.2 ρ dx²/dt passe dans
   le même solveur (glissement libre aux parois, comme l'explicite), la borne de pas visqueuse disparaît — tourbillon de Taylor–Green à
   μ = 2 Pa·s : 30 pas au lieu de 70, énergie cinétique à 1e-4 de la loi e^(−4νπ²t/L²) ; sans fluide si visqueux, rien ne change.
+  Contre une interface (lave à 50 Pa·s contre l'air), la borne explicite d'une cellule prend la masse volumique de ses faces,
+  ½ (ρ_c + ρ_voisine), et celle d'un nœud (contrainte τxy) la plus petite des quatre cellules : la moyenne des viscosités au nœud
+  appliquait celle de la lave à des faces d'air 600 fois plus légères (100 m/s en quelques pas) ; à une surface libre, le cisaillement
+  est d'ailleurs presque nul. Sans effet sur l'eau aux mailles usuelles (≥ 5 mm).
 
 Validation (φ = 32°) : colonne 4 × 8 cm → tas aux flancs de 21.4° (inertie : un dépôt d'effondrement est sous l'angle de talus),
 hauteur 0.42 H₀ ; sans frottement : nappe à 5°. Tas à 20° : tient (|u| < 1e-4 m/s). Tas à 50° : **avalanche, 29.8° en 0.35 s**, puis
@@ -173,18 +181,20 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), inertie propre des grains
   (le souffle d'une poudre emporte ses grains), délai d'allumage d'un grain dans un gaz chaud.
 
-## 7. Solidification (étape 5, faite : eau ↔ glace)
+## 7. Solidification (étape 5, faite : eau ↔ glace, surfusion, cire, lave)
 
 Changement d'état liquide ↔ phase granulaire à la température de fusion, avec chaleur latente (`Registry::fusions`, paires `FusionDef`
-de la bibliothèque ; `fusion_step`, `k_fusion` sur le GPU). Méthode enthalpique à la température des groupes, sans paramètre de vitesse :
-un liquide plus froid que T_f gèle juste assez pour que sa chaleur latente le ramène à T_f (la glace naît à T_f), un solide plus chaud
-fond juste assez pour revenir à T_f ; tout gèle (fond) si la chaleur latente de tout le liquide (solide) n'y suffit pas. La vitesse est
-celle de l'arrivée de la chaleur (conduction, échange par la surface des grains). La chaleur latente est portée par l'énergie de
-référence du solide (e_l(T_f) − e_s(T_f) = L_f, comme celle de la vapeur pour l'ébullition) ; masse et énergie exactement conservées ;
-bilan de la masse gelée par paire (`frozen`). Opérateur à part plutôt que la mécanique liquide ↔ vapeur : ni pression partielle, ni
-germination, ni volume de vapeur à borner.
+de la bibliothèque, réglables dans l'éditeur de matériaux ; `fusion_step`, `k_fusion` sur le GPU). Méthode enthalpique à la
+température des groupes, sans paramètre de vitesse : un liquide plus froid que T_f gèle juste assez pour que sa chaleur latente le
+ramène à T_f (la glace naît à T_f), un solide plus chaud fond juste assez pour revenir à T_f ; tout gèle (fond) si la chaleur latente
+de tout le liquide (solide) n'y suffit pas. La vitesse est celle de l'arrivée de la chaleur (conduction, échange par la surface des
+grains). La chaleur latente est portée par l'énergie de référence du solide (e_l(T_f) − e_s(T_f) = L_f, comme celle de la vapeur
+pour l'ébullition) ; masse et énergie exactement conservées ; bilan de la masse gelée par paire (`frozen`). Opérateur à part plutôt
+que la mécanique liquide ↔ vapeur : ni pression partielle, ni volume de vapeur à borner.
 - **glace** (`Phase::ice` : cristaux de 2 mm, 917 kg/m³ — ils remontent dans l'eau —, c_p 2.11 kJ/(kg·K) à 0 °C croissant de
-  6.8 J/(kg·K²), k = 2.22 W/(m·K)) et paire eau ↔ glace (T_f = 273.15 K, L_f = 333.6 kJ/kg ; préréglage `with_ice`).
+  6.8 J/(kg·K²), k = 2.22 W/(m·K)) et paire eau ↔ glace (T_f = 273.15 K, L_f = 333.6 kJ/kg ; préréglage `with_ice`). L'eau a son
+  maximum de densité à 4 °C (formule de Kell, prolongée jusqu'à −30 °C pour l'eau surfondue : 998.11 kg/m³ à −10 °C, mesures de
+  Hare & Sorensen à 0.05 près).
 - validé : eau à −10 °C → 12.5498 % gelés (c ΔT / L_f), eau et glace à 273.150000 K ; glace à +10 °C → 6.4278 % fondus ; à −93 °C,
   tout gèle (glace à 245 K) ; énergie à 1e-12. Problème de Stefan (eau à 0 °C contre une paroi à −10 °C, mailles de 0.25 mm) :
   croissance de la glace entre 30 et 120 s = solution exacte à 0.2 % près (2.069 mm contre 2.064), épaisseur à une maille près (retard
@@ -193,10 +203,37 @@ germination, ni volume de vapeur à borner.
   pas).
 - scénario « Glace pilée dans l'eau tiède » : un nuage de cristaux à −10 °C au fond d'une eau à 27 °C remonte vers la surface en
   fondant (la moitié en 5 s), l'eau de fonte froide coule ; énergie à 2e-9 ; GPU : fonte à 0.15 % sur 2 s.
+- **surfusion et germination** (`supercooling` ΔT_n de la paire, 0 par défaut : le liquide gèle dès T_f). Sans GERME, le liquide ne
+  gèle qu'au-dessous de T_f − ΔT_n (germination spontanée ; eau très pure : 20 K, préréglage `with_supercooled_water`). Un germe est
+  de la glace dans la cellule (fraction ≥ 1 % : `FUSION_SEED_ALPHA` ; en dessous, les traces étalées par le transport avanceraient
+  d'une maille par pas) ou le front de dendrites venu d'une voisine. Ce front avance dans le liquide surfondu à v = a (ΔT / 1 K)^b
+  — glace : a = 1 mm/s, b = 1.9, soit 8 cm/s à 10 K et 0.64 m/s à 30 K (mesures : 7.7 cm/s et 0.6 m/s ; revue de Libbrecht 2014) :
+  `fusion_front` compte en mailles l'avancée du front dans chaque cellule sans germe voisine d'un germe (dt / (√2 dx) par un coin) ; à
+  1, la cellule germe et gèle d'un coup jusqu'à T_f (une eau à −8 °C laisse 10 % de glace : de la neige fondante), et garde
+  l'excédent, que ses voisines reprennent au pas suivant : le front avance à v quel que soit le pas (borné à dx / v). Germes relevés
+  avant le front, qui n'écrit que les cellules sans germe : calcul parallèle sans conflit, identique sur le GPU (`k_fusion_germ`,
+  `k_fusion_front`). Validé : eau à −8 °C sans germe → rien ne gèle en 50 pas ; avec 2 % de cristaux → 10.04 % gelés (c ΔT / L_f) ;
+  0.5 % de cristaux → rien ; à −21 °C → 26.4 % (spontané). Canal d'eau à −10 °C (mailles de 2 mm) : front à 7.82 cm/s pour 7.94
+  (l'eau qui gèle se dilate et pousse 1.1 % de sa maille, à 0 °C, dans la suivante, qui se réchauffe de 0.09 K), derrière lui 12.549 %
+  de glace à 0 °C ; GPU : même maille de front, glace à 5e-6 près. Scénario « Eau surfondue qui gèle d'un coup » (eau très pure à
+  −8 °C, germe de cristaux à la surface) : le front descend à 5.0 cm/s (v(8 K) = 5.2) ; le long de la surface il va deux fois plus
+  vite, car la neige fondante, plus légère, flotte et s'étale en courant de gravité (~6 cm/s) en semant le gel devant elle ; GPU :
+  glace formée à 1.4 % sur 2 s.
+- **cire de paraffine** (`Phase::liquid_wax` « cire fondue » : 775 kg/m³ à 70 °C, 4 mPa·s ; `Phase::wax` « cire » : paillettes de
+  2 mm, 900 kg/m³ — elles se déposent dans la cire fondue et flottent sur l'eau) ; paire à 58 °C, L_f = 200 kJ/kg (`with_wax`).
+- **lave basaltique** (`Phase::lava` : 2700 kg/m³, 50 Pa·s à 1200 °C, loi de Vogel–Fulcher–Tammann de Giordano et al. 2008 ;
+  module de compressibilité 2.1 GPa comme l'eau — le vrai, ~17 GPa, ne change rien à ces écoulements lents et rend la fermeture f32
+  du GPU 8 fois plus bruitée ; `Phase::basalt` : grains de 1 mm, 2900 kg/m³ — le sable noir) ; paire à 1100 °C (entre liquidus et
+  solidus d'un basalte), L_f = 400 kJ/kg ; roche volcanique (solide « roche ») ; préréglage `with_lava`. Validé : eau, cire et lave
+  dans les mêmes cellules → chacune fige de c ΔT / L_f à sa température (6.27, 9.2 et 17.5 %), GPU à 1e-6 ; un bloc de lave posé dans
+  l'air s'affaisse calmement (~4 m/s ; 411 m/s et divergence sans la borne visqueuse des nœuds, § 5). Essayée puis écartée : une
+  coulée qui se déverse d'une falaise dans la mer — l'eau qui touche la lave y bout d'un coup (pas de film de vapeur de Leidenfrost) :
+  explosions de vapeur à ~200 m/s qui projettent 4 % de la lave hors du domaine en 1.5 s (lave raide : le GPU f32 diverge).
 - limites : le solide formé est un tas de grains (une couche de glace s'écroule à son angle de talus, pas de bloc rigide → solides
-  mobiles) ; ni surfusion ni germination (l'eau gèle dès qu'elle passe sous T_f) ; eau sans maximum de densité à 4 °C ; cire, lave :
-  matériaux à définir (une paire de fusion de plus dans la bibliothèque) ; à la surface, des cristaux dans une cellule mêlée d'air y
-  « tombent » à leur vitesse dans l'air (~7 m/s : pas de 1.5 ms).
+  mobiles) ; les cristaux d'une neige fondante sont libres (pas de réseau de dendrites soudé : elle flotte et s'étale) ; une seule
+  température de fusion (pas d'intervalle liquidus–solidus pour la lave ou la cire) ; les liquides ne rayonnent pas (la surface
+  d'une lave à l'air refroidit bien moins vite qu'en vrai) ; pas d'ébullition en film (Leidenfrost) au contact lave–eau, dont les
+  explosions de vapeur sont trop violentes.
 
 ## 8. Étapes et validation
 
@@ -215,7 +252,8 @@ germination, ni volume de vapeur à borner.
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
 4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
    et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas, poudre noire (§ 6). Reste : fluidisation.
-5. **FAIT (2026-11-23) — Solidification** (eau ↔ glace, § 7) : méthode enthalpique, Stefan, glace pilée qui fond, CPU et GPU.
+5. **FAIT (2026-11-23) — Solidification** (eau ↔ glace, § 7) : méthode enthalpique, Stefan, glace pilée qui fond, CPU et GPU ;
+   puis surfusion et front de dendrites (eau surfondue), cire de paraffine, lave basaltique.
 
 ## 9. Choix à valider
 

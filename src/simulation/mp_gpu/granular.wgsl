@@ -65,6 +65,18 @@ fn settling_w(s: u32, c: u32) -> f32 {
     return select(0.0, wt * h, ok);
 }
 
+// masse volumique du fluide porteur de c (contenu non granulaire, miroir de carrier_fluid) ; 0 sans fluide
+fn carrier_rho(c: u32) -> f32 {
+    var a = 0.0; var m = 0.0;
+    for (var q = 0u; q < P.np; q++) {
+        let aq = alpha(q, c);
+        let use_ = !gran_k(q) && aq > 0.0;
+        a += select(0.0, aq, use_);
+        m += select(0.0, max(mass(q, c), 0.0), use_);
+    }
+    return select(0.0, m / max(a, 1e-30), a > 1e-12 && m > 0.0);
+}
+
 // volume de grains s qui traverse la face (c0 | c1) (c1 : voisine d'indice supérieur le long de l'axe, composante de gravité ga)
 // pendant dt, évalué sur l'état d'avant l'opérateur : > 0 de c0 vers c1, < 0 de c1 vers c0 (miroir de settle_grains)
 fn settle_vol(s: u32, c0: u32, c1: u32, ga: f32, share: f32, dt: f32) -> f32 {
@@ -87,7 +99,12 @@ fn settle_vol(s: u32, c0: u32, c1: u32, ga: f32, share: f32, dt: f32) -> f32 {
     vol = min(vol, share * ad);
     vol = min(vol, share * max(grain_amax(s) - grain_fraction(r), 0.0));
     vol = min(vol, share * fluid_fraction(r));
-    let ok = movable && (heavy || light) && ad > 1e-12 && vol > 1e-14;
+    // un grain léger qui remonte (glace dans l'eau) ne passe pas dans un fluide où il serait lourd (l'air au-dessus de la surface) : il
+    // flotte dans la dernière maille d'eau (miroir de settle_grains)
+    let rf = carrier_rho(r);
+    let rho_g = rho_k(s, S[O_prel + d], ptemp(s, d));
+    let keeps = heavy || (rf > 0.0 && rho_g < rf);
+    let ok = movable && (heavy || light) && ad > 1e-12 && vol > 1e-14 && keeps;
     return select(0.0, select(-vol, vol, d == c0), ok);
 }
 
@@ -238,7 +255,10 @@ fn k_fusion(@builtin(global_invocation_id) g: vec3<u32>) {
         var ef = 0.0;
         for (var k = 0u; k < P.np; k++) { ef += select(0.0, max(mass(k, c), 0.0) * erel_k(k, tm), group_k(k) == gl); }
         let ml = mass(l, c);
-        let frz = live && ml > 1e-12 && tgrp(gl, c) < tm;
+        // germe (surfusion) : glace dans la cellule, front de dendrites arrivé, germination spontanée ; sans surfusion, partout
+        let dtn = fuq(q, 4u);
+        let seeded = dtn <= 0.0 || alpha(s, c) >= FU_SEED || S[O_fu_phi + q * n + c] >= 1.0 || tm - tgrp(gl, c) > dtn;
+        let frz = live && ml > 1e-12 && tgrp(gl, c) < tm && seeded;
         let d1 = select(0.0, clamp((ef - S[O_epsg + gl * n + c]) / lf, 0.0, ml), frz);
         S[O_mass + l * n + c] -= d1;
         S[O_mass + s * n + c] += d1;
@@ -267,4 +287,71 @@ fn k_fusion(@builtin(global_invocation_id) g: vec3<u32>) {
         touched = touched || act;
     }
     if (touched) { cell_sync(c); }
+}
+
+// ===== surfusion : front de dendrites (miroir de MultiphaseSim::fusion_germ, advance_fusion_front, front_seeds) =====
+// germe de la paire q dans la cellule b : cristaux du solide s (fraction ≥ FU_SEED), ou du solide là où le front est passé (front ≥ 1)
+fn fu_is_germ(q: u32, s: u32, b: u32) -> bool {
+    return alpha(s, b) >= FU_SEED || (S[O_fu_phi + q * ncell() + b] >= 1.0 && mass(s, b) > 1e-12);
+}
+// germe dans la cellule (i, j) du domaine, hors solides ; flags : lu dans fu_germ (relevé par k_fusion_germ avant k_fusion_front),
+// sinon évalué sur place
+fn fu_germ_at(q: u32, s: u32, i: i32, j: i32, flags: bool) -> bool {
+    if (i < 0 || j < 0 || i >= i32(P.nx) || j >= i32(P.ny)) { return false; }
+    let b = u32(j) * P.nx + u32(i);
+    if (is_solid(b)) { return false; }
+    if (flags) { return S[O_fu_germ + q * ncell() + b] > 0.5; }
+    return fu_is_germ(q, s, b);
+}
+// voisines de c qui ont un germe : x = par une face, y = par un coin (0 / 1), z = excédent du front (au-delà de 1) le plus grand parmi
+// les voisines par une face
+fn fu_seeds(q: u32, s: u32, c: u32, flags: bool) -> vec3<f32> {
+    let i = i32(c % P.nx); let j = i32(c / P.nx);
+    let o = O_fu_phi + q * ncell();
+    let fl = fu_germ_at(q, s, i - 1, j, flags); let fr = fu_germ_at(q, s, i + 1, j, flags);
+    let fb = fu_germ_at(q, s, i, j - 1, flags); let ft = fu_germ_at(q, s, i, j + 1, flags);
+    let dg = fu_germ_at(q, s, i - 1, j - 1, flags) || fu_germ_at(q, s, i + 1, j - 1, flags) || fu_germ_at(q, s, i - 1, j + 1, flags)
+        || fu_germ_at(q, s, i + 1, j + 1, flags);
+    var inh = 0.0;
+    if (fl) { inh = max(inh, S[o + c - 1u] - 1.0); }
+    if (fr) { inh = max(inh, S[o + c + 1u] - 1.0); }
+    if (fb) { inh = max(inh, S[o + c - P.nx] - 1.0); }
+    if (ft) { inh = max(inh, S[o + c + P.nx] - 1.0); }
+    return vec3<f32>(select(0.0, 1.0, fl || fr || fb || ft), select(0.0, 1.0, dg), inh);
+}
+// vitesse du front de dendrites de la paire q dans un liquide surfondu de dT (m/s)
+fn fu_speed(q: u32, dT: f32) -> f32 { return fuq(q, 5u) * pow(max(dT, 1e-6), fuq(q, 6u)); }
+// relevé des germes sur l'état d'avant le front (le front n'écrit que les cellules sans germe : ses lectures restent fixes)
+@compute @workgroup_size(64)
+fn k_fusion_germ(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n) { return; }
+    for (var q = 0u; q < NFU; q++) {
+        let s = u32(fuq(q, 1u));
+        S[O_fu_germ + q * n + c] = select(0.0, 1.0, fu_is_germ(q, s, c));
+    }
+}
+// le front avance de v(ΔT) dt / dx dans une cellule de liquide surfondu sans germe voisine d'un germe (dt / (√2 dx) par un coin) ; la
+// cellule germe à 1 et garde l'excédent (≤ 2), repris par ses voisines par une face ; une cellule qui a un germe n'est pas écrite ; le
+// front s'efface dans une cellule qui n'est plus surfondue
+@compute @workgroup_size(64)
+fn k_fusion_front(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n) { return; }
+    let live = !is_solid(c) && !pinned(c);
+    let dt = D[D_DT];
+    for (var q = 0u; q < NFU; q++) {
+        let l = u32(fuq(q, 0u)); let s = u32(fuq(q, 1u)); let tm = fuq(q, 2u);
+        let dtn = fuq(q, 4u);
+        let own = S[O_fu_germ + q * n + c] > 0.5;
+        let dT = tm - tgrp(group_k(l), c);
+        let nb = fu_seeds(q, s, c, true);
+        let v = fu_speed(q, dT);
+        let rate = select(select(0.0, v / (1.41421356 * P.dx), nb.y > 0.5), v / P.dx, nb.x > 0.5);
+        let o = O_fu_phi + q * n + c;
+        let phi = S[o];
+        let sup = mass(l, c) > 1e-12 && dT > 0.0;
+        let nv = select(0.0, select(phi, min(max(phi, nb.z) + rate * dt, 2.0), rate > 0.0), sup);
+        if (live && dtn > 0.0 && !own) { S[o] = nv; }
+    }
 }

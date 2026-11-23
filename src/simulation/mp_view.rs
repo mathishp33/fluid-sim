@@ -55,6 +55,8 @@ pub enum MpScenario {
     Gunpowder,
     /// nuage de glace pilée dans l'eau tiède : les cristaux remontent en fondant (chaleur latente), l'eau de fonte froide coule
     IceMelting,
+    /// eau très pure surfondue à −8 °C et un germe de glace : le front de dendrites traverse l'eau, qui gèle d'un coup en neige fondante
+    SupercooledWater,
 }
 
 impl Default for MpScenario {
@@ -64,7 +66,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 16] = [
+    pub const ALL: [MpScenario; 17] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -81,11 +83,15 @@ impl MpScenario {
         Self::WoodFire,
         Self::Gunpowder,
         Self::IceMelting,
+        Self::SupercooledWater,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder | Self::IceMelting)
+        matches!(
+            self,
+            Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder | Self::IceMelting | Self::SupercooledWater
+        )
     }
     pub fn is_combustion(self) -> bool {
         matches!(
@@ -117,6 +123,7 @@ impl MpScenario {
             Self::WoodFire => "Feu de bois sur grille (pyrolyse : flammes des gaz du bois)",
             Self::Gunpowder => "Tas de poudre noire (déflagration sans air, fumée blanche)",
             Self::IceMelting => "Glace pilée dans l'eau tiède (fusion, chaleur latente)",
+            Self::SupercooledWater => "Eau surfondue qui gèle d'un coup (germe de glace, front de dendrites)",
         }
     }
 }
@@ -143,6 +150,10 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
     } else if sc == MpScenario::IceMelting {
         lib_c = lib.with_ice();
         &lib_c
+    } else if sc == MpScenario::SupercooledWater {
+        lib_c = lib.with_supercooled_water();
+        &lib_c
+
     } else if sc.is_combustion() {
         lib_c = lib.with_combustion();
         &lib_c
@@ -210,6 +221,28 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
                     }
                 }
             }
+            s.refresh();
+            return Ok(s);
+        }
+        MpScenario::SupercooledWater => {
+            // eau très pure surfondue à −8 °C (elle ne gèlerait seule que sous −20 °C) dans les 70 % du bas d'une cuve fermée, air à −8 °C
+            // au-dessus ; à la surface, au milieu, quelques cristaux de glace (5 % : le germe qu'on y laisse tomber). Le front de
+            // dendrites part du germe et traverse l'eau à v(8 K) ≈ 5 cm/s ; derrière lui, l'eau gèle d'un coup jusqu'à 0 °C en laissant
+            // 10 % de glace (c ΔT / L_f) : une neige fondante, plus légère que l'eau surfondue, qui remonte. Peindre de la glace ailleurs
+            // y lance un autre front.
+            let eau = need(roles.water, "un liquide (eau)")?;
+            let air = need(roles.air, "un gaz")?;
+            let glace = need(roles.ice, "une phase granulaire qui gèle (glace) et sa paire de fusion")?;
+            let h_w = 0.7 * ly;
+            let r = (0.02 * lx).max(1.5 * dx);
+            let (xs, ys) = (0.5 * lx, h_w - r);
+            let mut germ = vec![0.0; s.reg.phases.len()];
+            germ[eau] = 0.95;
+            germ[glace] = 0.05;
+            s.paint_phase(move |_, y| Some(if y < h_w { eau } else { air }));
+            s.paint_mixture(move |x, y| if (x - xs).hypot(y - ys) < r { Some(germ.clone()) } else { None });
+            t_fn = Box::new(|_, _| 265.15);
+            s.finalize_init(&*t_fn);
             s.refresh();
             return Ok(s);
         }

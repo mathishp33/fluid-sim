@@ -332,9 +332,23 @@ fn k_force_st(@builtin(global_invocation_id) g: vec3<u32>) {
 }
 // viscosité : w2 = τxx, w3 = τyy (centres), w5 = τxy (nœuds)
 // plafond de la viscosité traitée explicitement (au-delà : implicite, friction.wgsl), miroir de explicit_mu_cap
+// (bornée par la masse volumique de ses faces, ½ (ρ_c + ρ_voisine))
 fn mu_exp_cap(c: u32) -> f32 {
-    if (has(F_IMPVISC)) { return 0.2 * S[O_rho_mix + c] * P.dx * P.dx / D[D_DT]; }
-    return 3.0e38;
+    if (!has(F_IMPVISC)) { return 3.0e38; }
+    let i = c % P.nx; let j = c / P.nx;
+    let rc = S[O_rho_mix + c];
+    var rn = rc;
+    if (i > 0u && !is_solid(c - 1u)) { rn = min(rn, S[O_rho_mix + c - 1u]); }
+    if (i + 1u < P.nx && !is_solid(c + 1u)) { rn = min(rn, S[O_rho_mix + c + 1u]); }
+    if (j > 0u && !is_solid(c - P.nx)) { rn = min(rn, S[O_rho_mix + c - P.nx]); }
+    if (j + 1u < P.ny && !is_solid(c + P.nx)) { rn = min(rn, S[O_rho_mix + c + P.nx]); }
+    return 0.2 * 0.5 * (rc + rn) * P.dx * P.dx / D[D_DT];
+}
+// plafond de la viscosité explicite d'un nœud : 0.2 ρ_min dx² / dt sur ses quatre cellules (miroir de explicit_node_mu_cap)
+fn mu_node_cap(c0: u32, c1: u32, c2: u32, c3: u32) -> f32 {
+    if (!has(F_IMPVISC)) { return 3.0e38; }
+    let r = min(min(S[O_rho_mix + c0], S[O_rho_mix + c1]), min(S[O_rho_mix + c2], S[O_rho_mix + c3]));
+    return 0.2 * r * P.dx * P.dx / D[D_DT];
 }
 fn mu_exp(c: u32) -> f32 { return min(S[O_mu_cell + c], mu_exp_cap(c)); }
 @compute @workgroup_size(64)
@@ -355,7 +369,7 @@ fn k_visc_xy(@builtin(global_invocation_id) g: vec3<u32>) {
     if (i >= 1u && i < P.nx && j >= 1u && j < P.ny) {
         let c0 = cidx(i - 1u, j - 1u); let c1 = cidx(i, j - 1u); let c2 = cidx(i - 1u, j); let c3 = cidx(i, j);
         if (!(is_solid(c0) || is_solid(c1) || is_solid(c2) || is_solid(c3))) {
-            let mu = 0.25 * (mu_exp(c0) + mu_exp(c1) + mu_exp(c2) + mu_exp(c3));
+            let mu = min(0.25 * (mu_exp(c0) + mu_exp(c1) + mu_exp(c2) + mu_exp(c3)), mu_node_cap(c0, c1, c2, c3));
             t = mu * ((S[O_U + uidx(i, j)] - S[O_U + uidx(i, j - 1u)]) / P.dx + (S[O_V + vidx(i, j)] - S[O_V + vidx(i - 1u, j)]) / P.dx);
         }
     }

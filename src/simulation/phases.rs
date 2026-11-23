@@ -61,12 +61,16 @@ pub enum PhaseKind {
     Granular,
 }
 
+/// borne basse (°C) de la formule de Kell : eau surfondue jusqu'à −30 °C (au-delà, masse volumique figée)
+pub const KELL_C_MIN: f64 = -30.0;
+
 /// Masse volumique d'un liquide à la pression de référence p0, en fonction de T.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Thermal {
     /// ρ = rho0 / (1 + β (T − t0))
     Beta { rho0: f64, t0: f64, beta: f64 },
-    /// Formule de Kell (eau pure, 0–150 °C, précision ~1e-4 relatif), anomalie à 4 °C comprise.
+    /// Formule de Kell (eau pure, 0–150 °C, précision ~1e-4 relatif), anomalie à 4 °C comprise ; prolongée jusqu'à −30 °C pour l'eau
+    /// surfondue (écart aux mesures de Hare & Sorensen < 0.05 kg/m³ : 998.11 à −10 °C, 993.55 à −20 °C, 983.85 à −30 °C).
     Kell,
 }
 
@@ -75,7 +79,7 @@ impl Thermal {
         match *self {
             Thermal::Beta { rho0, t0, beta } => rho0 / (1.0 + beta * (t - t0)),
             Thermal::Kell => {
-                let c = (t - 273.15).clamp(0.0, 150.0);
+                let c = (t - 273.15).clamp(KELL_C_MIN, 150.0);
                 let num = 999.83952 + 16.945176 * c - 7.9870401e-3 * c * c - 46.170461e-6 * c.powi(3)
                     + 105.56302e-9 * c.powi(4)
                     - 280.54253e-12 * c.powi(5);
@@ -510,6 +514,78 @@ impl Phase {
         p.friction_angle = 30.0;
         p
     }
+    /// Cire de paraffine fondue : 775 kg/m³ à 70 °C (dilatation 9e-4 /K), c_p 2.3 kJ/(kg·K), k = 0.16 W/(m·K), viscosité 4 mPa·s à
+    /// 70 °C (2 mPa·s à 100 °C), tension de surface 0.03 N/m ; elle flotte sur l'eau. Fige à 58 °C en paillettes de cire
+    /// (`mp_materials::with_wax`, L_f = 200 kJ/kg)
+    pub fn liquid_wax() -> Phase {
+        let mut p = Phase::oil();
+        p.name = "cire fondue".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 2.9e8, n: 9.0, thermal: Thermal::Beta { rho0: 775.0, t0: 343.15, beta: 9.0e-4 } };
+        p.cp = 2300.0;
+        p.conductivity = 0.16;
+        p.mu_ref = 4.0e-3;
+        p.mu_law = PropertyLaw::Arrhenius { e_r: 3500.0 };
+        p.t_ref = 343.15;
+        p.sigma = 0.03;
+        p.color = [0.98, 0.86, 0.55];
+        p.molar_mass = 0.35;
+        p
+    }
+    /// Cire de paraffine solide en paillettes de 2 mm (phase granulaire) : 900 kg/m³ — plus dense que la cire fondue (elle s'y dépose), plus
+    /// légère que l'eau (elle y flotte) ; c_p 2.0 kJ/(kg·K), k = 0.24 W/(m·K), angle de talus 35°
+    pub fn wax() -> Phase {
+        let mut p = Phase::sand();
+        p.name = "cire".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 1.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 900.0, t0: 293.15, beta: 3.0e-4 } };
+        p.cp = 2000.0;
+        p.cp_slope = 0.0;
+        p.conductivity = 0.24;
+        p.color = [0.97, 0.95, 0.88];
+        p.molar_mass = 0.35;
+        p.h_formation = 0.0;
+        p.s_standard = 0.0;
+        p.grain_diameter = 2.0e-3;
+        p.alpha_max = 0.6;
+        p.friction_angle = 35.0;
+        p
+    }
+    /// Lave basaltique : 2700 kg/m³ à 1200 °C (dilatation 1e-4 /K ; module 2.1 GPa comme l'eau — le vrai, ~17 GPa, ne change rien à
+    /// ces écoulements lents et rendait la fermeture f32 du GPU 8 fois plus bruitée), c_p 1.4 kJ/(kg·K), k = 1.3 W/(m·K), viscosité de
+    /// Vogel–Fulcher–Tammann log10 μ = −4.55 + 5700 / (T − 560) (Giordano et al. 2008 : 50 Pa·s à 1200 °C, 300 Pa·s à 1100 °C), tension
+    /// de surface 0.35 N/m. Se solidifie en grains de basalte (`mp_materials::with_lava`, 1100 °C, L_f = 400 kJ/kg). Sans rayonnement de
+    /// sa surface (les liquides ne rayonnent pas dans ce modèle) : à l'air, elle refroidit bien moins vite qu'en vrai
+    pub fn lava() -> Phase {
+        let mut p = Phase::oil();
+        p.name = "lave".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 3.0e8, n: 7.0, thermal: Thermal::Beta { rho0: 2700.0, t0: 1473.15, beta: 1.0e-4 } };
+        p.cp = 1400.0;
+        p.conductivity = 1.3;
+        p.mu_ref = 49.0;
+        p.mu_law = PropertyLaw::Vogel { b: 5700.0, c: 560.0 };
+        p.t_ref = 1473.15;
+        p.sigma = 0.35;
+        p.color = [1.0, 0.36, 0.06];
+        p.molar_mass = 0.06;
+        p
+    }
+    /// Basalte (lave solidifiée, phase granulaire) : grains de 1 mm — le sable noir des plages volcaniques —, 2900 kg/m³ (ils coulent dans
+    /// la lave et dans l'eau), c_p 0.84 kJ/(kg·K) à 25 °C croissant de 0.4 J/(kg·K²) (1.27 à 1100 °C), k = 1.8 W/(m·K), angle de talus 35°
+    pub fn basalt() -> Phase {
+        let mut p = Phase::sand();
+        p.name = "basalte".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 2900.0, t0: 293.15, beta: 2.4e-5 } };
+        p.cp = 840.0;
+        p.cp_slope = 0.4;
+        p.conductivity = 1.8;
+        p.color = [0.13, 0.13, 0.14];
+        p.molar_mass = 0.06;
+        p.h_formation = 0.0;
+        p.s_standard = 0.0;
+        p.grain_diameter = 1.0e-3;
+        p.alpha_max = 0.6;
+        p.friction_angle = 35.0;
+        p
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {
@@ -564,14 +640,20 @@ impl Solid {
     pub fn glass() -> Solid {
         Solid { name: "verre".into(), rho: 2500.0, cp: 840.0, conductivity: 1.0, color: [0.62, 0.82, 0.80] }
     }
+    /// roche volcanique (basalte massif)
+    pub fn rock() -> Self {
+        Solid { name: "roche".into(), rho: 2900.0, cp: 840.0, conductivity: 1.8, color: [0.30, 0.28, 0.27] }
+    }
     pub fn rho_cp(&self) -> f64 {
         self.rho * self.cp
     }
 }
 
-/// Paire liquide ↔ vapeur (ébullition, condensation, cavitation)
 /// Paire liquide ↔ phase granulaire (gel / fusion : eau ↔ glace) : température de fusion et chaleur latente. L'énergie de référence du
-/// solide est fixée pour que e_l(T_f) − e_s(T_f) = L_f (`Registry::add_fusion`) ; opérateur `MultiphaseSim::fusion_step`
+/// solide est fixée pour que e_l(T_f) − e_s(T_f) = L_f (`Registry::add_fusion`) ; opérateur `MultiphaseSim::fusion_step`.
+/// Surfusion (`supercooling` > 0) : sans germe de glace, le liquide ne gèle qu'au-dessous de T_f − ΔT_n (germination spontanée) ; un
+/// germe est de la glace dans la cellule (fraction ≥ `FUSION_SEED_ALPHA`, ou de la glace laissée par le front) ou le front de dendrites
+/// venu d'une voisine, qui avance dans le liquide surfondu à v = a (ΔT / 1 K)^b (`dendrite_speed`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Fusion {
     pub liquid: usize,
@@ -580,6 +662,28 @@ pub struct Fusion {
     pub t_melt: f64,
     /// chaleur latente de fusion à t_melt (J/kg)
     pub l_fusion: f64,
+    /// surfusion maximale ΔT_n (K) avant la germination spontanée ; 0 : le liquide gèle dès qu'il passe sous T_f (germes partout)
+    pub supercooling: f64,
+    /// vitesse du front de dendrites à 1 K de surfusion (m/s) : v = growth_a (ΔT / 1 K)^growth_b
+    pub growth_a: f64,
+    /// exposant de la vitesse du front de dendrites
+    pub growth_b: f64,
+}
+
+/// fraction volumique de solide qui sert de germe (des cristaux dans la cellule : 1 %, ~2 cristaux de 2 mm par cm³) : en dessous, les
+/// traces étalées par le transport ne font pas geler le liquide surfondu (elles avanceraient d'une maille par pas, plus vite que les
+/// dendrites) ; là où le front de dendrites est passé, tout solide compte (`MultiphaseSim::fusion_germ`)
+pub const FUSION_SEED_ALPHA: f64 = 1e-2;
+/// front de dendrites de la glace dans l'eau surfondue : v = 1 mm/s × (ΔT / 1 K)^1.9 — 8 cm/s à 10 K, 0.64 m/s à 30 K (mesures : 7.7 cm/s
+/// à 10 K, 0.6 m/s à 30 K ; revue de Libbrecht 2014, arXiv:1407.0740)
+pub const ICE_GROWTH_A: f64 = 1.0e-3;
+pub const ICE_GROWTH_B: f64 = 1.9;
+
+impl Fusion {
+    /// vitesse du front de dendrites dans le liquide surfondu de ΔT (m/s)
+    pub fn dendrite_speed(&self, dt_sup: f64) -> f64 {
+        self.growth_a * dt_sup.max(0.0).powf(self.growth_b)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -860,12 +964,14 @@ impl Registry {
     }
     /// Paire de fusion liquide ↔ solide granulaire : l'énergie de référence du SOLIDE est fixée pour que e_l(T_f) − e_s(T_f) = L_f (le liquide
     /// garde la sienne : vapeur, thermochimie). Appelé après les changements liquide ↔ vapeur.
-    pub fn add_fusion(&mut self, liquid: usize, solid: usize, t_melt: f64, l_fusion: f64) {
+    /// Sans surfusion (ΔT_n = 0) ; la renvoie pour régler `supercooling`, `growth_a`, `growth_b`.
+    pub fn add_fusion(&mut self, liquid: usize, solid: usize, t_melt: f64, l_fusion: f64) -> &mut Fusion {
         let el = self.phases[liquid].e_int(t_melt);
         let s = &mut self.phases[solid];
         s.e0 = 0.0;
         s.e0 = el - l_fusion - s.e_int(t_melt);
-        self.fusions.push(Fusion { liquid, solid, t_melt, l_fusion });
+        self.fusions.push(Fusion { liquid, solid, t_melt, l_fusion, supercooling: 0.0, growth_a: ICE_GROWTH_A, growth_b: ICE_GROWTH_B });
+        self.fusions.last_mut().unwrap()
     }
     /// Références d'énergie chimique : e0 = Δh_f°/M − cp·298.15  ⇒  h(298.15 K) = Δh_f°/M pour chaque fluide (gaz : h = e + rT ;
     /// liquide : h ≈ e). Appelé quand des réactions sont définies, AVANT les changements de phase.
@@ -1040,7 +1146,8 @@ mod tests {
     fn kell_density_values() {
         let w = Phase::water();
         let p0 = 101325.0;
-        for &(c, rho) in &[(0.0, 999.84), (4.0, 999.97), (20.0, 998.21), (60.0, 983.2), (100.0, 958.4)] {
+        // (eau surfondue : Hare & Sorensen 1987)
+        for &(c, rho) in &[(-30.0, 983.85), (-20.0, 993.55), (-10.0, 998.12), (0.0, 999.84), (4.0, 999.97), (20.0, 998.21), (60.0, 983.2), (100.0, 958.4)] {
             let r = w.rho(p0, 273.15 + c);
             assert!((r - rho).abs() < 0.3, "ρ({c}°C)={r} attendu {rho}");
         }

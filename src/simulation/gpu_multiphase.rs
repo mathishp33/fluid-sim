@@ -105,12 +105,14 @@ const F_GRAN: u32 = 2048;
 const F_IMPVISC: u32 = 4096;
 const F_FRIC: u32 = 8192;
 const F_PERC: u32 = 16384;
+const F_FUS: u32 = 32768;
 
 const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
 const PC_STRIDE: usize = 8;
-/// paire de fusion : liquide, solide granulaire, température de fusion, chaleur latente
-const FU_STRIDE: usize = 4;
+/// paire de fusion : liquide, solide granulaire, température de fusion, chaleur latente, surfusion maximale, vitesse du front de dendrites
+/// (a, b : v = a ΔT^b)
+const FU_STRIDE: usize = 7;
 const LEV_STRIDE: usize = 8;
 const RX_STRIDE: usize = 56;
 
@@ -128,6 +130,11 @@ fn implicit_viscosity_needed(sim: &MultiphaseSim, _nx: usize) -> bool {
             let rho = p.rho(101325.0, p.t_ref).max(1e-3);
             100.0 * p.mu_ref > 0.2 * rho * sim.dx * sim.dx / sim.dt_max.max(1e-12)
         })
+}
+
+/// surfusion possible : changement de phase actif et une paire de fusion qui se surfond (front de dendrites, `fusion_step`)
+fn fronts_possible(sim: &MultiphaseSim) -> bool {
+    sim.phase_change && sim.reg.fusions.iter().any(|f| f.supercooling > 0.0)
 }
 
 /// La scène peut-elle percoler (miroir de `darcy_faces`) : grilles, ou phases granulaires de grains d'au moins 1 mm
@@ -338,6 +345,8 @@ impl MultiphaseGpu {
             sl.add(name, n);
         }
         sl.add("tpmix", TP_CAP * (np + 2));
+        // surfusion : avancée du front de dendrites par paire de fusion (miroir de `fusion_front`)
+        sl.add("fu_phi", nfus.max(1) * n);
         let acc_start = sl.total;
         sl.add("bflux", np * n);
         sl.add("acc_ein", n);
@@ -414,6 +423,8 @@ impl MultiphaseGpu {
             sl.add(name, nre.max(1) * n);
         }
         sl.add("dloc", npmax * n);
+        // surfusion : germes relevés avant le front de dendrites (k_fusion_germ)
+        sl.add("fu_germ", nfus.max(1) * n);
         sl.add("ys", npmax * n);
         sl.add("newm", npmax * n);
         sl.add("part", 8 * nwg);
@@ -456,7 +467,10 @@ impl MultiphaseGpu {
             nre.max(1),
             1 + npmax
         );
-        header += &format!("const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\n");
+        header += &format!(
+            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\n",
+            super::phases::FUSION_SEED_ALPHA as f32
+        );
         let mut source = format!("{header}{}", SHADERS.join("\n"));
         // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
         if let Ok(patch) = std::env::var("MP_WGSL_PATCH") {
@@ -776,7 +790,7 @@ impl MultiphaseGpu {
         }
         for (q, fu) in sim.reg.fusions.iter().enumerate() {
             let b = self.tl.o("FU") + q * FU_STRIDE;
-            for (i, v) in [fu.liquid as f64, fu.solid as f64, fu.t_melt, fu.l_fusion].iter().enumerate() {
+            for (i, v) in [fu.liquid as f64, fu.solid as f64, fu.t_melt, fu.l_fusion, fu.supercooling, fu.growth_a, fu.growth_b].iter().enumerate() {
                 t[b + i] = *v as f32;
             }
         }
@@ -1044,6 +1058,12 @@ impl MultiphaseGpu {
             s[o_fl + c] = sim.flame_factor.get(c).copied().unwrap_or(1.0) as f32;
             s[o_hr + c] = sim.heat_release.get(c).copied().unwrap_or(0.0) as f32;
         }
+        let o_fp = o("fu_phi");
+        for (q, fr) in sim.fusion_front.iter().enumerate().take(self.nfus) {
+            for (c, &v) in fr.iter().enumerate().take(n) {
+                s[o_fp + q * n + c] = v as f32;
+            }
+        }
         let (o_qu, o_qv) = (o("qu"), o("qv"));
         for f in 0..nfu {
             s[o_u + f] = sim.u[f] as f32;
@@ -1070,7 +1090,8 @@ impl MultiphaseGpu {
         d[D_DT] = sim.last_dt as f32;
         d[D_DTCHEM] = if sim.dt_chem.is_finite() { sim.dt_chem as f32 } else { 3e38 };
         d[D_DTPHASE] = if sim.dt_phase.is_finite() { sim.dt_phase as f32 } else { 3e38 };
-        // borne de pas des poudres : recalculée au début de chaque pas (`k_burn_dt`) quand une poudre peut brûler ; 0 = aucune
+        // borne de pas des poudres et des fronts de dendrites : recalculée au début de chaque pas (`k_burn_dt`) quand une poudre peut
+        // brûler ou une eau se surfondre ; 0 = aucune
         d[D_DTBURN] = 0.0;
         self.queue.write_buffer(&self.d_buf, 0, bytemuck::cast_slice(&d));
         self.base = Baselines {
@@ -1160,6 +1181,8 @@ impl MultiphaseGpu {
             sim.flame_factor[c] = data[o_fl + c] as f64;
             sim.heat_release[c] = data[o_hr + c] as f64;
         }
+        let o_fp = o("fu_phi");
+        sim.fusion_front = (0..self.nfus).map(|q| (0..n).map(|c| data[o_fp + q * n + c] as f64).collect()).collect();
         let (o_qu, o_qv) = (o("qu"), o("qv"));
         if sim.q_u.len() != nfu || sim.q_v.len() != nfv {
             sim.q_u = vec![0.0; nfu];
@@ -1270,6 +1293,9 @@ impl MultiphaseGpu {
         }
         if sim.has_friction() {
             flags |= F_FRIC;
+        }
+        if sim.phase_change && self.nfus > 0 {
+            flags |= F_FUS;
         }
         if percolation_possible(sim) {
             flags |= F_PERC;
@@ -1417,8 +1443,9 @@ impl MultiphaseGpu {
             v.push(cell("k_pin_reset"));
             v.push(cell("k_refresh"));
         }
-        // combustion des poudres : borne du pas sur l'état du début du pas (avant k_red_dt, qui réutilise les sommes partielles)
-        if sim.chemistry && sim.reg.reactions.iter().any(|r| r.burn().is_some()) {
+        // combustion des poudres, fronts de dendrites (surfusion) : borne du pas sur l'état du début du pas (avant k_red_dt, qui
+        // réutilise les sommes partielles)
+        if (sim.chemistry && sim.reg.reactions.iter().any(|r| r.burn().is_some())) || fronts_possible(sim) {
             v.push(cell("k_burn_dt"));
             v.push(one("k_burn_dt_final"));
         }
@@ -1568,8 +1595,13 @@ impl MultiphaseGpu {
                 v.push(cell("k_exch_grains"));
             }
         }
-        // gel / fusion (eau ↔ glace) sur les températures de groupe après les échanges (miroir de fusion_step)
+        // gel / fusion (eau ↔ glace) sur les températures de groupe après les échanges (miroir de fusion_step) ; avant, le front de
+        // dendrites de l'eau surfondue (advance_fusion_front)
         if sim.phase_change && self.nfus > 0 {
+            if fronts_possible(sim) {
+                v.push(cell("k_fusion_germ"));
+                v.push(cell("k_fusion_front"));
+            }
             v.push(cell("k_fusion"));
         }
         // pression : Newton + MG-PCG

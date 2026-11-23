@@ -39,6 +39,7 @@ const F_GRAN: u32 = 2048u;   // au moins une phase granulaire (granular.wgsl)
 const F_IMPVISC: u32 = 4096u; // viscosité implicite au-delà de la borne explicite (friction.wgsl)
 const F_FRIC: u32 = 8192u;   // frottement des grains (friction.wgsl)
 const F_PERC: u32 = 16384u;  // percolation : lits de grains tassés de 1 mm et plus, grilles (percolation.wgsl)
+const F_FUS: u32 = 32768u;   // gel / fusion actifs (paires de fusion, changement de phase coché)
 
 // paramètres par lancement (décalage dynamique, groupe 1)
 struct Disp { a: u32, b: u32, c: u32, d: u32 };
@@ -97,7 +98,7 @@ fn law_factor(id: u32, a: f32, b: f32, t_in: f32, t_ref: f32) -> f32 {
     return clamp(f, 1e-2, 1e2);
 }
 fn kell_rho(t: f32) -> f32 {
-    let c = clamp(t - 273.15, 0.0, 150.0);
+    let c = clamp(t - 273.15, -30.0, 150.0);   // (phases::KELL_C_MIN : eau surfondue)
     let num = 999.83952 + c * (16.945176 + c * (-7.9870401e-3 + c * (-46.170461e-6 + c * (105.56302e-9 - c * 280.54253e-12))));
     return num / (1.0 + 16.87985e-3 * c);
 }

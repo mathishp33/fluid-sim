@@ -532,22 +532,33 @@ impl MultiphaseSim {
     /// revenir à T_f (l'eau naît à T_f) ; tout gèle (fond) quand la chaleur latente de tout le liquide (solide) n'y suffit pas. La vitesse
     /// est celle de l'arrivée de la chaleur (conduction, échange entre groupes) : aucun paramètre. Masse et énergie exactement conservées ;
     /// en parallèle (chaque cellule ne dépend que d'elle-même), masses gelées sommées ensuite dans l'ordre des cellules.
-    pub(crate) fn fusion_step(&mut self) {
+    /// Surfusion (ΔT_n = `supercooling` > 0) : le liquide ne gèle que s'il a un GERME — de la glace dans la cellule (fraction
+    /// ≥ `FUSION_SEED_ALPHA`), le front de dendrites arrivé d'une voisine (`advance_fusion_front`), ou plus de ΔT_n de surfusion
+    /// (germination spontanée) ; il gèle alors d'un coup jusqu'à T_f (une eau à −8 °C laisse 10 % de glace : la neige fondante).
+    pub(crate) fn fusion_step(&mut self, dt: f64) {
         use super::mp_par::for_ranges;
         use super::multiphase::SyncPtr;
+        use super::phases::FUSION_SEED_ALPHA;
         let nf = self.reg.fusions.len();
         if self.frozen.len() != nf {
             self.frozen = vec![0.0; nf];
         }
+        let n = self.nx * self.ny;
+        if self.fusion_front.len() != nf || self.fusion_front.iter().any(|v| v.len() != n) {
+            self.fusion_front = vec![vec![0.0; n]; nf];
+        }
         if !self.phase_change || nf == 0 {
             return;
         }
-        let n = self.nx * self.ny;
         let a2 = self.dx * self.dx;
         for fi in 0..nf {
             let fu = self.reg.fusions[fi].clone();
             let (l, s, tm) = (fu.liquid, fu.solid, fu.t_melt);
             let (gl, gs) = (self.group_of[l], self.group_of[s]);
+            let dtn = fu.supercooling;
+            if dtn > 0.0 {
+                self.advance_fusion_front(fi, dt);
+            }
             // chaleur latente cohérente avec les énergies du solveur (e_l(T_f) − e_s(T_f) = L_f par construction)
             let (el_m, es_m) = (self.reg.phases[l].e_int(tm), self.reg.phases[s].e_int(tm));
             let lf = (el_m - es_m).max(1.0);
@@ -559,17 +570,20 @@ impl MultiphaseSim {
                 let dmp = SyncPtr(dm_cell.as_mut_ptr());
                 let this = &*self;
                 let members_l = &members_l;
+                let front = &self.fusion_front[fi];
                 for_ranges(n, MIN_HEAVY, |lo, hi| {
                     for c in lo..hi {
                         if this.is_solid(c) || this.pinned(c) {
                             continue;
                         }
+                        // germe (surfusion) : glace dans la cellule, front de dendrites arrivé, germination spontanée ; sans surfusion, partout
+                        let seeded = dtn <= 0.0 || this.alpha[s][c] >= FUSION_SEED_ALPHA || front[c] >= 1.0 || tm - this.tg[gl][c] > dtn;
                         // SAFETY : la cellule c n'est lue et écrite que par sa tranche
                         unsafe {
                             let ml = *mp[l].at(c);
                             let mut dm = 0.0;
                             // (les deux, indépendamment : une eau à T_f à l'arrondi près ne doit pas empêcher la glace de fondre)
-                            if ml > 1e-12 && this.tg[gl][c] < tm {
+                            if ml > 1e-12 && this.tg[gl][c] < tm && seeded {
                                 // gel : la chaleur qui ramènerait le groupe du liquide à T_f vient de sa chaleur latente
                                 let e_tm: f64 = members_l.iter().map(|&k| (*mp[k].at(c)).max(0.0) * this.reg.phases[k].e_int(tm)).sum();
                                 let d = ((e_tm - *egp[gl].at(c)) / lf).clamp(0.0, ml);
@@ -609,6 +623,123 @@ impl MultiphaseSim {
             self.frozen[fi] += frozen * a2;
             self.sync_cells(|c| dm_cell[c] != 0.0);
         }
+    }
+
+    /// Germe de la paire `fi` dans la cellule c (surfusion) : des cristaux du solide s (fraction ≥ `FUSION_SEED_ALPHA` : en dessous, les
+    /// traces étalées par le transport avanceraient d'une maille par pas), ou du solide là où le front de dendrites est passé (front ≥ 1).
+    pub(crate) fn fusion_germ(&self, s: usize, c: usize, front: &[f64]) -> bool {
+        use super::phases::FUSION_SEED_ALPHA;
+        self.alpha[s][c] >= FUSION_SEED_ALPHA || (front.get(c).copied().unwrap_or(0.0) >= 1.0 && self.mass[s][c] > 1e-12)
+    }
+
+    /// Surfusion : avance pendant dt le front de dendrites de la paire `fi`. Dans une cellule de liquide surfondu (ΔT = T_f − T > 0) sans
+    /// germe (`fusion_germ`) dont une voisine a un germe, le front avance de v(ΔT) dt / dx (voisine par une face ; dt / (√2 dx) par un
+    /// coin) ; la cellule germe à 1 (elle gèle alors jusqu'à T_f) et garde l'excédent, que ses voisines par une face reprennent au pas
+    /// suivant : le front avance à v exactement, quel que soit le pas (≤ dx / v : `front_dt_bound`). Germes relevés sur l'état d'avant ;
+    /// une cellule germée n'est pas modifiée (ses voisines lisent son excédent : aucun conflit, en parallèle comme sur le GPU) ; le front
+    /// s'efface dans une cellule qui n'est plus surfondue. Sans effet sur la masse et l'énergie (seul `fusion_step` gèle).
+    fn advance_fusion_front(&mut self, fi: usize, dt: f64) {
+        use super::mp_par::{for_ranges, map_ranges};
+        use super::multiphase::SyncPtr;
+        let fu = self.reg.fusions[fi].clone();
+        let (l, s, tm) = (fu.liquid, fu.solid, fu.t_melt);
+        let gl = self.group_of[l];
+        let n = self.nx * self.ny;
+        let old = std::mem::take(&mut self.fusion_front[fi]);
+        let germ: Vec<bool> = map_ranges(n, MIN_HEAVY, |lo, hi| (lo..hi).map(|c| self.fusion_germ(s, c, &old)).collect::<Vec<bool>>()).concat();
+        let mut new = old.clone();
+        {
+            let np_ = SyncPtr(new.as_mut_ptr());
+            let this = &*self;
+            let (old, fu, germ) = (&old, &fu, &germ);
+            for_ranges(n, MIN_HEAVY, |lo, hi| {
+                for c in lo..hi {
+                    if this.is_solid(c) || this.pinned(c) || germ[c] {
+                        continue;
+                    }
+                    let d_t = tm - this.tg[gl][c];
+                    let val = if this.mass[l][c] <= 1e-12 || d_t <= 0.0 {
+                        0.0
+                    } else {
+                        let (face, diag, inh) = this.front_seeds(c, &|q| germ[q], old);
+                        let v = fu.dendrite_speed(d_t);
+                        let rate = if face { v / this.dx } else if diag { v / (std::f64::consts::SQRT_2 * this.dx) } else { 0.0 };
+                        if rate > 0.0 {
+                            (old[c].max(inh) + rate * dt).min(2.0)
+                        } else {
+                            old[c]
+                        }
+                    };
+                    // SAFETY : chaque tranche n'écrit que ses propres cellules
+                    unsafe {
+                        *np_.at(c) = val;
+                    }
+                }
+            });
+        }
+        self.fusion_front[fi] = new;
+    }
+
+    /// Voisines de c (hors solides) qui ont un germe : par une face, par un coin ; excédent du front (au-delà de 1) le plus grand parmi
+    /// les voisines par une face.
+    fn front_seeds(&self, c: usize, germ: &dyn Fn(usize) -> bool, front: &[f64]) -> (bool, bool, f64) {
+        let (nx, ny) = (self.nx as i64, self.ny as i64);
+        let (i, j) = ((c % self.nx) as i64, (c / self.nx) as i64);
+        let (mut face, mut diag, mut inh) = (false, false, 0.0f64);
+        for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            let (a, b) = (i + di, j + dj);
+            if a < 0 || b < 0 || a >= nx || b >= ny {
+                continue;
+            }
+            let q = (b * nx + a) as usize;
+            if self.is_solid(q) || !germ(q) {
+                continue;
+            }
+            if di == 0 || dj == 0 {
+                face = true;
+                inh = inh.max(front.get(q).copied().unwrap_or(0.0) - 1.0);
+            } else {
+                diag = true;
+            }
+        }
+        (face, diag, inh)
+    }
+
+    /// Borne du pas des fronts de dendrites (surfusion) : le front ne franchit pas plus d'une maille par pas, dt ≤ dx / v(ΔT) dans les
+    /// cellules de liquide surfondu (sans germination spontanée) sans germe voisines d'un germe (état du début du pas ; miroir de
+    /// `k_burn_dt` sur le GPU).
+    pub(crate) fn front_dt_bound(&self) -> f64 {
+        if !self.phase_change || !self.reg.fusions.iter().any(|f| f.supercooling > 0.0) {
+            return f64::INFINITY;
+        }
+        let n = self.nx * self.ny;
+        let none: Vec<f64> = vec![];
+        super::mp_par::map_ranges(n, MIN_HEAVY, |lo, hi| {
+            let mut m = f64::INFINITY;
+            for c in lo..hi {
+                if self.is_solid(c) || self.pinned(c) {
+                    continue;
+                }
+                for (fi, fu) in self.reg.fusions.iter().enumerate() {
+                    if fu.supercooling <= 0.0 {
+                        continue;
+                    }
+                    let (l, s) = (fu.liquid, fu.solid);
+                    let front: &[f64] = self.fusion_front.get(fi).map(|v| v.as_slice()).unwrap_or(&none);
+                    let d_t = fu.t_melt - self.tg[self.group_of[l]][c];
+                    if self.mass[l][c] <= 1e-12 || d_t <= 0.0 || d_t > fu.supercooling || self.fusion_germ(s, c, front) {
+                        continue;
+                    }
+                    let (face, diag, _) = self.front_seeds(c, &|q| self.fusion_germ(s, q, front), front);
+                    if face || diag {
+                        m = m.min(self.dx / fu.dendrite_speed(d_t).max(1e-30));
+                    }
+                }
+            }
+            m
+        })
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
     }
 
     /// Évaporation / condensation à travers une interface ALIGNÉE sur la grille (cellule de gaz pur voisine d'une cellule de liquide sans gaz :

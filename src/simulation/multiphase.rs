@@ -106,6 +106,10 @@ pub struct MultiphaseSim {
     /// masse gelée (liquide → solide, négative à la fusion) cumulée par paire de fusion (kg/m), pour les bilans
     #[serde(default)]
     pub frozen: Vec<f64>,
+    /// surfusion : avancée du front de dendrites dans chaque cellule, par paire de fusion (en mailles : la cellule germe à 1 ; les
+    /// cellules germées gardent l'excédent, repris par leurs voisines)
+    #[serde(default)]
+    pub fusion_front: Vec<Vec<f64>>,
     pub(crate) step_count: usize,
     /// flux de masse total (toutes phases) à travers chaque face de cellule pendant le dernier advect_mass_energy (kg/m³ de cellule, + = vers +x / +y)
     pub(crate) mfx: Vec<f64>,
@@ -328,6 +332,7 @@ impl MultiphaseSim {
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
             frozen: vec![0.0; nfu],
+            fusion_front: vec![vec![0.0; n]; nfu],
             step_count: 0,
             mfx: vec![0.0; (nx + 1) * ny],
             mfy: vec![0.0; nx * (ny + 1)],

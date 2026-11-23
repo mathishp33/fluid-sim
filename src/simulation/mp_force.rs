@@ -168,7 +168,7 @@ impl MultiphaseSim {
                     if cs.iter().any(|&c| self.is_solid(c)) {
                         continue;
                     }
-                    let mu = cs.iter().map(|&c| mue[c]).sum::<f64>() / 4.0;
+                    let mu = (cs.iter().map(|&c| mue[c]).sum::<f64>() / 4.0).min(self.explicit_node_mu_cap(cs, dt));
                     txy[j * (nx + 1) + i] = mu * ((ui(i, j) - ui(i, j - 1)) / dx + (vi(i, j) - vi(i - 1, j)) / dx);
                 }
             }

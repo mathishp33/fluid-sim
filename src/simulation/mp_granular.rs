@@ -169,6 +169,15 @@ impl MultiphaseSim {
                         if ad <= 1e-12 {
                             continue;
                         }
+                        // un grain léger qui remonte (glace dans l'eau) ne passe pas dans un fluide où il serait lourd (l'air au-dessus de la
+                        // surface, où il retomberait aussitôt) : il flotte dans la dernière maille d'eau ; un grain qui tombe de l'air dans
+                        // l'eau y entre et y flotte (sans cela, ce va-et-vient à chaque pas brassait la surface et bornait le pas)
+                        if wa <= 0.0 {
+                            let Some((rho_fr, _, _, _)) = self.carrier_fluid(r) else { continue };
+                            if self.reg.phases[s].rho(self.p[d], self.phase_temp(s, d)) >= rho_fr {
+                                continue;
+                            }
+                        }
                         let mut vol = ad * w * proj * dt / self.dx;
                         vol = vol.min(share * ad);
                         vol = vol.min(share * (amax - self.grain_fraction(r)).max(0.0));

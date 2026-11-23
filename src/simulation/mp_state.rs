@@ -19,7 +19,7 @@ use super::multiphase::MultiphaseSim;
 /// en-tête d'un fichier d'état complet
 pub const MAGIC: &[u8; 8] = b"FSIMMPST";
 /// version du format (voir l'en-tête du module)
-pub const VERSION: u32 = 9; // 2 : rayon de la destination des téléporteurs ; 3 : phases granulaires ; 4 : frottement des grains ; 5 : viscosité implicite ; 6 : percolation, grilles ; 7 : réactions en volume (pyrolyse) ; 8 : combustion des poudres (loi de Vieille) ; 9 : gel / fusion (eau ↔ glace)
+pub const VERSION: u32 = 10; // 2 : rayon de la destination des téléporteurs ; 3 : phases granulaires ; 4 : frottement des grains ; 5 : viscosité implicite ; 6 : percolation, grilles ; 7 : réactions en volume (pyrolyse) ; 8 : combustion des poudres (loi de Vieille) ; 9 : gel / fusion (eau ↔ glace) ; 10 : surfusion (front de dendrites)
 
 /// Contenu d'un fichier d'état complet.
 #[derive(Serialize, Deserialize)]

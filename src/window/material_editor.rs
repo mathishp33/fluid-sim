@@ -5,7 +5,7 @@
 use egui::{ComboBox, DragValue, Ui};
 
 use crate::simulation::materials::PropertyLaw;
-use crate::simulation::mp_materials::{ChangeDef, MaterialLibrary, MixtureDef, ReactionDef};
+use crate::simulation::mp_materials::{ChangeDef, FusionDef, MaterialLibrary, MixtureDef, ReactionDef};
 use crate::simulation::phases::{Eos, Phase, PhaseKind, Radiator, Reaction, Registry, Thermal};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -387,6 +387,57 @@ impl MaterialEditor {
         }
         if let Some(i) = remove {
             lib.changes.remove(i);
+            changed = true;
+        }
+        // ---- gel / fusion
+        ui.add_space(8.0);
+        ui.label("Paire liquide ↔ solide en grains (gel et fusion : eau ↔ glace), méthode enthalpique : le liquide plus froid que T_f gèle juste assez pour revenir à T_f, le solide plus chaud fond de même. Surfusion : sans germe (cristaux ≥ 1 % de la maille, ou front de dendrites venu d'une voisine, qui avance à v = a·ΔT^b), le liquide ne gèle qu'au-dessous de T_f − ΔT ; 0 = il gèle dès T_f.");
+        let grains: Vec<String> = lib.fluids.iter().filter(|p| p.kind == PhaseKind::Granular).map(|p| p.name.clone()).collect();
+        if ui.add_enabled(!liquids.is_empty() && !grains.is_empty(), egui::Button::new("+ Paire liquide ↔ solide (fusion)")).clicked() {
+            lib.fusions.push(FusionDef::new(&liquids[0], &grains[0], 273.15, 333.55e3));
+            changed = true;
+        }
+        let mut remove = None;
+        for (fi, f) in lib.fusions.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Liquide");
+                    ComboBox::from_id_source(("fu_liq", fi)).selected_text(&f.liquid).show_ui(ui, |ui| {
+                        for n in &liquids {
+                            changed |= ui.selectable_value(&mut f.liquid, n.clone(), n).changed();
+                        }
+                    });
+                    ui.label("Solide (grains)");
+                    ComboBox::from_id_source(("fu_sol", fi)).selected_text(&f.solid).show_ui(ui, |ui| {
+                        for n in &grains {
+                            changed |= ui.selectable_value(&mut f.solid, n.clone(), n).changed();
+                        }
+                    });
+                    if ui.button("Supprimer").clicked() {
+                        remove = Some(fi);
+                    }
+                });
+                egui::Grid::new(("fu_grid", fi)).num_columns(2).show(ui, |ui| {
+                    ui.label("Température de fusion T_f (K)");
+                    changed |= ui.add(DragValue::new(&mut f.t_melt).speed(0.5).clamp_range(20.0..=4000.0)).changed();
+                    ui.end_row();
+                    ui.label("Chaleur latente L_f (J/kg)");
+                    changed |= ui.add(DragValue::new(&mut f.l_fusion).speed(1e3).clamp_range(1e3..=5e6)).changed();
+                    ui.end_row();
+                    ui.label("Surfusion maximale ΔT (K)");
+                    changed |= ui.add(DragValue::new(&mut f.supercooling).speed(0.5).clamp_range(0.0..=100.0)).changed();
+                    ui.end_row();
+                    ui.label("Front de dendrites a (m/s à 1 K)");
+                    changed |= ui.add(DragValue::new(&mut f.growth_a).speed(1e-4).clamp_range(1e-6..=1.0)).changed();
+                    ui.end_row();
+                    ui.label("Exposant b (v = a·ΔT^b)");
+                    changed |= ui.add(DragValue::new(&mut f.growth_b).speed(0.05).clamp_range(0.0..=4.0)).changed();
+                    ui.end_row();
+                });
+            });
+        }
+        if let Some(i) = remove {
+            lib.fusions.remove(i);
             changed = true;
         }
         changed

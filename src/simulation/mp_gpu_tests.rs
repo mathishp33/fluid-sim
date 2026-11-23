@@ -175,6 +175,8 @@ fn clone_sim(s: &MultiphaseSim) -> MultiphaseSim {
     c.boundary_flux = s.boundary_flux.clone();
     c.transferred = s.transferred.clone();
     c.reacted = s.reacted.clone();
+    c.frozen = s.frozen.clone();
+    c.fusion_front = s.fusion_front.clone();
     c.step_count = s.step_count;
     c.time = s.time;
     c.conservative_momentum = s.conservative_momentum;
@@ -1860,3 +1862,41 @@ fn gpu_melts_crushed_ice_like_the_cpu() {
         melt(&cpu), melt(&gs), -cpu.frozen[0], -gs.frozen[0], cpu.step_count, gs.step_count);
     assert!(melt(&cpu) > 0.0 && rel(melt(&cpu), melt(&gs)) < 0.03, "fonte CPU {} GPU {}", melt(&cpu), melt(&gs));
 }
+
+#[test]
+fn gpu_supercools_water_like_the_cpu() {
+    // surfusion : accord d'un pas sur une eau très pure à −8 °C sans germe (rien ne gèle) et avec des cristaux (elle gèle jusqu'à 0 °C) ;
+    // front de dendrites dans un canal d'eau à −10 °C (1 s : mêmes mailles gelées à une près, glace formée à 1 % près) ; scénario « eau
+    // surfondue » (2 s : glace formée à 5 % près)
+    use super::mp_materials::GLACE;
+    let sc = |ai: f64| {
+        let mut s = super::mp_chem_tests::ice_water_box(0.9 - ai, 265.15, ai, 265.15);
+        s.reg.fusions[0].supercooling = 20.0;
+        s
+    };
+    one_step_agreement("eau surfondue sans germe", sc(0.0), 0, 3, 1e-4, 1e-2);
+    one_step_agreement("eau surfondue et cristaux", sc(0.02), 0, 3, 1e-4, 1e-2);
+    let mk = || super::mp_chem_tests::supercooled_channel(100, 2e-3, 263.15);
+    let Some((cpu, gs, _)) = compare("front de dendrites", &mk, 1.0) else { return };
+    let gl = cpu.reg.phases.iter().position(|p| p.name == GLACE).unwrap();
+    let lead = |s: &MultiphaseSim| (0..s.nx).filter(|&i| s.alpha[gl][s.idx(i, 0)] > 0.05).max().unwrap_or(0);
+    eprintln!(" front : maille {} (CPU) / {} (GPU) ; glace CPU {:.5e} GPU {:.5e} kg/m ; pas {} / {}",
+        lead(&cpu), lead(&gs), cpu.total_mass(gl), gs.total_mass(gl), cpu.step_count, gs.step_count);
+    assert!(lead(&cpu) > 30 && lead(&cpu).abs_diff(lead(&gs)) <= 1, "front CPU {} GPU {}", lead(&cpu), lead(&gs));
+    assert!(rel(cpu.total_mass(gl), gs.total_mass(gl)) < 0.01, "glace CPU {} GPU {}", cpu.total_mass(gl), gs.total_mass(gl));
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::SupercooledWater, 40, 30, 0.02, 9.81).unwrap();
+    let Some((cpu, gs, _)) = compare("eau surfondue", &mk, 2.0) else { return };
+    let mi0 = mk().total_mass(gl);
+    let frz = |s: &MultiphaseSim| s.total_mass(gl) - mi0;
+    eprintln!(" glace formée CPU {:.5e} GPU {:.5e} kg/m ; bilan CPU {:.5e} GPU {:.5e} ; pas {} / {}",
+        frz(&cpu), frz(&gs), cpu.frozen[0], gs.frozen[0], cpu.step_count, gs.step_count);
+    assert!(frz(&cpu) > 0.0 && rel(frz(&cpu), frz(&gs)) < 0.05, "glace CPU {} GPU {}", frz(&cpu), frz(&gs));
+}
+
+#[test]
+fn gpu_freezes_water_wax_and_lava_like_the_cpu() {
+    // trois paires de fusion dans les mêmes cellules (eau ↔ glace, cire fondue ↔ cire, lave ↔ basalte) : accord d'un pas
+    one_step_agreement("eau, cire et lave", super::mp_chem_tests::water_wax_lava_box(268.15, 323.15, 1323.15), 0, 3, 1e-4, 1e-2);
+}
+

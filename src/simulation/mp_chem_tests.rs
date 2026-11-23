@@ -1171,7 +1171,7 @@ fn undercooled_water_freezes_and_warm_ice_melts_back_to_the_melting_point() {
         let (eau, glace) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
         let c = s.idx(1, 1);
         let (mw0, mi0, e0) = (s.mass[eau][c], s.mass[glace][c], s.total_internal_energy());
-        s.fusion_step();
+        s.fusion_step(1e-3);
         let (gw, gi) = (s.group_of[eau], s.group_of[glace]);
         let (tw, ti) = (s.tg[gw][c], s.tg[gi][c]);
         assert!(((s.total_internal_energy() - e0) / e0.abs().max(1.0)).abs() < 1e-12, "énergie");
@@ -1195,7 +1195,7 @@ fn undercooled_water_freezes_and_warm_ice_melts_back_to_the_melting_point() {
     // sans changement de phase (case décochée) : rien ne gèle
     let mut s = ice_water_box(0.9, 263.15, 0.0, 263.15);
     s.phase_change = false;
-    s.fusion_step();
+    s.fusion_step(1e-3);
     assert!(s.total_mass(idx(&s.reg, GLACE)) == 0.0);
 }
 
@@ -1305,3 +1305,321 @@ fn ice_melting_diag() {
     }
     eprintln!("divergé : {}", s.diverged);
 }
+
+// ============================================================================================ surfusion : germes, front de dendrites
+
+/// Canal d'eau très pure surfondue (préréglage `with_supercooled_water` : germination spontanée sous −20 °C), sans gravité (nx × 2
+/// mailles de dx) à t_w ; germe de glace (2 % du volume) dans la première colonne ; poche d'air au bout (elle absorbe la dilatation de
+/// l'eau qui gèle)
+pub(crate) fn supercooled_channel(nx: usize, dx: f64, t_w: f64) -> MultiphaseSim {
+    use super::mp_materials::GLACE;
+    let lib = MaterialLibrary::default().with_supercooled_water();
+    let b = lib.build().expect("préréglage eau surfondue valide");
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let reg = b.registry;
+    let (eau, glace, air) = (idx(&reg, "eau"), idx(&reg, GLACE), idx(&reg, "air"));
+    let np = reg.phases.len();
+    let mut s = MultiphaseSim::new(nx, 2, dx, reg, b.ambient);
+    s.gravity = [0.0, 0.0];
+    s.surface_tension = false;
+    s.dt_max = 5e-3;
+    let lx = nx as f64 * dx;
+    let (mut w, mut a, mut g) = (vec![0.0; np], vec![0.0; np], vec![0.0; np]);
+    w[eau] = 1.0;
+    a[air] = 1.0;
+    g[eau] = 0.98;
+    g[glace] = 0.02;
+    s.paint_mixture(move |x, _| Some(if x < dx { g.clone() } else if x < 0.9 * lx { w.clone() } else { a.clone() }));
+    s.finalize_init(move |_, _| t_w);
+    s.refresh();
+    s
+}
+
+#[test]
+fn supercooled_water_needs_a_germ_to_freeze() {
+    // eau très pure à −8 °C (germination spontanée seulement sous −20 °C) : sans germe, elle reste liquide ; avec des cristaux de glace
+    // (2 % de la cellule), elle gèle d'un coup jusqu'à 0 °C (c ΔT / L_f = 10.04 % de l'eau) ; des traces de glace (0.5 %, sous le seuil
+    // de germe de 1 %) ne suffisent pas ; à −21 °C, elle gèle seule (26.4 %) ; sans surfusion (défaut), elle gèle dès 0 °C
+    use super::mp_materials::GLACE;
+    let lf = 333.55e3;
+    let probe = |dtn: f64, t: f64, ai: f64| -> (f64, f64) {
+        let mut s = ice_water_box(0.9 - ai, t, ai, t);
+        s.reg.fusions[0].supercooling = dtn;
+        let (eau, glace) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+        let c = s.idx(1, 1);
+        let (mw0, mi0, e0) = (s.mass[eau][c], s.mass[glace][c], s.total_internal_energy());
+        s.fusion_step(1e-3);
+        assert!(((s.total_internal_energy() - e0) / e0.abs().max(1.0)).abs() < 1e-12, "énergie");
+        ((s.mass[glace][c] - mi0) / mw0, s.tg[s.group_of[eau]][c])
+    };
+    let expect = |dt_c: f64| 4186.0 * dt_c / lf;
+    let (f, tw) = probe(20.0, 265.15, 0.0);
+    eprintln!("sans germe : {:.4} % gelés, eau à {tw:.3} K", 100.0 * f);
+    assert!(f == 0.0 && (tw - 265.15).abs() < 1e-9);
+    let (f, tw) = probe(20.0, 265.15, 0.02);
+    eprintln!("germe de 2 % : {:.4} % gelés (c ΔT / L_f = {:.4} %), eau à {tw:.6} K", 100.0 * f, 100.0 * expect(8.0));
+    assert!((f / expect(8.0) - 1.0).abs() < 1e-9 && (tw - 273.15).abs() < 1e-9);
+    let (f, _) = probe(20.0, 265.15, 0.005);
+    assert!(f == 0.0, "des traces de glace ont fait geler l'eau : {f}");
+    let (f, tw) = probe(20.0, 252.15, 0.0);
+    eprintln!("à −21 °C, germination spontanée : {:.4} % gelés (attendu {:.4} %), eau à {tw:.6} K", 100.0 * f, 100.0 * expect(21.0));
+    assert!((f / expect(21.0) - 1.0).abs() < 1e-9 && (tw - 273.15).abs() < 1e-9);
+    let (f, _) = probe(0.0, 265.15, 0.0);
+    assert!((f / expect(8.0) - 1.0).abs() < 1e-9, "sans surfusion, l'eau gèle dès 0 °C");
+    // la boîte entière, pas complets : toujours liquide après 50 pas
+    let mut s = ice_water_box(0.9, 265.15, 0.0, 265.15);
+    s.reg.fusions[0].supercooling = 20.0;
+    for _ in 0..50 {
+        s.step();
+    }
+    assert!(s.total_mass(idx(&s.reg, GLACE)) == 0.0 && !s.diverged);
+}
+
+#[test]
+fn dendrite_front_crosses_supercooled_water_at_the_measured_speed() {
+    // canal de 100 mailles de 2 mm d'eau à −10 °C, germe au bout : le front de dendrites avance à v(10 K) = 1 mm/s × 10^1.9 = 7.94 cm/s
+    // (mesures : 7.7 cm/s) ; la maille i gèle à t = i dx / v, au pas près (l'excédent du front passe d'une maille à la suivante) — à 2 %
+    // près : l'eau qui gèle se dilate et pousse 1.1 % de sa maille, à 0 °C, dans la suivante, qui se réchauffe de 0.09 K (surfusion
+    // 9.91 K) ; rien ne gèle devant le front ; derrière, l'eau est à 0 °C avec c ΔT / L_f = 12.55 % de glace
+    use super::mp_materials::GLACE;
+    let (nx, dx) = (100, 2e-3);
+    let mut s = supercooled_channel(nx, dx, 263.15);
+    let (eau, gl) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+    let v = s.reg.fusions[0].dendrite_speed(10.0);
+    let mut t_frz = vec![f64::NAN; nx];
+    let (mut ahead, mut max_dt) = (0usize, 0.0f64);
+    while s.time < 2.2 && !s.diverged {
+        let dt = s.step();
+        max_dt = max_dt.max(dt);
+        // maille gelée : plus de 5 % de glace (les traces portées par l'écoulement de dilatation ne comptent pas)
+        for i in 0..nx {
+            if t_frz[i].is_nan() && s.alpha[gl][s.idx(i, 0)] > 0.05 {
+                t_frz[i] = s.time;
+            }
+        }
+        // aucune glace à plus d'une maille devant le front
+        let lead = (0..nx).filter(|&i| !t_frz[i].is_nan()).max().unwrap_or(0);
+        ahead = ahead.max(lead.saturating_sub((v * s.time / dx).floor() as usize + 1));
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let (i0, i1) = (10, 80);
+    let speed = (i1 - i0) as f64 * dx / (t_frz[i1] - t_frz[i0]);
+    eprintln!("front de dendrites : {:.2} cm/s mesurés pour {:.2} cm/s (maille {i0} à {:.3} s, {i1} à {:.3} s ; attendu {:.3} et {:.3}) ; pas max {:.1} ms ; {} pas",
+        100.0 * speed, 100.0 * v, t_frz[i0], t_frz[i1], i0 as f64 * dx / v, i1 as f64 * dx / v, 1e3 * max_dt, s.step_count);
+    assert!(speed < v && speed > 0.975 * v, "vitesse du front {speed} m/s pour {v}");
+    for &i in &[i0, i1] {
+        let te = i as f64 * dx / v;
+        assert!(t_frz[i] >= te - 1e-9 && t_frz[i] <= 1.025 * te + max_dt, "maille {i} gelée à {} s (attendu {te} s)", t_frz[i]);
+    }
+    assert!(ahead == 0, "glace devant le front ({ahead} mailles)");
+    // derrière le front : neige fondante à 0 °C
+    let c = s.idx(40, 0);
+    let frac = s.mass[gl][c] / (s.mass[gl][c] + s.mass[eau][c]);
+    let tw = s.tg[s.group_of[eau]][c];
+    eprintln!("maille 40 : {:.3} % de glace (c ΔT / L_f = {:.3} %), eau à {tw:.4} K", 100.0 * frac, 100.0 * 4186.0 * 10.0 / 333.55e3);
+    assert!((frac / (4186.0 * 10.0 / 333.55e3) - 1.0).abs() < 0.02 && (tw - 273.15).abs() < 0.05);
+}
+
+#[test]
+fn supercooled_water_freezes_outward_from_the_germ() {
+    // scénario « eau surfondue » (40 × 30, mailles de 2 cm) : sous le germe (à la surface, au milieu), le front de dendrites descend à
+    // v(8 K) ≈ 5.2 cm/s ; derrière lui, de la neige fondante à 0 °C ; le long de la surface il va plus vite (la neige fondante, plus
+    // légère, flotte et s'étale en courant de gravité, ~6 cm/s, en semant le gel devant elle : cristaux libres, pas de réseau de
+    // dendrites soudé) ; le fond de la cuve reste surfondu ; masse et énergie conservées
+    use super::mp_materials::GLACE;
+    use super::phases::FUSION_SEED_ALPHA;
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::SupercooledWater, 40, 30, 0.02, 9.81).unwrap();
+    let (eau, gl) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+    assert!(s.reg.fusions[0].supercooling >= 20.0);
+    let v = s.reg.fusions[0].dendrite_speed(8.0);
+    let (m0, u0) = (s.total_mass_all(), s.total_internal_energy() + s.kinetic_energy());
+    let (mi0, mw0) = (s.total_mass(gl), s.total_mass(eau));
+    let (xs, ys) = (0.5 * 40.0 * 0.02, 0.7 * 30.0 * 0.02);
+    // mailles gelées d'affilée sous la surface, au milieu
+    let down = |s: &MultiphaseSim| (0..21).rev().take_while(|&j| s.alpha[gl][s.idx(20, j)] >= FUSION_SEED_ALPHA).count();
+    s.step();
+    let d0 = down(&s);
+    while s.time < 4.0 && !s.diverged {
+        s.step();
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let n = s.nx * s.ny;
+    let r_front = (0..n)
+        .filter(|&c| !s.is_solid(c) && s.alpha[gl][c] >= FUSION_SEED_ALPHA && s.mass[eau][c] > 1e-6)
+        .map(|c| {
+            let (x, y) = s.center(c % s.nx, c / s.nx);
+            (x - xs).hypot(y - ys)
+        })
+        .fold(0.0f64, f64::max);
+    let frozen = s.total_mass(gl) - mi0;
+    let tb = s.tg[s.group_of[eau]][s.idx(20, 1)];
+    let d1 = down(&s);
+    let v_down = (d1 - d0) as f64 * s.dx / s.time;
+    eprintln!("eau surfondue : {} pas ; front vers le bas {:.2} cm/s ({d0} → {d1} mailles ; v(8 K) = {:.2} cm/s), le plus loin à {:.3} m du germe (v t = {:.3} m) ; {:.2} % de l'eau gelée ; fond à {tb:.2} K ; énergie {:+.2e}",
+        s.step_count, 100.0 * v_down, 100.0 * v, r_front, v * s.time, 100.0 * frozen / mw0, (s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0);
+    assert!(v_down > 0.75 * v && v_down < 1.35 * v, "front vers le bas à {v_down} m/s pour {v}");
+    assert!(r_front < 3.0 * v * s.time + 0.05, "front à {r_front} m pour v t = {}", v * s.time);
+    assert!(frozen > 0.01 * mw0 && frozen < 0.1004 * mw0, "glace formée : {frozen} kg/m");
+    assert!(tb < 266.0, "le fond a gelé : {tb} K");
+    assert!((s.frozen[0] / frozen - 1.0).abs() < 1e-6, "bilan du gel");
+    assert!((s.total_mass_all() / m0 - 1.0).abs() < 1e-9, "masse");
+    assert!(((s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0).abs() < 1e-7, "énergie");
+}
+
+/// diagnostic : eau surfondue (MP_SC_NX mailles de large, défaut 40, 0.8 m × 0.6 m ; MP_SC_T s, défaut 6)
+#[test]
+#[ignore]
+fn supercooled_water_diag() {
+    use super::mp_materials::GLACE;
+    use super::phases::FUSION_SEED_ALPHA;
+    let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let nx = env("MP_SC_NX", 40.0) as usize;
+    let dx = 0.8 / nx as f64;
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::SupercooledWater, nx, nx * 3 / 4, dx, env("MP_SC_G", 9.81)).unwrap();
+    let (eau, gl) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+    if let Ok(r) = std::env::var("MP_SC_RHOI") {
+        let r: f64 = r.parse().unwrap();
+        if let super::phases::Eos::Tait { thermal: super::phases::Thermal::Beta { rho0, .. }, .. } = &mut s.reg.phases[gl].eos {
+            *rho0 = r;
+        }
+        s.refresh();
+    }
+    if std::env::var("MP_SC_NOST").is_ok() {
+        s.surface_tension = false;
+    }
+    let v = s.reg.fusions[0].dendrite_speed(8.0);
+    let (xs, ys) = (0.4, 0.7 * (nx * 3 / 4) as f64 * dx);
+    let mw0 = s.total_mass(eau);
+    let mut next = 0.0;
+    let t0 = std::time::Instant::now();
+    let every = env("MP_SC_EVERY", 0.5);
+    while s.time < env("MP_SC_T", 6.0) && !s.diverged {
+        let dt = s.step();
+        if std::env::var("MP_SC_WHERE").is_ok() && s.time >= next {
+            // vitesse maximale : où, et dans quoi
+            let (nx, ny) = (s.nx, s.ny);
+            let mut best = (0.0f64, 0usize, 0usize, 'u');
+            for j in 0..ny { for i in 0..=nx { let f = j * (nx + 1) + i; if s.u[f].abs() > best.0 { best = (s.u[f].abs(), i.min(nx - 1), j, 'u'); } } }
+            for j in 0..=ny { for i in 0..nx { let f = j * nx + i; if s.v[f].abs() > best.0 { best = (s.v[f].abs(), i, j.min(ny - 1), 'v'); } } }
+            let c = s.idx(best.1, best.2);
+            let air = idx(&s.reg, "air");
+            // dans l'eau (α > 0.5) : vitesse max, où, et la composition
+            let mut bw = (0.0f64, 0usize, 0usize);
+            for j in 0..ny { for i in 0..nx { let cc = s.idx(i, j); if s.alpha[eau][cc] > 0.5 {
+                let uc = 0.5 * (s.u[j * (nx + 1) + i] + s.u[j * (nx + 1) + i + 1]); let vc = 0.5 * (s.v[j * nx + i] + s.v[(j + 1) * nx + i]);
+                let sp = uc.hypot(vc); if sp > bw.0 { bw = (sp, i, j); } } } }
+            let cw = s.idx(bw.1, bw.2);
+            eprintln!("  eau : |u| max {:.3} m/s en ({}, {}) : eau {:.3} air {:.3} glace {:.4} ; T eau {:.2}", bw.0, bw.1, bw.2, s.alpha[eau][cw], s.alpha[air][cw], s.alpha[gl][cw], s.tg[s.group_of[eau]][cw]);
+            let ws = s.max_settling_speed();
+            eprintln!("  |{}| max {:.3} m/s en ({}, {}) : eau {:.3} air {:.3} glace {:.4} ; T eau {:.2} glace {:.2} ; p {:.0} Pa ; dérive max {:.3} m/s", best.3, best.0, best.1, best.2,
+                s.alpha[eau][c], s.alpha[air][c], s.alpha[gl][c], s.tg[s.group_of[eau]][c], s.tg[s.group_of[gl]][c], s.p[c], ws);
+        }
+        if s.time >= next {
+            next += every;
+            let n = s.nx * s.ny;
+            let (mut r_phi, mut r_ice, mut n_phi, mut n_ice) = (0.0f64, 0.0f64, 0, 0);
+            for c in 0..n {
+                let (x, y) = s.center(c % s.nx, c / s.nx);
+                let r = (x - xs).hypot(y - ys);
+                if s.fusion_front[0][c] >= 1.0 { r_phi = r_phi.max(r); n_phi += 1; }
+                if s.alpha[gl][c] >= FUSION_SEED_ALPHA && s.mass[eau][c] > 1e-6 { r_ice = r_ice.max(r); n_ice += 1; }
+            }
+            // étendue le long de la surface (rangée sous la surface) et vers le bas sous le germ
+            let js = ((ys / dx) as usize).min(s.ny) - 1;
+            let isx = s.nx / 2;
+            let left = (0..isx).rev().take_while(|&i| s.alpha[gl][s.idx(i, js)] >= FUSION_SEED_ALPHA).count();
+            let down = (0..js).rev().take_while(|&j| s.alpha[gl][s.idx(isx, j)] >= FUSION_SEED_ALPHA).count();
+            let mut tw = vec![];
+            for j in [js, js / 2, 1] { tw.push(format!("{:.2}", s.tg[s.group_of[eau]][s.idx(isx / 2, j)])); }
+            eprintln!("t {:.2} s ({} pas, {:.0} s, dt {dt:.2e}) : v t = {:.3} m ; front φ≥1 {:.3} m ({n_phi} mailles), glace ≥ 1 % {:.3} m ({n_ice}) ; surface ← {left} mailles, bas ↓ {down} ; gelé {:.2} % ; |u| max {:.3} m/s ; T eau à x/4 (surface, milieu, fond) {}",
+                s.time, s.step_count, t0.elapsed().as_secs_f64(), v * s.time, r_phi, r_ice, 100.0 * s.frozen[0] / mw0, s.max_speed(), tw.join(" "));
+        }
+    }
+}
+
+/// boîte fermée (4 × 4, 1 cm, sans gravité) avec trois paires de fusion : eau (fraction 0.3) à t_w, cire fondue (0.3) à t_c, lave
+/// (0.2) à t_l, air
+pub(crate) fn water_wax_lava_box(t_w: f64, t_c: f64, t_l: f64) -> MultiphaseSim {
+    use super::mp_materials::{CIRE_FONDUE, LAVE};
+    let lib = MaterialLibrary::default().with_ice().with_wax().with_lava();
+    let b = lib.build().expect("préréglages glace, cire et lave valides");
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let reg = b.registry;
+    assert_eq!(reg.fusions.len(), 3);
+    let (eau, cire, lave, air) = (idx(&reg, "eau"), idx(&reg, CIRE_FONDUE), idx(&reg, LAVE), idx(&reg, "air"));
+    let np = reg.phases.len();
+    let mut s = MultiphaseSim::new(4, 4, 0.01, reg, b.ambient);
+    s.gravity = [0.0, 0.0];
+    s.surface_tension = false;
+    let mut m = vec![0.0; np];
+    m[eau] = 0.3;
+    m[cire] = 0.3;
+    m[lave] = 0.2;
+    m[air] = 0.2;
+    s.paint_mixture(move |_, _| Some(m.clone()));
+    s.finalize_init(move |_, _| t_w);
+    let (gc, gl) = (s.group_of[cire], s.group_of[lave]);
+    for c in 0..16 {
+        s.set_group_temperature(c, gc, t_c);
+        s.set_group_temperature(c, gl, t_l);
+    }
+    s.refresh();
+    s
+}
+
+#[test]
+fn water_wax_and_lava_freeze_at_their_own_melting_points() {
+    // trois paires de fusion dans les mêmes cellules : l'eau à −5 °C gèle de c ΔT / L_f = 4186 × 5 / 333550 = 6.27 %, la cire fondue
+    // à 50 °C (8 K sous son point de fusion, 58 °C) fige de 2300 × 8 / 200000 = 9.2 %, la lave à 1050 °C (50 K sous 1100 °C) de
+    // 1400 × 50 / 400000 = 17.5 % ; chacune revient à SA température de fusion ; masse et énergie conservées
+    use super::mp_materials::{BASALTE, CIRE, CIRE_FONDUE, GLACE, LAVE};
+    let mut s = water_wax_lava_box(268.15, 323.15, 1323.15);
+    let pairs = [("eau", GLACE, 4186.0 * 5.0 / 333.55e3, 273.15), (CIRE_FONDUE, CIRE, 2300.0 * 8.0 / 200.0e3, 331.15), (LAVE, BASALTE, 1400.0 * 50.0 / 400.0e3, 1373.15)];
+    let c = s.idx(1, 1);
+    let m0: Vec<f64> = pairs.iter().map(|&(l, _, _, _)| s.mass[idx(&s.reg, l)][c]).collect();
+    let e0 = s.total_internal_energy();
+    s.fusion_step(1e-3);
+    for (q, &(l, sol, expect, tm)) in pairs.iter().enumerate() {
+        let (kl, ks) = (idx(&s.reg, l), idx(&s.reg, sol));
+        let f = s.mass[ks][c] / m0[q];
+        let t = s.tg[s.group_of[kl]][c];
+        eprintln!("{l} : {:.4} % figés (attendu {:.4} %), {t:.6} K (fusion à {tm} K)", 100.0 * f, 100.0 * expect);
+        assert!((f / expect - 1.0).abs() < 1e-9 && (t - tm).abs() < 1e-9, "{l} : {f} figés à {t} K");
+        assert!(s.frozen[q] > 0.0);
+    }
+    assert!(((s.total_internal_energy() - e0) / e0.abs()).abs() < 1e-12, "énergie");
+}
+
+#[test]
+fn viscous_lava_resting_in_air_stays_calm() {
+    // bloc de lave (50 Pa·s, 18 cm de haut) posé au fond d'une cuve d'air (40 × 30, mailles de 2 cm) : il s'affaisse (échelle
+    // visqueuse ρ g h² / 3μ ≈ 6 m/s : ~4 m/s mesurés). Sans plafonner la viscosité explicite par la masse volumique des faces et des
+    // nœuds, la viscosité de la lave, moyennée aux nœuds, s'appliquait à des faces d'air 600 fois plus légères : 50 à 120 m/s en
+    // quelques pas, pas de 1e-4 s
+    use super::mp_materials::LAVE;
+    let lib = MaterialLibrary::default().with_lava();
+    let b = lib.build().expect("préréglage lave valide");
+    let reg = b.registry;
+    let lave = idx(&reg, LAVE);
+    let mut s = MultiphaseSim::new(40, 30, 0.02, reg, b.ambient);
+    s.gravity = [0.0, -9.81];
+    let (lx, ly) = (0.8, 0.6);
+    s.paint_phase(move |x, y| if x > 0.3 * lx && x < 0.7 * lx && y < 0.3 * ly { Some(lave) } else { None });
+    s.finalize_init(|_, _| 293.15);
+    let gl = s.group_of[lave];
+    for c in 0..s.nx * s.ny {
+        if s.mass[lave][c] > 0.0 {
+            s.set_group_temperature(c, gl, 1473.15);
+        }
+    }
+    s.refresh();
+    let mut umax = 0.0f64;
+    while s.time < 0.3 && !s.diverged {
+        s.step();
+        umax = umax.max(s.max_speed());
+    }
+    eprintln!("lave dans l'air : {} pas, {} refaits, |u| max {umax:.3} m/s", s.step_count, s.rollbacks);
+    assert!(!s.diverged && s.state_is_sane());
+    assert!(umax < 10.0 && s.rollbacks == 0 && s.step_count < 1000, "|u| max {umax} m/s, {} pas refaits, {} pas", s.rollbacks, s.step_count);
+}
+

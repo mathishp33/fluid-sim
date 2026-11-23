@@ -68,7 +68,7 @@ struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
     q_u: Vec<f64>, q_v: Vec<f64>,
     eg: Vec<Vec<f64>>, tg: Vec<Vec<f64>>,
-    rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>, frozen: Vec<f64>,
+    rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>, frozen: Vec<f64>, fusion_front: Vec<Vec<f64>>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
     flame_factor: Vec<f64>, heat_release: Vec<f64>, chem_heat: f64, radiated: f64, reacted: Vec<f64>, dt_chem: f64,
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
@@ -81,7 +81,7 @@ impl MultiphaseSim {
         let n = self.nx * self.ny;
         let dx = self.dx;
         let umax = self.max_speed();
-        let mut dt = self.dt_max.min(self.dt_chem).min(self.dt_phase).min(self.burn_dt_bound());
+        let mut dt = self.dt_max.min(self.dt_chem).min(self.dt_phase).min(self.burn_dt_bound()).min(self.front_dt_bound());
         // chauffage au pinceau : au plus ~20 K par pas (dilatation thermique progressive des liquides, ébullition suivie pas à pas)
         let gap = self.heat_gap();
         if gap > 0.0 {
@@ -177,7 +177,7 @@ impl MultiphaseSim {
             eg: self.eg.clone(), tg: self.tg.clone(),
             u: self.u.clone(), v: self.v.clone(), rho_mix: self.rho_mix.clone(), mu_cell: self.mu_cell.clone(), k_cell: self.k_cell.clone(),
             q_u: self.q_u.clone(), q_v: self.q_v.clone(),
-            boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(), frozen: self.frozen.clone(),
+            boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(), frozen: self.frozen.clone(), fusion_front: self.fusion_front.clone(),
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
             flame_factor: self.flame_factor.clone(), heat_release: self.heat_release.clone(), chem_heat: self.chem_heat,
             radiated: self.radiated, reacted: self.reacted.clone(), dt_chem: self.dt_chem,
@@ -193,7 +193,7 @@ impl MultiphaseSim {
         self.p.clone_from(&s.p); self.u.clone_from(&s.u); self.v.clone_from(&s.v); self.rho_mix.clone_from(&s.rho_mix);
         self.q_u.clone_from(&s.q_u); self.q_v.clone_from(&s.q_v);
         self.mu_cell.clone_from(&s.mu_cell); self.k_cell.clone_from(&s.k_cell);
-        self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred); self.frozen.clone_from(&s.frozen);
+        self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred); self.frozen.clone_from(&s.frozen); self.fusion_front.clone_from(&s.fusion_front);
         self.energy_input = s.energy_input; self.tp_mix.clone_from(&s.tp_mix);
         self.flame_factor.clone_from(&s.flame_factor); self.heat_release.clone_from(&s.heat_release); self.chem_heat = s.chem_heat;
         self.radiated = s.radiated; self.reacted.clone_from(&s.reacted); self.dt_chem = s.dt_chem;
@@ -380,8 +380,8 @@ impl MultiphaseSim {
         // (son couplage χ entre dans la fermeture et la répartition du travail de pression)
         self.exchange_heat(dt);
         self.exchange_grains(dt);
-        // gel / fusion (eau ↔ glace) sur les températures de groupe après les échanges
-        self.fusion_step();
+        // gel / fusion (eau ↔ glace) sur les températures de groupe après les échanges ; front de dendrites de l'eau surfondue
+        self.fusion_step(dt);
         self.probe("échange entre groupes");
         lap(&mut prof, P_PHASE);
         // 5-6. pression

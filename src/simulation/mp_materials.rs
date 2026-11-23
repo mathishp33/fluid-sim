@@ -27,13 +27,44 @@ pub struct ChangeDef {
     pub p_ref: f64,
 }
 
-/// paire liquide ↔ solide granulaire (gel / fusion) définie par noms : température de fusion (K), chaleur latente (J/kg)
+/// paire liquide ↔ solide granulaire (gel / fusion) définie par noms : température de fusion (K), chaleur latente (J/kg) ; surfusion
+/// (voir `phases::Fusion`)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FusionDef {
     pub liquid: String,
     pub solid: String,
     pub t_melt: f64,
     pub l_fusion: f64,
+    /// surfusion maximale avant la germination spontanée (K) ; 0 : gèle dès T_f
+    #[serde(default)]
+    pub supercooling: f64,
+    /// vitesse du front de dendrites à 1 K de surfusion (m/s) et son exposant : v = a (ΔT / 1 K)^b
+    #[serde(default = "default_growth_a")]
+    pub growth_a: f64,
+    #[serde(default = "default_growth_b")]
+    pub growth_b: f64,
+}
+
+fn default_growth_a() -> f64 {
+    super::phases::ICE_GROWTH_A
+}
+fn default_growth_b() -> f64 {
+    super::phases::ICE_GROWTH_B
+}
+
+impl FusionDef {
+    /// paire sans surfusion (front de dendrites de la glace par défaut)
+    pub fn new(liquid: &str, solid: &str, t_melt: f64, l_fusion: f64) -> Self {
+        FusionDef {
+            liquid: liquid.into(),
+            solid: solid.into(),
+            t_melt,
+            l_fusion,
+            supercooling: 0.0,
+            growth_a: default_growth_a(),
+            growth_b: default_growth_b(),
+        }
+    }
 }
 
 /// Réaction par noms de fluides (voir `phases::Reaction` pour la loi de vitesse et les unités)
@@ -180,7 +211,9 @@ impl Roles {
         let powder = by_name(&["poudre noire", "poudre", "gunpowder", "black powder"], Some(PhaseKind::Granular)).or_else(|| {
             reg.reactions.iter().find(|r| r.burn().is_some()).and_then(|r| r.reactants.first().map(|&(k, _)| k))
         });
-        let ice = by_name(&["glace", "ice"], Some(PhaseKind::Granular)).or_else(|| reg.fusions.first().map(|f| f.solid));
+        let ice = by_name(&["glace", "ice"], Some(PhaseKind::Granular))
+            .or_else(|| reg.fusions.iter().find(|f| Some(f.liquid) == water).map(|f| f.solid))
+            .or_else(|| reg.fusions.first().map(|f| f.solid));
         Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal, powder, ice }
     }
 }
@@ -277,6 +310,10 @@ impl MaterialLibrary {
             if c.liquid == old { c.liquid = new.clone() }
             if c.vapor == old { c.vapor = new.clone() }
         }
+        for f in self.fusions.iter_mut() {
+            if f.liquid == old { f.liquid = new.clone() }
+            if f.solid == old { f.solid = new.clone() }
+        }
         for r in self.reactions.iter_mut() {
             for (n, _) in r.reactants.iter_mut().chain(r.products.iter_mut()).chain(r.modifiers.iter_mut()) {
                 if *n == old { *n = new.clone() }
@@ -298,11 +335,12 @@ impl MaterialLibrary {
         }
         self.solids[i].name = new.to_string();
     }
-    /// Supprime un fluide et tout ce qui le référence (miscibilité, changements de phase, réactions).
+    /// Supprime un fluide et tout ce qui le référence (miscibilité, changements de phase, paires de fusion, réactions).
     pub fn remove_fluid(&mut self, i: usize) {
         let old = self.fluids.remove(i).name;
         self.miscible.retain(|(a, b)| *a != old && *b != old);
         self.changes.retain(|c| c.liquid != old && c.vapor != old);
+        self.fusions.retain(|f| f.liquid != old && f.solid != old);
         self.reactions.retain(|r| !r.reactants.iter().chain(r.products.iter()).any(|(n, _)| *n == old));
         for r in self.reactions.iter_mut() {
             r.modifiers.retain(|(n, _)| *n != old);
@@ -405,8 +443,13 @@ impl MaterialLibrary {
                         warnings.push(format!("fusion « {} ↔ {} » ignorée : le liquide ou le solide est déjà utilisé par une autre paire", f.liquid, f.solid));
                     } else if !(f.t_melt > 0.0 && f.l_fusion > 0.0) {
                         warnings.push(format!("fusion « {} ↔ {} » ignorée : température et chaleur latente doivent être > 0", f.liquid, f.solid));
+                    } else if !(f.supercooling >= 0.0 && f.growth_a > 0.0 && f.growth_b >= 0.0) {
+                        warnings.push(format!("fusion « {} ↔ {} » ignorée : surfusion ≥ 0, vitesse du front > 0 et exposant ≥ 0 attendus", f.liquid, f.solid));
                     } else {
-                        reg.add_fusion(l, s, f.t_melt, f.l_fusion);
+                        let fu = reg.add_fusion(l, s, f.t_melt, f.l_fusion);
+                        fu.supercooling = f.supercooling;
+                        fu.growth_a = f.growth_a;
+                        fu.growth_b = f.growth_b;
                     }
                 }
                 _ => warnings.push(format!("fusion « {} ↔ {} » ignorée : fluide inexistant", f.liquid, f.solid)),
@@ -495,6 +538,12 @@ pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C 
 pub const HOUILLE: &str = "houille";
 pub const RX_HOUILLE: &str = "pyrolyse de la houille (houille → charbon + CH4, CO, CO2, H2O, H2)";
 pub const GLACE: &str = "glace";
+pub const CIRE: &str = "cire";
+pub const CIRE_FONDUE: &str = "cire fondue";
+pub const LAVE: &str = "lave";
+pub const BASALTE: &str = "basalte";
+/// surfusion maximale d'une eau très pure dans un récipient lisse (K) : préréglage `with_supercooled_water`
+pub const SUPERCOOLING_PURE_WATER: f64 = 20.0;
 pub const POUDRE: &str = "poudre noire";
 pub const FUMEE: &str = "fumée de poudre";
 pub const RX_POUDRE: &str = "combustion de la poudre noire (→ CO2, CO, N2, H2O, H2, fumée)";
@@ -835,7 +884,52 @@ impl MaterialLibrary {
             l.fluids.push(Phase::ice());
         }
         if !l.fusions.iter().any(|f| f.solid == GLACE) {
-            l.fusions.push(FusionDef { liquid: "eau".into(), solid: GLACE.into(), t_melt: 273.15, l_fusion: 333.55e3 });
+            l.fusions.push(FusionDef::new("eau", GLACE, 273.15, 333.55e3));
+        }
+        l
+    }
+
+    /// Cire de paraffine fondue et en paillettes, et sa paire de fusion : elle fige à 58 °C, L_f = 200 kJ/kg
+    pub fn with_wax(&self) -> MaterialLibrary {
+        let mut l = self.clone();
+        if l.fluid_index(CIRE_FONDUE).is_none() {
+            l.fluids.push(Phase::liquid_wax());
+        }
+        if l.fluid_index(CIRE).is_none() {
+            l.fluids.push(Phase::wax());
+        }
+        if !l.fusions.iter().any(|f| f.solid == CIRE) {
+            l.fusions.push(FusionDef::new(CIRE_FONDUE, CIRE, 331.15, 200.0e3));
+        }
+        l
+    }
+
+    /// Lave basaltique, basalte en grains (sable noir) et leur paire de fusion — solidification à 1100 °C, entre le liquidus (~1200 °C)
+    /// et le solidus (~1000 °C) d'un basalte, L_f = 400 kJ/kg —, roche volcanique (solide)
+    pub fn with_lava(&self) -> MaterialLibrary {
+        let mut l = self.clone();
+        if l.fluid_index(LAVE).is_none() {
+            l.fluids.push(Phase::lava());
+        }
+        if l.fluid_index(BASALTE).is_none() {
+            l.fluids.push(Phase::basalt());
+        }
+        if !l.fusions.iter().any(|f| f.solid == BASALTE) {
+            l.fusions.push(FusionDef::new(LAVE, BASALTE, 1373.15, 400.0e3));
+        }
+        if l.solid_index("roche").is_none() {
+            l.solids.push(Solid::rock());
+        }
+        l
+    }
+
+    /// Comme `with_ice`, avec une eau très pure qui se surfond : germination spontanée seulement sous −20 °C
+    /// (`SUPERCOOLING_PURE_WATER` ; l'eau du robinet gèle vers −5 °C, de fines gouttelettes pures vers −38 °C) ; au-dessus, il faut un germe
+    /// de glace (des cristaux, ou le front de dendrites venu d'une voisine)
+    pub fn with_supercooled_water(&self) -> MaterialLibrary {
+        let mut l = self.with_ice();
+        for f in l.fusions.iter_mut().filter(|f| f.solid == GLACE) {
+            f.supercooling = f.supercooling.max(SUPERCOOLING_PURE_WATER);
         }
         l
     }
