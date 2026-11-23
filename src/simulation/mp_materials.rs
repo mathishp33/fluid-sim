@@ -27,6 +27,15 @@ pub struct ChangeDef {
     pub p_ref: f64,
 }
 
+/// paire liquide ↔ solide granulaire (gel / fusion) définie par noms : température de fusion (K), chaleur latente (J/kg)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FusionDef {
+    pub liquid: String,
+    pub solid: String,
+    pub t_melt: f64,
+    pub l_fusion: f64,
+}
+
 /// Réaction par noms de fluides (voir `phases::Reaction` pour la loi de vitesse et les unités)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReactionDef {
@@ -77,6 +86,8 @@ pub struct MaterialLibrary {
     /// paires de fluides miscibles (par nom)
     pub miscible: Vec<(String, String)>,
     pub changes: Vec<ChangeDef>,
+    /// paires de fusion liquide ↔ solide granulaire (eau ↔ glace)
+    pub fusions: Vec<FusionDef>,
     pub reactions: Vec<ReactionDef>,
     /// mélanges nommés (air sec, prémélanges…) : pinceaux et fluide ambiant possible
     pub mixtures: Vec<MixtureDef>,
@@ -91,6 +102,7 @@ impl Default for MaterialLibrary {
             solids: vec![Solid::steel(), Solid::glass()],
             miscible: vec![],
             changes: vec![ChangeDef { liquid: "eau".into(), vapor: "vapeur".into(), l_ref: 2.257e6, t_ref: 373.15, p_ref: 101325.0 }],
+            fusions: vec![],
             reactions: vec![],
             mixtures: vec![],
             ambient: "air".into(),
@@ -129,6 +141,8 @@ pub struct Roles {
     pub charcoal: Option<usize>,
     /// phase granulaire qui brûle sans air (réactif d'une combustion de poudre : poudre noire)
     pub powder: Option<usize>,
+    /// solide granulaire d'une paire de fusion (glace)
+    pub ice: Option<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -166,7 +180,8 @@ impl Roles {
         let powder = by_name(&["poudre noire", "poudre", "gunpowder", "black powder"], Some(PhaseKind::Granular)).or_else(|| {
             reg.reactions.iter().find(|r| r.burn().is_some()).and_then(|r| r.reactants.first().map(|&(k, _)| k))
         });
-        Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal, powder }
+        let ice = by_name(&["glace", "ice"], Some(PhaseKind::Granular)).or_else(|| reg.fusions.first().map(|f| f.solid));
+        Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal, powder, ice }
     }
 }
 
@@ -381,6 +396,22 @@ impl MaterialLibrary {
                 _ => warnings.push(format!("changement de phase « {} → {} » ignoré : fluide inexistant", c.liquid, c.vapor)),
             }
         }
+        for f in &self.fusions {
+            match (idx(&f.liquid), idx(&f.solid)) {
+                (Some(l), Some(s)) => {
+                    if reg.phases[l].kind != PhaseKind::Liquid || reg.phases[s].kind != PhaseKind::Granular {
+                        warnings.push(format!("fusion « {} ↔ {} » ignorée : il faut un liquide et une phase granulaire", f.liquid, f.solid));
+                    } else if reg.fusions.iter().any(|q| q.liquid == l || q.solid == s) {
+                        warnings.push(format!("fusion « {} ↔ {} » ignorée : le liquide ou le solide est déjà utilisé par une autre paire", f.liquid, f.solid));
+                    } else if !(f.t_melt > 0.0 && f.l_fusion > 0.0) {
+                        warnings.push(format!("fusion « {} ↔ {} » ignorée : température et chaleur latente doivent être > 0", f.liquid, f.solid));
+                    } else {
+                        reg.add_fusion(l, s, f.t_melt, f.l_fusion);
+                    }
+                }
+                _ => warnings.push(format!("fusion « {} ↔ {} » ignorée : fluide inexistant", f.liquid, f.solid)),
+            }
+        }
         for (a, b) in &self.miscible {
             match (idx(a), idx(b)) {
                 (Some(x), Some(y)) if x != y => reg.set_miscible(x, y, true),
@@ -463,6 +494,7 @@ pub const RX_CHARCOAL: &str = "combustion du charbon de bois (C + O2 → CO2, su
 pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C + CO2 → 2 CO)";
 pub const HOUILLE: &str = "houille";
 pub const RX_HOUILLE: &str = "pyrolyse de la houille (houille → charbon + CH4, CO, CO2, H2O, H2)";
+pub const GLACE: &str = "glace";
 pub const POUDRE: &str = "poudre noire";
 pub const FUMEE: &str = "fumée de poudre";
 pub const RX_POUDRE: &str = "combustion de la poudre noire (→ CO2, CO, N2, H2O, H2, fumée)";
@@ -793,7 +825,22 @@ impl MaterialLibrary {
         l
     }
 
-    /// Préréglage combustion + poudre noire (phase granulaire qui brûle sans air), sa fumée et sa combustion (scénario « traînée de
+    /// Glace (cristaux, phase granulaire) et gel / fusion de l'eau : T_f = 273.15 K, L_f = 333.6 kJ/kg (eau ajoutée si absente)
+    pub fn with_ice(&self) -> MaterialLibrary {
+        let mut l = self.clone();
+        if l.fluid_index("eau").is_none() {
+            l.fluids.push(Phase::water());
+        }
+        if l.fluid_index(GLACE).is_none() {
+            l.fluids.push(Phase::ice());
+        }
+        if !l.fusions.iter().any(|f| f.solid == GLACE) {
+            l.fusions.push(FusionDef { liquid: "eau".into(), solid: GLACE.into(), t_melt: 273.15, l_fusion: 333.55e3 });
+        }
+        l
+    }
+
+    /// Préréglage combustion + poudre noire (phase granulaire qui brûle sans air), sa fumée et sa combustion (scénario « tas de
     /// poudre »)
     pub fn with_gunpowder(&self) -> MaterialLibrary {
         let mut l = self.with_combustion();

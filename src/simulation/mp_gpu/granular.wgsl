@@ -217,3 +217,54 @@ fn k_exch_grains(@builtin(global_invocation_id) g: vec3<u32>) {
     }
     cell_sync(c);
 }
+
+// ===== gel / fusion (miroir de MultiphaseSim::fusion_step) : méthode enthalpique à la température des groupes =====
+// liquide sous T_f : gèle juste assez pour que sa chaleur latente le ramène à T_f (glace née à T_f) ; solide au-dessus : fond juste assez
+// pour revenir à T_f ; tout gèle / fond si la chaleur latente n'y suffit pas (le reste d'énergie du groupe vidé passe à l'autre).
+// Énergies relatives à P.t0 : ε_g = E_g − Σ m h0
+fn fuq(q: u32, k: u32) -> f32 { return T[T_FU + q * FU_STRIDE + k]; }
+@compute @workgroup_size(64)
+fn k_fusion(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n) { return; }
+    let live = !is_solid(c) && !pinned(c);
+    var touched = false;
+    for (var q = 0u; q < NFU; q++) {
+        let l = u32(fuq(q, 0u)); let s = u32(fuq(q, 1u)); let tm = fuq(q, 2u);
+        let gl = group_k(l); let gs = group_k(s);
+        let el_m = eabs_k(l, tm); let es_m = eabs_k(s, tm);
+        let lf = max(el_m - es_m, 1.0);
+        // gel : chaleur qui ramènerait le groupe du liquide à T_f (énergie relative du groupe à T_f, masses courantes)
+        var ef = 0.0;
+        for (var k = 0u; k < P.np; k++) { ef += select(0.0, max(mass(k, c), 0.0) * erel_k(k, tm), group_k(k) == gl); }
+        let ml = mass(l, c);
+        let frz = live && ml > 1e-12 && tgrp(gl, c) < tm;
+        let d1 = select(0.0, clamp((ef - S[O_epsg + gl * n + c]) / lf, 0.0, ml), frz);
+        S[O_mass + l * n + c] -= d1;
+        S[O_mass + s * n + c] += d1;
+        S[O_epsg + gl * n + c] -= d1 * (es_m - h0_k(l));
+        S[O_epsg + gs * n + c] += d1 * (es_m - h0_k(s));
+        // fusion (groupe granulaire : cette seule phase ; glace née ci-dessus comprise)
+        let ms = mass(s, c);
+        let mlt = live && ms > 1e-12 && tgrp(gs, c) > tm;
+        let d2 = select(0.0, clamp((S[O_epsg + gs * n + c] - ms * (es_m - h0_k(s))) / lf, 0.0, ms), mlt);
+        S[O_mass + s * n + c] -= d2;
+        S[O_mass + l * n + c] += d2;
+        S[O_epsg + gs * n + c] -= d2 * (el_m - h0_k(s));
+        S[O_epsg + gl * n + c] += d2 * (el_m - h0_k(l));
+        let dm = d1 - d2;
+        let act = d1 != 0.0 || d2 != 0.0;
+        // groupe vidé : le reste de son énergie (la chaleur qui n'a pas suffi à tout geler / fondre) passe à l'autre
+        var mgl = 0.0;
+        for (var k = 0u; k < P.np; k++) { mgl += select(0.0, max(mass(k, c), 0.0), group_k(k) == gl); }
+        let empty_l = act && mgl <= 0.0;
+        let empty_s = act && !empty_l && mass(s, c) <= 0.0;
+        let eps_l = S[O_epsg + gl * n + c];
+        let eps_s = S[O_epsg + gs * n + c];
+        S[O_epsg + gs * n + c] = select(select(eps_s, 0.0, empty_s), eps_s + eps_l, empty_l);
+        S[O_epsg + gl * n + c] = select(select(eps_l, eps_l + eps_s, empty_s), 0.0, empty_l);
+        S[O_acc_fu + q * n + c] += dm * P.dx * P.dx;
+        touched = touched || act;
+    }
+    if (touched) { cell_sync(c); }
+}

@@ -491,6 +491,25 @@ impl Phase {
         p.friction_angle = 35.0;
         p
     }
+    /// Glace en cristaux (phase granulaire) : 917 kg/m³ à 0 °C, elle flotte sur l'eau (la dérive la fait remonter) ; c_p 2.11 kJ/(kg·K) à
+    /// 0 °C, croissant de 6.8 J/(kg·K²) (1.97 à −20 °C), k = 2.22 W/(m·K), dilatation volumique 1.5e-4 /K, module ~9 GPa ; cristaux de 2 mm
+    /// (frasil), angle de talus 30°. Gel et fusion avec l'eau : `mp_materials::with_ice` (T_f = 273.15 K, L_f = 333.6 kJ/kg)
+    pub fn ice() -> Phase {
+        let mut p = Phase::sand();
+        p.name = "glace".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 1.3e9, n: 7.0, thermal: Thermal::Beta { rho0: 917.0, t0: 273.15, beta: 1.5e-4 } };
+        p.cp = 2280.0;
+        p.cp_slope = 6.8;
+        p.conductivity = 2.22;
+        p.color = [0.82, 0.92, 1.0];
+        p.molar_mass = 0.018015;
+        p.h_formation = -291.83e3;
+        p.s_standard = 41.0;
+        p.grain_diameter = 2.0e-3;
+        p.alpha_max = 0.6;
+        p.friction_angle = 30.0;
+        p
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {
@@ -551,6 +570,18 @@ impl Solid {
 }
 
 /// Paire liquide ↔ vapeur (ébullition, condensation, cavitation)
+/// Paire liquide ↔ phase granulaire (gel / fusion : eau ↔ glace) : température de fusion et chaleur latente. L'énergie de référence du
+/// solide est fixée pour que e_l(T_f) − e_s(T_f) = L_f (`Registry::add_fusion`) ; opérateur `MultiphaseSim::fusion_step`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fusion {
+    pub liquid: usize,
+    pub solid: usize,
+    /// température de fusion (K)
+    pub t_melt: f64,
+    /// chaleur latente de fusion à t_melt (J/kg)
+    pub l_fusion: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhaseChange {
     pub liquid: usize,
@@ -783,6 +814,9 @@ pub struct Registry {
     pub miscible: Vec<(usize, usize)>,
     /// réactions chimiques (cinétique : `mp_species::react_step`)
     pub reactions: Vec<Reaction>,
+    /// paires de fusion liquide ↔ solide granulaire (gel de l'eau en glace : `MultiphaseSim::fusion_step`)
+    #[serde(default)]
+    pub fusions: Vec<Fusion>,
 }
 
 impl Registry {
@@ -823,6 +857,15 @@ impl Registry {
             v.e0 = h_l + l_ref - v.h_mass(t_ref);
         }
         self.changes.push(PhaseChange { liquid, vapor, l_ref, t_ref, p_ref, r_v, dcp });
+    }
+    /// Paire de fusion liquide ↔ solide granulaire : l'énergie de référence du SOLIDE est fixée pour que e_l(T_f) − e_s(T_f) = L_f (le liquide
+    /// garde la sienne : vapeur, thermochimie). Appelé après les changements liquide ↔ vapeur.
+    pub fn add_fusion(&mut self, liquid: usize, solid: usize, t_melt: f64, l_fusion: f64) {
+        let el = self.phases[liquid].e_int(t_melt);
+        let s = &mut self.phases[solid];
+        s.e0 = 0.0;
+        s.e0 = el - l_fusion - s.e_int(t_melt);
+        self.fusions.push(Fusion { liquid, solid, t_melt, l_fusion });
     }
     /// Références d'énergie chimique : e0 = Δh_f°/M − cp·298.15  ⇒  h(298.15 K) = Δh_f°/M pour chaque fluide (gaz : h = e + rT ;
     /// liquide : h ≈ e). Appelé quand des réactions sont définies, AVANT les changements de phase.

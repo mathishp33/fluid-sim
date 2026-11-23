@@ -109,6 +109,8 @@ const F_PERC: u32 = 16384;
 const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
 const PC_STRIDE: usize = 8;
+/// paire de fusion : liquide, solide granulaire, température de fusion, chaleur latente
+const FU_STRIDE: usize = 4;
 const LEV_STRIDE: usize = 8;
 const RX_STRIDE: usize = 56;
 
@@ -203,6 +205,7 @@ struct Baselines {
     chem_heat: f64,
     radiated: f64,
     reacted: Vec<f64>,
+    frozen: Vec<f64>,
 }
 
 pub struct MultiphaseGpu {
@@ -235,6 +238,7 @@ pub struct MultiphaseGpu {
     ng: usize,
     npc: usize,
     nre: usize,
+    nfus: usize,
     levels: Vec<(usize, usize)>,
     mg_tail: usize,
     slot_base: Vec<usize>,
@@ -289,6 +293,7 @@ impl MultiphaseGpu {
         let ng = groups.len();
         let npc = sim.reg.changes.len();
         let nre = sim.reg.reactions.len();
+        let nfus = sim.reg.fusions.len();
         let npmax = np.max(1);
         // hiérarchie multigrille (mêmes règles que mp_mg::Multigrid::new)
         let mut levels = vec![(nx, ny)];
@@ -340,6 +345,7 @@ impl MultiphaseGpu {
         sl.add("acc_rad", n);
         sl.add("acc_chem", n);
         sl.add("acc_xi", nre.max(1) * n);
+        sl.add("acc_fu", nfus.max(1) * n);
         let pers_end = sl.total;
         // prédicteur-correcteur : u^{n+1} prédit, instantané de l'état persistant et de D
         sl.add("Up", nfu);
@@ -432,6 +438,7 @@ impl MultiphaseGpu {
         tl.add("RX", nre.max(1) * RX_STRIDE);
         tl.add("KC", nrev.max(1) * KC_N);
         tl.add("TP", n.max(1) * 2); // paires (source, groupe) : toutes les sources possibles
+        tl.add("FU", nfus.max(1) * FU_STRIDE);
 
         // ---------------------------------------------------------------- source WGSL
         let mut header = String::from("// ---- constantes générées par gpu_multiphase.rs ----\n");
@@ -449,6 +456,7 @@ impl MultiphaseGpu {
             nre.max(1),
             1 + npmax
         );
+        header += &format!("const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\n");
         let mut source = format!("{header}{}", SHADERS.join("\n"));
         // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
         if let Ok(patch) = std::env::var("MP_WGSL_PATCH") {
@@ -619,6 +627,7 @@ impl MultiphaseGpu {
             ng,
             npc,
             nre,
+            nfus,
             levels,
             mg_tail,
             slot_base,
@@ -762,6 +771,12 @@ impl MultiphaseGpu {
         for (q, pc) in sim.reg.changes.iter().enumerate() {
             let b = self.tl.o("PC") + q * PC_STRIDE;
             for (i, v) in [pc.liquid as f64, pc.vapor as f64, pc.l_ref, pc.t_ref, pc.p_ref, pc.r_v, pc.dcp, h0[pc.vapor] - h0[pc.liquid]].iter().enumerate() {
+                t[b + i] = *v as f32;
+            }
+        }
+        for (q, fu) in sim.reg.fusions.iter().enumerate() {
+            let b = self.tl.o("FU") + q * FU_STRIDE;
+            for (i, v) in [fu.liquid as f64, fu.solid as f64, fu.t_melt, fu.l_fusion].iter().enumerate() {
                 t[b + i] = *v as f32;
             }
         }
@@ -1065,6 +1080,7 @@ impl MultiphaseGpu {
             chem_heat: sim.chem_heat,
             radiated: sim.radiated,
             reacted: sim.reacted.clone(),
+            frozen: sim.frozen.clone(),
         };
         self.host_stale = false;
     }
@@ -1181,6 +1197,13 @@ impl MultiphaseGpu {
         for j in 0..self.nre {
             self.base.reacted[j] += sum("acc_xi", j);
         }
+        if self.base.frozen.len() != self.nfus {
+            self.base.frozen = vec![0.0; self.nfus];
+        }
+        for q in 0..self.nfus {
+            self.base.frozen[q] += sum("acc_fu", q);
+        }
+        sim.frozen.clone_from(&self.base.frozen);
         sim.boundary_flux.clone_from(&self.base.boundary_flux);
         sim.transferred.clone_from(&self.base.transferred);
         sim.energy_input = self.base.energy_input;
@@ -1544,6 +1567,10 @@ impl MultiphaseGpu {
             if sim.has_granular() {
                 v.push(cell("k_exch_grains"));
             }
+        }
+        // gel / fusion (eau ↔ glace) sur les températures de groupe après les échanges (miroir de fusion_step)
+        if sim.phase_change && self.nfus > 0 {
+            v.push(cell("k_fusion"));
         }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));

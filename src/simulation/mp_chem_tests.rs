@@ -4,7 +4,7 @@
 use super::mp_materials::{MaterialLibrary, AIR_SEC, CH4, CO, CO2, H2, H2O_G, MIX_CH4_AIR, MIX_H2_AIR, N2, O2, RX_CH4, RX_CO, RX_H2};
 use super::mp_view::{build_scenario_with, MpScenario};
 use super::multiphase::{Bc, MultiphaseSim};
-use super::phases::{Registry, R_GAS};
+use super::phases::{Phase, Registry, R_GAS};
 
 fn combustion_registry() -> (Registry, MaterialLibrary) {
     let lib = MaterialLibrary::default().with_combustion();
@@ -1094,4 +1094,214 @@ fn gunpowder_first_bad_step_probe() {
             eprintln!("  maille ({}, {}) : {} — p {:.4e}, masses {}", c % s.nx, c / s.nx, why.join(", "), s.p[c], m.join(" "));
         }
     }
+}
+
+// ===================================================================================================== gel / fusion (eau ↔ glace)
+
+/// boîte fermée (4 × 4, 1 cm, sans gravité) : eau (fraction aw) à t_w, glace (fraction ai) à t_i, le reste en air à t_w
+pub(crate) fn ice_water_box(aw: f64, t_w: f64, ai: f64, t_i: f64) -> MultiphaseSim {
+    let lib = MaterialLibrary::default().with_ice();
+    let b = lib.build().expect("préréglage glace valide");
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let reg = b.registry;
+    let (eau, glace, air) = (idx(&reg, "eau"), idx(&reg, super::mp_materials::GLACE), idx(&reg, "air"));
+    let np = reg.phases.len();
+    let mut s = MultiphaseSim::new(4, 4, 0.01, reg, b.ambient);
+    s.gravity = [0.0, 0.0];
+    s.surface_tension = false;
+    let mut m = vec![0.0; np];
+    m[eau] = aw;
+    m[glace] = ai;
+    m[air] = 1.0 - aw - ai;
+    s.paint_mixture(move |_, _| Some(m.clone()));
+    s.finalize_init(move |_, _| t_w);
+    if ai > 0.0 {
+        let gi = s.group_of[glace];
+        for c in 0..16 {
+            s.set_group_temperature(c, gi, t_i);
+        }
+    }
+    s.refresh();
+    s
+}
+
+/// Colonne de gel sans gravité (40 × 2 mailles de 0.25 mm) : paroi d'acier à t_wall à gauche, eau à 0 °C, poche d'air au bout (elle
+/// absorbe la dilatation de l'eau qui gèle)
+pub(crate) fn freezing_column(t_wall: f64) -> MultiphaseSim {
+    use super::mp_cells::MpThermal;
+    let lib = MaterialLibrary::default().with_ice();
+    let b = lib.build().expect("préréglage glace valide");
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let reg = b.registry;
+    let (eau, air) = (idx(&reg, "eau"), idx(&reg, "air"));
+    let steel = reg.solids.iter().position(|so| so.name == "acier").expect("acier");
+    let np = reg.phases.len();
+    let (nx, ny, dx) = (40, 2, 2.5e-4);
+    let mut s = MultiphaseSim::new(nx, ny, dx, reg, b.ambient);
+    s.gravity = [0.0, 0.0];
+    // (sans tension de surface : à 0.25 mm de maille, l'interface eau–air imposerait un pas capillaire de 2e-4 s)
+    s.surface_tension = false;
+    s.dt_max = 0.02;
+    let lx = nx as f64 * dx;
+    let mut w = vec![0.0; np];
+    w[eau] = 1.0;
+    let mut a = vec![0.0; np];
+    a[air] = 1.0;
+    s.paint_mixture(move |x, _| Some(if x < 0.85 * lx { w.clone() } else { a.clone() }));
+    s.paint_solid(move |x, _| if x < dx { Some(steel) } else { None });
+    s.finalize_init(|_, _| 273.15);
+    for c in 0..nx * ny {
+        if s.is_solid(c) {
+            s.set_thermal_cell(c, MpThermal::Isothermal(t_wall));
+        }
+    }
+    s.refresh();
+    s
+}
+
+#[test]
+fn undercooled_water_freezes_and_warm_ice_melts_back_to_the_melting_point() {
+    // méthode enthalpique : l'eau à −10 °C gèle juste assez pour que sa chaleur latente la ramène à 0 °C (c ΔT / L_f = 12.55 %), la
+    // glace à +10 °C fond juste assez pour revenir à 0 °C ; à −93 °C, la chaleur latente ne suffit pas (c ΔT > L_f dès −80 °C) : tout
+    // gèle, et la glace reste sous 0 °C ; masse et énergie exactement conservées
+    use super::mp_materials::GLACE;
+    let lf = 333.55e3;
+    let probe = |aw: f64, t_w: f64, ai: f64, t_i: f64| {
+        let mut s = ice_water_box(aw, t_w, ai, t_i);
+        let (eau, glace) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+        let c = s.idx(1, 1);
+        let (mw0, mi0, e0) = (s.mass[eau][c], s.mass[glace][c], s.total_internal_energy());
+        s.fusion_step();
+        let (gw, gi) = (s.group_of[eau], s.group_of[glace]);
+        let (tw, ti) = (s.tg[gw][c], s.tg[gi][c]);
+        assert!(((s.total_internal_energy() - e0) / e0.abs().max(1.0)).abs() < 1e-12, "énergie");
+        assert!((s.mass[eau][c] + s.mass[glace][c] - mw0 - mi0).abs() < 1e-9 * (mw0 + mi0), "masse");
+        (mw0, mi0, s.mass[eau][c], s.mass[glace][c], tw, ti, s.frozen[0])
+    };
+    let (mw0, _, _, mi, tw, ti, frozen) = probe(0.9, 263.15, 0.0, 263.15);
+    let frac = mi / mw0;
+    eprintln!("eau à −10 °C : {:.4} % gelée (c ΔT / L_f = {:.4} %), eau à {tw:.6} K, glace à {ti:.6} K", 100.0 * frac, 100.0 * 4186.0 * 10.0 / lf);
+    assert!((frac / (4186.0 * 10.0 / lf) - 1.0).abs() < 1e-9 && (tw - 273.15).abs() < 1e-9 && (ti - 273.15).abs() < 1e-9);
+    assert!(frozen > 0.0);
+    let (_, mi0, _, mi, tw, ti, frozen) = probe(0.5, 273.15, 0.4, 283.15);
+    let ice = Phase::ice();
+    let expect = (ice.e_int(283.15) - ice.e_int(273.15)) / lf;
+    let melted = (mi0 - mi) / mi0;
+    eprintln!("glace à +10 °C : {:.4} % fondue (attendu {:.4} %), glace à {ti:.6} K, eau à {tw:.6} K", 100.0 * melted, 100.0 * expect);
+    assert!((melted / expect - 1.0).abs() < 1e-9 && (ti - 273.15).abs() < 1e-9 && frozen < 0.0);
+    let (mw0, _, mw, mi, _, ti, _) = probe(0.9, 180.0, 0.0, 180.0);
+    eprintln!("eau à −93 °C : tout gèle ({:.3e} kg/m³ d'eau restante), glace à {ti:.2} K", mw);
+    assert!(mw == 0.0 && (mi - mw0).abs() < 1e-9 * mw0 && ti < 273.15 && ti > 180.0, "glace à {ti} K, eau restante {mw}");
+    // sans changement de phase (case décochée) : rien ne gèle
+    let mut s = ice_water_box(0.9, 263.15, 0.0, 263.15);
+    s.phase_change = false;
+    s.fusion_step();
+    assert!(s.total_mass(idx(&s.reg, GLACE)) == 0.0);
+}
+
+/// fonction d'erreur (Abramowitz & Stegun 7.1.26, erreur < 1.5e-7)
+fn erf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
+    if x >= 0.0 { y } else { -y }
+}
+
+#[test]
+fn ice_grows_on_a_cold_wall_like_the_stefan_solution() {
+    // eau à 0 °C contre une paroi à −10 °C (sans gravité) : la glace s'épaissit en h = 2 λ √(α_s t) — problème de Stefan à une phase
+    // (liquide à la température de fusion), λ e^{λ²} erf λ = St / √π, St = c_s ΔT / L_f = 0.063 → λ = 0.177 : 3 mm en 60 s
+    use super::mp_materials::GLACE;
+    let mut s = freezing_column(263.15);
+    let gl = idx(&s.reg, GLACE);
+    let ph = s.reg.phases[gl].clone();
+    let (k, rho, cs) = (ph.conductivity, ph.rho(101325.0, 268.15), ph.cp_at(268.15));
+    let st = cs * 10.0 / 333.55e3;
+    let f = |l: f64| l * (l * l).exp() * erf(l) - st / std::f64::consts::PI.sqrt();
+    let (mut a, mut b) = (1e-6, 2.0);
+    for _ in 0..80 {
+        let m = 0.5 * (a + b);
+        if f(m) < 0.0 { a = m } else { b = m }
+    }
+    let lam = 0.5 * (a + b);
+    let alpha = k / (rho * cs);
+    let width = s.ny as f64 * s.dx;
+    let t0 = std::time::Instant::now();
+    let mut out = vec![];
+    for t_mark in [30.0, 60.0, 120.0] {
+        while s.time < t_mark && !s.diverged {
+            s.step();
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        // épaisseur équivalente de glace compacte
+        let h = s.total_mass(gl) / (rho * width);
+        out.push((s.time, h, 2.0 * lam * (alpha * s.time).sqrt()));
+    }
+    eprintln!("Stefan : St = {st:.4}, λ = {lam:.4} ; {} pas en {:.1} s ; {}", s.step_count, t0.elapsed().as_secs_f64(),
+        out.iter().map(|(t, h, he)| format!("t {t:.0} s : glace {:.3} mm (Stefan {:.3} mm)", 1e3 * h, 1e3 * he)).collect::<Vec<_>>().join(" ; "));
+    // la croissance entre 30 et 120 s suit Stefan ; l'épaisseur garde le retard d'environ une maille pris au départ (méthode enthalpique,
+    // erreur en dx sur la position du front)
+    let ((_, h1, e1), (_, h3, e3)) = (out[0], out[2]);
+    assert!(((h3 - h1) / (e3 - e1) - 1.0).abs() < 0.03, "croissance {} m contre {} m (Stefan)", h3 - h1, e3 - e1);
+    for (t, h, he) in out {
+        assert!((he - h).abs() < 1.5 * s.dx, "à {t} s : {h} m de glace contre {he} m (Stefan)");
+    }
+}
+
+#[test]
+fn crushed_ice_rises_and_melts_in_warm_water() {
+    // nuage de glace pilée (−10 °C) au fond d'une eau à 27 °C (40 × 30, 0.8 m × 0.6 m) : les cristaux remontent vers la surface et
+    // fondent (la moitié en ~5 s) ; cuve fermée : masse et énergie conservées, la masse fondue du bilan est celle de la glace disparue
+    use super::mp_materials::GLACE;
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::IceMelting, 40, 30, 0.02, 9.81).unwrap();
+    let gl = idx(&s.reg, GLACE);
+    let n = s.nx * s.ny;
+    let y_ice = |s: &MultiphaseSim| {
+        let m: f64 = (0..n).map(|c| s.mass[gl][c]).sum::<f64>().max(1e-300);
+        (0..n).map(|c| s.mass[gl][c] * ((c / s.nx) as f64 + 0.5) * s.dx).sum::<f64>() / m
+    };
+    let (mi0, m0, u0, y0) = (s.total_mass(gl), s.total_mass_all(), s.total_internal_energy() + s.kinetic_energy(), y_ice(&s));
+    while s.time < 5.0 && !s.diverged {
+        s.step();
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let (mi, y1) = (s.total_mass(gl), y_ice(&s));
+    eprintln!("glace pilée : {} pas ; {:.1} % fondue en 5 s (bilan {:.4} kg/m, disparue {:.4}) ; centre de la glace y = {y0:.3} → {y1:.3} m ; énergie {:+.2e}",
+        s.step_count, 100.0 * (1.0 - mi / mi0), -s.frozen[0], mi0 - mi, (s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0);
+    assert!(mi < 0.7 * mi0, "la glace ne fond pas : {mi} sur {mi0}");
+    assert!(y1 > y0 + 0.15, "la glace ne remonte pas : {y0} → {y1}");
+    assert!((-s.frozen[0] / (mi0 - mi) - 1.0).abs() < 1e-9, "bilan de fusion");
+    assert!((s.total_mass_all() / m0 - 1.0).abs() < 1e-9, "masse");
+    assert!(((s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0).abs() < 1e-7, "énergie");
+}
+
+/// diagnostic : glace pilée dans l'eau tiède (MP_ICE_NX mailles de large, défaut 40, 0.8 m × 0.6 m ; MP_ICE_T s, défaut 10 ; une ligne
+/// toutes les MP_ICE_DT s, défaut 1)
+#[test]
+#[ignore]
+fn ice_melting_diag() {
+    use super::mp_materials::GLACE;
+    let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let nx = env("MP_ICE_NX", 40.0) as usize;
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::IceMelting, nx, nx * 3 / 4, 0.8 / nx as f64, 9.81).unwrap();
+    let (eau, gl) = (idx(&s.reg, "eau"), idx(&s.reg, GLACE));
+    let (gw, gi) = (s.group_of[eau], s.group_of[gl]);
+    let (mi0, u0) = (s.total_mass(gl), s.total_internal_energy() + s.kinetic_energy());
+    let (t_end, every) = (env("MP_ICE_T", 10.0), env("MP_ICE_DT", 1.0));
+    let t0 = std::time::Instant::now();
+    let mut next = 0.0;
+    while s.time < t_end && !s.diverged {
+        let dt = s.step();
+        if s.time >= next {
+            next += every;
+            let n = s.nx * s.ny;
+            let mi = s.total_mass(gl);
+            let mic: f64 = (0..n).map(|c| s.mass[gl][c]).sum::<f64>().max(1e-300);
+            let yc = (0..n).map(|c| s.mass[gl][c] * ((c / s.nx) as f64 + 0.5) * s.dx).sum::<f64>() / mic;
+            let tw = (0..n).map(|c| s.mass[eau][c] * s.tg[gw][c]).sum::<f64>() / (0..n).map(|c| s.mass[eau][c]).sum::<f64>();
+            let ti = (0..n).map(|c| s.mass[gl][c] * s.tg[gi][c]).sum::<f64>() / mic;
+            eprintln!("t {:.2} s ({} pas, {:.0} s, dt {dt:.2e}) : glace {:.2} % (centre à y = {yc:.3} m, {ti:.2} K), fondue (bilan) {:.4} kg/m ; eau {tw:.3} K ; U/U0 − 1 = {:+.2e} ; |u| max {:.3} m/s ; refaits {}",
+                s.time, s.step_count, t0.elapsed().as_secs_f64(), 100.0 * mi / mi0, -s.frozen[0], (s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0, s.max_speed(), s.rollbacks);
+        }
+    }
+    eprintln!("divergé : {}", s.diverged);
 }

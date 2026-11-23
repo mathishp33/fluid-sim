@@ -527,6 +527,90 @@ impl MultiphaseSim {
         self.dt_phase = dt_phase.max(1e-8);
     }
 
+    /// Gel / fusion (`Registry::fusions` : eau ↔ glace), méthode enthalpique à la température des groupes : un liquide plus froid que T_f
+    /// gèle juste assez pour que sa chaleur latente le ramène à T_f (la glace naît à T_f), un solide plus chaud fond juste assez pour
+    /// revenir à T_f (l'eau naît à T_f) ; tout gèle (fond) quand la chaleur latente de tout le liquide (solide) n'y suffit pas. La vitesse
+    /// est celle de l'arrivée de la chaleur (conduction, échange entre groupes) : aucun paramètre. Masse et énergie exactement conservées ;
+    /// en parallèle (chaque cellule ne dépend que d'elle-même), masses gelées sommées ensuite dans l'ordre des cellules.
+    pub(crate) fn fusion_step(&mut self) {
+        use super::mp_par::for_ranges;
+        use super::multiphase::SyncPtr;
+        let nf = self.reg.fusions.len();
+        if self.frozen.len() != nf {
+            self.frozen = vec![0.0; nf];
+        }
+        if !self.phase_change || nf == 0 {
+            return;
+        }
+        let n = self.nx * self.ny;
+        let a2 = self.dx * self.dx;
+        for fi in 0..nf {
+            let fu = self.reg.fusions[fi].clone();
+            let (l, s, tm) = (fu.liquid, fu.solid, fu.t_melt);
+            let (gl, gs) = (self.group_of[l], self.group_of[s]);
+            // chaleur latente cohérente avec les énergies du solveur (e_l(T_f) − e_s(T_f) = L_f par construction)
+            let (el_m, es_m) = (self.reg.phases[l].e_int(tm), self.reg.phases[s].e_int(tm));
+            let lf = (el_m - es_m).max(1.0);
+            let members_l: Vec<usize> = self.groups[gl].clone();
+            let mut dm_cell = vec![0.0f64; n];
+            {
+                let mp: Vec<SyncPtr<f64>> = self.mass.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+                let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+                let dmp = SyncPtr(dm_cell.as_mut_ptr());
+                let this = &*self;
+                let members_l = &members_l;
+                for_ranges(n, MIN_HEAVY, |lo, hi| {
+                    for c in lo..hi {
+                        if this.is_solid(c) || this.pinned(c) {
+                            continue;
+                        }
+                        // SAFETY : la cellule c n'est lue et écrite que par sa tranche
+                        unsafe {
+                            let ml = *mp[l].at(c);
+                            let mut dm = 0.0;
+                            // (les deux, indépendamment : une eau à T_f à l'arrondi près ne doit pas empêcher la glace de fondre)
+                            if ml > 1e-12 && this.tg[gl][c] < tm {
+                                // gel : la chaleur qui ramènerait le groupe du liquide à T_f vient de sa chaleur latente
+                                let e_tm: f64 = members_l.iter().map(|&k| (*mp[k].at(c)).max(0.0) * this.reg.phases[k].e_int(tm)).sum();
+                                let d = ((e_tm - *egp[gl].at(c)) / lf).clamp(0.0, ml);
+                                *mp[l].at(c) -= d;
+                                *mp[s].at(c) += d;
+                                *egp[gl].at(c) -= d * es_m;
+                                *egp[gs].at(c) += d * es_m;
+                                dm += d;
+                            }
+                            let ms = *mp[s].at(c);
+                            if ms > 1e-12 && this.tg[gs][c] > tm {
+                                // fusion (groupe granulaire : cette seule phase ; glace née ci-dessus comprise)
+                                let d = ((*egp[gs].at(c) - ms * es_m) / lf).clamp(0.0, ms);
+                                *mp[s].at(c) -= d;
+                                *mp[l].at(c) += d;
+                                *egp[gs].at(c) -= d * el_m;
+                                *egp[gl].at(c) += d * el_m;
+                                dm -= d;
+                            }
+                            if dm != 0.0 {
+                                // groupe vidé : le reste de son énergie (la chaleur qui n'a pas suffi à tout geler / fondre) passe à l'autre
+                                let mgl: f64 = members_l.iter().map(|&k| (*mp[k].at(c)).max(0.0)).sum();
+                                if mgl <= 0.0 {
+                                    *egp[gs].at(c) += *egp[gl].at(c);
+                                    *egp[gl].at(c) = 0.0;
+                                } else if *mp[s].at(c) <= 0.0 {
+                                    *egp[gl].at(c) += *egp[gs].at(c);
+                                    *egp[gs].at(c) = 0.0;
+                                }
+                                *dmp.at(c) = dm;
+                            }
+                        }
+                    }
+                });
+            }
+            let frozen: f64 = dm_cell.iter().sum();
+            self.frozen[fi] += frozen * a2;
+            self.sync_cells(|c| dm_cell[c] != 0.0);
+        }
+    }
+
     /// Évaporation / condensation à travers une interface ALIGNÉE sur la grille (cellule de gaz pur voisine d'une cellule de liquide sans gaz :
     /// aucune cellule mixte, donc rien à faire pour le traitement cellule par cellule). La cellule de gaz est amenée à saturation
     /// (x_v·p = p_sat(T_surface)) ; la chaleur latente est prise au LIQUIDE (refroidissement par évaporation), la vapeur entre dans le gaz à

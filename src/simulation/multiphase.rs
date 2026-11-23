@@ -103,6 +103,9 @@ pub struct MultiphaseSim {
     pub boundary_flux: Vec<f64>,
     /// masse transformée liquide→vapeur cumulée par paire (kg/m), pour les bilans
     pub transferred: Vec<f64>,
+    /// masse gelée (liquide → solide, négative à la fusion) cumulée par paire de fusion (kg/m), pour les bilans
+    #[serde(default)]
+    pub frozen: Vec<f64>,
     pub(crate) step_count: usize,
     /// flux de masse total (toutes phases) à travers chaque face de cellule pendant le dernier advect_mass_energy (kg/m³ de cellule, + = vers +x / +y)
     pub(crate) mfx: Vec<f64>,
@@ -259,6 +262,7 @@ impl MultiphaseSim {
         let n = nx * ny;
         let np = reg.phases.len();
         let nch = reg.changes.len();
+        let nfu = reg.fusions.len();
         let nre = reg.reactions.len();
         let groups = reg.miscible_groups();
         let mut group_of = vec![0; np];
@@ -323,6 +327,7 @@ impl MultiphaseSim {
             pc_dvol: vec![vec![0.0; n]; ng],
             boundary_flux: vec![0.0; np],
             transferred: vec![0.0; nch],
+            frozen: vec![0.0; nfu],
             step_count: 0,
             mfx: vec![0.0; (nx + 1) * ny],
             mfy: vec![0.0; nx * (ny + 1)],

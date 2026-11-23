@@ -173,10 +173,30 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), inertie propre des grains
   (le souffle d'une poudre emporte ses grains), délai d'allumage d'un grain dans un gaz chaud.
 
-## 7. Solidification (étape 5)
+## 7. Solidification (étape 5, faite : eau ↔ glace)
 
-Changement d'état liquide ↔ phase granulaire (eau ↔ cristaux de glace, cire, lave) à la température de fusion, avec chaleur latente :
-réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). La glace (917 kg/m³) remonte d'elle-même par la dérive.
+Changement d'état liquide ↔ phase granulaire à la température de fusion, avec chaleur latente (`Registry::fusions`, paires `FusionDef`
+de la bibliothèque ; `fusion_step`, `k_fusion` sur le GPU). Méthode enthalpique à la température des groupes, sans paramètre de vitesse :
+un liquide plus froid que T_f gèle juste assez pour que sa chaleur latente le ramène à T_f (la glace naît à T_f), un solide plus chaud
+fond juste assez pour revenir à T_f ; tout gèle (fond) si la chaleur latente de tout le liquide (solide) n'y suffit pas. La vitesse est
+celle de l'arrivée de la chaleur (conduction, échange par la surface des grains). La chaleur latente est portée par l'énergie de
+référence du solide (e_l(T_f) − e_s(T_f) = L_f, comme celle de la vapeur pour l'ébullition) ; masse et énergie exactement conservées ;
+bilan de la masse gelée par paire (`frozen`). Opérateur à part plutôt que la mécanique liquide ↔ vapeur : ni pression partielle, ni
+germination, ni volume de vapeur à borner.
+- **glace** (`Phase::ice` : cristaux de 2 mm, 917 kg/m³ — ils remontent dans l'eau —, c_p 2.11 kJ/(kg·K) à 0 °C croissant de
+  6.8 J/(kg·K²), k = 2.22 W/(m·K)) et paire eau ↔ glace (T_f = 273.15 K, L_f = 333.6 kJ/kg ; préréglage `with_ice`).
+- validé : eau à −10 °C → 12.5498 % gelés (c ΔT / L_f), eau et glace à 273.150000 K ; glace à +10 °C → 6.4278 % fondus ; à −93 °C,
+  tout gèle (glace à 245 K) ; énergie à 1e-12. Problème de Stefan (eau à 0 °C contre une paroi à −10 °C, mailles de 0.25 mm) :
+  croissance de la glace entre 30 et 120 s = solution exacte à 0.2 % près (2.069 mm contre 2.064), épaisseur à une maille près (retard
+  pris au départ : erreur en dx de la méthode enthalpique). GPU : premier pas à 1e-7 près (gel et fusion), même croissance à 0.007 %
+  (pas de 2 ms ; à 20 ms, la pression de cette colonne d'eau presque incompressible est mal conditionnée en f32 et le GPU refait des
+  pas).
+- scénario « Glace pilée dans l'eau tiède » : un nuage de cristaux à −10 °C au fond d'une eau à 27 °C remonte vers la surface en
+  fondant (la moitié en 5 s), l'eau de fonte froide coule ; énergie à 2e-9 ; GPU : fonte à 0.15 % sur 2 s.
+- limites : le solide formé est un tas de grains (une couche de glace s'écroule à son angle de talus, pas de bloc rigide → solides
+  mobiles) ; ni surfusion ni germination (l'eau gèle dès qu'elle passe sous T_f) ; eau sans maximum de densité à 4 °C ; cire, lave :
+  matériaux à définir (une paire de fusion de plus dans la bibliothèque) ; à la surface, des cristaux dans une cellule mêlée d'air y
+  « tombent » à leur vitesse dans l'air (~7 m/s : pas de 1.5 ms).
 
 ## 8. Étapes et validation
 
@@ -195,7 +215,7 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
 4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
    et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas, poudre noire (§ 6). Reste : fluidisation.
-5. Solidification.
+5. **FAIT (2026-11-23) — Solidification** (eau ↔ glace, § 7) : méthode enthalpique, Stefan, glace pilée qui fond, CPU et GPU.
 
 ## 9. Choix à valider
 

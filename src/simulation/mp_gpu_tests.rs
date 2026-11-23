@@ -1807,3 +1807,56 @@ fn gpu_brasero_trace() {
         }
     }
 }
+
+#[test]
+fn gpu_freezes_and_melts_like_the_cpu() {
+    // gel / fusion (méthode enthalpique, `k_fusion`) : accord d'un pas sur une eau à −10 °C qui gèle et sur une glace à +10 °C qui fond,
+    // puis 5 s de croissance de la glace contre une paroi froide (masse gelée par seconde à 1 % près). Pas bornés à 2 ms des deux
+    // côtés : à 20 ms, la pression de cette colonne d'eau presque incompressible est mal conditionnée en f32 (le gradient conjugué
+    // plafonne, le GPU refait des pas et finit à ~2 ms, le CPU tient 20 ms)
+    use super::mp_materials::GLACE;
+    one_step_agreement("gel", super::mp_chem_tests::ice_water_box(0.9, 263.15, 0.0, 263.15), 0, 3, 1e-4, 1e-2);
+    one_step_agreement("fusion", super::mp_chem_tests::ice_water_box(0.5, 273.15, 0.4, 283.15), 0, 3, 1e-4, 1e-2);
+    let mk = || {
+        let mut s = super::mp_chem_tests::freezing_column(263.15);
+        s.dt_max = 2e-3;
+        s
+    };
+    let Some((cpu, gs, _)) = compare("colonne de gel", &mk, 5.0) else { return };
+    let gl = cpu.reg.phases.iter().position(|p| p.name == GLACE).unwrap();
+    let rate = |s: &MultiphaseSim| s.total_mass(gl) / s.time;
+    eprintln!(" glace formée CPU {:.5e} GPU {:.5e} kg/(m·s) ; bilan gelé CPU {:.5e} GPU {:.5e} kg/m ; pas {} / {}",
+        rate(&cpu), rate(&gs), cpu.frozen[0], gs.frozen[0], cpu.step_count, gs.step_count);
+    assert!(rate(&cpu) > 0.0 && rel(rate(&cpu), rate(&gs)) < 0.01, "glace CPU {} GPU {}", rate(&cpu), rate(&gs));
+    assert!(rel(gs.frozen[0], gs.total_mass(gl)) < 1e-3, "bilan gelé du GPU {} pour {} kg/m de glace", gs.frozen[0], gs.total_mass(gl));
+}
+
+/// diagnostic : pas de temps du GPU sur la colonne de gel (20 pas)
+#[test]
+#[ignore]
+fn gpu_freezing_column_dt_diag() {
+    let mut gs = super::mp_chem_tests::freezing_column(263.15);
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    let mut cpu = super::mp_chem_tests::freezing_column(263.15);
+    for k in 0..20 {
+        let dg = g.step(&mut gs);
+        let dc = cpu.step();
+        eprintln!("pas {k} : dt GPU {dg:.3e} (chimie {:.2e}, phase {:.2e}) ; CPU {dc:.3e} (chimie {:.2e}, phase {:.2e}, choisi {:.2e}) ; GPU {:?}",
+            gs.dt_chem, gs.dt_phase, cpu.dt_chem, cpu.dt_phase, cpu.choose_dt(), g.last);
+    }
+}
+
+#[test]
+fn gpu_melts_crushed_ice_like_the_cpu() {
+    // glace pilée dans l'eau tiède : les cristaux remontent en fondant ; masse fondue par seconde sur 2 s à 3 % près
+    use super::mp_materials::GLACE;
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::IceMelting, 40, 30, 0.02, 9.81).unwrap();
+    let Some((cpu, gs, _)) = compare("glace pilée", &mk, 2.0) else { return };
+    let gl = cpu.reg.phases.iter().position(|p| p.name == GLACE).unwrap();
+    let mi0 = mk().total_mass(gl);
+    let melt = |s: &MultiphaseSim| (mi0 - s.total_mass(gl)) / s.time;
+    eprintln!(" glace fondue CPU {:.5e} GPU {:.5e} kg/(m·s) ; bilan CPU {:.5e} GPU {:.5e} kg/m ; pas {} / {}",
+        melt(&cpu), melt(&gs), -cpu.frozen[0], -gs.frozen[0], cpu.step_count, gs.step_count);
+    assert!(melt(&cpu) > 0.0 && rel(melt(&cpu), melt(&gs)) < 0.03, "fonte CPU {} GPU {}", melt(&cpu), melt(&gs));
+}

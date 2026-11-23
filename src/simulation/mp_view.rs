@@ -53,6 +53,8 @@ pub enum MpScenario {
     WoodFire,
     /// tas de poudre noire allumé sur un flanc : combustion sans air, gaz chauds qui traversent la poudre voisine, fumée blanche
     Gunpowder,
+    /// nuage de glace pilée dans l'eau tiède : les cristaux remontent en fondant (chaleur latente), l'eau de fonte froide coule
+    IceMelting,
 }
 
 impl Default for MpScenario {
@@ -62,7 +64,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 15] = [
+    pub const ALL: [MpScenario; 16] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -78,11 +80,12 @@ impl MpScenario {
         Self::CoalFire,
         Self::WoodFire,
         Self::Gunpowder,
+        Self::IceMelting,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder)
+        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder | Self::IceMelting)
     }
     pub fn is_combustion(self) -> bool {
         matches!(
@@ -113,6 +116,7 @@ impl MpScenario {
             Self::CoalFire => "Feu de charbon sur grille (braséro : houille sur braises, flamme des matières volatiles)",
             Self::WoodFire => "Feu de bois sur grille (pyrolyse : flammes des gaz du bois)",
             Self::Gunpowder => "Tas de poudre noire (déflagration sans air, fumée blanche)",
+            Self::IceMelting => "Glace pilée dans l'eau tiède (fusion, chaleur latente)",
         }
     }
 }
@@ -135,6 +139,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
         &lib_c
     } else if sc == MpScenario::Gunpowder {
         lib_c = lib.with_gunpowder();
+        &lib_c
+    } else if sc == MpScenario::IceMelting {
+        lib_c = lib.with_ice();
         &lib_c
     } else if sc.is_combustion() {
         lib_c = lib.with_combustion();
@@ -174,6 +181,37 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let (x0, x1, y0, y1) = (0.3 * lx, 0.7 * lx, 0.6 * ly, 0.85 * ly);
             s.paint_phase(move |_, y| if y < 0.4 * ly { Some(eau) } else { None });
             s.paint_mixture(move |x, y| if x > x0 && x < x1 && y > y0 && y < y1 { Some(cloud.clone()) } else { None });
+        }
+        MpScenario::IceMelting => {
+            // eau tiède (27 °C) dans les 60 % du bas d'une cuve fermée, air au-dessus ; au fond, au milieu, un nuage de glace pilée
+            // (cristaux de 2 mm à −10 °C, 20 % du volume) : plus légers que l'eau, les cristaux remontent en fondant — la chaleur de l'eau
+            // arrive par leur surface (Nu = 2) : réchauffés à 0 °C en ~1 s, fondus en ~6 s (chaleur latente 333.6 kJ/kg) ; l'eau de fonte, à
+            // 0 °C et plus dense, coule vers le fond
+            let eau = need(roles.water, "un liquide (eau)")?;
+            let air = need(roles.air, "un gaz")?;
+            let glace = need(roles.ice, "une phase granulaire qui fond (glace) et sa paire de fusion")?;
+            let mut cloud = vec![0.0; s.reg.phases.len()];
+            cloud[eau] = 0.8;
+            cloud[glace] = 0.2;
+            let (x0, x1, y0, y1) = (0.35 * lx, 0.65 * lx, 0.08 * ly, 0.3 * ly);
+            let h_w = 0.6 * ly;
+            let in_cloud = move |x: f64, y: f64| x > x0 && x < x1 && y > y0 && y < y1;
+            s.paint_phase(move |_, y| Some(if y < h_w { eau } else { air }));
+            s.paint_mixture(move |x, y| if in_cloud(x, y) { Some(cloud.clone()) } else { None });
+            t_fn = Box::new(|_, _| 300.15);
+            s.finalize_init(&*t_fn);
+            let gi = s.group_of[glace];
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (x, y) = s.center(i, j);
+                    if in_cloud(x, y) {
+                        let c = s.idx(i, j);
+                        s.set_group_temperature(c, gi, 263.15);
+                    }
+                }
+            }
+            s.refresh();
+            return Ok(s);
         }
         MpScenario::SandColumn => {
             // colonne de sable sec tassé (α_max de grains, le reste d'air) au milieu : elle s'effondre en un tas dont les flancs
