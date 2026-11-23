@@ -19,6 +19,9 @@ pub const T_STD: f64 = 298.15;
 pub const P_STD: f64 = 1.0e5;
 /// Constante des gaz parfaits (J/(mol·K))
 pub const R_GAS: f64 = 8.314462618;
+/// masse molaire de la fumée de poudre (kg/mol) : ce qui reste d'une « mole » de poudre noire (100 g) une fois partis ses gaz,
+/// 0.60 CO2 + 0.15 CO + 0.371 N2 + 0.05 H2O + 0.03 H2 (masses molaires du préréglage combustion) — bilan de masse exact
+pub const POWDER_SMOKE_MOLAR_MASS: f64 = 0.1 - (0.60 * 0.044009 + 0.15 * 0.028010 + 0.371 * 0.028014 + 0.05 * 0.018015 + 0.03 * 0.002016);
 
 /// Rayonnement thermique d'un gaz (modèle optiquement mince, coefficients d'absorption moyens de Planck du TNF Workshop / RADCAL).
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -448,6 +451,46 @@ impl Phase {
         p.s_standard = 20.0;
         p
     }
+    /// Poudre noire (poudre à canon : 75 % de salpêtre KNO3, 15 % de charbon de bois, 10 % de soufre) en grains de 2 mm : elle porte son
+    /// oxydant et brûle sans air (combustion de surface, loi de Vieille : voir `mp_materials::gunpowder_reactions`). « Mole » de 100 g
+    /// (M = 0.1 kg/mol), Δh_f° = 75 g de KNO3 (−494.6 kJ/mol) = −366.9 kJ/mol. Grains de 1800 kg/m³ (poudre en vrac à ~1 g/cm³ :
+    /// α_max = 0.55), c_p = 0.88 kJ/(kg·K) (moyenne de KNO3, C et S), k = 0.3 W/(m·K), angle de talus 34°
+    pub fn gunpowder() -> Phase {
+        let mut p = Phase::coal();
+        p.name = "poudre noire".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 1800.0, t0: 293.15, beta: 1.0e-5 } };
+        p.cp = 880.0;
+        p.cp_slope = 0.8;
+        p.conductivity = 0.3;
+        p.color = [0.13, 0.13, 0.14];
+        p.molar_mass = 0.1;
+        p.h_formation = -366.93e3;
+        p.s_standard = 116.0;
+        p.grain_diameter = 2.0e-3;
+        p.alpha_max = 0.55;
+        p.friction_angle = 34.0;
+        p
+    }
+    /// Fumée de poudre : les résidus SOLIDES de la combustion de la poudre noire (58 % de sa masse : K2CO3, K2SO4, K2S), en particules
+    /// de 2 µm — la fumée blanche, qui tombe à ~0.3 mm/s. « Mole » de 58.04 g (le reste d'une mole de poudre une fois ses gaz partis),
+    /// Δh_f° = −401.1 kJ/mol (−6.9 kJ/g, entre K2S et K2CO3 ; chaleur d'explosion de la poudre 3.0 MJ/kg) ; 2300 kg/m³, c_p 0.8 kJ/(kg·K)
+    /// à 298 K croissant de 0.5 J/(kg·K²) (fusion des sels comprise : flamme de la poudre vers 2500 K)
+    pub fn powder_smoke() -> Phase {
+        let mut p = Phase::coal();
+        p.name = "fumée de poudre".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 2300.0, t0: 293.15, beta: 1.0e-5 } };
+        p.cp = 800.0;
+        p.cp_slope = 0.5;
+        p.conductivity = 0.5;
+        p.color = [0.93, 0.93, 0.90];
+        p.molar_mass = POWDER_SMOKE_MOLAR_MASS;
+        p.h_formation = -401.147e3;
+        p.s_standard = 65.0;
+        p.grain_diameter = 2.0e-6;
+        p.alpha_max = 0.6;
+        p.friction_angle = 35.0;
+        p
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {
@@ -591,9 +634,65 @@ pub struct Reaction {
     /// ∝ surface des grains × concentration de l'oxydant, limitée par sa diffusion)
     #[serde(default)]
     pub bulk: bool,
+    /// COMBUSTION d'une phase granulaire qui porte son oxydant (poudre noire), avec `bulk` : la surface des grains régresse à
+    /// r = burn_rate · (p / 1 atm)^burn_exponent (m/s, loi de Vieille) dès qu'ils atteignent `ignition_temp` (K) ; ils sont consommés à
+    /// ρ_s r S_v (S_v = 6 α / d, premier ordre exact) et leurs produits naissent à la température adiabatique (la flamme est collée au
+    /// grain). 0 = réaction en volume ordinaire (pyrolyse : loi d'Arrhenius)
+    #[serde(default)]
+    pub burn_rate: f64,
+    #[serde(default)]
+    pub burn_exponent: f64,
+    #[serde(default)]
+    pub ignition_temp: f64,
+}
+
+/// Température T telle que Σ m_p e_p(T) = e, pour des énergies internes quadratiques e_p(T) = c_e T + ½ s (T − 298.15)² + e0 sommées
+/// (ce = Σ m c_e, sl = Σ m s, e0 = Σ m e0) : racine exacte, sous la forme sans annulation
+pub fn adiabatic_t(ce: f64, sl: f64, e0: f64, e: f64) -> f64 {
+    let k = e - e0 - ce * T_STD;
+    T_STD + 2.0 * k / (ce + (ce * ce + 2.0 * sl * k).max(0.0).sqrt()).max(1e-300)
+}
+
+/// Combustion d'une poudre : constante du premier ordre (1/s) des grains de diamètre d dont la surface régresse à r = a (p / 1 atm)ⁿ,
+/// ρ_s r S_v / (ρ_s α) = 6 r / d
+pub fn burn_rate_constant(a: f64, n: f64, p: f64, d: f64) -> f64 {
+    6.0 * a * (p.max(1.0) / 101325.0).powf(n) / d.max(1e-9)
 }
 
 impl Reaction {
+    /// combustion d'une phase granulaire porteuse de son oxydant : (a (m/s à 1 atm), exposant n de r = a (p / 1 atm)ⁿ, température
+    /// d'allumage des grains (K)) ; None sinon
+    pub fn burn(&self) -> Option<(f64, f64, f64)> {
+        (self.bulk && self.burn_rate > 0.0).then_some((self.burn_rate, self.burn_exponent, self.ignition_temp))
+    }
+    /// température des produits d'une combustion (`burn`) de réactifs à t, à énergie interne conservée : Σ ν_p M_p e_p(T_f) =
+    /// Σ ν_s M_s e_s(t) (produits recalés sur la masse des réactifs, comme dans l'opérateur)
+    pub fn adiabatic_products_temp(&self, phases: &[Phase], t: f64) -> f64 {
+        let (ma, mb) = self.mass_balance(phases);
+        let scale = if mb > 0.0 { ma / mb } else { 1.0 };
+        let e_in: f64 = self.reactants.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass * p.e_int(t))).sum();
+        let (mut ce, mut sl, mut e0) = (0.0, 0.0, 0.0);
+        for &(k, nu) in &self.products {
+            if let Some(p) = phases.get(k) {
+                let m = nu * p.molar_mass * scale;
+                ce += m * p.c_e();
+                sl += m * p.cp_slope;
+                e0 += m * p.e0;
+            }
+        }
+        adiabatic_t(ce, sl, e0, e_in)
+    }
+    /// combustion : volume de gaz produit par kg de réactif, fois la pression (J/kg) — n_gaz R T_f avec les produits nés de réactifs à
+    /// la température d'allumage ; borne du pas (`MultiphaseSim::dt_burn`)
+    pub fn burn_gas_volume(&self, phases: &[Phase]) -> f64 {
+        let Some((_, _, t_ign)) = self.burn() else { return 0.0 };
+        let (ma, _) = self.mass_balance(phases);
+        let n_gas: f64 = self.products.iter().filter(|&&(k, _)| phases.get(k).is_some_and(|p| p.is_gas())).map(|x| x.1).sum();
+        if ma <= 0.0 {
+            return 0.0;
+        }
+        n_gas * R_GAS * self.adiabatic_products_temp(phases, t_ign.max(T_STD)) / ma
+    }
     /// bilan de masse stœchiométrique : (Σ ν M réactifs, Σ ν M produits) en kg
     pub fn mass_balance(&self, phases: &[Phase]) -> (f64, f64) {
         let sum = |v: &[(usize, f64)]| v.iter().filter_map(|&(k, nu)| phases.get(k).map(|p| nu * p.molar_mass)).sum::<f64>();

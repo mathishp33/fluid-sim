@@ -1429,6 +1429,51 @@ fn gpu_pyrolyses_wood_like_the_cpu() {
 }
 
 #[test]
+fn gpu_burns_gunpowder_like_the_cpu() {
+    // combustion de la poudre noire (loi de Vieille dès 580 K, produits à la température adiabatique, borne du pas) dans un vase clos
+    // d'azote : accord pas à pas, puis débit de combustion et montée en pression sur la durée
+    use super::mp_materials::{FUMEE, POUDRE};
+    let mk = || {
+        let mut s = super::mp_chem_tests::gunpowder_dust(700.0, 10.0 / 1800.0, true);
+        s.radiation = false;
+        s
+    };
+    one_step_agreement("poudre noire", mk(), 2, 3, 1e-4, 0.05);
+    let Some((cpu, gs, _)) = compare("poudre noire", &mk, 0.05) else { return };
+    let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
+    let (w, f) = (pos(POUDRE), pos(FUMEE));
+    let w0 = mk().total_mass(w);
+    let burnt = |s: &MultiphaseSim| (w0 - s.total_mass(w)) / s.time;
+    let p = |s: &MultiphaseSim| s.p.iter().sum::<f64>() / s.p.len() as f64;
+    eprintln!(" poudre brûlée CPU {:.5e} GPU {:.5e} kg/(m·s) ; fumée CPU {:.4e} GPU {:.4e} ; p CPU {:.4} GPU {:.4} bar ; temps {:.4} / {:.4} s, pas {} / {}",
+        burnt(&cpu), burnt(&gs), cpu.total_mass(f), gs.total_mass(f), p(&cpu) / 1e5, p(&gs) / 1e5, cpu.time, gs.time, cpu.step_count, gs.step_count);
+    assert!(burnt(&cpu) > 0.0 && rel(burnt(&cpu), burnt(&gs)) < 0.01, "poudre brûlée CPU {} GPU {}", burnt(&cpu), burnt(&gs));
+    assert!(gs.step_count == cpu.step_count || rel(p(&cpu), p(&gs)) < 0.05, "p CPU {} GPU {}", p(&cpu), p(&gs));
+}
+
+#[test]
+fn gpu_runs_the_gunpowder_heap_like_the_cpu() {
+    // tas de poudre noire : allumage au contact des gaz chauds, souffle, fumée — comparaison sur 10 ms (poudre brûlée et fumée à 15 %
+    // près). Pas d'accord pas à pas : dès le premier pas, le CO et le H2 de la poudre brûlent avec l'air des pores vers 2200 K, chimie
+    // raide qui ne s'accorde pas entre f32 et f64 (voir le feu de bois) ; la combustion de la poudre elle-même s'accorde à 1e-7 près
+    // (vase clos, `gpu_burns_gunpowder_like_the_cpu`)
+    use super::mp_materials::{FUMEE, POUDRE};
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::Gunpowder, 40, 30, 0.02, 9.81).unwrap();
+    let Some((cpu, gs, _)) = compare("tas de poudre", &mk, 0.01) else { return };
+    let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
+    let (w, f) = (pos(POUDRE), pos(FUMEE));
+    let w0 = mk().total_mass(w);
+    // poudre brûlée par seconde (celle qui a disparu moins celle que le souffle a fait sortir du domaine) et fumée produite
+    let burnt = |s: &MultiphaseSim| (w0 - (s.total_mass(w) - s.boundary_flux[w])) / s.time;
+    let smoke = |s: &MultiphaseSim| (s.total_mass(f) - s.boundary_flux[f]) / s.time;
+    eprintln!(" poudre brûlée CPU {:.4e} GPU {:.4e} kg/(m·s) ; fumée CPU {:.4e} GPU {:.4e} kg/(m·s) ; temps {:.4} / {:.4} s, pas {} / {}",
+        burnt(&cpu), burnt(&gs), smoke(&cpu), smoke(&gs), cpu.time, gs.time, cpu.step_count, gs.step_count);
+    assert!(burnt(&cpu) > 0.0 && rel(burnt(&cpu), burnt(&gs)) < 0.15, "poudre brûlée CPU {} GPU {}", burnt(&cpu), burnt(&gs));
+    assert!(rel(smoke(&cpu), smoke(&gs)) < 0.15, "fumée CPU {} GPU {}", smoke(&cpu), smoke(&gs));
+}
+
+#[test]
 fn gpu_radiates_in_the_grain_bed_like_the_cpu() {
     // rayonnement du tas : entre mailles (braises sous du bois froid) et entre les populations mêlées d'une maille (miroirs de
     // conduct et de exchange_grains)

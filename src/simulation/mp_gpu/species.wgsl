@@ -610,32 +610,82 @@ fn k_pyrolysis(@builtin(global_invocation_id) g: vec3<u32>) {
     if (c >= n) { return; }
     let live = !is_solid(c) && !pinned(c);
     let dt = dtv();
+    let pc = max(S[O_prel + c] + P.p0, 1.0);
+    let tcon = fluid_contact_temp(c);
     var touched = false;
     for (var j = 0u; j < P.nre; j++) {
         let bulk = rxv(j, 48u) < -0.5;
         let s = select(0u, u32(rxv(j, 49u)), bulk);
         let tau = rxv(j, 50u);
         let ms = mass(s, c);
-        let ok = live && bulk && ms > 1e-12;
         let gs = group_k(s);
         let ts = tgrp(gs, c);
+        // combustion d'une poudre (rxv 52 > 0) : allumée quand le grain ou le fluide qui le baigne atteint T_allumage,
+        // k = 6 a (p / 1 atm)ⁿ / d, premier ordre en masse
+        let burn = rxv(j, 52u) > 0.0;
+        let ok = live && bulk && ms > 1e-12 && (!burn || max(ts, tcon) >= rxv(j, 54u));
         let ik = exp(-ln_kf(j, ts));
-        let keff = 1.0 / max(ik + tau, 1e-30);
+        let kb = 6.0 * rxv(j, 52u) * pow(pc / 101325.0, rxv(j, 53u)) / max(grain_d(s), 1e-9);
         let nus = max(rx_rnu(j, 0u), 1e-30);
         // 1 − e^(−x) sans annulation : x = ν k dt ~ 1e-5 pour la houille (f32 : 1 − exp(−1e-5) n'a que 2 ou 3 chiffres justes)
-        let xi = select(0.0, ms / molar_k(s) * one_minus_exp(nus * keff * dt) / nus, ok);
+        let xarg = select(nus * dt / max(ik + tau, 1e-30), kb * dt, burn);
+        let xi = select(0.0, ms / molar_k(s) * one_minus_exp(xarg) / nus, ok);
         let dms = min(nus * xi * molar_k(s), ms);
-        var eabs_out = 0.0;
+        // température des produits : celle du grain (pyrolyse) ; adiabatique pour une combustion, Σ dm_p e_p(T_f) = dm_s e_s(T_s)
+        // (énergies relatives à P.t0, quadratiques : racine exacte, forme sans annulation)
+        var ce = 0.0; var sl = 0.0; var h0p = 0.0;
+        for (var i = 0u; i < rx_np(j); i++) {
+            let p = rx_ps(j, i);
+            let dm = xi * rx_pnu(j, i) * molar_k(p) * rxv(j, 8u);
+            ce += dm * ce_k(p); sl += dm * slope_k(p); h0p += dm * h0_k(p);
+        }
+        let erel_in = dms * eabs_k(s, ts) - h0p;
+        let tauf = 2.0 * erel_in / max(ce + sqrt(max(ce * ce + 2.0 * sl * erel_in, 0.0)), 1e-30);
+        let tprod = select(ts, P.t0 + tauf, burn);
+        var eabs_out = 0.0; var erel_out = 0.0;
         for (var i = 0u; i < rx_np(j); i++) {
             let p = rx_ps(j, i);
             let dm = select(0.0, xi * rx_pnu(j, i) * molar_k(p) * rxv(j, 8u), ok);
             S[O_mass + p * n + c] += dm;
-            S[O_epsg + group_k(p) * n + c] += dm * erel_k(p, ts);
-            eabs_out += dm * eabs_k(p, ts);
+            let er = dm * erel_k(p, tprod);
+            S[O_epsg + group_k(p) * n + c] += er;
+            erel_out += er;
+            eabs_out += dm * eabs_k(p, tprod);
         }
         S[O_mass + s * n + c] -= select(0.0, dms, ok);
-        S[O_epsg + gs * n + c] -= select(0.0, eabs_out - dms * h0_k(s), ok);
+        // grain : pyrolyse, il cède l'énergie absolue de ses produits (chaleur de réaction comprise) ; combustion, celle de sa masse
+        S[O_epsg + gs * n + c] -= select(0.0, select(eabs_out - dms * h0_k(s), dms * erel_k(s, ts), burn), ok);
+        // combustion : arrondi de T_f au groupe du premier produit (énergie exactement conservée)
+        S[O_epsg + group_k(rx_ps(j, 0u)) * n + c] += select(0.0, erel_in - erel_out, ok && burn);
         touched = touched || ok;
     }
     if (touched) { cell_sync(c); }
+}
+// borne du pas des poudres (miroir de MultiphaseSim::burn_dt_bound) : au plus le volume d'une cellule de gaz produit par pas, là où la
+// poudre brûle ou est à moins de 50 K de s'allumer ; sur l'état du début du pas
+@compute @workgroup_size(64)
+fn k_burn_dt(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    let c = g.x;
+    var m = 3.0e38;
+    if (c < ncell() && !is_solid(c) && !pinned(c)) {
+        let pc = max(S[O_prel + c] + P.p0, 1.0);
+        let tcon = fluid_contact_temp(c);
+        for (var j = 0u; j < P.nre; j++) {
+            let burn = rxv(j, 48u) < -0.5 && rxv(j, 52u) > 0.0;
+            let s = select(0u, u32(rxv(j, 49u)), burn);
+            let ms = mass(s, c);
+            let near = max(tgrp(group_k(s), c), tcon) >= rxv(j, 54u) - 50.0;
+            let kb = 6.0 * rxv(j, 52u) * pow(pc / 101325.0, rxv(j, 53u)) / max(grain_d(s), 1e-9);
+            let rate = ms * kb * rxv(j, 55u) / pc;
+            m = select(m, min(m, 1.0 / max(rate, 1e-30)), burn && ms > 1e-12 && near && rate > 0.0);
+        }
+    }
+    var v: array<f32, 8>;
+    v[0] = -m;
+    wg_reduce(v, 1u, 1u, l.x, w.x, 0u);
+}
+@compute @workgroup_size(256)
+fn k_burn_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
+    let m = -final_reduce(0u, nwg_cells(), 1u, l.x);
+    if (l.x == 0u) { D[D_DTBURN] = select(3.0e38, max(m, 1e-9), m < 1e37); }
 }

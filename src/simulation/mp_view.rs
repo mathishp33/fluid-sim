@@ -51,6 +51,8 @@ pub enum MpScenario {
     CoalFire,
     /// feu de bois : bûchettes sur une grille allumées par des braises ; pyrolyse, flammes des gaz du bois, charbon de bois qui brûle
     WoodFire,
+    /// tas de poudre noire allumé sur un flanc : combustion sans air, gaz chauds qui traversent la poudre voisine, fumée blanche
+    Gunpowder,
 }
 
 impl Default for MpScenario {
@@ -60,7 +62,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 14] = [
+    pub const ALL: [MpScenario; 15] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -75,14 +77,18 @@ impl MpScenario {
         Self::SandColumn,
         Self::CoalFire,
         Self::WoodFire,
+        Self::Gunpowder,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire)
+        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder)
     }
     pub fn is_combustion(self) -> bool {
-        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame | Self::CoalFire | Self::WoodFire)
+        matches!(
+            self,
+            Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame | Self::CoalFire | Self::WoodFire | Self::Gunpowder
+        )
     }
     pub fn from_index(i: usize) -> Self {
         Self::ALL[i.min(Self::ALL.len() - 1)]
@@ -106,6 +112,7 @@ impl MpScenario {
             Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
             Self::CoalFire => "Feu de charbon sur grille (braséro : houille sur braises, flamme des matières volatiles)",
             Self::WoodFire => "Feu de bois sur grille (pyrolyse : flammes des gaz du bois)",
+            Self::Gunpowder => "Tas de poudre noire (déflagration sans air, fumée blanche)",
         }
     }
 }
@@ -125,6 +132,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
         &lib_c
     } else if sc == MpScenario::WoodFire {
         lib_c = lib.with_wood();
+        &lib_c
+    } else if sc == MpScenario::Gunpowder {
+        lib_c = lib.with_gunpowder();
         &lib_c
     } else if sc.is_combustion() {
         lib_c = lib.with_combustion();
@@ -399,6 +409,36 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             s.bc[3] = Bc::Open { p: P_ATM };
             s.dt_max = 2e-3;
             t_fn = Box::new(move |x, y| if ink(x, y) { T_KERNEL } else { 293.15 });
+        }
+        MpScenario::Gunpowder => {
+            // petit tas de poudre noire (grains de 2 mm en vrac, α = 0.55 ; flancs à 34°, l'angle de talus ; ~1 kg par mètre de
+            // profondeur à 0.8 m × 0.6 m) posé au milieu du sol, allumé sur son flanc gauche (mailles à 700 K, au-dessus des 580 K
+            // d'allumage). Les grains allumés brûlent sans air, en surface (loi de Vieille) ; leurs gaz chauds (CO2, CO, N2, eau, H2 : ~3000
+            // fois le volume de la poudre) traversent le tas et allument les grains qu'ils baignent : le tas fuse en quelques dizaines de ms
+            // et laisse un nuage de fumée blanche (les résidus solides, en particules de 2 µm) ; le CO et le H2 des produits finissent de
+            // brûler dans l'air. Haut ouvert
+            let powder = need(roles.powder, "une phase granulaire qui brûle sans air (poudre noire) et sa combustion")?;
+            let dry = mix(AIR_SEC)?;
+            let h2o = built_index(&s, H2O_G);
+            let mut air = dry.iter().map(|a| a * if h2o.is_some() { 0.99 } else { 1.0 }).collect::<Vec<f64>>();
+            if let Some(w) = h2o {
+                air[w] += 0.01;
+            }
+            s.ambient_mix = air.clone();
+            let ap = s.reg.phases[powder].alpha_max;
+            let mut heap = air.iter().map(|a| a * (1.0 - ap)).collect::<Vec<f64>>();
+            heap[powder] = ap;
+            // (au moins 3 mailles de demi-largeur et 2 de haut : sur une grille grossière le tas garde quelques mailles, dont une allumée)
+            let (xc, b) = (0.5 * lx, (0.05 * lx).max(3.0 * dx));
+            let hh = (b * 34f64.to_radians().tan()).max(2.0 * dx);
+            let in_heap = move |x: f64, y: f64| y < hh * (1.0 - (x - xc).abs() / b);
+            let fuse = move |x: f64, y: f64| in_heap(x, y) && x < xc - 0.2 * b;
+            s.paint_mixture(move |x, y| Some(if in_heap(x, y) { heap.clone() } else { air.clone() }));
+            s.bc[3] = Bc::Open { p: P_ATM };
+            s.dt_max = 1e-3;
+            // combustion du CO et du H2 des produits dans l'air : flamme de diffusion, épaississement modéré (voir le feu de bois)
+            s.flame_resolution = 0.25;
+            t_fn = Box::new(move |x, y| if fuse(x, y) { 700.0 } else { 293.15 });
         }
         MpScenario::DiffusionFlame => {
             // buse de méthane au centre du fond (émetteurs, 0.25 m/s), air au repos, haut ouvert ; un noyau chaud de prémélange au-dessus

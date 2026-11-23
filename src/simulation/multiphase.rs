@@ -241,14 +241,17 @@ pub fn temp_from_masses(phases: &[super::phases::Phase], m: impl Iterator<Item =
 pub fn temp_from_parts(cap: f64, slope: f64, off: f64, e: f64) -> f64 {
     let t0 = super::phases::T_STD;
     let rhs = e - off - cap * t0; // = C τ + ½ S τ²
-    if slope.abs() <= 1e-12 * cap.abs().max(1e-300) {
+    if slope.abs() <= 1e-12 * cap.abs().max(1e-300) || !(cap > 1e-300) {
         return t0 + rhs / cap.max(1e-30);
     }
-    let disc = cap * cap + 2.0 * slope * rhs;
+    // forme adimensionnée τ + ½ a τ² = b (a = S/C, b = rhs/C), miroir de `tau_from` sur le GPU : C² d'une trace (1e-165 kg de poudre
+    // noire, C ~ 1e-162 J/K) sortait de la plage f64 — discriminant nul, T = 298 − c/s = −802 K et pas refusés en cascade
+    let (a, b) = (slope / cap, rhs / cap);
+    let disc = 1.0 + 2.0 * a * b;
     if disc <= 0.0 {
-        return t0 - cap / slope; // minimum de e(T) : énergie hors du domaine du modèle (ne se produit pas en pratique)
+        return t0 - 1.0 / a; // minimum de e(T) : énergie hors du domaine du modèle (ne se produit pas en pratique)
     }
-    t0 + 2.0 * rhs / (cap + disc.sqrt()).max(1e-30)
+    t0 + 2.0 * b / (1.0 + disc.sqrt())
 }
 
 impl MultiphaseSim {

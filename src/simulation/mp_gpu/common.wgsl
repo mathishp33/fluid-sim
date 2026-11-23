@@ -421,4 +421,5 @@ const D_FR_R0: u32 = 62u;
 const D_FR_DONE: u32 = 63u;
 const D_FR_IT: u32 = 64u;
 const D_FR_UNCONV: u32 = 65u;
+const D_DTBURN: u32 = 66u;   // borne du pas des poudres (k_burn_dt ; 0 ou 3e38 : aucune)
 const D_LEN: u32 = 72u;

@@ -562,6 +562,140 @@ fn houille_releases_its_volatiles_and_leaves_its_char() {
     assert!((pcs / 1e6 - 34.0).abs() < 0.5, "PCS {pcs}");
 }
 
+// ===================================================================================================== poudre noire
+
+/// poudre noire en grains (fraction a0) dans de l'azote à T, sans gravité ; `only_powder` : sans les réactions du gaz (composition des
+/// produits figée — vers 2500 K, la dissociation de CO2 et de H2O changerait leur nombre de moles)
+pub(crate) fn gunpowder_dust(t: f64, a0: f64, only_powder: bool) -> MultiphaseSim {
+    let mut lib = MaterialLibrary::default().with_gunpowder();
+    if only_powder {
+        lib.reactions.retain(|r| r.name == super::mp_materials::RX_POUDRE);
+    }
+    grain_dust(&lib, super::mp_materials::POUDRE, t, a0)
+}
+
+#[test]
+fn gunpowder_burns_at_the_vieille_rate_and_releases_its_heat() {
+    // poudre noire : combustion de surface sans air, r = 1.1 cm/s (p / 1 atm)^0.15 dès 580 K — des grains de 2 mm sont consommés à
+    // 6 r / d = 33 s⁻¹ ; produits : 42 % de gaz (12 mol/kg), 58 % de fumée ; chaleur d'explosion 3.0 MJ/kg (Noble & Abel : 3.04, eau
+    // liquide), flamme à volume constant vers 2600 K, « force » n R T_v ≈ 260 kJ/kg ; énergie exactement conservée
+    use super::mp_materials::{FUMEE, POUDRE, RX_POUDRE};
+    let s0 = gunpowder_dust(700.0, 1e-3, false);
+    let reg = &s0.reg;
+    let r = rx(reg, RX_POUDRE);
+    let (w, f) = (idx(reg, POUDRE), idx(reg, FUMEE));
+    assert!(r.bulk && r.burn().is_some() && r.surface(&reg.phases).is_none() && !reg.is_cell_reactive(w));
+    let mw = reg.phases[w].molar_mass;
+    let gas = |x: &(usize, f64)| reg.phases[x.0].is_gas();
+    let m_gas: f64 = r.products.iter().filter(|x| gas(x)).map(|&(k, nu)| nu * reg.phases[k].molar_mass).sum::<f64>() / mw;
+    let n_gas: f64 = r.products.iter().filter(|x| gas(x)).map(|x| x.1).sum::<f64>() / mw;
+    let (ma, mb) = r.mass_balance(&reg.phases);
+    let qv = -r.delta_u(&reg.phases, 298.15) / mw;
+    let tv = r.adiabatic_products_temp(&reg.phases, 298.15);
+    let force = n_gas * R_GAS * tv;
+    eprintln!("poudre noire : gaz {:.2} % de la masse, {n_gas:.2} mol/kg ; chaleur d'explosion {:.3} MJ/kg ; flamme à volume constant {tv:.0} K ; force {:.0} kJ/kg",
+        100.0 * m_gas, qv / 1e6, force / 1e3);
+    assert!((ma / mb - 1.0).abs() < 1e-12, "bilan de masse : {ma} → {mb}");
+    assert!((m_gas - 0.4196).abs() < 1e-3 && (n_gas - 12.01).abs() < 0.01, "gaz : {m_gas}, {n_gas} mol/kg");
+    assert!((qv / 1e6 - 3.02).abs() < 0.03, "chaleur d'explosion {qv} J/kg");
+    assert!(tv > 2400.0 && tv < 2800.0, "T_v = {tv}");
+    assert!(force > 2.4e5 && force < 3.0e5, "force {force} J/kg");
+    // vitesse dans une cellule à 700 K, sous 1 atm puis sous 10 atm (×10^0.15 = ×1.41)
+    for (p, ratio) in [(101325.0, 1.0), (1013250.0, 10f64.powf(0.15))] {
+        let mut s = gunpowder_dust(700.0, 1e-3, false);
+        let c = s.idx(1, 1);
+        s.p.iter_mut().for_each(|x| *x = p);
+        let (m0, u0) = (s.mass[w][c], s.total_internal_energy());
+        let dt = 1e-5;
+        s.pyrolysis_step(dt);
+        let k = -(s.mass[w][c] / m0).ln() / dt;
+        let expect = 6.0 * 0.011 * ratio / s.reg.phases[w].grain_diameter;
+        eprintln!("p = {:.1} bar : poudre consommée à {k:.4} s⁻¹ (6 r / d = {expect:.4}) ; fumée {:.3e} kg/m³ ; borne du pas {:.3e} s", p / 1e5, s.mass[f][c], s.burn_dt_bound());
+        assert!((k / expect - 1.0).abs() < 1e-6, "vitesse sous {p} Pa : {k} contre {expect}");
+        assert!(s.mass[f][c] > 0.0 && s.burn_dt_bound().is_finite());
+        assert!((s.total_internal_energy() / u0 - 1.0).abs() < 1e-12, "énergie");
+    }
+    // sous la température d'allumage, rien ne brûle
+    let mut s = gunpowder_dust(500.0, 1e-3, false);
+    let m0 = s.total_mass(w);
+    s.pyrolysis_step(1e-3);
+    assert!(s.total_mass(w) == m0, "la poudre brûle à 500 K");
+}
+
+#[test]
+fn gunpowder_explodes_in_a_closed_vessel_to_its_isochoric_pressure() {
+    // 10 kg/m³ de poudre noire dans une boîte fermée d'azote, allumée partout à 700 K : elle brûle en ~0.1 s ; à la fin, gaz et fumée
+    // sont à la température T_v qui conserve l'énergie interne, sous p_v = n_gaz R T_v / V_gaz (la boîte moins le volume de la fumée)
+    use super::mp_materials::POUDRE;
+    let mut s = gunpowder_dust(700.0, 10.0 / 1800.0, true);
+    // (gaz optiquement mince : sous 30 bar de CO2 à 2800 K, le rayonnement viderait la boîte de sa chaleur — test de thermodynamique)
+    s.radiation = false;
+    let w = idx(&s.reg, POUDRE);
+    let m0 = s.total_mass(w);
+    let u0 = s.total_internal_energy() + s.kinetic_energy();
+    while s.time < 0.3 && !s.diverged {
+        s.step();
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let burnt = 1.0 - s.total_mass(w) / m0;
+    // état isochore attendu, avec les masses finales
+    let np = s.reg.phases.len();
+    let mass: Vec<f64> = (0..np).map(|k| s.total_mass(k)).collect();
+    let (mut ce, mut sl, mut e0) = (0.0, 0.0, 0.0);
+    for (k, p) in s.reg.phases.iter().enumerate() {
+        ce += mass[k] * p.c_e();
+        sl += mass[k] * p.cp_slope;
+        e0 += mass[k] * p.e0;
+    }
+    let tv = super::phases::adiabatic_t(ce, sl, e0, u0);
+    let vol = (s.nx * s.ny) as f64 * s.dx * s.dx;
+    let v_cond: f64 = (0..np).filter(|&k| !s.reg.phases[k].is_gas()).map(|k| mass[k] / s.reg.phases[k].rho(2e6, tv)).sum();
+    let n_gas: f64 = (0..np).filter(|&k| s.reg.phases[k].is_gas()).map(|k| mass[k] / s.reg.phases[k].molar_mass).sum();
+    let pv = n_gas * R_GAS * tv / (vol - v_cond);
+    let p_sim = s.p.iter().sum::<f64>() / s.p.len() as f64;
+    let t_sim = s.temp.iter().sum::<f64>() / s.temp.len() as f64;
+    eprintln!("vase clos : {} pas, poudre brûlée {:.5} % ; T {t_sim:.1} K (attendue {tv:.1}), p {:.3} bar (attendue {:.3} bar)",
+        s.step_count, 100.0 * burnt, p_sim / 1e5, pv / 1e5);
+    assert!(burnt > 0.999, "poudre restante : {}", 1.0 - burnt);
+    assert!((t_sim - tv).abs() < 5.0, "T finale {t_sim} contre {tv}");
+    assert!((p_sim / pv - 1.0).abs() < 0.01, "p finale {p_sim} contre {pv}");
+    assert!(((s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0).abs() < 1e-9, "énergie");
+}
+
+#[test]
+fn a_gunpowder_heap_deflagrates_into_white_smoke() {
+    // tas de poudre noire allumé sur un flanc (40 × 30, 0.8 m × 0.6 m) : les gaz chauds traversent le tas et allument les grains qu'ils
+    // baignent ; le tas fuse en boule de feu (gaz vers 2800 K) et laisse sa fumée, 58 % de la masse brûlée ; masse conservée (sorties
+    // par le haut comprises). Une seule vitesse par cellule : les grains n'ont pas d'inertie propre, le souffle (gaz jaillissant des
+    // grains tassés à plusieurs centaines de m/s) en emporte la moitié hors du domaine avant qu'ils aient brûlé
+    use super::mp_materials::{FUMEE, POUDRE};
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::Gunpowder, 40, 30, 0.02, 9.81).unwrap();
+    let k = |n: &str| idx(&s.reg, n);
+    let (w, f, n2) = (k(POUDRE), k(FUMEE), k(N2));
+    let gg = s.group_of[n2];
+    let np = s.reg.phases.len();
+    let kept = |s: &MultiphaseSim| (0..np).map(|q| s.total_mass(q) - s.boundary_flux[q]).sum::<f64>();
+    let (m0, all0) = (s.total_mass(w), kept(&s));
+    let mut t_gas = 0.0f64;
+    while s.time < 0.03 && !s.diverged {
+        s.step();
+        let tg = (0..s.nx * s.ny).filter(|&c| !s.is_solid(c) && s.group_mass(gg, c) > 0.0).map(|c| s.tg[gg][c]).fold(0.0f64, f64::max);
+        t_gas = t_gas.max(tg);
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    // (poudre brûlée : celle qui a disparu, moins celle que le souffle a projetée hors du domaine par le haut ouvert)
+    let burnt = m0 - (s.total_mass(w) - s.boundary_flux[w]);
+    let smoke = s.total_mass(f) - s.boundary_flux[f];
+    let ratio = s.reg.phases[f].molar_mass / s.reg.phases[w].molar_mass;
+    eprintln!("tas de poudre : {} pas, {} refaits ; poudre brûlée {:.1} % de {m0:.3} kg/m en 30 ms (projetée dehors {:.3} kg/m) ; fumée {smoke:.4} kg/m ({:.4} de la masse brûlée, attendu {ratio:.4}) ; gaz jusqu'à {t_gas:.0} K",
+        s.step_count, s.rollbacks, 100.0 * burnt / m0, -s.boundary_flux[w], smoke / burnt);
+    assert!(burnt > 0.3 * m0, "le tas n'a pas brûlé : {burnt} sur {m0}");
+    assert!(burnt - s.boundary_flux[w] > 0.85 * m0, "poudre restée dans le tas : {}", s.total_mass(w));
+    assert!(t_gas > 2000.0, "pas de flamme : {t_gas} K");
+    assert!((smoke / burnt / ratio - 1.0).abs() < 1e-6, "fumée {smoke} pour {burnt} brûlés");
+    assert!((kept(&s) / all0 - 1.0).abs() < 1e-9, "masse : {all0} → {}", kept(&s));
+}
+
 /// Lit tassé de 4 × 6 mailles de 1 cm, sans gravité ni chimie, dans l'azote : braises de charbon de bois (1450 K) dans les 3 rangées du
 /// bas et bois (293 K) au-dessus ; ou (`mixed`) braises et bois mêlés à parts égales dans toutes les mailles, gaz et bois à 293 K
 pub(crate) fn ember_bed(mixed: bool) -> MultiphaseSim {
@@ -856,6 +990,108 @@ fn wood_fire_cell_history() {
             let x = |n: &str| s.mass[idx(&s.reg, n)][q] / s.group_mass(gg, q).max(1e-300);
             eprintln!("t {:.5} dt {:.2e} : V−1 {:+.3e}, T gaz {:.0} K, p {:.0}, masse gaz {:.3e}, u {ul:+.2}/{ur:+.2}, v {vb:+.2}/{vt:+.2} m/s ; chaleur {:.2e} W/m³, dt chimie {:.2e} ; Y CH4 {:.2e} CO {:.2e} H2 {:.2e} O2 {:.2e}",
                 s.time, s.last_dt, s.cell_volume(q, s.p[q]) - 1.0, s.tg[gg][q], s.p[q], s.group_mass(gg, q), s.heat_release[q], s.dt_chem, x(CH4), x(CO), x(H2), x(O2));
+        }
+    }
+}
+
+/// diagnostic : vase clos de poudre noire, pas à pas (MP_POWDER_N pas, défaut 40)
+#[test]
+#[ignore]
+fn gunpowder_vessel_diag() {
+    use super::mp_materials::{FUMEE, POUDRE};
+    let mut s = gunpowder_dust(700.0, 10.0 / 1800.0, true);
+    s.radiation = std::env::var("MP_RAD").is_ok();
+    let (w, f, n2) = (idx(&s.reg, POUDRE), idx(&s.reg, FUMEE), idx(&s.reg, N2));
+    let u0 = s.total_internal_energy() + s.kinetic_energy();
+    let nmax: usize = std::env::var("MP_POWDER_N").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let c = s.idx(1, 1);
+    for k in 0..nmax {
+        let dt = s.step();
+        let tg: Vec<String> = (0..s.ngroups()).map(|g| format!("{:.0}", s.tg[g][c])).collect();
+        eprintln!("pas {k} dt {dt:.3e} (borne {:.3e}) : poudre {:.4e} fumée {:.4e} N2 {:.4e} ; U/U0 {:.9} ; T {:.1} tg {:?} ; p {:.4} bar ; vol−1 {:+.3e} ; refaits {}",
+            s.burn_dt_bound(), s.total_mass(w), s.total_mass(f), s.total_mass(n2), (s.total_internal_energy() + s.kinetic_energy()) / u0, s.temp[c], tg,
+            s.p[c] / 1e5, s.cell_volume(c, s.p[c]) - 1.0, s.rollbacks);
+    }
+}
+
+/// diagnostic : tas de poudre noire (MP_POWDER_NX mailles de large, défaut 80, domaine 0.8 m × 0.6 m ; MP_POWDER_T s, défaut 0.3 ;
+/// une ligne toutes les MP_POWDER_DT s, défaut 0.01)
+#[test]
+#[ignore]
+fn gunpowder_heap_diag() {
+    use super::mp_materials::{FUMEE, POUDRE};
+    let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let nx = env("MP_POWDER_NX", 80.0) as usize;
+    let ny = nx * 3 / 4;
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::Gunpowder, nx, ny, 0.8 / nx as f64, 9.81).unwrap();
+    let (w, f, n2) = (idx(&s.reg, POUDRE), idx(&s.reg, FUMEE), idx(&s.reg, N2));
+    let (gw, gg) = (s.group_of[w], s.group_of[n2]);
+    let m0 = s.total_mass(w);
+    let (t_end, every) = (env("MP_POWDER_T", 0.3), env("MP_POWDER_DT", 0.01));
+    let t0 = std::time::Instant::now();
+    let mut next = 0.0;
+    while s.time < t_end && !s.diverged {
+        let dt = s.step();
+        if s.time >= next {
+            next += every;
+            let n = s.nx * s.ny;
+            let x_of = |c: usize| ((c % s.nx) as f64 + 0.5) * s.dx;
+            let front = (0..n).filter(|&c| s.mass[w][c] > 1.0 && s.tg[gw][c] >= 580.0).map(x_of).fold(-1.0f64, f64::max);
+            let tail = (0..n).filter(|&c| s.mass[w][c] > 1.0).map(x_of).fold(f64::INFINITY, f64::min);
+            let tg_max = (0..n).filter(|&c| !s.is_solid(c) && s.group_mass(gg, c) > 0.0).map(|c| s.tg[gg][c]).fold(0.0f64, f64::max);
+            let pmax = s.p.iter().fold(0.0f64, |a, &b| a.max(b));
+            eprintln!(
+                "t {:.3} s ({} pas, {:.0} s, dt {dt:.2e}) : front de flamme x = {front:.3} m, poudre restante dès x = {tail:.3} m ({:.2} % de la poudre) ; fumée {:.3e} kg/m ; T gaz max {tg_max:.0} K ; p max {:.3} bar ; |u| max {:.1} m/s ; refaits {}",
+                s.time, s.step_count, t0.elapsed().as_secs_f64(), 100.0 * s.total_mass(w) / m0, s.total_mass(f), pmax / 1e5, s.max_speed(), s.rollbacks
+            );
+        }
+    }
+    eprintln!("divergé : {}", s.diverged);
+}
+
+/// diagnostic : premier pas refusé du tas de poudre (40 × 40, 1 cm) — fait MP_POWDER_OK pas protégés (défaut 6), puis un pas
+/// SANS filet de sécurité, et liste les mailles hors bornes (T de groupe, masses négatives, p) et la vitesse max
+#[test]
+#[ignore]
+fn gunpowder_first_bad_step_probe() {
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::Gunpowder, 40, 40, 0.01, 9.81).unwrap();
+    let nok: usize = std::env::var("MP_POWDER_OK").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    for _ in 0..nok {
+        s.step();
+    }
+    let dt = s.choose_dt();
+    eprintln!("après {nok} pas : t {:.3e}, pas choisi {dt:.3e}, refaits {}", s.time, s.rollbacks);
+    let dt = s.step_raw_pub();
+    let n = s.nx * s.ny;
+    eprintln!("pas brut dt {dt:.3e} : |u| max {:.1} m/s (Courant {:.2}), sain {}", s.max_speed(), s.max_speed() * dt / s.dx, s.state_is_sane());
+    let names: Vec<String> = s.reg.phases.iter().map(|p| p.name.chars().take(8).collect()).collect();
+    let mut shown = 0;
+    for c in 0..n {
+        if s.is_solid(c) {
+            continue;
+        }
+        let mut why = vec![];
+        if !(s.temp[c] >= 50.0 && s.temp[c] <= 5000.0) {
+            why.push(format!("T {:.1}", s.temp[c]));
+        }
+        if !(s.p[c] >= 0.0) {
+            why.push(format!("p {:.3e}", s.p[c]));
+        }
+        for g in 0..s.groups.len() {
+            if s.group_mass(g, c) > 0.0 && !(s.tg[g][c] >= 50.0 && s.tg[g][c] <= 5000.0) {
+                why.push(format!("T groupe {g} = {:.1} (masse {:.3e})", s.tg[g][c], s.group_mass(g, c)));
+            }
+        }
+        for k in 0..s.mass.len() {
+            if !(s.mass[k][c] >= -1e-6) {
+                why.push(format!("m {} = {:.3e}", names[k], s.mass[k][c]));
+            }
+        }
+        if !why.is_empty() && shown < 12 {
+            shown += 1;
+            let m: Vec<String> = (0..s.mass.len()).filter(|&k| s.mass[k][c].abs() > 1e-9).map(|k| format!("{} {:.3e}", names[k], s.mass[k][c])).collect();
+            eprintln!("  maille ({}, {}) : {} — p {:.4e}, masses {}", c % s.nx, c / s.nx, why.join(", "), s.p[c], m.join(" "));
         }
     }
 }

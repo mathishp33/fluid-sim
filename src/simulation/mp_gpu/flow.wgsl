@@ -102,6 +102,9 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
     let wset = final_reduce(7u, nw, 1u, l.x);
     if (l.x == 0u) {
         var dt = min(min(P.dt_max, D[D_DTCHEM]), min(D[D_DTPHASE], P.dt_cap));
+        // borne des poudres (k_burn_dt, recalculée à chaque pas quand une poudre peut brûler ; 0 = aucune : une série de pas remet à
+        // zéro les emplacements D_B_TSUM et suivants)
+        if (D[D_DTBURN] > 0.0) { dt = min(dt, D[D_DTBURN]); }
         if (gap > 0.0) { dt = min(dt, max(P.heat_tau * 20.0 / gap, 1e-6)); }
         dt = min(dt, P.cfl * P.dx / max(umax, 1e-9));
         // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas ; percolation : |q| dt ≤ 0.4 du fluide amont

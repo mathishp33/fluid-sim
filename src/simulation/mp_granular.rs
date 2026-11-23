@@ -48,6 +48,21 @@ impl MultiphaseSim {
         self.groups[g].iter().all(|&k| self.reg.phases[k].is_granular())
     }
 
+    /// température du fluide au contact des grains de c : groupes non granulaires présents, moyenne pondérée par leur fraction volumique
+    /// (0 sans fluide). Une poudre s'allume dans un fluide plus chaud que sa température d'allumage (voir `pyrolysis_step`)
+    pub(crate) fn fluid_contact_temp(&self, c: usize) -> f64 {
+        let (mut a, mut at) = (0.0, 0.0);
+        for g in 0..self.groups.len() {
+            if self.group_is_granular(g) || self.group_mass(g, c) <= 0.0 {
+                continue;
+            }
+            let al = self.group_alpha(g, c);
+            a += al;
+            at += al * self.tg[g][c];
+        }
+        if a > 0.0 { at / a } else { 0.0 }
+    }
+
     /// fraction volumique de grains (toutes phases granulaires) de la cellule c
     pub(crate) fn grain_fraction(&self, c: usize) -> f64 {
         (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].is_granular()).map(|k| self.alpha[k][c]).sum()

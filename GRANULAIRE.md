@@ -145,9 +145,33 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - corrigé au passage (tout le solveur, CPU et GPU) : croissance du pas de temps bornée à ×2 d'un pas au suivant (`DT_GROWTH` ; ×1.25 enchaînait les retours arrière du braséro). Après
   un pas court imposé par la chimie, les vitesses de la projection — calculées pour corriger l'erreur de volume en CE pas — servaient à
   l'advection d'un pas 4× plus long et vidaient la maille à 92 % (pic à 3786 K sous la grille du feu de bois).
+- **poudre noire** (`Phase::gunpowder` : 75 % KNO3, 15 % charbon de bois, 10 % S, grains de 2 mm, 1800 kg/m³, α_max 0.55) : COMBUSTION
+  d'une phase granulaire qui porte son oxydant, sans air (réaction en volume avec `burn_rate`, `burn_exponent`, `ignition_temp` ;
+  `pyrolysis_step`, `k_pyrolysis` sur le GPU). La surface des grains régresse à r = 1.1 cm/s (p / 1 atm)^0.15 (loi de Vieille : 2.3 s
+  par pouce à l'air libre, exposant 0.13–0.16 mesuré au-dessus de 0.3 MPa — la poudre noire est peu sensible à la pression) dès que
+  les grains, ou le fluide qui les baigne (`fluid_contact_temp`), atteignent 580 K (auto-allumage vers 580 °F ; la surface d'un grain
+  baigné de gaz de combustion s'allume en ~1 ms, la chaleur met ~3 s à gagner le cœur d'un grain de 2 mm) ; grains consommés à 6 r / d
+  (33 s⁻¹ à 1 atm, premier ordre exact). Produits nés à la température adiabatique (énergie interne quadratique : racine exacte,
+  `adiabatic_t`) : par 100 g, 0.60 CO2 + 0.15 CO + 0.371 N2 + 0.05 H2O + 0.03 H2 (42 % de gaz, 12.0 mol/kg) et 58 % de fumée blanche
+  (`Phase::powder_smoke` : K2CO3, K2SO4, K2S en particules de 2 µm) — Noble & Abel : 43 % de gaz, 274 cm³/g, 725.7 cal/g. Chaleur
+  d'explosion 3.02 MJ/kg, flamme à volume constant 2671 K, « force » n R T_v = 267 kJ/kg. Borne du pas (`burn_dt_bound`, `k_burn_dt`) :
+  au plus le volume d'une cellule de gaz produit par pas — une maille de poudre tassée en dégage ~8e4 fois son volume par seconde.
+  Validé : vitesse = 6 r / d à 1e-6 près sous 1 et 10 atm (×10^0.15), énergie conservée à 1e-12 ; vase clos (10 kg/m³ dans l'azote à
+  700 K) : T finale 2846.6 K et p 32.49 bar = état isochore attendu, énergie à 1e-9 ; GPU : premier pas à 1e-7 près, même débit de
+  combustion et même pression (30.93 bar) au chiffre imprimé près. Limite : sous 30 bar, le rayonnement optiquement mince des gaz chauds
+  viderait la boîte de sa chaleur (le test le coupe).
+- scénario « Tas de poudre noire » : petit tas (flancs à 34°, ~1 kg par mètre de profondeur à 0.8 m × 0.6 m) allumé sur son flanc
+  gauche (700 K), haut ouvert. Les gaz chauds jaillissent des grains tassés à plusieurs centaines de m/s, traversent le tas et allument
+  les grains qu'ils baignent : le tas fuse en boule de feu (gaz vers 2800 K, le CO et le H2 des produits finissent de brûler dans l'air)
+  et laisse un nuage de fumée blanche. À 40 × 30 : 37 % de la poudre brûlée en 30 ms, fumée = 0.5804 de la masse brûlée (stœchiométrie
+  exacte), masse conservée sorties comprises ; GPU : poudre brûlée et fumée à 0.2 % sur 10 ms. Limite (une seule vitesse par cellule,
+  les grains n'ont pas d'inertie propre) : le souffle emporte avec les gaz la moitié du tas hors du domaine avant qu'elle ait brûlé.
+- corrigé au passage (CPU) : l'inversion e → T d'un groupe (`temp_from_parts`) élevait au carré sa capacité ; pour une trace de 1e-165
+  kg (poudre dispersée par le souffle jusqu'au bord du domaine), C² sortait de la plage f64, le discriminant s'annulait et T valait
+  298 − c/s = −802 K : pas refusés en cascade. Forme adimensionnée, celle de `tau_from` sur le GPU (qui avait le même défaut en f32).
 - reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), séchage du bois, allumage
-  d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), poudre à canon (KNO3/S/C →
-  gaz chauds, oxydant intégré : brûle sans air).
+  d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), inertie propre des grains
+  (le souffle d'une poudre emporte ses grains), délai d'allumage d'un grain dans un gaz chaud.
 
 ## 7. Solidification (étape 5)
 
@@ -170,7 +194,7 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
 3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5), puis : avalanche rapide (un défaut des faces de paroi
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
 4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
-   et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas (§ 6). Reste : fluidisation, poudre à canon.
+   et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas, poudre noire (§ 6). Reste : fluidisation.
 5. Solidification.
 
 ## 9. Choix à valider

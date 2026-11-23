@@ -584,15 +584,33 @@ impl MultiphaseSim {
     /// réaction comprise) : énergie totale conservée. Dans la chimie des cellules (température commune des groupes qui réagissent), le bois
     /// froid se mêlait aux braises de la même cellule : le gaz y passait d'un coup à ~900 K, se dilatait, et le calcul divergeait.
     /// En parallèle (chaque cellule ne dépend que d'elle-même) ; avancements sommés ensuite dans l'ordre des cellules.
+    ///
+    /// COMBUSTION d'une poudre (`Reaction::burn` : poudre noire, qui porte son oxydant) : dès que ses grains atteignent leur température
+    /// d'allumage — ou que le fluide qui les baigne la dépasse (gaz de combustion qui traversent le tas : leur surface s'allume en ~1 ms,
+    /// bien avant que la chaleur gagne le cœur d'un grain de 2 mm, ~3 s ; `fluid_contact_temp`) —, leur surface régresse à
+    /// r = a (p / 1 atm)ⁿ (loi de Vieille) ; ils sont consommés à ρ_s r S_v = m_s · 6 r / d (premier
+    /// ordre exact) et les produits naissent à la température adiabatique T_f, Σ dm_p e_p(T_f) = dm_s e_s(T_s) (la flamme est collée au
+    /// grain : les grains restants gardent leur température, les gaz et la fumée emportent la chaleur). Borne du pas : `burn_dt_bound`.
     pub(crate) fn pyrolysis_step(&mut self, dt: f64) {
         use super::mp_par::{for_ranges, MIN_HEAVY};
         use super::multiphase::SyncPtr;
+        use super::phases::{adiabatic_t, burn_rate_constant};
         if !self.chemistry {
             return;
         }
+        /// réaction, réactif granulaire, ν, τ, rapport de masses réactifs / produits, combustion (a, n, T d'allumage), volume de gaz × p
+        /// par kg de réactif (J/kg)
+        struct Bulk {
+            j: usize,
+            s: usize,
+            nu: f64,
+            tau: f64,
+            scale: f64,
+            burn: Option<(f64, f64, f64)>,
+            vg: f64,
+        }
         let phases = &self.reg.phases;
-        // (réaction, réactif granulaire, ν, τ, rapport de masses réactifs / produits)
-        let bulk: Vec<(usize, usize, f64, f64, f64)> = self
+        let bulk: Vec<Bulk> = self
             .reg
             .reactions
             .iter()
@@ -601,7 +619,8 @@ impl MultiphaseSim {
             .filter_map(|(j, r)| {
                 let &(s, nu) = r.reactants.first().filter(|&&(k, _)| phases[k].is_granular())?;
                 let (a, b) = r.mass_balance(phases);
-                Some((j, s, nu, r.bulk_tau(phases), if b > 0.0 { a / b } else { 1.0 }))
+                let scale = if b > 0.0 { a / b } else { 1.0 };
+                Some(Bulk { j, s, nu, tau: r.bulk_tau(phases), scale, burn: r.burn(), vg: r.burn_gas_volume(phases) })
             })
             .collect();
         if bulk.is_empty() {
@@ -622,7 +641,8 @@ impl MultiphaseSim {
                     if this.is_solid(c) || this.pinned(c) {
                         continue;
                     }
-                    for (q, &(j, s, nu, tau, scale)) in bulk.iter().enumerate() {
+                    for (q, b) in bulk.iter().enumerate() {
+                        let (j, s, nu, tau, scale) = (b.j, b.s, b.nu, b.tau, b.scale);
                         let r = &this.reg.reactions[j];
                         // SAFETY (tout le bloc) : la cellule c n'est lue et écrite que par sa tranche
                         unsafe {
@@ -632,6 +652,41 @@ impl MultiphaseSim {
                             }
                             let gs = this.group_of[s];
                             let ts = this.tg[gs][c];
+                            if let Some((a, ex, t_ign)) = b.burn {
+                                if ts < t_ign && this.fluid_contact_temp(c) < t_ign {
+                                    continue;
+                                }
+                                let ph = &this.reg.phases;
+                                let kb = burn_rate_constant(a, ex, this.p[c], ph[s].grain_diameter);
+                                let xi = ms / ph[s].molar_mass * (1.0 - (-kb * dt).exp()) / nu;
+                                let dms = (nu * xi * ph[s].molar_mass).min(ms);
+                                let e_in = dms * ph[s].e_int(ts);
+                                let (mut ce, mut sl, mut e0) = (0.0, 0.0, 0.0);
+                                for &(p, nup) in &r.products {
+                                    let dm = xi * nup * ph[p].molar_mass * scale;
+                                    ce += dm * ph[p].c_e();
+                                    sl += dm * ph[p].cp_slope;
+                                    e0 += dm * ph[p].e0;
+                                }
+                                let tf = adiabatic_t(ce, sl, e0, e_in);
+                                let mut e_out = 0.0;
+                                for &(p, nup) in &r.products {
+                                    let dm = xi * nup * ph[p].molar_mass * scale;
+                                    let ep = dm * ph[p].e_int(tf);
+                                    *mp[p].at(c) += dm;
+                                    *egp[this.group_of[p]].at(c) += ep;
+                                    e_out += ep;
+                                }
+                                // (arrondi de T_f : le reste au groupe du premier produit, énergie exactement conservée)
+                                if let Some(&(p0, _)) = r.products.first() {
+                                    *egp[this.group_of[p0]].at(c) += e_in - e_out;
+                                }
+                                *mp[s].at(c) -= dms;
+                                *egp[gs].at(c) -= e_in;
+                                *xp.at(c * nb + q) = xi;
+                                *tp.at(c) = true;
+                                continue;
+                            }
                             let k = r.k_forward(ts);
                             if !(k > 0.0) {
                                 continue;
@@ -662,14 +717,59 @@ impl MultiphaseSim {
             self.reacted = vec![0.0; self.reg.reactions.len()];
         }
         for c in 0..n {
-            for (q, &(j, ..)) in bulk.iter().enumerate() {
+            for (q, b) in bulk.iter().enumerate() {
                 let x = xi_cell[c * nb + q];
                 if x != 0.0 {
-                    self.reacted[j] += x * a2;
+                    self.reacted[b.j] += x * a2;
                 }
             }
         }
         self.sync_cells(|c| touched[c]);
+    }
+
+    /// Borne du pas imposée par la combustion des poudres (`Reaction::burn`) : au plus le volume d'une cellule de gaz produit par pas, là
+    /// où la poudre brûle ou est à moins de 50 K de s'allumer — une maille de poudre tassée en grains de 2 mm dégage ~8e4 fois son volume
+    /// de gaz par seconde (sur l'état du début du pas ; miroir de `k_burn_dt` sur le GPU). ∞ sans poudre.
+    pub(crate) fn burn_dt_bound(&self) -> f64 {
+        use super::phases::burn_rate_constant;
+        if !self.chemistry || !self.reg.reactions.iter().any(|r| r.burn().is_some()) {
+            return f64::INFINITY;
+        }
+        let phases = &self.reg.phases;
+        // (réactif granulaire, (a, n, T d'allumage), volume de gaz × p par kg de réactif)
+        let burns: Vec<(usize, (f64, f64, f64), f64)> = self
+            .reg
+            .reactions
+            .iter()
+            .filter_map(|r| {
+                let b = r.burn()?;
+                let &(s, _) = r.reactants.first().filter(|&&(k, _)| phases[k].is_granular())?;
+                Some((s, b, r.burn_gas_volume(phases)))
+            })
+            .collect();
+        let n = self.nx * self.ny;
+        super::mp_par::map_ranges(n, super::mp_par::MIN_HEAVY, |lo, hi| {
+            let mut m = f64::INFINITY;
+            for c in lo..hi {
+                if self.is_solid(c) || self.pinned(c) {
+                    continue;
+                }
+                for &(s, (a, ex, t_ign), vg) in &burns {
+                    let ms = self.mass[s][c];
+                    if ms <= 1e-12 || self.tg[self.group_of[s]][c].max(self.fluid_contact_temp(c)) < t_ign - 50.0 {
+                        continue;
+                    }
+                    let p = self.p[c].max(1.0);
+                    let rate = ms * burn_rate_constant(a, ex, p, phases[s].grain_diameter) * vg / p;
+                    if rate > 0.0 {
+                        m = m.min(1.0 / rate);
+                    }
+                }
+            }
+            m
+        })
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
     }
 
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir.

@@ -18,6 +18,18 @@ fn fluid_fraction(c: u32) -> f32 {
     return s;
 }
 fn grav_norm() -> f32 { return sqrt(P.gx * P.gx + P.gy * P.gy); }
+// température du fluide au contact des grains de c (miroir de fluid_contact_temp) : groupes non granulaires présents, pondérés par leur
+// fraction volumique ; 0 sans fluide
+fn fluid_contact_temp(c: u32) -> f32 {
+    var a = 0.0; var at = 0.0;
+    for (var g = 0u; g < P.ng; g++) {
+        let ok = !gdisp(g) && group_mass(g, c) > 0.0;
+        let al = select(0.0, group_alpha(g, c), ok);
+        a += al;
+        at += al * select(0.0, tgrp(g, c), ok);
+    }
+    return select(0.0, at / max(a, 1e-30), a > 0.0);
+}
 // rayonnement dans un tas de grains : conductance de face 4 σ ε_r d T_m³ f_a f_b (miroir de mp_granular::bed_rad_k ; ε = 0.9)
 fn bed_rad_k(d: f32, ta: f32, tb: f32, fa: f32, fb: f32) -> f32 {
     let tm3 = (ta * ta + tb * tb) * (ta + tb) * 0.25;

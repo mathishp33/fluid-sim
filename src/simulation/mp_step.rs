@@ -81,7 +81,7 @@ impl MultiphaseSim {
         let n = self.nx * self.ny;
         let dx = self.dx;
         let umax = self.max_speed();
-        let mut dt = self.dt_max.min(self.dt_chem).min(self.dt_phase);
+        let mut dt = self.dt_max.min(self.dt_chem).min(self.dt_phase).min(self.burn_dt_bound());
         // chauffage au pinceau : au plus ~20 K par pas (dilatation thermique progressive des liquides, ébullition suivie pas à pas)
         let gap = self.heat_gap();
         if gap > 0.0 {

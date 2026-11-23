@@ -52,6 +52,14 @@ pub struct ReactionDef {
     /// réaction en volume d'une phase granulaire (pyrolyse : voir `phases::Reaction::bulk`)
     #[serde(default)]
     pub bulk: bool,
+    /// combustion d'une phase granulaire porteuse de son oxydant (poudre noire) : vitesse de régression de la surface des grains à
+    /// 1 atm (m/s), exposant de la loi de Vieille, température d'allumage (K) — voir `phases::Reaction::burn_rate`
+    #[serde(default)]
+    pub burn_rate: f64,
+    #[serde(default)]
+    pub burn_exponent: f64,
+    #[serde(default)]
+    pub ignition_temp: f64,
 }
 
 /// Mélange nommé : fractions VOLUMIQUES (= molaires pour des gaz parfaits) de fluides de la bibliothèque, normalisées à 1.
@@ -119,6 +127,8 @@ pub struct Roles {
     pub wood: Option<usize>,
     /// résidu granulaire de cette décomposition (charbon de bois)
     pub charcoal: Option<usize>,
+    /// phase granulaire qui brûle sans air (réactif d'une combustion de poudre : poudre noire)
+    pub powder: Option<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -148,13 +158,15 @@ impl Roles {
         let coal = by_name(&["charbon", "coal", "carbone"], Some(PhaseKind::Granular)).or_else(|| {
             reg.reactions.iter().find_map(|r| r.surface(&reg.phases).map(|s| s.solid))
         });
-        let wood = by_name(&["bois", "wood"], Some(PhaseKind::Granular)).or_else(|| {
-            reg.reactions.iter().find(|r| r.bulk).and_then(|r| r.reactants.first().map(|&(k, _)| k))
+        // (pyrolyse : réaction en volume qui n'est pas une combustion de poudre)
+        let pyro = || reg.reactions.iter().find(|r| r.bulk && r.burn().is_none());
+        let wood = by_name(&["bois", "wood"], Some(PhaseKind::Granular)).or_else(|| pyro().and_then(|r| r.reactants.first().map(|&(k, _)| k)));
+        let charcoal = by_name(&["charbon de bois", "charcoal"], Some(PhaseKind::Granular))
+            .or_else(|| pyro().and_then(|r| r.products.iter().map(|&(k, _)| k).find(|&k| reg.phases[k].is_granular())));
+        let powder = by_name(&["poudre noire", "poudre", "gunpowder", "black powder"], Some(PhaseKind::Granular)).or_else(|| {
+            reg.reactions.iter().find(|r| r.burn().is_some()).and_then(|r| r.reactants.first().map(|&(k, _)| k))
         });
-        let charcoal = by_name(&["charbon de bois", "charcoal"], Some(PhaseKind::Granular)).or_else(|| {
-            reg.reactions.iter().find(|r| r.bulk).and_then(|r| r.products.iter().map(|&(k, _)| k).find(|&k| reg.phases[k].is_granular()))
-        });
-        Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal }
+        Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal, powder }
     }
 }
 
@@ -343,6 +355,9 @@ impl MaterialLibrary {
                     modifiers: md,
                     flame_thickness: r.flame_thickness,
                     bulk: r.bulk,
+                    burn_rate: r.burn_rate,
+                    burn_exponent: r.burn_exponent,
+                    ignition_temp: r.ignition_temp,
                 }),
                 _ => warnings.push(format!("réaction « {} » ignorée : fluide inexistant", r.name)),
             }
@@ -448,6 +463,9 @@ pub const RX_CHARCOAL: &str = "combustion du charbon de bois (C + O2 → CO2, su
 pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C + CO2 → 2 CO)";
 pub const HOUILLE: &str = "houille";
 pub const RX_HOUILLE: &str = "pyrolyse de la houille (houille → charbon + CH4, CO, CO2, H2O, H2)";
+pub const POUDRE: &str = "poudre noire";
+pub const FUMEE: &str = "fumée de poudre";
+pub const RX_POUDRE: &str = "combustion de la poudre noire (→ CO2, CO, N2, H2O, H2, fumée)";
 
 /// Gaz parfait de combustion. cp(T) = cp + pente·(T − 298.15) : les deux coefficients sont ajustés pour reproduire EXACTEMENT
 /// h(2000 K) − h(298 K) et s°(2000 K) des tables NIST-JANAF (donc la température de flamme et les équilibres de dissociation vers
@@ -635,6 +653,26 @@ pub fn houille_reactions() -> Vec<ReactionDef> {
     }]
 }
 
+/// Combustion de la poudre noire (réaction EN VOLUME qui porte son oxydant, `burn_rate`) : une « mole » de 100 g de poudre (75 % KNO3,
+/// 15 % charbon de bois, 10 % S) → 0.60 CO2 + 0.15 CO + 0.371 N2 + 0.05 H2O + 0.03 H2 (42 % de la masse, 12.0 mol/kg : 269 L/kg aux
+/// conditions normales) + 58 % de fumée (K2CO3, K2SO4, K2S). Analyse de Noble & Abel : 43 % de gaz (en volume CO2 49 %, N2 33 %,
+/// CO 12 %), 56 % de solides, 274 cm³/g, 725.7 cal/g. Chaleur d'explosion 3.0 MJ/kg, flamme vers 2500 K. La surface des grains régresse
+/// à r = 1.1 cm/s (p / 1 atm)^0.15 (2.3 s par pouce à l'air libre ; exposant 0.13–0.16 mesuré au-dessus de 0.3 MPa : la poudre noire
+/// est peu sensible à la pression) dès qu'ils atteignent 580 K (auto-allumage vers 580 °F)
+pub fn gunpowder_reactions() -> Vec<ReactionDef> {
+    vec![ReactionDef {
+        name: RX_POUDRE.into(),
+        reactants: vec![(POUDRE.into(), 1.0)],
+        products: vec![(CO2.into(), 0.60), (CO.into(), 0.15), (N2.into(), 0.371), (H2O_G.into(), 0.05), (H2.into(), 0.03), (FUMEE.into(), 1.0)],
+        orders: vec![1.0],
+        bulk: true,
+        burn_rate: 0.011,
+        burn_exponent: 0.15,
+        ignition_temp: 580.0,
+        ..Default::default()
+    }]
+}
+
 /// fractions molaires de l'air sec : O2 20.95 %, N2 + Ar 79.05 %
 const X_O2_AIR: f64 = 0.2095;
 
@@ -748,6 +786,23 @@ impl MaterialLibrary {
             l.fluids.push(Phase::bituminous_coal());
         }
         for r in coal_reactions().into_iter().chain(houille_reactions()) {
+            if !l.reactions.iter().any(|q| q.name == r.name) {
+                l.reactions.push(r);
+            }
+        }
+        l
+    }
+
+    /// Préréglage combustion + poudre noire (phase granulaire qui brûle sans air), sa fumée et sa combustion (scénario « traînée de
+    /// poudre »)
+    pub fn with_gunpowder(&self) -> MaterialLibrary {
+        let mut l = self.with_combustion();
+        for p in [Phase::gunpowder(), Phase::powder_smoke()] {
+            if l.fluid_index(&p.name).is_none() {
+                l.fluids.push(p);
+            }
+        }
+        for r in gunpowder_reactions() {
             if !l.reactions.iter().any(|q| q.name == r.name) {
                 l.reactions.push(r);
             }

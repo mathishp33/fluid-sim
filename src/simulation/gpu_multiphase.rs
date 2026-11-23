@@ -71,6 +71,7 @@ const MAX_BATCH_OPS: usize = 400;
 const D_DT: usize = 0;
 const D_DTCHEM: usize = 1;
 const D_DTPHASE: usize = 2;
+const D_DTBURN: usize = 66;
 const D_SUB_C: usize = 4;
 const D_NEWTON_IT: usize = 8;
 const D_PCG_IT: usize = 10;
@@ -109,7 +110,7 @@ const PH_STRIDE: usize = 36;
 const SOL_STRIDE: usize = 8;
 const PC_STRIDE: usize = 8;
 const LEV_STRIDE: usize = 8;
-const RX_STRIDE: usize = 52;
+const RX_STRIDE: usize = 56;
 
 /// Le pas doit-il passer par le solveur de viscosité implicite ? Frottement des grains, ou un fluide dont la viscosité (jusqu'à 100 × μ_ref
 /// selon sa loi en T) dépasserait la borne explicite 0.2 ρ dx²/dt au pas maximal (le gradient conjugué s'arrête sinon tout de suite)
@@ -849,6 +850,14 @@ impl MultiphaseGpu {
                 row[49] = r.reactants.first().map_or(0.0, |&(k, _)| k as f64);
                 row[50] = r.bulk_tau(ph);
             }
+            // combustion d'une poudre (`Reaction::burn`) : 52 vitesse de régression à 1 atm, 53 exposant de Vieille, 54 température
+            // d'allumage, 55 volume de gaz × p par kg de réactif (borne du pas)
+            if let Some((a, ex, t_ign)) = r.burn() {
+                row[52] = a;
+                row[53] = ex;
+                row[54] = t_ign;
+                row[55] = r.burn_gas_volume(ph);
+            }
             if r.reversible && surf.is_none() {
                 row[9] = kc_next as f64;
                 for i in 0..KC_N {
@@ -1046,6 +1055,8 @@ impl MultiphaseGpu {
         d[D_DT] = sim.last_dt as f32;
         d[D_DTCHEM] = if sim.dt_chem.is_finite() { sim.dt_chem as f32 } else { 3e38 };
         d[D_DTPHASE] = if sim.dt_phase.is_finite() { sim.dt_phase as f32 } else { 3e38 };
+        // borne de pas des poudres : recalculée au début de chaque pas (`k_burn_dt`) quand une poudre peut brûler ; 0 = aucune
+        d[D_DTBURN] = 0.0;
         self.queue.write_buffer(&self.d_buf, 0, bytemuck::cast_slice(&d));
         self.base = Baselines {
             boundary_flux: sim.boundary_flux.clone(),
@@ -1382,6 +1393,11 @@ impl MultiphaseGpu {
             v.push(face("k_apply_pf"));
             v.push(cell("k_pin_reset"));
             v.push(cell("k_refresh"));
+        }
+        // combustion des poudres : borne du pas sur l'état du début du pas (avant k_red_dt, qui réutilise les sommes partielles)
+        if sim.chemistry && sim.reg.reactions.iter().any(|r| r.burn().is_some()) {
+            v.push(cell("k_burn_dt"));
+            v.push(one("k_burn_dt_final"));
         }
         v.push(Op { k: "k_red_dt", wg: wm, slot: 0 });
         v.push(one("k_dt_final"));
