@@ -74,6 +74,12 @@ fn k_cond_prep(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invoc
                     let cap = group_cap_at(gq, c, t);
                     S[O_agc + ndx(gq, c)] = a; S[O_kc2 + ndx(gq, c)] = kc; S[O_capc + ndx(gq, c)] = cap;
                     if (cap > 0.0 && a > 0.0) { v[0] = max(v[0], kc * a / cap); }
+                    // rayonnement dans le tas (miroir de conduct : marge 2, nœud à sa propre température)
+                    if (gdisp(gq) && cap > 0.0 && a > 0.0) {
+                        let k0 = gmember(gq, 0u);
+                        let f = min(a / max(grain_amax(k0), 1e-6), 1.0);
+                        v[0] = max(v[0], 2.0 * bed_rad_k(max(grain_d(k0), 1e-6), t, t, f, 1.0) / cap);
+                    }
                 }
             }
         }
@@ -128,7 +134,12 @@ fn k_cond_step(@builtin(global_invocation_id) g: vec3<u32>) {
                 let ab = select(0.0, S[O_agc + ndx(h, b)], inside && h < ngb && S[O_agc + ndx(h, b)] > 0.0);
                 let kb = S[O_kc2 + ndx(h, b)];
                 var kl = 0.0; if (ka + kb > 0.0) { kl = 2.0 * ka * kb / (ka + kb); }
-                de += kl * aa * ab * (S[src + ndx(h, b)] - tcv) / dx2;
+                // rayonnement dans le tas entre deux nœuds granulaires (miroir de conduct / bed_rad_k)
+                let rad = s < 0 && !is_solid(b) && gdisp(gq) && gdisp(h) && aa > 0.0 && ab > 0.0;
+                let kg0 = gmember(gq, 0u); let kh0 = gmember(h, 0u);
+                let fa = min(aa / max(grain_amax(kg0), 1e-6), 1.0); let fb = min(ab / max(grain_amax(kh0), 1e-6), 1.0);
+                let kr = select(0.0, bed_rad_k(0.5 * (max(grain_d(kg0), 1e-6) + max(grain_d(kh0), 1e-6)), tcv, S[src + ndx(h, b)], fa, fb), rad);
+                de += (kl * aa * ab + kr) * (S[src + ndx(h, b)] - tcv) / dx2;
             }
         }
         if (gq < ngc) {

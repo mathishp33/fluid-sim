@@ -18,6 +18,22 @@
 //! à 1 cm de maille il donnait une constante de temps de ~800 s, au lieu de quelques millisecondes pour une poudre fine.
 
 use super::mp_par::{for_ranges, MIN_HEAVY};
+
+/// constante de Stefan–Boltzmann (W/(m²·K⁴))
+pub(crate) const SIGMA_SB: f64 = 5.670374e-8;
+/// facteur d'échange radiatif entre grains voisins d'un tas, ε / (2 − ε) pour une émissivité ε = 0.9 (charbon, bois, cendres)
+pub(crate) const BED_RAD: f64 = 0.9 / (2.0 - 0.9);
+
+/// Rayonnement dans un tas de grains : à haute température, les grains échangent surtout par rayonnement, qui se comporte dans le tas
+/// comme une conduction (Damköhler, Schotte) de conductivité k_rad = 4 σ ε_r d T³ — 8.5 W/(m·K) pour des braises de 1.5 cm à 1450 K,
+/// 30× la conduction du charbon de bois. Entre deux nœuds granulaires (cellules voisines), T³ pris à la face par la linéarisation exacte
+/// de T_a⁴ − T_b⁴ : T_m³ = (T_a² + T_b²)(T_a + T_b) / 4 (une braise chauffe un morceau de bois froid même s'il rayonne peu), au prorata
+/// des parts tassées f = α / α_max des deux cellules. Conductance (W/(m·K)) de la face.
+#[inline]
+pub(crate) fn bed_rad_k(d: f64, ta: f64, tb: f64, fa: f64, fb: f64) -> f64 {
+    let tm3 = (ta * ta + tb * tb) * (ta + tb) * 0.25;
+    4.0 * SIGMA_SB * BED_RAD * d * tm3 * fa * fb
+}
 use super::multiphase::{MultiphaseSim, SyncPtr};
 use super::phases::MAX_PHASES;
 
@@ -240,6 +256,30 @@ impl MultiphaseSim {
                     let q = g * dt * (tf - ts) / (1.0 + g * dt * (1.0 / cs + 1.0 / cf));
                     egn[s] += q;
                     egn[f] -= q;
+                    changed = true;
+                }
+            }
+            // rayonnement entre deux populations de grains de la cellule (braises et bois mêlés) : h = 4 σ ε_r T_m³ sur l'aire des grains
+            // de l'une tournée vers l'autre (la plus petite des deux estimations S_v,1 α_2 / α_s et S_v,2 α_1 / α_s), implicite à deux corps
+            let a_s: f64 = (0..ng).filter(|&q| gran[q]).map(|q| this.group_alpha(q, c)).sum();
+            for s1 in 0..ng {
+                if !gran[s1] || this.group_mass(s1, c) <= 0.0 {
+                    continue;
+                }
+                for s2 in s1 + 1..ng {
+                    if !gran[s2] || this.group_mass(s2, c) <= 0.0 {
+                        continue;
+                    }
+                    let (t1, t2) = (this.tg[s1][c], this.tg[s2][c]);
+                    let (a1, a2) = (this.group_alpha(s1, c), this.group_alpha(s2, c));
+                    let d1 = this.reg.phases[this.groups[s1][0]].grain_diameter.max(1e-6);
+                    let d2 = this.reg.phases[this.groups[s2][0]].grain_diameter.max(1e-6);
+                    let area = (6.0 * a1 / d1 * a2 / a_s.max(1e-30)).min(6.0 * a2 / d2 * a1 / a_s.max(1e-30));
+                    let gq = lam * 4.0 * super::mp_granular::SIGMA_SB * BED_RAD * (t1 * t1 + t2 * t2) * (t1 + t2) * 0.25 * area;
+                    let (c1, c2) = (this.group_cap_at(s1, c, t1).max(1e-300), this.group_cap_at(s2, c, t2).max(1e-300));
+                    let q = gq * dt * (t2 - t1) / (1.0 + gq * dt * (1.0 / c1 + 1.0 / c2));
+                    egn[s1] += q;
+                    egn[s2] -= q;
                     changed = true;
                 }
             }

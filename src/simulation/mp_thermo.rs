@@ -32,6 +32,11 @@ impl MultiphaseSim {
         let dx2 = dx * dx;
         let harm = |a: f64, b: f64| if a + b > 0.0 { 2.0 * a * b / (a + b) } else { 0.0 };
         let ptrs = |v: &mut Vec<Vec<f64>>| -> Vec<SyncPtr<f64>> { v.iter_mut().map(|a| SyncPtr(a.as_mut_ptr())).collect() };
+        // groupes granulaires : diamètre des grains et compaction maximale (rayonnement dans le tas, voir `bed_rad_k`)
+        let gran: Vec<bool> = (0..ng).map(|g| self.group_is_granular(g)).collect();
+        let gd: Vec<f64> = (0..ng).map(|g| if gran[g] { self.reg.phases[self.groups[g][0]].grain_diameter.max(1e-6) } else { 0.0 }).collect();
+        let gmx: Vec<f64> = (0..ng).map(|g| if gran[g] { self.reg.phases[self.groups[g][0]].alpha_max.max(1e-6) } else { 1.0 }).collect();
+        let (gran, gd, gmx) = (&gran, &gd, &gmx);
         // nœuds : conductivité (×F_eff des flammes épaissies), fraction, capacité, température
         let mut kg = vec![vec![0.0; n]; ng];
         let mut ag = vec![vec![0.0; n]; ng];
@@ -71,6 +76,13 @@ impl MultiphaseSim {
                             *cgp[g].at(c) = cap;
                             if cap > 0.0 && a > 0.0 {
                                 amax = amax.max(k * a / cap);
+                                // rayonnement dans le tas : conductance de face ≤ k_rad à la température du nœud le plus chaud, f/C ne
+                                // dépend que du matériau ; marge 2 (miroir de k_cond_prep)
+                                if gran[g] {
+                                    let tg = this.tg[g][c];
+                                    let f = (a / gmx[g]).min(1.0);
+                                    amax = amax.max(2.0 * super::mp_granular::bed_rad_k(gd[g], tg, tg, f, 1.0) / cap);
+                                }
                             }
                         }
                     }
@@ -135,7 +147,12 @@ impl MultiphaseSim {
                                         if ag[h][b] <= 0.0 {
                                             continue;
                                         }
-                                        let q = harm(kg[g][a], kg[h][b]) * ag[g][a] * ag[h][b] * (tgn[h][b] - tgn[g][a]) / dx2;
+                                        let mut kf = harm(kg[g][a], kg[h][b]) * ag[g][a] * ag[h][b];
+                                        if gran[g] && gran[h] {
+                                            let (fa, fb) = ((ag[g][a] / gmx[g]).min(1.0), (ag[h][b] / gmx[h]).min(1.0));
+                                            kf += super::mp_granular::bed_rad_k(0.5 * (gd[g] + gd[h]), tgn[g][a], tgn[h][b], fa, fb);
+                                        }
+                                        let q = kf * (tgn[h][b] - tgn[g][a]) / dx2;
                                         if c == a {
                                             acc[g] += q
                                         } else {

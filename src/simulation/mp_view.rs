@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::mp_cells::{MpEffect, MpThermal};
-use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, H2O_G, MIX_CH4_AIR, MIX_H2_AIR};
+use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, H2O_G, HOUILLE, MIX_CH4_AIR, MIX_H2_AIR};
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Phase, Registry};
 
@@ -104,7 +104,7 @@ impl MpScenario {
             Self::DiffusionFlame => "Flamme de diffusion (jet de méthane)",
             Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
             Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
-            Self::CoalFire => "Feu de charbon sur grille (braséro : percolation, flamme de CO)",
+            Self::CoalFire => "Feu de charbon sur grille (braséro : houille sur braises, flamme des matières volatiles)",
             Self::WoodFire => "Feu de bois sur grille (pyrolyse : flammes des gaz du bois)",
         }
     }
@@ -183,10 +183,22 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             // long des parois, passe sous la grille et traverse le lit par percolation (tirage naturel : le gaz chaud du lit est léger) ;
             // il brûle à la surface des morceaux (C + ½O2 → CO surtout, C + O2 → CO2 ; zone d'oxydation au-dessus de la grille), le CO
             // brûle dans les pores tant qu'il y reste de l'oxygène ; plus haut, sans oxygène, le CO2 est réduit en CO (Boudouard), qui
-            // brûle au-dessus des braises au contact de l'air (petite flamme bleue ; l'humidité de l'air, 1 %, catalyse son oxydation)
+            // brûle au-dessus des braises au contact de l'air (petite flamme bleue ; l'humidité de l'air, 1 %, catalyse son oxydation).
+            // Sur les braises (60 % du bas du lit), une charge de houille en noix (3 cm, 40 % du haut) déjà chaude (700 K, feu établi) :
+            // elle dégage ses matières volatiles (surtout du méthane, ~0.8 %/s de sa masse : la chaleur met ~2 min à gagner le cœur d'un
+            // morceau), qui sortent du lit sans oxygène et brûlent en grande flamme (~2200 K) au contact de l'air, au-dessus du lit
+            // (allumée par une flamme d'allumage : gaz à 1600 K sur 4 cm au-dessus du lit) ; elle laisse son char, qui devient braise à son
+            // tour. Une charge FROIDE fume : ses gaz, refroidis en la traversant, sortent sous le seuil d'allumage et étouffent les braises.
+            // Sans houille dans la bibliothèque : tout le lit en braises
             let coal = need(roles.coal, "une phase granulaire combustible (charbon) et sa réaction de surface")?;
+            let fresh = built_index(&s, HOUILLE);
             let plate = need(roles.plate, "un solide (parois et grille du braséro)")?;
             s.reg.phases[coal].grain_diameter = s.reg.phases[coal].grain_diameter.max(0.012);
+            if let Some(h) = fresh {
+                s.reg.phases[h].grain_diameter = s.reg.phases[h].grain_diameter.max(0.03);
+                // flamme de diffusion des matières volatiles : épaississement modéré, comme le feu de bois
+                s.flame_resolution = 0.25;
+            }
             let dry = mix(AIR_SEC)?;
             let h2o = built_index(&s, H2O_G);
             let mut air = dry.iter().map(|a| a * if h2o.is_some() { 0.99 } else { 1.0 }).collect::<Vec<f64>>();
@@ -197,6 +209,12 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let amax = s.reg.phases[coal].alpha_max;
             let mut bed = air.iter().map(|a| a * (1.0 - amax)).collect::<Vec<f64>>();
             bed[coal] = amax;
+            let load = fresh.map(|h| {
+                let ah = s.reg.phases[h].alpha_max;
+                let mut m = air.iter().map(|a| a * (1.0 - ah)).collect::<Vec<f64>>();
+                m[h] = ah;
+                m
+            });
             let wall = (0.025 * lx).max(dx);
             let (x0, x1) = (0.3 * lx, 0.7 * lx);
             let yg = 0.15 * ly;
@@ -206,13 +224,24 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let grate = move |x: f64, y: f64| x > x0 && x < x1 && y >= yg && y < yg + dx;
             let in_bed = move |x: f64, y: f64| x > x0 && x < x1 && y >= yb0 && y < yb1;
             let walls = move |x: f64, y: f64| y >= yg && y < ytop && ((x > x0 - wall && x <= x0) || (x >= x1 && x < x1 + wall));
-            s.paint_mixture(move |x, y| Some(if in_bed(x, y) { bed.clone() } else { air.clone() }));
+            let y_load = if load.is_some() { yb0 + 0.6 * (yb1 - yb0) } else { yb1 };
+            let on_top = move |x: f64, y: f64| in_bed(x, y) && y >= y_load;
+            s.paint_mixture(move |x, y| {
+                Some(match (&load, on_top(x, y)) {
+                    (Some(l), true) => l.clone(),
+                    _ if in_bed(x, y) => bed.clone(),
+                    _ => air.clone(),
+                })
+            });
             s.paint_solid(move |x, y| if walls(x, y) { Some(plate) } else { None });
             s.bc[3] = Bc::Open { p: P_ATM };
             s.dt_max = 2e-3;
-            // feu établi : tout le lit est en braises
-            let ember = in_bed;
-            t_fn = Box::new(move |x, y| if ember(x, y) { 1450.0 } else { 293.15 });
+            // feu établi : braises à 1450 K, houille à 700 K, flamme d'allumage entre les parois au-dessus du lit
+            let lit = fresh.is_some();
+            let pilot = move |x: f64, y: f64| lit && x > x0 && x < x1 && y >= yb1 && y < yb1 + 0.04;
+            t_fn = Box::new(move |x, y| {
+                if on_top(x, y) { 700.0 } else if in_bed(x, y) { 1450.0 } else if pilot(x, y) { 1600.0 } else { 293.15 }
+            });
             s.finalize_init(&*t_fn);
             for j in 0..ny {
                 for i in 0..nx {
@@ -227,7 +256,7 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             return Ok(s);
         }
         MpScenario::WoodFire => {
-            // feu de bois : bûchettes de 2 cm sur un lit de braises de charbon de bois (la moitié du bas du tas, 1450 K), sur la grille du
+            // feu de bois : bûchettes de 2 cm sur un lit de braises de charbon de bois (le tiers du bas du tas, 1450 K), sur la grille du
             // braséro. Le bois chauffé par les braises se décompose (pyrolyse, ~1 s vers 900 K) : ses gaz (CO, CH4, H2, et la
             // vapeur et le CO2 qu'il libère) montent à travers le tas et brûlent en flamme dans l'air au-dessus ; le charbon de bois qu'il
             // laisse brûle ensuite à la surface des morceaux, comme les braises. L'air entre par le haut ouvert, descend le long des parois
@@ -270,8 +299,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             // l'autre) et dont le reste de gaz, comprimé, monte à 2600–3800 K
             s.flame_resolution = 0.25;
             // feu établi : braises à 1450 K, bûches déjà chaudes (750 K) qui dégagent leurs gaz, et une flamme d'allumage (gaz à 1600 K
-            // sur 4 cm au-dessus du tas) qui les enflamme au contact de l'air. Sans rayonnement dans le tas (à faire), des braises ne
-            // chaufferaient le bois froid posé dessus qu'en des heures simulées
+            // sur 4 cm au-dessus du tas) qui les enflamme au contact de l'air. Du bois FROID posé sur les braises chauffe vite (rayonnement
+            // dans le tas : 1000 K au contact en 4 s), mais une telle charge (deux tiers du tas, sans cheminée : tirage faible) étouffe les
+            // braises avant que ses gaz ne s'enflamment — O2 du tas à 1 %, braises à 1250 K au bout de 14 s, comme un feu trop chargé
             let pilot = move |x: f64, y: f64| x > x0 - 0.02 && x < x1 + 0.02 && y >= yb1 && y < yb1 + 0.04;
             t_fn = Box::new(move |x, y| {
                 if in_bed(x, y) && y < y_emb { 1450.0 } else if in_bed(x, y) { 750.0 } else if pilot(x, y) { 1600.0 } else { 293.15 }

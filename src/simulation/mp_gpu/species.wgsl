@@ -622,7 +622,8 @@ fn k_pyrolysis(@builtin(global_invocation_id) g: vec3<u32>) {
         let ik = exp(-ln_kf(j, ts));
         let keff = 1.0 / max(ik + tau, 1e-30);
         let nus = max(rx_rnu(j, 0u), 1e-30);
-        let xi = select(0.0, ms / molar_k(s) * (1.0 - exp(-nus * keff * dt)) / nus, ok);
+        // 1 − e^(−x) sans annulation : x = ν k dt ~ 1e-5 pour la houille (f32 : 1 − exp(−1e-5) n'a que 2 ou 3 chiffres justes)
+        let xi = select(0.0, ms / molar_k(s) * one_minus_exp(nus * keff * dt) / nus, ok);
         let dms = min(nus * xi * molar_k(s), ms);
         var eabs_out = 0.0;
         for (var i = 0u; i < rx_np(j); i++) {

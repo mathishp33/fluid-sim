@@ -446,6 +446,8 @@ pub const RX_WOOD: &str = "pyrolyse du bois (bois → charbon de bois + CO, CO2,
 pub const RX_CHARCOAL_CO: &str = "gazéification du charbon de bois (C + ½O2 → CO, surface des grains)";
 pub const RX_CHARCOAL: &str = "combustion du charbon de bois (C + O2 → CO2, surface des grains)";
 pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C + CO2 → 2 CO)";
+pub const HOUILLE: &str = "houille";
+pub const RX_HOUILLE: &str = "pyrolyse de la houille (houille → charbon + CH4, CO, CO2, H2O, H2)";
 
 /// Gaz parfait de combustion. cp(T) = cp + pente·(T − 298.15) : les deux coefficients sont ajustés pour reproduire EXACTEMENT
 /// h(2000 K) − h(298 K) et s°(2000 K) des tables NIST-JANAF (donc la température de flamme et les équilibres de dissociation vers
@@ -615,6 +617,24 @@ pub fn wood_reactions() -> Vec<ReactionDef> {
     v
 }
 
+/// Pyrolyse de la houille (réaction EN VOLUME, du premier ordre, comme le bois) : CH0.8O0.08 → 0.763 C + 0.187 CH4 + 0.04 CO + 0.01 CO2
+/// + 0.02 H2O + 0.006 H2. Matières volatiles 35 % de la masse (CH4 21 %, CO 8 %, CO2 3 %, eau 2.6 %, H2 0.1 % ; goudrons comptés en CH4),
+/// le reste est le char `coal` ; chaleur de pyrolyse +0.08 MJ/kg. Vitesse de dégazage de Badzioch & Hawksley (1970, charbons
+/// bitumineux) : A = 3.12e5 s⁻¹, Ea = 74 kJ/mol (0.1 s⁻¹ à 600 K, 1 s⁻¹ à 700 K), bornée par la conduction interne des morceaux
+/// (k / (1 + k τ) ; 1.2 cm : τ ≈ 19 s). Ce sont ces gaz qui font la grande flamme d'un feu de houille ; le char brûle ensuite en braises.
+pub fn houille_reactions() -> Vec<ReactionDef> {
+    vec![ReactionDef {
+        name: RX_HOUILLE.into(),
+        reactants: vec![(HOUILLE.into(), 1.0)],
+        products: vec![(COAL.into(), 0.763), (CH4.into(), 0.187), (CO.into(), 0.04), (CO2.into(), 0.01), (H2O_G.into(), 0.02), (H2.into(), 0.006)],
+        pre_exp: 3.12e5,
+        activation_energy: 74.0e3,
+        orders: vec![1.0],
+        bulk: true,
+        ..Default::default()
+    }]
+}
+
 /// fractions molaires de l'air sec : O2 20.95 %, N2 + Ar 79.05 %
 const X_O2_AIR: f64 = 0.2095;
 
@@ -718,13 +738,16 @@ impl MaterialLibrary {
         l
     }
 
-    /// Préréglage combustion + charbon (phase granulaire) et sa combustion de surface (scénario « feu de charbon »)
+    /// Préréglage combustion + charbon (phase granulaire) et sa combustion de surface, houille et sa pyrolyse (scénario « feu de charbon »)
     pub fn with_coal(&self) -> MaterialLibrary {
         let mut l = self.with_combustion();
         if l.fluid_index(COAL).is_none() {
             l.fluids.push(Phase::coal());
         }
-        for r in coal_reactions() {
+        if l.fluid_index(HOUILLE).is_none() {
+            l.fluids.push(Phase::bituminous_coal());
+        }
+        for r in coal_reactions().into_iter().chain(houille_reactions()) {
             if !l.reactions.iter().any(|q| q.name == r.name) {
                 l.reactions.push(r);
             }

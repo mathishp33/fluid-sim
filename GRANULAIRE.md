@@ -93,7 +93,8 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - scénario « Feu de charbon sur grille (braséro) » : charbon en morceaux de 1.2 cm sur une grille entre deux parois, lit de 0.25 ly
   entièrement en braises (1450 K), air humide (1 %), haut ouvert. Tirage naturel à travers la grille ≈ 4e-3 m²/s (≈ 2–3 cm/s), oxygène
   consommé du bas vers le haut du lit (10 % → 0), CO de Boudouard au sommet qui brûle au-dessus des braises (≈ 2 % de CO, petite flamme
-  bleue vers 1000 K) ; carbone conservé à 1e-6 (charbon + CO + CO2 + sorties). GPU : carbone brûlé à 3 % du CPU.
+  bleue vers 1000 K) ; carbone conservé à 1e-6 (charbon + CO + CO2 + sorties). GPU : carbone brûlé à 3 % du CPU. Depuis la houille,
+  le haut du lit est une charge de houille (voir plus bas).
 - corrigés en route : une cellule de surface partiellement remplie, rigide (frottement) mais non poreuse, scellait le lit (plus aucun
   tirage) ; la chimie donnait le reste d'énergie du sous-système réactif au DERNIER groupe — une trace de charbon dans le gaz prenait
   l'arrondi f32 de toute l'énergie (7000 K, pas refaits en boucle sur le GPU) : il va au groupe de plus grande capacité.
@@ -107,6 +108,33 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   chimie commune (température commune des groupes qui réagissent), le bois froid se mêlait aux braises de sa cellule (gaz porté d'un
   coup à ~900 K, divergence) ; sans la borne de conduction, une maille de bois au contact des braises se décomposait en ~3 ms (mille fois
   son volume de gaz). Le charbon de bois brûle comme le charbon (mêmes réactions de surface).
+- **houille** (`Phase::bituminous_coal`, CH0.8O0.08, 1300 kg/m³, PCS 34 MJ/kg, morceaux de 1.2 cm par défaut) : même pyrolyse en volume
+  que le bois, vitesse de Badzioch & Hawksley (charbons bitumineux : A = 3.12e5 s⁻¹, Ea = 74 kJ/mol, 0.1 s⁻¹ à 600 K, 1 s⁻¹ à 700 K)
+  bornée par la conduction interne (τ = 19 s pour 1.2 cm, 2 min pour 3 cm) → 65 % de char (`coal`, qui brûle ensuite en braises) et
+  35 % de matières volatiles (CH4 21 %, CO 8 %, CO2 3 %, eau 2.6 %, H2 0.1 % ; goudrons comptés en CH4). Validé : vitesse = loi à 2e-6
+  près, 65.01 % de char, CH4/CO = 4.675, PCS 34.0 MJ/kg. Froide, elle se conserve (loi extrapolée : 4e-8 s⁻¹ à 300 K).
+- braséro avec houille (feu établi) : braises sur les 60 % du bas du lit, houille en noix (3 cm) déjà chaude (700 K) sur les 40 % du
+  haut, flamme d'allumage au-dessus du lit (gaz à 1600 K sur 4 cm), épaississement de flamme modéré comme le feu de bois. La houille
+  dégaze à 0.83 %/s (la chaleur met ~2 min à gagner le cœur d'un morceau de 3 cm) ; ses matières volatiles sortent du lit sans oxygène
+  et brûlent en grande flamme au contact de l'air (2230 K à 40 × 40, sur 3 s) ; braises à 1450 K, tirage moyen 2.6e-3 m²/s ; carbone (charbon +
+  houille + CO + CO2 + CH4 + sorties) conservé à 1e-6. GPU : premier pas à 1e-7 près (masses) ; sur 1 s, houille dégazée à 0.04 %,
+  carbone passé dans le gaz à 0.2 %, CO2 formé à 0.3 %, flamme 2087 K (CPU 2102 K). Une charge FROIDE (293 K) fume : ses gaz,
+  refroidis en traversant la charge, sortent sous le seuil d'allumage, l'oxygène des pores tombe à 0 en 1.3 s, le tirage s'annule.
+  Corrigé au passage (GPU) : `k_pyrolysis` calculait 1 − e^(−ν k dt) en f32, qui n'a que 2 ou 3 chiffres justes pour k dt ~ 1e-5
+  (houille : pyrolyse à 0.17 % du CPU en un pas) → forme sans annulation (`one_minus_exp`, à 1e-7 près).
+- **rayonnement dans le tas** (`mp_granular::bed_rad_k`, dans `conduct` et `exchange_grains` ; `k_cond_prep`, `k_cond_step`,
+  `k_exch_grains` sur le GPU) : à haute température, les morceaux d'un tas échangent surtout par rayonnement, qui y agit comme une
+  conduction de conductivité k_rad = 4 σ ε/(2 − ε) d T_m³ (Damköhler, ε = 0.9), au prorata des parts tassées f = α/α_max des deux
+  nœuds granulaires — 8.5 W/(m·K) pour des braises de 1.5 cm à 1450 K, 30× la conduction du charbon de bois. Entre cellules voisines,
+  T_m³ = (T_a² + T_b²)(T_a + T_b)/4, linéarisation exacte de T_a⁴ − T_b⁴ (une braise chauffe un bois froid même s'il rayonne peu) ;
+  entre deux populations mêlées d'une cellule, h = 4 σ ε/(2 − ε) T_m³ sur l'aire d'une population tournée vers l'autre
+  (min(6 α_1/d_1 · α_2/α_s, 6 α_2/d_2 · α_1/α_s)), implicite à deux corps, énergie exactement conservée ; sous-pas de conduction bornés
+  par 2 k_rad(T_nœud) f/C. Validé : rangée de bois à 293 K sur des braises à 1450 K → 3.18 W/(m·K) à travers la face (k_rad = 3.10, plus
+  la conduction) ; braises et bois mêlés → 3.24e4 W/(m³·K) pour 3.20e4 attendus (dans la cellule, et vers les voisines : de même ordre à
+  1 cm de maille pour des morceaux de 1.5–2 cm) ; GPU : échauffement du bois à 0.2–0.3 % du CPU. Effet : du bois froid posé sur les
+  braises atteint 566 K au contact en 1 s, 1000 K en 4 s (346 K en 6 s sans rayonnement) ; mais une charge de deux tiers du tas, dans ce
+  braséro sans cheminée, étouffe les braises (O2 du tas à 1 %, braises à 1250 K en 14 s, tirage nul) avant que ses gaz ne s'enflamment —
+  comme un feu trop chargé : les deux scénarios partent d'un feu établi.
 - scénario « Feu de bois sur grille » : braises de charbon de bois (1450 K), bûchettes de 2 cm déjà chaudes (750 K) au-dessus, flamme
   d'allumage ; parois basses (le panache aspire l'air par les côtés : entre de hautes parois il se remplit de gaz sans oxygène et rien ne
   brûle). Le bois se décompose (~1 %/s), ses gaz brûlent en flamme de diffusion vers 2000 K au-dessus du tas (sans suie ni rayonnement :
@@ -117,9 +145,9 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - corrigé au passage (tout le solveur, CPU et GPU) : croissance du pas de temps bornée à ×2 d'un pas au suivant (`DT_GROWTH` ; ×1.25 enchaînait les retours arrière du braséro). Après
   un pas court imposé par la chimie, les vitesses de la projection — calculées pour corriger l'erreur de volume en CE pas — servaient à
   l'advection d'un pas 4× plus long et vidaient la maille à 92 % (pic à 3786 K sous la grille du feu de bois).
-- reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), rayonnement dans le tas (des
-  braises n'allument pas encore du bois froid posé dessus : le scénario part d'un feu établi), houille (matières volatiles du charbon),
-  séchage du bois, poudre à canon (KNO3/S/C → gaz chauds, oxydant intégré : brûle sans air).
+- reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), séchage du bois, allumage
+  d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), poudre à canon (KNO3/S/C →
+  gaz chauds, oxydant intégré : brûle sans air).
 
 ## 7. Solidification (étape 5)
 
@@ -142,7 +170,7 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
 3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5), puis : avalanche rapide (un défaut des faces de paroi
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
 4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
-   et grilles, braséro, pyrolyse du bois et feu de bois (§ 6). Reste : fluidisation, rayonnement dans le tas, houille, poudre à canon.
+   et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas (§ 6). Reste : fluidisation, poudre à canon.
 5. Solidification.
 
 ## 9. Choix à valider

@@ -429,6 +429,25 @@ impl Phase {
         p.alpha_max = 0.55;
         p
     }
+    /// Houille (charbon bitumineux) : ~35 % de matières volatiles, surtout du méthane, qui partent en chauffant (pyrolyse, réaction en
+    /// volume, voir `mp_materials::houille_reactions`) en laissant le char `coal`. Formule moyenne par atome de carbone CH0.8O0.08 (sèche
+    /// sans cendres : C 85 %, H 5.7 %, O 9 % en masse), M = 14.10 g/mol ; Δh_f° = −28.4 kJ/mol, soit un pouvoir calorifique supérieur de
+    /// 34 MJ/kg. ρ = 1300 kg/m³, c_p = 1.0 kJ/(kg·K) à 298 K croissant de 1.5 J/(kg·K²), k = 0.25 W/(m·K), angle de frottement 35° ;
+    /// en morceaux de 1.2 cm (houille « grains » d'un poêle)
+    pub fn bituminous_coal() -> Phase {
+        let mut p = Phase::coal();
+        p.name = "houille".into();
+        p.grain_diameter = 0.012;
+        p.eos = Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 1300.0, t0: 293.15, beta: 1.0e-5 } };
+        p.cp = 1000.0;
+        p.cp_slope = 1.5;
+        p.conductivity = 0.25;
+        p.color = [0.20, 0.19, 0.21];
+        p.molar_mass = 0.014097;
+        p.h_formation = -28.4e3;
+        p.s_standard = 20.0;
+        p
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {

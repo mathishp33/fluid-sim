@@ -18,6 +18,11 @@ fn fluid_fraction(c: u32) -> f32 {
     return s;
 }
 fn grav_norm() -> f32 { return sqrt(P.gx * P.gx + P.gy * P.gy); }
+// rayonnement dans un tas de grains : conductance de face 4 σ ε_r d T_m³ f_a f_b (miroir de mp_granular::bed_rad_k ; ε = 0.9)
+fn bed_rad_k(d: f32, ta: f32, tb: f32, fa: f32, fb: f32) -> f32 {
+    let tm3 = (ta * ta + tb * tb) * (ta + tb) * 0.25;
+    return 4.0 * 5.670374e-8 * (0.9 / 1.1) * d * tm3 * fa * fb;
+}
 
 // vitesse de chute ENTRAVÉE de la phase granulaire s dans la cellule c (> 0 dans le sens de la gravité, < 0 : le grain remonte) :
 // Ferguson–Church (C1 = 18, C2 = 0.4), Richardson–Zaki avec l'exposant de Rowe. 0 sans gravité, sans fluide ou sans grains.
@@ -178,6 +183,24 @@ fn k_exch_grains(@builtin(global_invocation_id) g: vec3<u32>) {
             let q = select(0.0, gg * dt * (tf - ts) / (1.0 + gg * dt * (1.0 / cs + 1.0 / cf)), fok);
             S[O_epsg + s * n + c] += q;
             S[O_epsg + f * n + c] -= q;
+        }
+    }
+    // rayonnement entre deux populations de grains de la cellule (miroir de exchange_grains), températures et capacités d'avant l'échange
+    var a_s = 0.0;
+    for (var s = 0u; s < P.ng; s++) { a_s += select(0.0, group_alpha(s, c), gdisp(s)); }
+    for (var s1 = 0u; s1 < P.ng; s1++) {
+        for (var s2 = 0u; s2 < P.ng; s2++) {
+            let ok = s2 > s1 && gdisp(s1) && gdisp(s2) && group_mass(s1, c) > 0.0 && group_mass(s2, c) > 0.0;
+            let t1 = tgrp(s1, c); let t2 = tgrp(s2, c);
+            let a1 = group_alpha(s1, c); let a2 = group_alpha(s2, c);
+            let d1 = max(grain_d(gmember(s1, 0u)), 1e-6); let d2 = max(grain_d(gmember(s2, 0u)), 1e-6);
+            let ia = 1.0 / max(a_s, 1e-30);
+            let area = min(6.0 * a1 / d1 * a2 * ia, 6.0 * a2 / d2 * a1 * ia);
+            let gq = P.phase_exch * 4.0 * 5.670374e-8 * (0.9 / 1.1) * (t1 * t1 + t2 * t2) * (t1 + t2) * 0.25 * area;
+            let c1 = max(group_cap_at(s1, c, t1), 1e-30); let c2 = max(group_cap_at(s2, c, t2), 1e-30);
+            let q = select(0.0, gq * dt * (t2 - t1) / (1.0 + gq * dt * (1.0 / c1 + 1.0 / c2)), ok);
+            S[O_epsg + s1 * n + c] += q;
+            S[O_epsg + s2 * n + c] -= q;
         }
     }
     cell_sync(c);

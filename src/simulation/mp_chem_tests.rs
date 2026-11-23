@@ -342,37 +342,56 @@ fn coal_burns_at_the_grain_surface_kinetic_then_diffusion_limited() {
 
 #[test]
 fn a_coal_fire_keeps_burning_and_conserves_carbon() {
+    // braséro, feu établi : braises (1450 K) sous une charge de houille chaude (700 K). Les braises restent chaudes, l'air traverse la
+    // grille (tirage), la houille dégaze et ses matières volatiles brûlent en flamme ; carbone (charbon + houille + CO + CO2 + CH4 +
+    // sorties) conservé
     let lib = MaterialLibrary::default();
     let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
     let k = |n: &str| idx(&s.reg, n);
-    let (c, co2, o2, co) = (k(super::mp_materials::COAL), k(CO2), k(O2), k(CO));
+    let (c, co2, o2, co, ch4, hou) = (k(super::mp_materials::COAL), k(CO2), k(O2), k(CO), k(CH4), k(super::mp_materials::HOUILLE));
     let gas_c = |s: &MultiphaseSim, q: usize| (s.total_mass(q) - s.boundary_flux[q]) / s.reg.phases[q].molar_mass;
-    let carbon = |s: &MultiphaseSim| s.total_mass(c) / 0.012011 + gas_c(s, co2) + gas_c(s, co);
-    let (m_c0, n_c0) = (s.total_mass(c), carbon(&s));
+    let gas_carbon = |s: &MultiphaseSim| gas_c(s, co2) + gas_c(s, co) + gas_c(s, ch4);
+    let carbon = |s: &MultiphaseSim| s.total_mass(c) / 0.012011 + s.total_mass(hou) / s.reg.phases[hou].molar_mass + gas_carbon(s);
+    let (m_c0, n_c0, g_c0, m_h0) = (s.total_mass(c), carbon(&s), gas_carbon(&s), s.total_mass(hou));
     let t_start = std::time::Instant::now();
     let mut t_hot = vec![];
-    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0f64);
+    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
+    // tirage naturel (l'air monte à travers la grille, percolation), moyen sur la seconde moitié ; flamme : gaz le plus chaud hors du lit
+    let gj = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
+    let draft_of = |s: &MultiphaseSim| (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
+    let gg = s.group_of[o2];
+    let (mut d_int, mut d_t, mut t_flame) = (0.0, 0.0, 0.0f64);
     while s.time < t_end && !s.diverged {
-        s.step();
-        if s.step_count % 250 == 0 {
+        let dt = s.step();
+        if s.time > 0.5 * t_end {
+            d_int += dt * draft_of(&s);
+            d_t += dt;
+        }
+        if s.time > 0.3 {
+            let n = s.nx * s.ny;
+            let tf = (0..n).filter(|&q| !s.is_solid(q) && s.mass[c][q] + s.mass[hou][q] < 1.0 && s.group_mass(gg, q) > 0.0).map(|q| s.tg[gg][q]).fold(0.0f64, f64::max);
+            t_flame = t_flame.max(tf);
+        }
+        if s.step_count % 1000 == 0 {
             let tmax = (0..s.nx * s.ny).filter(|&q| s.mass[c][q] > 1.0).map(|q| s.tg[s.group_of[c]][q]).fold(0.0f64, f64::max);
             t_hot.push((s.time, tmax));
         }
     }
     assert!(!s.diverged && s.state_is_sane());
-    let burnt = m_c0 - s.total_mass(c);
+    // carbone passé dans le gaz (CO, CO2, CH4 de la houille, sorties comprises), en kg de carbone
+    let burnt = (gas_carbon(&s) - g_c0) * 0.012011;
     let tmax = t_hot.last().map_or(0.0, |x| x.1);
-    eprintln!("feu de charbon : {} pas en {:.1} s ; charbon brûlé {:.3e} kg/m ({:.2} %), CO2 {:.3e} kg/m, CO {:.3e}, O2 {:.3e} ; T max des braises {:?}",
-        s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(co), s.total_mass(o2),
-        t_hot.iter().map(|(t, x)| format!("{t:.1}s:{x:.0}K")).collect::<Vec<_>>());
+    let draft = d_int / d_t.max(1e-30);
+    eprintln!("feu de charbon : {} pas en {:.1} s ; carbone passé dans le gaz {:.3e} kg/m ({:.2} % du charbon), CO2 {:.3e} kg/m, CO {:.3e}, CH4 {:.3e}, O2 {:.3e} ; houille dégazée {:.3} % ; flamme {t_flame:.0} K ; tirage moyen {draft:.4} m²/s ; T max des braises {:?}",
+        s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(co), s.total_mass(ch4), s.total_mass(o2),
+        100.0 * (1.0 - s.total_mass(hou) / m_h0.max(1e-300)), t_hot.iter().map(|(t, x)| format!("{t:.1}s:{x:.0}K")).collect::<Vec<_>>());
     assert!(burnt > 1e-5 * m_c0, "le charbon n'a pas brûlé");
     assert!(tmax > 1000.0, "le feu s'est éteint : braises à {tmax} K");
-    // tirage naturel : l'air monte à travers la grille (percolation)
-    let gj = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
-    let draft: f64 = (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
-    eprintln!("tirage à travers la grille : {draft:.4} m²/s");
     assert!(draft > 1e-3, "pas de tirage à travers la grille : {draft}");
-    assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + CO + CO2 + sorties) : {} → {}", n_c0, carbon(&s));
+    // les matières volatiles de la houille (0.8 %/s de sa masse) brûlent en grande flamme au-dessus du lit
+    assert!(m_h0 - s.total_mass(hou) > 0.01 * m_h0, "la houille ne dégaze pas : {} → {}", m_h0, s.total_mass(hou));
+    assert!(t_flame > 1700.0, "pas de flamme au-dessus du lit : {t_flame} K");
+    assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + houille + CO + CO2 + CH4 + sorties) : {} → {}", n_c0, carbon(&s));
 }
 
 /// diagnostic : braséro, débits de percolation à travers la grille et le lit, températures, oxygène (MP_COAL_T s, défaut 1)
@@ -437,11 +456,15 @@ fn coal_brasero_diag() {
 
 /// bois en morceaux (fraction a0) dans de l'azote à T, sans gravité
 pub(crate) fn wood_dust(t: f64, a0: f64) -> MultiphaseSim {
-    let lib = MaterialLibrary::default().with_wood();
-    let b = lib.build().expect("préréglage bois valide");
+    grain_dust(&MaterialLibrary::default().with_wood(), super::mp_materials::WOOD, t, a0)
+}
+
+/// morceaux de la phase granulaire `solid` de `lib` (fraction a0) dans de l'azote à T, sans gravité
+fn grain_dust(lib: &MaterialLibrary, solid: &str, t: f64, a0: f64) -> MultiphaseSim {
+    let b = lib.build().expect("préréglage valide");
     assert!(b.warnings.is_empty(), "{:?}", b.warnings);
     let reg = b.registry;
-    let (w, n2) = (idx(&reg, super::mp_materials::WOOD), idx(&reg, N2));
+    let (w, n2) = (idx(&reg, solid), idx(&reg, N2));
     let np = reg.phases.len();
     let mut s = MultiphaseSim::new(4, 4, 0.01, reg, b.ambient);
     s.gravity = [0.0, 0.0];
@@ -458,11 +481,16 @@ pub(crate) fn wood_dust(t: f64, a0: f64) -> MultiphaseSim {
 /// (masse), CH4 / CO formés (moles))
 fn wood_rates(t: f64) -> (f64, f64, f64, f64) {
     use super::mp_materials::{CHARCOAL, RX_WOOD, WOOD};
-    let mut s = wood_dust(t, 1e-3);
-    let (w, ch, co, ch4) = (idx(&s.reg, WOOD), idx(&s.reg, CHARCOAL), idx(&s.reg, CO), idx(&s.reg, CH4));
+    pyrolysis_rates(&MaterialLibrary::default().with_wood(), WOOD, CHARCOAL, RX_WOOD, t)
+}
+
+/// `wood_rates` pour la pyrolyse `rx_name` de la phase `solid` de `lib`, qui laisse le résidu `residue`
+fn pyrolysis_rates(lib: &MaterialLibrary, solid: &str, residue: &str, rx_name: &str, t: f64) -> (f64, f64, f64, f64) {
+    let mut s = grain_dust(lib, solid, t, 1e-3);
+    let (w, ch, co, ch4) = (idx(&s.reg, solid), idx(&s.reg, residue), idx(&s.reg, CO), idx(&s.reg, CH4));
     let q = s.idx(1, 1);
     let mw = s.reg.phases[w].molar_mass;
-    let r = rx(&s.reg, RX_WOOD);
+    let r = rx(&s.reg, rx_name);
     let k = r.k_forward(s.tg[s.group_of[w]][q]);
     let tau = r.bulk_tau(&s.reg.phases);
     let expect = k / (1.0 + k * tau) * s.mass[w][q] / mw;
@@ -503,6 +531,130 @@ fn wood_pyrolysis_follows_its_rate_law_and_leaves_charcoal() {
 }
 
 #[test]
+fn houille_releases_its_volatiles_and_leaves_its_char() {
+    // pyrolyse de la houille (Badzioch & Hawksley, charbons bitumineux) : du premier ordre, 0.1 s⁻¹ vers 600 K, 1 s⁻¹ vers 700 K ;
+    // 35 % de matières volatiles, surtout du méthane (CH4/CO = 0.187/0.04), et 65 % de char, qui brûle ensuite comme le charbon ;
+    // bornée à chaud par la conduction interne des morceaux (1.2 cm : τ ≈ 19 s)
+    use super::mp_materials::{COAL, HOUILLE, RX_HOUILLE};
+    let lib = MaterialLibrary::default().with_coal();
+    for t in [600.0, 700.0] {
+        let (got, expect, yield_c, ch4_co) = pyrolysis_rates(&lib, HOUILLE, COAL, RX_HOUILLE, t);
+        eprintln!("T = {t} K : pyrolyse {got:.5e} mol/(m³·s) (loi {expect:.5e}) ; char {yield_c:.4} de la masse ; CH4/CO {ch4_co:.4}");
+        assert!((got / expect - 1.0).abs() < 2e-3, "vitesse de pyrolyse à {t} K : {got} vs {expect}");
+        assert!((yield_c - 0.763 * 0.012011 / 0.014097).abs() < 1e-4, "rendement en char : {yield_c}");
+        assert!((ch4_co - 0.187 / 0.04).abs() < 1e-6, "CH4/CO : {ch4_co}");
+    }
+    let b = lib.build().unwrap();
+    let r = b.registry.reactions.iter().find(|r| r.name == RX_HOUILLE).unwrap();
+    assert!(r.bulk && r.surface(&b.registry.phases).is_none());
+    let (k3, k6, k7) = (r.k_forward(300.0), r.k_forward(600.0), r.k_forward(700.0));
+    let tau = r.bulk_tau(&b.registry.phases);
+    eprintln!("k(300 K) = {k3:.2e}, k(600 K) = {k6:.3}, k(700 K) = {k7:.3} s⁻¹ ; temps de conduction interne d'un morceau de 1.2 cm : {tau:.1} s");
+    assert!(k6 > 0.09 && k6 < 0.13 && k7 > 0.8 && k7 < 1.1, "k = {k6}, {k7}");
+    // froide, la houille se conserve (loi extrapolée : 0.3 % par jour à 300 K)
+    assert!(k3 < 1e-7, "k(300 K) = {k3}");
+    assert!((tau - 19.0).abs() < 1.0, "τ = {tau}");
+    // pouvoir calorifique supérieur 34 MJ/kg : CH0.8O0.08 + 1.16 O2 → CO2 + 0.4 H2O(l)
+    let ph = &b.registry.phases;
+    let hf = |n: &str| ph[idx(&b.registry, n)].h_formation;
+    let pcs = -(hf(CO2) + 0.4 * (hf(H2O_G) - 44.0e3) - hf(HOUILLE)) / ph[idx(&b.registry, HOUILLE)].molar_mass;
+    eprintln!("pouvoir calorifique supérieur de la houille : {:.2} MJ/kg", pcs / 1e6);
+    assert!((pcs / 1e6 - 34.0).abs() < 0.5, "PCS {pcs}");
+}
+
+/// Lit tassé de 4 × 6 mailles de 1 cm, sans gravité ni chimie, dans l'azote : braises de charbon de bois (1450 K) dans les 3 rangées du
+/// bas et bois (293 K) au-dessus ; ou (`mixed`) braises et bois mêlés à parts égales dans toutes les mailles, gaz et bois à 293 K
+pub(crate) fn ember_bed(mixed: bool) -> MultiphaseSim {
+    use super::mp_materials::{CHARCOAL, WOOD};
+    let lib = MaterialLibrary::default().with_wood();
+    let b = lib.build().expect("préréglage bois valide");
+    let reg = b.registry;
+    let (w, ch, n2) = (idx(&reg, WOOD), idx(&reg, CHARCOAL), idx(&reg, N2));
+    let np = reg.phases.len();
+    let (aw, ac) = (reg.phases[w].alpha_max, reg.phases[ch].alpha_max);
+    let mut s = MultiphaseSim::new(4, 6, 0.01, reg, b.ambient);
+    s.gravity = [0.0, 0.0];
+    s.chemistry = false;
+    let mix = move |fw: f64, fc: f64| {
+        let mut m = vec![0.0; np];
+        m[w] = fw * aw;
+        m[ch] = fc * ac;
+        m[n2] = 1.0 - m[w] - m[ch];
+        m
+    };
+    let low = |y: f64| y < 0.03;
+    s.paint_mixture(move |_, y| Some(if mixed { mix(0.5, 0.5) } else if low(y) { mix(0.0, 1.0) } else { mix(1.0, 0.0) }));
+    s.finalize_init(move |_, y| if !mixed && low(y) { 1450.0 } else { 293.15 });
+    if mixed {
+        let gc = s.group_of[ch];
+        for c in 0..s.nx * s.ny {
+            s.set_group_temperature(c, gc, 1450.0);
+        }
+    }
+    s.refresh();
+    s
+}
+
+#[test]
+fn embers_heat_the_wood_above_them_by_radiation_through_the_bed() {
+    // À haute température, les morceaux d'un tas échangent surtout par rayonnement, qui y agit comme une conduction de conductivité
+    // k_rad = 4 σ ε/(2 − ε) d T_m³ (Damköhler) : 3.1 W/(m·K) entre des braises à 1450 K et du bois à 293 K (morceaux de 1.5 et 2 cm),
+    // ~50× la conduction des morceaux et du gaz. La rangée de bois posée sur les braises reçoit d'abord k_rad ΔT par mètre de face
+    use super::mp_granular::bed_rad_k;
+    use super::mp_materials::{CHARCOAL, WOOD};
+    let mut s = ember_bed(false);
+    let (w, ch) = (idx(&s.reg, WOOD), idx(&s.reg, CHARCOAL));
+    let gw = s.group_of[w];
+    let e_w = |s: &MultiphaseSim| (0..s.nx * s.ny).map(|q| s.eg[gw][q]).sum::<f64>() * s.dx * s.dx;
+    let (e0, u0) = (e_w(&s), s.total_internal_energy() + s.kinetic_energy());
+    let d = 0.5 * (s.reg.phases[w].grain_diameter + s.reg.phases[ch].grain_diameter);
+    let k_rad = bed_rad_k(d, 1450.0, 293.15, 1.0, 1.0);
+    while s.time < 0.01 {
+        s.step();
+    }
+    let k_eff = (e_w(&s) - e0) / (s.time * s.nx as f64 * (1450.0 - 293.15));
+    eprintln!("k_rad = {k_rad:.4} W/(m·K) ; conductance mesurée entre les braises et le bois : {k_eff:.4} W/(m·K) ({} pas)", s.step_count);
+    assert!(k_rad > 3.0 && k_rad < 3.2, "k_rad = {k_rad}");
+    assert!(k_eff / k_rad > 0.995 && k_eff / k_rad < 1.06, "conductance {k_eff} contre k_rad {k_rad}");
+    assert!(((s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0).abs() < 1e-9, "énergie");
+}
+
+#[test]
+fn embers_mixed_with_wood_heat_it_by_radiation_within_the_cell() {
+    // braises (1450 K) et bois (293 K) mêlés dans chaque maille. Le bois reçoit le rayonnement des braises de sa maille : h = 4 σ ε/(2 − ε)
+    // T_m³ sur l'aire des morceaux d'une population tournée vers l'autre (la plus petite de 6 α_1/d_1 · α_2/α_s et 6 α_2/d_2 · α_1/α_s) ;
+    // et celui des braises des mailles voisines, à travers chaque face, comme dans un tas en couches (k_rad f_braises f_bois / dx², avec
+    // f = α / α_max : le quart de k_rad ici) — de même ordre à 1 cm de maille pour des morceaux de 1.5–2 cm, négligeable sur une maille
+    // bien plus grande qu'eux. Le gaz, chauffé par les braises, n'en porte que quelques pour cent de plus
+    use super::mp_granular::{bed_rad_k, BED_RAD, SIGMA_SB};
+    use super::mp_materials::{CHARCOAL, WOOD};
+    let mut s = ember_bed(true);
+    let (w, ch) = (idx(&s.reg, WOOD), idx(&s.reg, CHARCOAL));
+    let (gw, gc) = (s.group_of[w], s.group_of[ch]);
+    let c = s.idx(1, 2);
+    let (aw, ac) = (s.group_alpha(gw, c), s.group_alpha(gc, c));
+    let (dw, dc) = (s.reg.phases[w].grain_diameter, s.reg.phases[ch].grain_diameter);
+    let area = (6.0 * aw / dw * ac / (aw + ac)).min(6.0 * ac / dc * aw / (aw + ac));
+    let (t1, t2) = (1450.0f64, 293.15f64);
+    let h = 4.0 * SIGMA_SB * BED_RAD * (t1 * t1 + t2 * t2) * (t1 + t2) * 0.25;
+    let g_local = s.phase_heat_exchange * h * area;
+    let (fw, fc) = (aw / s.reg.phases[w].alpha_max, ac / s.reg.phases[ch].alpha_max);
+    let faces = ((s.nx - 1) * s.ny + s.nx * (s.ny - 1)) as f64;
+    let ncell = (s.nx * s.ny) as f64;
+    let g_faces = 2.0 * faces * bed_rad_k(0.5 * (dw + dc), t1, t2, fc, fw) / (ncell * s.dx * s.dx);
+    let e_w = |s: &MultiphaseSim| (0..s.nx * s.ny).map(|q| s.eg[gw][q]).sum::<f64>() / (s.nx * s.ny) as f64;
+    let (e0, u0) = (e_w(&s), s.total_internal_energy() + s.kinetic_energy());
+    while s.time < 0.01 {
+        s.step();
+    }
+    let g = (e_w(&s) - e0) / (s.time * (t1 - t2));
+    eprintln!("aire d'échange {area:.2} m²/m³, h = {h:.2} W/(m²·K) : conductance dans la maille {g_local:.4e}, entre mailles {g_faces:.4e} W/(m³·K), mesurée {g:.4e} ({} pas)", s.step_count);
+    let ratio = g / (g_local + g_faces);
+    assert!(ratio > 0.995 && ratio < 1.06, "conductance {g} contre {} + {}", g_local, g_faces);
+    assert!(((s.total_internal_energy() + s.kinetic_energy()) / u0 - 1.0).abs() < 1e-9, "énergie");
+}
+
+#[test]
 fn a_wood_fire_burns_its_gases_in_a_flame_and_conserves_carbon() {
     // feu établi (braises 1450 K, bûches à 750 K, flamme d'allumage) : le bois se décompose, ses gaz brûlent en flamme de diffusion
     // au-dessus du tas, bien plus chaude que les braises ; carbone (bois + charbon de bois + CO + CO2 + CH4 + sorties) conservé
@@ -535,59 +687,80 @@ fn a_wood_fire_burns_its_gases_in_a_flame_and_conserves_carbon() {
     assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone : {} → {}", n_c0, carbon(&s));
 }
 
-/// diagnostic : feu de bois, toutes les 0.1 s (MP_WOOD_T s, défaut 2)
-#[test]
-#[ignore]
-fn wood_fire_diag() {
-    use super::mp_materials::{CHARCOAL, WOOD};
-    let lib = MaterialLibrary::default();
-    let mut s = build_scenario_with(&lib, MpScenario::WoodFire, 40, 40, 0.01, 9.81).unwrap();
+/// scénario du feu de bois pour les diagnostics : MP_WOOD_NX mailles de côté (défaut 40, 0.4 m) ; MP_WOOD_T0 : température initiale
+/// du bois (défaut : celle du scénario) ; MP_TFM_OFF : sans épaississement des flammes
+pub(crate) fn wood_fire_for_diag() -> MultiphaseSim {
+    let n: usize = std::env::var("MP_WOOD_NX").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let mut s = build_scenario_with(&MaterialLibrary::default(), MpScenario::WoodFire, n, n, 0.4 / n as f64, 9.81).unwrap();
     if std::env::var("MP_TFM_OFF").is_ok() {
         s.flame_resolution = 0.0;
     }
+    if let Some(t0) = std::env::var("MP_WOOD_T0").ok().and_then(|v| v.parse::<f64>().ok()) {
+        let w = idx(&s.reg, super::mp_materials::WOOD);
+        let gw = s.group_of[w];
+        for c in 0..s.nx * s.ny {
+            if s.mass[w][c] > 0.0 {
+                s.set_group_temperature(c, gw, t0);
+            }
+        }
+        s.refresh();
+    }
+    s
+}
+
+/// une ligne de diagnostic du feu de bois (`m_w0` : bois au départ, `wall` : durée de calcul)
+pub(crate) fn wood_fire_report(s: &MultiphaseSim, m_w0: f64, wall: f64) {
+    use super::mp_materials::{CHARCOAL, WOOD};
     let k = |n: &str| idx(&s.reg, n);
     let (w, ch, ch4, h2, co, co2, o2) = (k(WOOD), k(CHARCOAL), k(CH4), k(H2), k(CO), k(CO2), k(O2));
-    let gw = s.group_of[w];
-    let gg = s.group_of[o2];
+    let (gw, gg, gc) = (s.group_of[w], s.group_of[o2], s.group_of[ch]);
+    let n = s.nx * s.ny;
+    let tg_max = (0..n).filter(|&q| !s.is_solid(q) && s.group_mass(gg, q) > 0.0).map(|q| s.tg[gg][q]).fold(0.0f64, f64::max);
+    let tw_max = (0..n).filter(|&q| s.mass[w][q] > 1e-3).map(|q| s.tg[gw][q]).fold(0.0f64, f64::max);
+    let tw_mean = (0..n).map(|q| s.mass[w][q] * s.tg[gw][q]).sum::<f64>() / (0..n).map(|q| s.mass[w][q]).sum::<f64>().max(1e-300);
+    let tc_max = (0..n).filter(|&q| s.mass[ch][q] > 1e-3).map(|q| s.tg[gc][q]).fold(0.0f64, f64::max);
+    let bed: Vec<usize> = (0..n).filter(|&q| s.mass[w][q] + s.mass[ch][q] > 1.0).collect();
+    let x_o2 = |q: usize| {
+        let tot: f64 = (0..s.reg.phases.len()).filter(|&k| s.reg.phases[k].is_gas()).map(|k| s.mass[k][q] / s.reg.phases[k].molar_mass).sum();
+        s.mass[o2][q] / s.reg.phases[o2].molar_mass / tot.max(1e-300)
+    };
+    let o2_bed = bed.iter().map(|&q| x_o2(q)).sum::<f64>() / bed.len().max(1) as f64;
+    let gj = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
+    let draft: f64 = (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
+    let (mut below, mut inbed, mut above, mut outside) = (0.0, 0.0, 0.0, 0.0);
+    let bed_top = (0..s.ny).rev().find(|&j| (0..s.nx).any(|i| s.mass[w][s.idx(i, j)] + s.mass[ch][s.idx(i, j)] > 1.0)).unwrap_or(0);
+    let (xl, xr) = ((0..s.nx).find(|&i| s.is_grille(s.idx(i, gj))).unwrap_or(0), (0..s.nx).rev().find(|&i| s.is_grille(s.idx(i, gj))).unwrap_or(0));
+    for j in 0..s.ny {
+        for i in 0..s.nx {
+            let q = s.idx(i, j);
+            let m = s.mass[ch4][q];
+            if j < gj { below += m } else if i < xl || i > xr { outside += m } else if j <= bed_top { inbed += m } else { above += m }
+        }
+    }
+    eprintln!("      CH4 sous la grille {below:.3e}, dans le tas {inbed:.3e}, au-dessus du tas {above:.3e}, hors des parois {outside:.3e} (kg/m³·mailles)");
+    let made_co2 = (s.total_mass(co2) - s.boundary_flux[co2]) / s.reg.phases[co2].molar_mass;
+    eprintln!(
+        "t {:.2} s ({} pas, {wall:.0} s) : bois {:.4} kg/m ({:.2} %), charbon de bois {:.4}, CH4 {:.3e}, H2 {:.3e}, CO {:.3e}, CO2 formé {made_co2:.3e} mol/m ; T gaz max {tg_max:.0} K, T bois moyenne {tw_mean:.0} K (max {tw_max:.0} K), T braises max {tc_max:.0} K ; O2 moyen dans le tas {o2_bed:.3} ; tirage {draft:.4} m²/s",
+        s.time, s.step_count, s.total_mass(w), 100.0 * s.total_mass(w) / m_w0, s.total_mass(ch), s.total_mass(ch4), s.total_mass(h2),
+        s.total_mass(co)
+    );
+}
+
+/// diagnostic : feu de bois, une ligne toutes les MP_WOOD_DT s (défaut 0.1) pendant MP_WOOD_T s (défaut 2) ; scène : `wood_fire_for_diag`
+#[test]
+#[ignore]
+fn wood_fire_diag() {
+    let mut s = wood_fire_for_diag();
+    let m_w0 = s.total_mass(idx(&s.reg, super::mp_materials::WOOD));
     let t_end = std::env::var("MP_WOOD_T").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
-    let m_w0 = s.total_mass(w);
+    let every = std::env::var("MP_WOOD_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1f64);
     let t0 = std::time::Instant::now();
     let mut next = 0.0;
     while s.time < t_end && !s.diverged {
         s.step();
         if s.time >= next {
-            next += std::env::var("MP_WOOD_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
-            let n = s.nx * s.ny;
-            let tg_max = (0..n).filter(|&q| !s.is_solid(q)).map(|q| s.tg[gg][q]).fold(0.0f64, f64::max);
-            let tw_max = (0..n).filter(|&q| s.mass[w][q] > 1e-3).map(|q| s.tg[gw][q]).fold(0.0f64, f64::max);
-            let gc = s.group_of[ch];
-            let tc_max = (0..n).filter(|&q| s.mass[ch][q] > 1e-3).map(|q| s.tg[gc][q]).fold(0.0f64, f64::max);
-            let bed: Vec<usize> = (0..n).filter(|&q| s.mass[w][q] + s.mass[ch][q] > 1.0).collect();
-            let x_o2 = |q: usize| {
-                let tot: f64 = (0..s.reg.phases.len()).filter(|&k| s.reg.phases[k].is_gas()).map(|k| s.mass[k][q] / s.reg.phases[k].molar_mass).sum();
-                s.mass[o2][q] / s.reg.phases[o2].molar_mass / tot.max(1e-300)
-            };
-            let o2_bed = bed.iter().map(|&q| x_o2(q)).sum::<f64>() / bed.len().max(1) as f64;
-            let gj = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
-            let draft: f64 = (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
-            let (mut below, mut inbed, mut above, mut outside) = (0.0, 0.0, 0.0, 0.0);
-            let bed_top = (0..s.ny).rev().find(|&j| (0..s.nx).any(|i| s.mass[w][s.idx(i, j)] + s.mass[ch][s.idx(i, j)] > 1.0)).unwrap_or(0);
-            let (xl, xr) = ((0..s.nx).find(|&i| s.is_grille(s.idx(i, gj))).unwrap_or(0), (0..s.nx).rev().find(|&i| s.is_grille(s.idx(i, gj))).unwrap_or(0));
-            for j in 0..s.ny {
-                for i in 0..s.nx {
-                    let q = s.idx(i, j);
-                    let m = s.mass[ch4][q];
-                    if j < gj { below += m } else if i < xl || i > xr { outside += m } else if j <= bed_top { inbed += m } else { above += m }
-                }
-            }
-            eprintln!("      CH4 sous la grille {below:.3e}, dans le tas {inbed:.3e}, au-dessus du tas {above:.3e}, hors des parois {outside:.3e} (kg/m³·mailles)");
-            let rx: Vec<String> = s.reg.reactions.iter().zip(&s.reacted).map(|(r, x)| format!("{}:{x:.2e}", r.name.chars().take(14).collect::<String>())).collect();
-            eprintln!(
-                "t {:.2} s ({} pas, {:.0} s) : bois {:.4} kg/m ({:.1} %), charbon de bois {:.4}, CH4 {:.3e}, H2 {:.3e}, CO {:.3e}, CO2 {:.3e} ; T gaz max {tg_max:.0} K, T bois max {tw_max:.0} K, T braises max {tc_max:.0} K ; O2 moyen dans le tas {:.3} ; tirage {draft:.4} m²/s
-      {}",
-                s.time, s.step_count, t0.elapsed().as_secs_f64(), s.total_mass(w), 100.0 * s.total_mass(w) / m_w0, s.total_mass(ch),
-                s.total_mass(ch4), s.total_mass(h2), s.total_mass(co), s.total_mass(co2), o2_bed, rx.join(" ")
-            );
+            next += every;
+            wood_fire_report(&s, m_w0, t0.elapsed().as_secs_f64());
         }
     }
     eprintln!("divergé : {}", s.diverged);

@@ -1381,16 +1381,28 @@ fn gpu_decays_a_very_viscous_vortex_like_the_cpu() {
 
 #[test]
 fn gpu_burns_coal_like_the_cpu() {
-    // réaction de surface (C + O2 → CO2 sur les grains, limitée par la diffusion de l'oxygène) dans le scénario « feu de charbon »
+    // braséro : réactions de surface des braises (C + O2 → CO, CO2, limitées par la diffusion de l'oxygène), pyrolyse de la houille et
+    // flamme de ses matières volatiles. Accord du PREMIER pas (pyrolyse, braises, percolation, rayonnement du lit) : dès le suivant, les
+    // gaz de la houille diffusent dans la flamme d'allumage et y brûlent, et dans une maille de flamme la chimie raide intégrée en f32
+    // et en f64 ne s'accorde pas pas à pas (voir le feu de bois). Puis comparaison sur la durée, en débits (le GPU s'arrête au pas qui
+    // dépasse t_end)
+    use super::mp_materials::{CH4, CO, CO2, HOUILLE, O2};
     let lib = super::mp_materials::MaterialLibrary::default();
     let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
-    one_step_agreement("feu de charbon", mk(), 20, 3, 1e-3, 0.5);
+    one_step_agreement("feu de charbon", mk(), 0, 1, 1e-3, 0.5);
     let Some((cpu, gs, _)) = compare("feu de charbon", &mk, 1.0) else { return };
     let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
-    let (co2, co) = (pos(super::mp_materials::CO2), pos(super::mp_materials::CO));
-    // carbone passé dans le gaz (CO + CO2, sorties comprises), mol/m
-    let made = |s: &MultiphaseSim| (s.total_mass(co2) - s.boundary_flux[co2]) / 0.044009 + (s.total_mass(co) - s.boundary_flux[co]) / 0.02801;
-    eprintln!(" carbone brûlé : CPU {:.4e} GPU {:.4e} mol/m", made(&cpu), made(&gs));
+    let (co2, co, ch4, hou, o2) = (pos(CO2), pos(CO), pos(CH4), pos(HOUILLE), pos(O2));
+    let h0 = mk().total_mass(hou);
+    // houille dégazée (kg/(m·s)) ; carbone passé dans le gaz (CO + CO2 + CH4, sorties comprises) et carbone brûlé en CO2 (mol/(m·s))
+    let pyro = |s: &MultiphaseSim| (h0 - s.total_mass(hou)) / s.time;
+    let gas = |s: &MultiphaseSim, q: usize, m: f64| (s.total_mass(q) - s.boundary_flux[q]) / m / s.time;
+    let made = |s: &MultiphaseSim| gas(s, co2, 0.044009) + gas(s, co, 0.02801) + gas(s, ch4, 0.016043);
+    let gg = cpu.group_of[o2];
+    let tmax = |s: &MultiphaseSim| (0..s.nx * s.ny).filter(|&q| !s.is_solid(q) && s.group_mass(gg, q) > 0.0).map(|q| s.tg[gg][q]).fold(0.0f64, f64::max);
+    eprintln!(" houille dégazée CPU {:.4e} GPU {:.4e} kg/(m·s) ; carbone passé dans le gaz CPU {:.4e} GPU {:.4e}, brûlé en CO2 CPU {:.4e} GPU {:.4e} mol/(m·s) ; T gaz max CPU {:.0} GPU {:.0} K",
+        pyro(&cpu), pyro(&gs), made(&cpu), made(&gs), gas(&cpu, co2, 0.044009), gas(&gs, co2, 0.044009), tmax(&cpu), tmax(&gs));
+    assert!(pyro(&cpu) > 0.0 && rel(pyro(&cpu), pyro(&gs)) < 0.05, "houille CPU {} GPU {}", pyro(&cpu), pyro(&gs));
     assert!(made(&cpu) > 0.0 && rel(made(&cpu), made(&gs)) < 0.1, "carbone CPU {} GPU {}", made(&cpu), made(&gs));
 }
 
@@ -1417,6 +1429,31 @@ fn gpu_pyrolyses_wood_like_the_cpu() {
 }
 
 #[test]
+fn gpu_radiates_in_the_grain_bed_like_the_cpu() {
+    // rayonnement du tas : entre mailles (braises sous du bois froid) et entre les populations mêlées d'une maille (miroirs de
+    // conduct et de exchange_grains)
+    for mixed in [false, true] {
+        let name = if mixed { "braises et bois mêlés" } else { "braises sous le bois" };
+        let mk = || super::mp_chem_tests::ember_bed(mixed);
+        one_step_agreement(name, mk(), 2, 3, 1e-4, 1e-2);
+        let Some((cpu, gs, _)) = compare(name, &mk, 0.05) else { return };
+        let w = cpu.reg.phases.iter().position(|p| p.name == super::mp_materials::WOOD).unwrap();
+        let gw = cpu.group_of[w];
+        // échauffement moyen du bois par seconde (le GPU s'arrête au pas qui dépasse t_end : comparer des débits)
+        let heat = |s: &MultiphaseSim| {
+            let (mut a, mut m) = (0.0, 0.0);
+            for q in 0..s.nx * s.ny {
+                a += s.mass[w][q] * (s.tg[gw][q] - 293.15);
+                m += s.mass[w][q];
+            }
+            a / m / s.time
+        };
+        eprintln!(" {name} : bois chauffé de {:.4} K/s (CPU), {:.4} K/s (GPU)", heat(&cpu), heat(&gs));
+        assert!(heat(&cpu) > 1.0 && rel(heat(&cpu), heat(&gs)) < 0.01, "{name} : CPU {} GPU {} K/s", heat(&cpu), heat(&gs));
+    }
+}
+
+#[test]
 fn gpu_runs_the_wood_fire_like_the_cpu() {
     // feu de bois : pyrolyse, flamme de diffusion des gaz du bois, braises de charbon de bois, percolation. Comparaison sur la durée
     // (comme le braséro) : dans une maille de flamme, la chimie raide intégrée en f32 sur le GPU et en f64 sur le CPU ne s'accorde pas
@@ -1438,6 +1475,30 @@ fn gpu_runs_the_wood_fire_like_the_cpu() {
     assert!(rel(pyro(&cpu), pyro(&gs)) < 0.05, "pyrolyse CPU {} GPU {}", pyro(&cpu), pyro(&gs));
     assert!(rel(burnt(&cpu), burnt(&gs)) < 0.25, "CO2 formé CPU {} GPU {}", burnt(&cpu), burnt(&gs));
     assert!(tmax(&cpu) > 1700.0 && tmax(&gs) > 1700.0, "flamme CPU {} GPU {}", tmax(&cpu), tmax(&gs));
+}
+
+/// diagnostic : feu de bois sur le GPU, sur la durée (MP_WOOD_T s, défaut 60 ; une ligne toutes les MP_WOOD_DT s, défaut 2 ; scène :
+/// `wood_fire_for_diag`)
+#[test]
+#[ignore]
+fn gpu_wood_fire_long_diag() {
+    let mut gs = super::mp_chem_tests::wood_fire_for_diag();
+    let Some(mut g) = gpu_or_skip(&gs) else { return };
+    let w = gs.reg.phases.iter().position(|p| p.name == super::mp_materials::WOOD).unwrap();
+    let m_w0 = gs.total_mass(w);
+    let t_end = std::env::var("MP_WOOD_T").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0f64);
+    let every = std::env::var("MP_WOOD_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
+    let t0 = std::time::Instant::now();
+    let mut next = every;
+    while gs.time < t_end && !gs.diverged {
+        g.step_batch(&mut gs, 50);
+        if gs.time >= next {
+            next += every;
+            g.download(&mut gs);
+            super::mp_chem_tests::wood_fire_report(&gs, m_w0, t0.elapsed().as_secs_f64());
+        }
+    }
+    eprintln!("divergé : {}", gs.diverged);
 }
 
 #[test]
