@@ -111,11 +111,13 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   monte de 4 cm en 0.5 s ; cuve large à 1.3 U_mf : le lit bouillonne, tout le sable reste dans la cuve. GPU : un pas à 1.5e-7, même
   perte de charge du lit retenu (2300 Pa), lit fluidisé qui monte des deux côtés. Scénario « Lit fluidisé (sable grossier soufflé par
   une grille) ». Limites : juste sous U_mf (0.93 U_mf), la surface du lit bouillonne déjà (l'écoulement se concentre là où le lit est
-  le plus lâche) ; fluidisé, le lit gonfle trop (×2 au lieu de ~×1.2) et s'agite trop (4–6 m/s) — une seule vitesse par cellule :
-  les paquets décollés, étanches, sont poussés comme des pistons, sans viscosité de la phase dense fluidisée ; dans une colonne
-  étroite, le lit monte en bouchons (pistonnage) qui peuvent sortir par le haut. Les lits de grains de moins de 1 mm restent étanches :
-  dans l'air, ils sont si perméables à l'échelle d'un pas (K/μ ≫ dt/ρ) que la percolation impose sa pression au mélange, qui perd sa
-  contrainte moyenne (le sable redevient « cohésif ») ; il faudrait une pression des pores à part (deux pressions, modèle de Biot).
+  le plus lâche) ; fluidisé, le lit gonfle trop (×2 au lieu de ~×1.2) et s'agite trop (4–6 m/s, même à 1.11 U_mf) — une seule
+  vitesse par cellule : les paquets denses décollés, étanches, sont poussés comme des pistons (essayés sans effet notable : place des
+  receveuses de la sédimentation comptée sur le bilan des cellules, viscosité de la phase dense jusqu'à 2 Pa·s ; il faut deux
+  vitesses, gaz et grains) ; dans une colonne étroite, le lit monte en bouchons (pistonnage) qui peuvent sortir par le haut. Les lits
+  de grains de moins de 1 mm restent étanches : dans l'air, ils sont si perméables à l'échelle d'un pas (K/μ ≫ dt/ρ) que la percolation
+  impose sa pression au mélange, qui perd sa contrainte moyenne (le sable redevient « cohésif ») ; il faudrait une pression des pores à
+  part (deux pressions, modèle de Biot).
 - **grille** (cellule spéciale `MpEffect::Grille`, « Grille » dans les cellules) : arrête les grains (le tas y repose, comme sur un
   solide : non-glissement, faces fermées au mélange), laisse passer le fluide par percolation (trous, fraction ouverte).
 - scénario « Feu de charbon sur grille (braséro) » : charbon en morceaux de 1.2 cm sur une grille entre deux parois, lit de 0.25 ly

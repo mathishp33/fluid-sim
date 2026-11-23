@@ -55,7 +55,41 @@ pub(crate) fn metrics(s: &MultiphaseSim) -> Metrics {
 }
 
 /// GPU disponible ? (lavapipe, pilote réel…)
+/// au plus `GPU_TESTS_AT_ONCE` tests GPU à la fois : un processeur graphique intégré ne va pas plus vite avec davantage de calculs en
+/// même temps (il partage son temps et la mémoire du système), et pendant les arrêts de la suite complète (une dizaine de tests GPU
+/// en même temps que des tests CPU qui chargent tous les cœurs) Windows a noté des délais de pilote dépassés (« LiveKernelEvent 141 ») —
+/// la cause principale était la fuite de mémoire de périphérique corrigée par `shared_gpu`. Jeton pris par le fil du test à son premier
+/// appareil GPU, rendu à la fin du test (fin du fil).
+const GPU_TESTS_AT_ONCE: usize = 2;
+static GPU_SLOTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static GPU_SLOT_FREED: std::sync::Condvar = std::sync::Condvar::new();
+struct GpuSlot;
+impl Drop for GpuSlot {
+    fn drop(&mut self) {
+        let mut n = GPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        GPU_SLOT_FREED.notify_one();
+    }
+}
+thread_local! {
+    static GPU_SLOT: std::cell::RefCell<Option<GpuSlot>> = const { std::cell::RefCell::new(None) };
+}
+fn take_gpu_slot() {
+    GPU_SLOT.with(|slot| {
+        if slot.borrow().is_some() {
+            return;
+        }
+        let mut n = GPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= GPU_TESTS_AT_ONCE {
+            n = GPU_SLOT_FREED.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        *slot.borrow_mut() = Some(GpuSlot);
+    });
+}
+
 pub(crate) fn gpu_or_skip(sim: &MultiphaseSim) -> Option<MultiphaseGpu> {
+    take_gpu_slot();
     match MultiphaseGpu::try_new(sim) {
         Ok(g) => Some(g),
         Err(e) => {
@@ -1927,4 +1961,24 @@ fn gpu_holds_and_fluidizes_a_blown_bed_like_the_cpu() {
     let (dc, dg) = (sand_height(&cpu, 1) - y0, sand_height(&gs, 1) - y0);
     eprintln!(" lit fluidisé : sable monté CPU {:.1} GPU {:.1} mm", 1e3 * dc, 1e3 * dg);
     assert!(dc > 0.005 && dg > 0.005, "lit non fluidisé : CPU {dc} GPU {dg}");
+}
+
+/// diagnostic : crée, avance et détruit MP_GPU_REPEAT solveurs GPU de suite (défaut 60, barrage 160 × 120) : la mémoire du processeur
+/// graphique doit être rendue à chaque fois (sinon : « Not enough memory left » ou arrêt net du processus au bout de quelques dizaines)
+#[test]
+#[ignore]
+fn gpu_create_and_drop_many_solvers_diag() {
+    let n: usize = std::env::var("MP_GPU_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    for k in 0..n {
+        let mut gs = build_scenario(MpScenario::DamBreak, 160, 120, 0.005, 9.81);
+        let Some(mut g) = gpu_or_skip(&gs) else { return };
+        for _ in 0..3 {
+            g.step(&mut gs);
+        }
+        g.download(&mut gs);
+        drop(g);
+        if k % 10 == 0 {
+            eprintln!("solveur GPU {k} créé, avancé et détruit");
+        }
+    }
 }

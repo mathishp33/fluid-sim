@@ -14,6 +14,7 @@
 //! d'un même pas évalués en parallèle (le CPU les traite en séquence).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::mp_cells::{MpEffect, MpThermal, PinInfo};
@@ -216,8 +217,9 @@ struct Baselines {
 }
 
 pub struct MultiphaseGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    /// périphérique et file partagés par tous les solveurs GPU du processus (`shared_gpu`)
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     s_buf: wgpu::Buffer,
     t_buf: wgpu::Buffer,
     d_buf: wgpu::Buffer,
@@ -492,33 +494,17 @@ impl MultiphaseGpu {
             let _ = std::fs::write(path, &header);
         }
 
-        // ---------------------------------------------------------------- périphérique
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .ok_or("aucun adaptateur GPU (Vulkan / Metal / DX12)")?;
-        let info = adapter.get_info();
-        let software = info.device_type == wgpu::DeviceType::Cpu || info.name.to_lowercase().contains("llvmpipe");
-        let adapter_name = format!("{} ({:?})", info.name, info.backend);
+        // ---------------------------------------------------------------- périphérique (partagé)
+        let gpu = shared_gpu()?;
+        let (device, queue) = (gpu.device.clone(), gpu.queue.clone());
+        let (software, adapter_name) = (gpu.software, gpu.adapter_name.clone());
         let s_bytes = (sl.total * 4) as u64;
-        let mut limits = wgpu::Limits::default();
-        let al = adapter.limits();
-        if s_bytes > limits.max_storage_buffer_binding_size as u64 {
-            limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-            limits.max_buffer_size = al.max_buffer_size;
-        }
-        if s_bytes > limits.max_storage_buffer_binding_size as u64 || s_bytes > limits.max_buffer_size {
+        let lim = device.limits();
+        if s_bytes > lim.max_storage_buffer_binding_size as u64 || s_bytes > lim.max_buffer_size {
             return Err(format!("grille trop grande pour le GPU ({:.0} Mo dans un seul buffer)", s_bytes as f64 / 1e6));
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor { label: Some("multiphase GPU"), required_features: wgpu::Features::empty(), required_limits: limits },
-            None,
-        ))
-        .map_err(|e| format!("périphérique GPU : {e}"))?;
-
+        // (portées d'erreur du périphérique partagé : une création à la fois)
+        let _creating = GPU_CREATE.lock().unwrap_or_else(|e| e.into_inner());
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("multiphase resident"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         if let Some(e) = pollster::block_on(device.pop_error_scope()) {
@@ -2066,12 +2052,89 @@ impl MultiphaseGpu {
 }
 
 impl Drop for MultiphaseGpu {
-    /// attend la fin du travail soumis avant de détruire le périphérique (certains pilotes, dont lavapipe, plantent sinon)
+    /// attend la fin du travail soumis (certains pilotes, dont lavapipe, plantent sinon), puis libère TOUT DE SUITE les tampons du
+    /// solveur ; le périphérique, partagé, reste. Avant, chaque solveur créait son instance wgpu et son périphérique, et une longue
+    /// série de simulations GPU (la suite de tests : une centaine) épuisait la mémoire d'un processeur graphique intégré — mesuré sur 30
+    /// solveurs créés, avancés puis détruits : 82 → 440 Mo réservés et 439 → 2085 Mo partagés, même en détruisant tampons et
+    /// périphérique ; puis « Not enough memory left » à la création d'un tampon, ou arrêt net du processus (code 0xc0000409)
     fn drop(&mut self) {
         trace("drop");
         self.device.poll(wgpu::Maintain::Wait);
-        trace("drop: GPU inactif");
+        for b in [
+            &self.s_buf, &self.t_buf, &self.d_buf, &self.r_buf, &self.params_buf, &self.slot_buf, &self.snap_s, &self.snap_d, &self.d_read,
+            &self.s_read, &self.r_read,
+        ] {
+            b.destroy();
+        }
+        self.device.poll(wgpu::Maintain::Poll);
+        trace("drop: GPU inactif, tampons libérés");
     }
+}
+
+/// instance, adaptateur, périphérique et file wgpu partagés par tous les solveurs GPU du processus (créés au premier solveur) : la
+/// mémoire de pilote d'un périphérique n'était pas rendue à sa destruction. Limites : celles de l'adaptateur pour la taille des tampons
+/// de stockage (une grande grille tient dans un seul tampon), les valeurs par défaut ailleurs. Périphérique perdu (pilote réinitialisé
+/// après un délai dépassé…) : le solveur suivant en crée un neuf (repasser en CPU puis en GPU relance le calcul GPU).
+struct SharedGpu {
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    software: bool,
+    adapter_name: String,
+    lost: Arc<std::sync::atomic::AtomicBool>,
+}
+static SHARED_GPU: std::sync::Mutex<Option<Arc<SharedGpu>>> = std::sync::Mutex::new(None);
+/// une création de solveur à la fois : les portées d'erreur (compilation, initialisation) sont celles du périphérique partagé
+static GPU_CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn shared_gpu() -> Result<Arc<SharedGpu>, String> {
+    let mut g = SHARED_GPU.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(sh) = g.as_ref() {
+        if !sh.lost.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(sh.clone());
+        }
+        // (les solveurs encore attachés au périphérique perdu gardent leur référence ; il disparaît avec le dernier)
+        *g = None;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok_or("aucun adaptateur GPU (Vulkan / Metal / DX12)")?;
+    let info = adapter.get_info();
+    let software = info.device_type == wgpu::DeviceType::Cpu || info.name.to_lowercase().contains("llvmpipe");
+    let adapter_name = format!("{} ({:?})", info.name, info.backend);
+    let al = adapter.limits();
+    let mut limits = wgpu::Limits::default();
+    limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(al.max_storage_buffer_binding_size);
+    limits.max_buffer_size = limits.max_buffer_size.max(al.max_buffer_size);
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor { label: Some("multiphase GPU"), required_features: wgpu::Features::empty(), required_limits: limits },
+        None,
+    ))
+    .map_err(|e| format!("périphérique GPU : {e}"))?;
+    let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = lost.clone();
+    device.set_device_lost_callback(move |reason, msg| {
+        if !matches!(reason, wgpu::DeviceLostReason::Dropped | wgpu::DeviceLostReason::ReplacedCallback) {
+            eprintln!("GPU : périphérique perdu ({reason:?}) {msg}");
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    let sh = Arc::new(SharedGpu {
+        _instance: instance,
+        _adapter: adapter,
+        device: Arc::new(device),
+        queue: Arc::new(queue),
+        software,
+        adapter_name,
+        lost,
+    });
+    *g = Some(sh.clone());
+    Ok(sh)
 }
 
 const P0: f64 = 101325.0;
