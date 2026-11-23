@@ -114,6 +114,9 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
         if (has(F_ST) && sig > 0.0 && rmax > 0.0) {
             dt = min(dt, P.cap_safety * sqrt((rmin + rmax) * P.dx * P.dx * P.dx / (4.0 * PI * sig)));
         }
+        // croissance du pas bornée à ×2 (miroir de choose_dt, DT_GROWTH) : D[D_DT] est encore le pas précédent
+        let prev = D[D_DT];
+        if (prev > 0.0) { dt = min(dt, 2.0 * prev); }
         D[D_DT] = dt;
         D[D_DTF] = 1.0;
         D[D_SUB_C] = 0.0; D[D_SUB_S] = 0.0;

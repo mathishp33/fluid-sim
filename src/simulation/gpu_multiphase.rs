@@ -739,7 +739,7 @@ impl MultiphaseGpu {
             };
             r[26] = gid[k] as f64;
             // groupe réactif (une de ses phases intervient dans une réaction) : seul il participe à la chimie
-            r[30] = if sim.reg.phases.iter().enumerate().any(|(j, _)| gid[j] == gid[k] && sim.reg.is_reactive(j)) { 1.0 } else { 0.0 };
+            r[30] = if sim.reg.phases.iter().enumerate().any(|(j, _)| gid[j] == gid[k] && sim.reg.is_cell_reactive(j)) { 1.0 } else { 0.0 };
             r[27] = p.color[0] as f64;
             r[28] = p.color[1] as f64;
             r[29] = p.color[2] as f64;
@@ -841,6 +841,13 @@ impl MultiphaseGpu {
                 row[49] = sr.solid as f64;
                 row[50] = sr.d;
                 row[51] = sr.ox.map_or(-1.0, |o| o as f64);
+            }
+            // réaction en volume d'une phase granulaire (pyrolyse, `k_pyrolysis`) : 48 = −1, 49 réactif granulaire, 50 temps de conduction
+            // interne de ses grains (k_eff = k / (1 + k τ))
+            if r.bulk {
+                row[48] = -1.0;
+                row[49] = r.reactants.first().map_or(0.0, |&(k, _)| k as f64);
+                row[50] = r.bulk_tau(ph);
             }
             if r.reversible && surf.is_none() {
                 row[9] = kc_next as f64;
@@ -1035,6 +1042,8 @@ impl MultiphaseGpu {
         self.queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(&s));
         // scalaires dynamiques
         let mut d = vec![0f32; D_LEN];
+        // pas précédent (croissance du pas bornée, voir choose_dt)
+        d[D_DT] = sim.last_dt as f32;
         d[D_DTCHEM] = if sim.dt_chem.is_finite() { sim.dt_chem as f32 } else { 3e38 };
         d[D_DTPHASE] = if sim.dt_phase.is_finite() { sim.dt_phase as f32 } else { 3e38 };
         self.queue.write_buffer(&self.d_buf, 0, bytemuck::cast_slice(&d));
@@ -1442,6 +1451,9 @@ impl MultiphaseGpu {
             for s in (0..self.np).filter(|&k| sim.reg.phases[k].is_granular()) {
                 v.push(Op { k: "k_settle_delta", wg: wn, slot: self.slot(s, 0) });
                 v.push(Op { k: "k_settle_apply", wg: wn, slot: self.slot(s, 0) });
+            }
+            if sim.chemistry && sim.reg.reactions.iter().any(|r| r.bulk) {
+                v.push(cell("k_pyrolysis"));
             }
             v.push(cell("k_refresh"));
         }

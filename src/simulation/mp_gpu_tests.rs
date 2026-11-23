@@ -169,6 +169,8 @@ fn clone_sim(s: &MultiphaseSim) -> MultiphaseSim {
     c.dt_max = s.dt_max;
     c.dt_chem = s.dt_chem;
     c.dt_phase = s.dt_phase;
+    // pas précédent : borne la croissance du pas (choose_dt)
+    c.last_dt = s.last_dt;
     c.pressure_clamped = s.pressure_clamped.clone();
     c.boundary_flux = s.boundary_flux.clone();
     c.transferred = s.transferred.clone();
@@ -1390,6 +1392,52 @@ fn gpu_burns_coal_like_the_cpu() {
     let made = |s: &MultiphaseSim| (s.total_mass(co2) - s.boundary_flux[co2]) / 0.044009 + (s.total_mass(co) - s.boundary_flux[co]) / 0.02801;
     eprintln!(" carbone brûlé : CPU {:.4e} GPU {:.4e} mol/m", made(&cpu), made(&gs));
     assert!(made(&cpu) > 0.0 && rel(made(&cpu), made(&gs)) < 0.1, "carbone CPU {} GPU {}", made(&cpu), made(&gs));
+}
+
+#[test]
+fn gpu_pyrolyses_wood_like_the_cpu() {
+    // réaction EN VOLUME (pyrolyse) à la température des grains, bornée par la conduction interne des morceaux (2 cm : τ ≈ 66 s) :
+    // bois dans de l'azote à 800 K
+    let mk = || super::mp_chem_tests::wood_dust(800.0, 0.05);
+    one_step_agreement("pyrolyse", mk(), 2, 3, 1e-4, 1e-3);
+    let Some((cpu, gs, _)) = compare("pyrolyse", &mk, 0.5) else { return };
+    let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
+    let (w, ch4, ch) = (pos(super::mp_materials::WOOD), pos(super::mp_materials::CH4), pos(super::mp_materials::CHARCOAL));
+    eprintln!(" bois décomposé : CPU {:.4e} GPU {:.4e} kg/m ; CH4 CPU {:.4e} GPU {:.4e} ; charbon de bois CPU {:.4e} GPU {:.4e}",
+        mk().total_mass(w) - cpu.total_mass(w), mk().total_mass(w) - gs.total_mass(w), cpu.total_mass(ch4), gs.total_mass(ch4),
+        cpu.total_mass(ch), gs.total_mass(ch));
+    let tw = |s: &MultiphaseSim| (0..s.nx * s.ny).map(|q| s.tg[s.group_of[w]][q]).sum::<f64>() / (s.nx * s.ny) as f64;
+    let tgas = |s: &MultiphaseSim| (0..s.nx * s.ny).map(|q| s.tg[s.group_of[ch4]][q]).sum::<f64>() / (s.nx * s.ny) as f64;
+    eprintln!(" temps CPU {:.5} GPU {:.5} s ; pas CPU {} GPU {} ; T bois CPU {:.3} GPU {:.3} K ; T gaz CPU {:.3} GPU {:.3} K", cpu.time, gs.time, cpu.step_count, gs.step_count,
+        tw(&cpu), tw(&gs), tgas(&cpu), tgas(&gs));
+    // (le GPU s'arrête au pas qui dépasse t_end : comparer les débits, pas les quantités)
+    let (rc, rg) = (cpu.total_mass(ch4) / cpu.time, gs.total_mass(ch4) / gs.time);
+    assert!(rc > 0.0 && rel(rc, rg) < 0.01, "CH4 par seconde CPU {rc} GPU {rg}");
+    assert!(rel(cpu.total_mass(ch) / cpu.time, gs.total_mass(ch) / gs.time) < 0.01);
+}
+
+#[test]
+fn gpu_runs_the_wood_fire_like_the_cpu() {
+    // feu de bois : pyrolyse, flamme de diffusion des gaz du bois, braises de charbon de bois, percolation. Comparaison sur la durée
+    // (comme le braséro) : dans une maille de flamme, la chimie raide intégrée en f32 sur le GPU et en f64 sur le CPU ne s'accorde pas
+    // pas à pas (méthane brûlé en un pas d'un côté, pas tout à fait de l'autre), mais le feu, oui
+    use super::mp_materials::{CHARCOAL, CO, CO2, O2, WOOD};
+    let lib = super::mp_materials::MaterialLibrary::default();
+    let mk = || super::mp_view::build_scenario_with(&lib, MpScenario::WoodFire, 24, 24, 0.4 / 24.0, 9.81).unwrap();
+    let Some((cpu, gs, _)) = compare("feu de bois", &mk, 0.4) else { return };
+    let pos = |n: &str| cpu.reg.phases.iter().position(|p| p.name == n).unwrap();
+    let (w, ch, co, co2, o2) = (pos(WOOD), pos(CHARCOAL), pos(CO), pos(CO2), pos(O2));
+    let w0 = mk().total_mass(w);
+    let pyro = |s: &MultiphaseSim| (w0 - s.total_mass(w)) / s.time;
+    // carbone brûlé en CO2 (sorties comprises) par seconde
+    let burnt = |s: &MultiphaseSim| (s.total_mass(co2) - s.boundary_flux[co2]) / 0.044009 / s.time;
+    let gg = cpu.group_of[o2];
+    let tmax = |s: &MultiphaseSim| (0..s.nx * s.ny).filter(|&q| !s.is_solid(q) && s.group_mass(gg, q) > 0.0).map(|q| s.tg[gg][q]).fold(0.0f64, f64::max);
+    eprintln!(" bois décomposé CPU {:.4e} GPU {:.4e} kg/(m·s) ; CO2 formé CPU {:.4e} GPU {:.4e} mol/(m·s) ; T gaz max CPU {:.0} GPU {:.0} K ; CO CPU {:.3e} GPU {:.3e} ; charbon de bois CPU {:.4} GPU {:.4}",
+        pyro(&cpu), pyro(&gs), burnt(&cpu), burnt(&gs), tmax(&cpu), tmax(&gs), cpu.total_mass(co), gs.total_mass(co), cpu.total_mass(ch), gs.total_mass(ch));
+    assert!(rel(pyro(&cpu), pyro(&gs)) < 0.05, "pyrolyse CPU {} GPU {}", pyro(&cpu), pyro(&gs));
+    assert!(rel(burnt(&cpu), burnt(&gs)) < 0.25, "CO2 formé CPU {} GPU {}", burnt(&cpu), burnt(&gs));
+    assert!(tmax(&cpu) > 1700.0 && tmax(&gs) > 1700.0, "flamme CPU {} GPU {}", tmax(&cpu), tmax(&gs));
 }
 
 #[test]

@@ -256,6 +256,8 @@ fn cc_surface_rate(j: u32, t: f32) -> f32 {
 // (débit direct, débit inverse) (miroir de CellChem::rate_parts)
 fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
     if (rxv(j, 48u) > 0.5) { return vec2<f32>(cc_surface_rate(j, t), 0.0); }
+    // réaction en volume d'une phase granulaire : opérateur à part (`k_pyrolysis`)
+    if (rxv(j, 48u) < -0.5) { return vec2<f32>(0.0, 0.0); }
     if (rxv(j, 5u) < -1e29) { return vec2<f32>(0.0, 0.0); }
     var lk = ln_kf(j, t);
     if (rx_flame(j)) { lk -= log(cfe); }
@@ -597,4 +599,42 @@ fn k_chem_final(@builtin(local_invocation_id) l: vec3<u32>) {
         if (m < 1e37) { d = max(m, 1e-8); }
         D[D_DTCHEM_NEW] = min(D[D_DTCHEM_NEW], d);   // plusieurs appels par pas (sous-pas des flammes) : minimum
     }
+}
+
+// ===== pyrolyse : réactions EN VOLUME des phases granulaires, à la température du grain (miroir de MultiphaseSim::pyrolysis_step) =====
+// avancement exact du premier ordre c_s (1 − e^(−ν k_eff dt)) / ν, k_eff = 1 / (1/k + τ) ; produits à la température du grain, le groupe
+// du grain leur cède exactement leur énergie absolue (énergies relatives : ε_s −= Σ dm_p e_abs,p − dm_s h0_s, ε_p += dm_p e_rel,p)
+@compute @workgroup_size(64)
+fn k_pyrolysis(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x; let n = ncell();
+    if (c >= n) { return; }
+    let live = !is_solid(c) && !pinned(c);
+    let dt = dtv();
+    var touched = false;
+    for (var j = 0u; j < P.nre; j++) {
+        let bulk = rxv(j, 48u) < -0.5;
+        let s = select(0u, u32(rxv(j, 49u)), bulk);
+        let tau = rxv(j, 50u);
+        let ms = mass(s, c);
+        let ok = live && bulk && ms > 1e-12;
+        let gs = group_k(s);
+        let ts = tgrp(gs, c);
+        let ik = exp(-ln_kf(j, ts));
+        let keff = 1.0 / max(ik + tau, 1e-30);
+        let nus = max(rx_rnu(j, 0u), 1e-30);
+        let xi = select(0.0, ms / molar_k(s) * (1.0 - exp(-nus * keff * dt)) / nus, ok);
+        let dms = min(nus * xi * molar_k(s), ms);
+        var eabs_out = 0.0;
+        for (var i = 0u; i < rx_np(j); i++) {
+            let p = rx_ps(j, i);
+            let dm = select(0.0, xi * rx_pnu(j, i) * molar_k(p) * rxv(j, 8u), ok);
+            S[O_mass + p * n + c] += dm;
+            S[O_epsg + group_k(p) * n + c] += dm * erel_k(p, ts);
+            eabs_out += dm * eabs_k(p, ts);
+        }
+        S[O_mass + s * n + c] -= select(0.0, dms, ok);
+        S[O_epsg + gs * n + c] -= select(0.0, eabs_out - dms * h0_k(s), ok);
+        touched = touched || ok;
+    }
+    if (touched) { cell_sync(c); }
 }

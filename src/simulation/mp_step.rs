@@ -13,6 +13,10 @@ use super::multiphase::MultiphaseSim;
 
 /// Diagnostic : cellule sondée par `step_raw` après chaque étape (usize::MAX = aucune). Affiche T et e massique de chaque groupe, masses,
 /// p, fermeture Σ m/ρ − 1 et vitesse max des faces : repère l'étape qui fait diverger une cellule.
+/// croissance maximale du pas de temps d'un pas au suivant (voir `choose_dt`). ×1.25 était trop serré : après un pas refait (dt/4),
+/// le pas ne remontait pas assez vite et les retours arrière s'enchaînaient (braséro : dt jusqu'à 1.5e-6 s)
+pub(crate) const DT_GROWTH: f64 = 2.0;
+
 pub(crate) static PROBE_CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 pub const P_REFRESH: usize = 0;
@@ -96,6 +100,12 @@ impl MultiphaseSim {
         let g = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
         if g > 0.0 {
             dt = dt.min(0.5 * (dx / g).sqrt());
+        }
+        // croissance du pas bornée (×2) : les vitesses de la dernière projection, qui servent à l'advection de ce pas, ont été calculées
+        // pour corriger l'erreur de volume en `last_dt` ; appliquées sur un pas 4× plus long (après un pas court imposé par la chimie),
+        // elles déplacent 4× trop : une poche de gaz qui s'enflamme d'un coup était vidée à 92 % au pas suivant et son reste porté à 3800 K
+        if self.last_dt > 0.0 {
+            dt = dt.min(DT_GROWTH * self.last_dt);
         }
         let (mut rmin, mut rmax, mut sig) = (f64::MAX, 0.0f64, 0.0f64);
         for c in 0..n {
@@ -333,6 +343,8 @@ impl MultiphaseSim {
         // grains : sédimentation (dérive par rapport au fluide) sur l'état advecté
         if self.has_granular() {
             self.settle_grains(dt);
+            // réactions en volume des grains (pyrolyse), à la température des grains
+            self.pyrolysis_step(dt);
             self.refresh();
         }
         self.apply_thermal_sources(dt);

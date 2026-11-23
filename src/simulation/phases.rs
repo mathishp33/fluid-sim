@@ -388,6 +388,47 @@ impl Phase {
             friction_angle: 35.0,
         }
     }
+    /// Bois sec en morceaux (bûchettes, copeaux) : phase granulaire qui se décompose en chauffant (pyrolyse : réaction EN VOLUME, voir
+    /// `mp_materials::wood_reactions`) en charbon de bois et en gaz combustibles. Formule moyenne par atome de carbone CH1.44O0.66 (bois
+    /// sec sans cendres : C 50 %, H 6 %, O 44 % en masse), M = 24.02 g/mol ; Δh_f° = −130.9 kJ/mol (−5.45 MJ/kg), soit un pouvoir
+    /// calorifique supérieur de 19.5 MJ/kg (inférieur 18.2). ρ = 650 kg/m³ (chêne, hêtre), c_p = 1.5 kJ/(kg·K) à 298 K croissant de
+    /// 1 J/(kg·K²), k = 0.15 W/(m·K), morceaux de 2 cm empilés lâchement (α_max 0.55), angle de frottement 40°.
+    pub fn wood() -> Phase {
+        Phase {
+            name: "bois".into(),
+            kind: PhaseKind::Granular,
+            eos: Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 650.0, t0: 293.15, beta: 1.0e-5 } },
+            cp: 1500.0,
+            conductivity: 0.15,
+            mu_ref: 1.0e-3,
+            mu_law: PropertyLaw::Constant,
+            k_law: PropertyLaw::Constant,
+            t_ref: 293.15,
+            e0: 0.0,
+            sigma: 0.0,
+            color: [0.60, 0.40, 0.22],
+            molar_mass: 0.024022,
+            diffusivity: 0.0,
+            h_formation: -130.9e3,
+            s_standard: 30.0,
+            cp_slope: 1.0,
+            radiator: Radiator::None,
+            grain_diameter: 0.02,
+            alpha_max: 0.55,
+            friction_angle: 40.0,
+        }
+    }
+    /// Charbon de bois : du carbone comme `coal` (mêmes propriétés thermiques, mêmes réactions de surface), mais poreux et léger,
+    /// ρ = 350 kg/m³ : le résidu de la pyrolyse garde ~40 % du volume du bois (morceaux de 1.5 cm pour des bûchettes de 2 cm)
+    pub fn charcoal() -> Phase {
+        let mut p = Phase::coal();
+        p.name = "charbon de bois".into();
+        p.eos = Eos::Tait { p0: 101325.0, b: 5.0e9, n: 7.0, thermal: Thermal::Beta { rho0: 350.0, t0: 293.15, beta: 1.0e-5 } };
+        p.color = [0.09, 0.08, 0.08];
+        p.grain_diameter = 0.015;
+        p.alpha_max = 0.55;
+        p
+    }
     /// Huile végétale (Tait avec n et B typiques des huiles, dilatation β constante)
     pub fn oil() -> Phase {
         Phase {
@@ -526,6 +567,11 @@ pub struct Reaction {
     /// épaisseur de flamme laminaire δ_L (m) pour le modèle de flamme épaissie (TFM) ; 0 = pas de modèle de flamme
     #[serde(default)]
     pub flame_thickness: f64,
+    /// réaction EN VOLUME d'une phase granulaire (décomposition dans toute la masse du grain : pyrolyse du bois, de la houille) : loi
+    /// d'action de masse ordinaire, du premier ordre en quantité de grains (mol/m³ de cellule), au lieu de la loi de surface (vitesse
+    /// ∝ surface des grains × concentration de l'oxydant, limitée par sa diffusion)
+    #[serde(default)]
+    pub bulk: bool,
 }
 
 impl Reaction {
@@ -561,6 +607,24 @@ impl Reaction {
         -dg / (R_GAS * t) + self.delta_n() * (P_STD / (R_GAS * t)).ln()
     }
     /// constante de vitesse directe k(T)
+    /// Réaction en volume d'une phase granulaire : temps de conduction interne de ses grains, τ = (d/2)² ρ c_p / (π² k) (premier mode
+    /// d'une sphère chauffée en surface). La vitesse de la réaction est k(T) / (1 + k(T) τ) : la cinétique à basse température, l'arrivée
+    /// de la chaleur au cœur des morceaux à haute température — un morceau de bois de 2 cm met ~1 min à se décomposer, pas quelques ms.
+    /// Sans cette limite, la chimie (température commune des groupes qui réagissent) portait le bois au contact des braises à 1400 K et
+    /// toute une maille de bois se décomposait en ~3 ms : ~1000 fois son volume de gaz, et le calcul divergeait. 0 si la réaction n'est
+    /// pas en volume.
+    pub fn bulk_tau(&self, phases: &[Phase]) -> f64 {
+        if !self.bulk {
+            return 0.0;
+        }
+        let Some(&(s, _)) = self.reactants.iter().find(|&&(k, _)| phases.get(k).is_some_and(|p| p.is_granular())) else { return 0.0 };
+        let p = &phases[s];
+        let (r, k) = (0.5 * p.grain_diameter, p.conductivity);
+        if r <= 0.0 || k <= 0.0 {
+            return 0.0;
+        }
+        r * r * p.rho(101325.0, 293.15) * p.cp / (std::f64::consts::PI.powi(2) * k)
+    }
     pub fn k_forward(&self, t: f64) -> f64 {
         let t = t.max(1.0);
         self.pre_exp * if self.temp_exponent != 0.0 { t.powf(self.temp_exponent) } else { 1.0 } * (-self.activation_energy / (R_GAS * t)).exp()
@@ -571,6 +635,9 @@ impl Reaction {
     }
     /// réaction de surface : (réactif granulaire, diamètre des grains, oxydant = premier réactif non granulaire) ; None sinon
     pub fn surface(&self, phases: &[Phase]) -> Option<SurfaceRx> {
+        if self.bulk {
+            return None;
+        }
         let &(s, _) = self.reactants.iter().find(|&&(k, _)| phases.get(k).is_some_and(|p| p.is_granular()))?;
         let ox = self.reactants.iter().map(|&(k, _)| k).find(|&k| phases.get(k).is_some_and(|p| !p.is_granular()));
         Some(SurfaceRx { solid: s, d: phases[s].grain_diameter.max(1e-6), ox })
@@ -654,6 +721,11 @@ impl Registry {
     /// fluide k impliqué dans au moins une réaction (réactif, produit ou modulateur) ?
     pub fn is_reactive(&self, k: usize) -> bool {
         self.reactions.iter().any(|r| r.reactants.iter().chain(r.products.iter()).chain(r.modifiers.iter()).any(|x| x.0 == k))
+    }
+    /// la phase k intervient-elle dans la chimie des cellules (réactions autres qu'en volume : les réactions en volume des phases
+    /// granulaires — pyrolyse — sont un opérateur à part, à la température du grain, voir `MultiphaseSim::pyrolysis_step`)
+    pub fn is_cell_reactive(&self, k: usize) -> bool {
+        self.reactions.iter().filter(|r| !r.bulk).any(|r| r.reactants.iter().chain(r.products.iter()).chain(r.modifiers.iter()).any(|x| x.0 == k))
     }
     /// eau + vapeur d'eau + air (valeurs réelles à 100 °C / 1 atm). Retourne (registre, id_air, id_eau, id_vapeur).
     pub fn water_air_steam() -> (Registry, usize, usize, usize) {

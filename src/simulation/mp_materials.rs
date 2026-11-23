@@ -49,6 +49,9 @@ pub struct ReactionDef {
     /// épaisseur de flamme laminaire (m) pour le modèle de flamme épaissie ; 0 = aucun
     #[serde(default)]
     pub flame_thickness: f64,
+    /// réaction en volume d'une phase granulaire (pyrolyse : voir `phases::Reaction::bulk`)
+    #[serde(default)]
+    pub bulk: bool,
 }
 
 /// Mélange nommé : fractions VOLUMIQUES (= molaires pour des gaz parfaits) de fluides de la bibliothèque, normalisées à 1.
@@ -112,6 +115,10 @@ pub struct Roles {
     pub grains: Option<usize>,
     /// phase granulaire combustible (réactif d'une réaction de surface : charbon…)
     pub coal: Option<usize>,
+    /// phase granulaire qui se décompose en chauffant (réactif d'une réaction en volume : bois…)
+    pub wood: Option<usize>,
+    /// résidu granulaire de cette décomposition (charbon de bois)
+    pub charcoal: Option<usize>,
 }
 
 fn lower(s: &str) -> String {
@@ -141,7 +148,13 @@ impl Roles {
         let coal = by_name(&["charbon", "coal", "carbone"], Some(PhaseKind::Granular)).or_else(|| {
             reg.reactions.iter().find_map(|r| r.surface(&reg.phases).map(|s| s.solid))
         });
-        Roles { air, water, vapor, oil, plate, grains, coal }
+        let wood = by_name(&["bois", "wood"], Some(PhaseKind::Granular)).or_else(|| {
+            reg.reactions.iter().find(|r| r.bulk).and_then(|r| r.reactants.first().map(|&(k, _)| k))
+        });
+        let charcoal = by_name(&["charbon de bois", "charcoal"], Some(PhaseKind::Granular)).or_else(|| {
+            reg.reactions.iter().find(|r| r.bulk).and_then(|r| r.products.iter().map(|&(k, _)| k).find(|&k| reg.phases[k].is_granular()))
+        });
+        Roles { air, water, vapor, oil, plate, grains, coal, wood, charcoal }
     }
 }
 
@@ -329,6 +342,7 @@ impl MaterialLibrary {
                     reversible: r.reversible,
                     modifiers: md,
                     flame_thickness: r.flame_thickness,
+                    bulk: r.bulk,
                 }),
                 _ => warnings.push(format!("réaction « {} » ignorée : fluide inexistant", r.name)),
             }
@@ -426,6 +440,12 @@ pub const COAL: &str = "charbon";
 pub const RX_COAL: &str = "combustion du charbon (C + O2 → CO2, surface des grains)";
 pub const RX_COAL_CO: &str = "gazéification du charbon (C + ½O2 → CO, surface des grains)";
 pub const RX_BOUDOUARD: &str = "réduction de CO2 par le charbon (C + CO2 → 2 CO, Boudouard)";
+pub const WOOD: &str = "bois";
+pub const CHARCOAL: &str = "charbon de bois";
+pub const RX_WOOD: &str = "pyrolyse du bois (bois → charbon de bois + CO, CO2, H2O, CH4, H2)";
+pub const RX_CHARCOAL_CO: &str = "gazéification du charbon de bois (C + ½O2 → CO, surface des grains)";
+pub const RX_CHARCOAL: &str = "combustion du charbon de bois (C + O2 → CO2, surface des grains)";
+pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C + CO2 → 2 CO)";
 
 /// Gaz parfait de combustion. cp(T) = cp + pente·(T − 298.15) : les deux coefficients sont ajustés pour reproduire EXACTEMENT
 /// h(2000 K) − h(298 K) et s°(2000 K) des tables NIST-JANAF (donc la température de flamme et les équilibres de dissociation vers
@@ -567,6 +587,34 @@ pub fn coal_reactions() -> Vec<ReactionDef> {
     ]
 }
 
+/// Pyrolyse du bois : réaction EN VOLUME (le bois chauffé se décompose dans toute la masse du morceau), du premier ordre en bois,
+/// CH1.44O0.66 → 0.44 C + 0.30 CO + 0.08 CO2 + 0.20 H2O + 0.18 CH4 + 0.16 H2. Rendements massiques : charbon de bois 22 % (le « carbone
+/// fixe » d'un bois sec), gaz combustibles 49 % (CO 35 %, CH4 12 %, H2 1.3 %), CO2 15 %, eau 15 % ; les goudrons, qui se craquent et
+/// brûlent dans la flamme, sont comptés en CH4 et H2 (gaz sec : CO 42 %, CH4 25 %, H2 22 %, CO2 11 % en volume). Chaleur de pyrolyse
+/// +0.18 MJ/kg (légèrement endothermique ; mesures : −0.5 à +0.5 MJ/kg). Vitesse : somme des trois voies (gaz, goudrons, charbon) de
+/// Shafizadeh & Chin avec les constantes de Thurner & Mann (1981, chêne), approchée par une seule loi d'Arrhenius entre 700 et 800 K :
+/// A = 3.7e6 s⁻¹, Ea = 108.8 kJ/mol — 13 min à 600 K, 36 s à 700 K, 3.4 s à 800 K, 0.56 s à 900 K. Le charbon de bois brûle ensuite
+/// comme le charbon (réactions de surface : cinétique de Field, rapport CO/CO2 d'Arthur, Boudouard).
+pub fn wood_reactions() -> Vec<ReactionDef> {
+    let mut v = vec![ReactionDef {
+        name: RX_WOOD.into(),
+        reactants: vec![(WOOD.into(), 1.0)],
+        products: vec![(CHARCOAL.into(), 0.44), (CO.into(), 0.30), (CO2.into(), 0.08), (H2O_G.into(), 0.20), (CH4.into(), 0.18), (H2.into(), 0.16)],
+        pre_exp: 3.7e6,
+        activation_energy: 108.8e3,
+        orders: vec![1.0],
+        bulk: true,
+        ..Default::default()
+    }];
+    for (r, name) in coal_reactions().into_iter().zip([RX_CHARCOAL_CO, RX_CHARCOAL, RX_CHARCOAL_BOUD]) {
+        let mut r = r;
+        r.name = name.into();
+        r.reactants[0].0 = CHARCOAL.into();
+        v.push(r);
+    }
+    v
+}
+
 /// fractions molaires de l'air sec : O2 20.95 %, N2 + Ar 79.05 %
 const X_O2_AIR: f64 = 0.2095;
 
@@ -650,6 +698,23 @@ impl MaterialLibrary {
         let mut l = self.clone();
         l.add_combustion_preset();
         l.ambient = AIR_SEC.into();
+        l
+    }
+
+    /// Préréglage combustion + bois et charbon de bois (phases granulaires), pyrolyse du bois et combustion du charbon de bois (scénario
+    /// « feu de bois »)
+    pub fn with_wood(&self) -> MaterialLibrary {
+        let mut l = self.with_combustion();
+        for p in [Phase::wood(), Phase::charcoal()] {
+            if l.fluid_index(&p.name).is_none() {
+                l.fluids.push(p);
+            }
+        }
+        for r in wood_reactions() {
+            if !l.reactions.iter().any(|q| q.name == r.name) {
+                l.reactions.push(r);
+            }
+        }
         l
     }
 

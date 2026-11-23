@@ -49,6 +49,8 @@ pub enum MpScenario {
     SandColumn,
     /// braséro : charbon en morceaux sur une grille, allumé par le bas, tirage naturel à travers le lit, flamme de CO au-dessus
     CoalFire,
+    /// feu de bois : bûchettes sur une grille allumées par des braises ; pyrolyse, flammes des gaz du bois, charbon de bois qui brûle
+    WoodFire,
 }
 
 impl Default for MpScenario {
@@ -58,7 +60,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 13] = [
+    pub const ALL: [MpScenario; 14] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -72,14 +74,15 @@ impl MpScenario {
         Self::Sedimentation,
         Self::SandColumn,
         Self::CoalFire,
+        Self::WoodFire,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
-        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire)
+        matches!(self, Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire)
     }
     pub fn is_combustion(self) -> bool {
-        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame | Self::CoalFire)
+        matches!(self, Self::PremixedFlame | Self::ConfinedExplosion | Self::VentedExplosion | Self::DiffusionFlame | Self::CoalFire | Self::WoodFire)
     }
     pub fn from_index(i: usize) -> Self {
         Self::ALL[i.min(Self::ALL.len() - 1)]
@@ -102,6 +105,7 @@ impl MpScenario {
             Self::Sedimentation => "Sable qui tombe dans l'eau (sédimentation)",
             Self::SandColumn => "Effondrement d'une colonne de sable (frottement)",
             Self::CoalFire => "Feu de charbon sur grille (braséro : percolation, flamme de CO)",
+            Self::WoodFire => "Feu de bois sur grille (pyrolyse : flammes des gaz du bois)",
         }
     }
 }
@@ -118,6 +122,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
     let lib_c;
     let lib = if sc == MpScenario::CoalFire {
         lib_c = lib.with_coal();
+        &lib_c
+    } else if sc == MpScenario::WoodFire {
+        lib_c = lib.with_wood();
         &lib_c
     } else if sc.is_combustion() {
         lib_c = lib.with_combustion();
@@ -206,6 +213,69 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             // feu établi : tout le lit est en braises
             let ember = in_bed;
             t_fn = Box::new(move |x, y| if ember(x, y) { 1450.0 } else { 293.15 });
+            s.finalize_init(&*t_fn);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (x, y) = s.center(i, j);
+                    if grate(x, y) {
+                        let c = s.idx(i, j);
+                        s.set_effect(c, Some(MpEffect::Grille { hole: 0.01, open: 0.6 }));
+                    }
+                }
+            }
+            s.refresh();
+            return Ok(s);
+        }
+        MpScenario::WoodFire => {
+            // feu de bois : bûchettes de 2 cm sur un lit de braises de charbon de bois (la moitié du bas du tas, 1450 K), sur la grille du
+            // braséro. Le bois chauffé par les braises se décompose (pyrolyse, ~1 s vers 900 K) : ses gaz (CO, CH4, H2, et la
+            // vapeur et le CO2 qu'il libère) montent à travers le tas et brûlent en flamme dans l'air au-dessus ; le charbon de bois qu'il
+            // laisse brûle ensuite à la surface des morceaux, comme les braises. L'air entre par le haut ouvert, descend le long des parois
+            // et passe sous la grille (tirage naturel à travers le tas, percolation)
+            let wood = need(roles.wood, "une phase granulaire qui se décompose en chauffant (bois) et sa pyrolyse")?;
+            let charcoal = need(roles.charcoal, "le résidu granulaire de la pyrolyse (charbon de bois)")?;
+            let plate = need(roles.plate, "un solide (parois et grille)")?;
+            let dry = mix(AIR_SEC)?;
+            let h2o = built_index(&s, H2O_G);
+            let mut air = dry.iter().map(|a| a * if h2o.is_some() { 0.99 } else { 1.0 }).collect::<Vec<f64>>();
+            if let Some(w) = h2o {
+                air[w] += 0.01;
+            }
+            s.ambient_mix = air.clone();
+            let (aw, ac) = (s.reg.phases[wood].alpha_max, s.reg.phases[charcoal].alpha_max);
+            let mut logs = air.iter().map(|a| a * (1.0 - aw)).collect::<Vec<f64>>();
+            logs[wood] = aw;
+            let mut embers = air.iter().map(|a| a * (1.0 - ac)).collect::<Vec<f64>>();
+            embers[charcoal] = ac;
+            let wall = (0.025 * lx).max(dx);
+            let (x0, x1) = (0.3 * lx, 0.7 * lx);
+            let yg = 0.15 * ly;
+            let bed_h = 0.25;
+            let (yb0, yb1) = (yg + dx, yg + dx + bed_h * ly);
+            let y_emb = yb0 + (yb1 - yb0) / 3.0;
+            // parois basses (elles retiennent le tas) : au-dessus, le panache aspire l'air par les côtés et la flamme se forme sur ses bords
+            let ytop = yb1;
+            let grate = move |x: f64, y: f64| x > x0 && x < x1 && y >= yg && y < yg + dx;
+            let in_bed = move |x: f64, y: f64| x > x0 && x < x1 && y >= yb0 && y < yb1;
+            let walls = move |x: f64, y: f64| y >= yg && y < ytop && ((x > x0 - wall && x <= x0) || (x >= x1 && x < x1 + wall));
+            s.paint_mixture(move |x, y| {
+                Some(if in_bed(x, y) && y < y_emb { embers.clone() } else if in_bed(x, y) { logs.clone() } else { air.clone() })
+            });
+            s.paint_solid(move |x, y| if walls(x, y) { Some(plate) } else { None });
+            s.bc[3] = Bc::Open { p: P_ATM };
+            s.dt_max = 2e-3;
+            // flammes de DIFFUSION des gaz du bois (le mélange règle la combustion) : épaississement MODÉRÉ (facteur ~5 à 1 cm de maille).
+            // Complet (~100, fait pour la vitesse d'une flamme de prémélange), il divise les vitesses de réaction au point d'éteindre la
+            // flamme ; nul, une poche de gaz du bois et d'air brûle d'un coup dans une maille, qui « pompe » (volume ±50 % d'un pas à
+            // l'autre) et dont le reste de gaz, comprimé, monte à 2600–3800 K
+            s.flame_resolution = 0.25;
+            // feu établi : braises à 1450 K, bûches déjà chaudes (750 K) qui dégagent leurs gaz, et une flamme d'allumage (gaz à 1600 K
+            // sur 4 cm au-dessus du tas) qui les enflamme au contact de l'air. Sans rayonnement dans le tas (à faire), des braises ne
+            // chaufferaient le bois froid posé dessus qu'en des heures simulées
+            let pilot = move |x: f64, y: f64| x > x0 - 0.02 && x < x1 + 0.02 && y >= yb1 && y < yb1 + 0.04;
+            t_fn = Box::new(move |x, y| {
+                if in_bed(x, y) && y < y_emb { 1450.0 } else if in_bed(x, y) { 750.0 } else if pilot(x, y) { 1600.0 } else { 293.15 }
+            });
             s.finalize_init(&*t_fn);
             for j in 0..ny {
                 for i in 0..nx {

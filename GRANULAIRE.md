@@ -97,9 +97,29 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - corrigés en route : une cellule de surface partiellement remplie, rigide (frottement) mais non poreuse, scellait le lit (plus aucun
   tirage) ; la chimie donnait le reste d'énergie du sous-système réactif au DERNIER groupe — une trace de charbon dans le gaz prenait
   l'arrondi f32 de toute l'énergie (7000 K, pas refaits en boucle sur le GPU) : il va au groupe de plus grande capacité.
-- reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), feu « vif » : la flamme
-  visible d'un feu de charbon vient surtout des matières volatiles (pyrolyse : bois, houille), poudre à canon (KNO3/S/C → gaz chauds,
-  oxydant intégré : brûle sans air), pyrolyse du bois (bois → gaz volatils + charbon).
+- **pyrolyse** (réaction EN VOLUME, `Reaction::bulk` ; `pyrolysis_step`, `k_pyrolysis` sur le GPU) : le bois (`Phase::wood`, CH1.44O0.66,
+  650 kg/m³, PCS 19.5 MJ/kg) se décompose en chauffant en charbon de bois (`Phase::charcoal`, 350 kg/m³ : 22 % de la masse, ~40 % du
+  volume) et en gaz — CO 35 %, CO2 15 %, eau 15 %, CH4 12 %, H2 1.3 % (goudrons comptés en CH4 et H2). Vitesse : les trois voies de
+  Shafizadeh–Chin (Thurner & Mann, chêne) en une loi, A = 3.7e6 s⁻¹, Ea = 108.8 kJ/mol, bornée par la conduction interne des morceaux :
+  k_eff = k / (1 + k τ), τ = (d/2)² ρ c_p / (π² k) ≈ 66 s pour 2 cm. Opérateur à part, à la température du GRAIN : les produits naissent
+  à la température du bois, qui leur cède exactement leur énergie (chaleur de pyrolyse +0.18 MJ/kg) ; premier ordre intégré exactement.
+  Validé : vitesse = loi à 1e-6 près, 22.00 % de charbon de bois, CH4/CO = 0.6 ; GPU : débits à 1 % près. Deux défauts évités : dans la
+  chimie commune (température commune des groupes qui réagissent), le bois froid se mêlait aux braises de sa cellule (gaz porté d'un
+  coup à ~900 K, divergence) ; sans la borne de conduction, une maille de bois au contact des braises se décomposait en ~3 ms (mille fois
+  son volume de gaz). Le charbon de bois brûle comme le charbon (mêmes réactions de surface).
+- scénario « Feu de bois sur grille » : braises de charbon de bois (1450 K), bûchettes de 2 cm déjà chaudes (750 K) au-dessus, flamme
+  d'allumage ; parois basses (le panache aspire l'air par les côtés : entre de hautes parois il se remplit de gaz sans oxygène et rien ne
+  brûle). Le bois se décompose (~1 %/s), ses gaz brûlent en flamme de diffusion vers 2000 K au-dessus du tas (sans suie ni rayonnement :
+  un vrai feu de bois est vers 1300–1500 K) ; carbone conservé à 1e-6 ; GPU : bois décomposé à 0.1 %, CO2 formé à 3 %, flamme à 15 K.
+  Épaississement de flamme MODÉRÉ (`flame_resolution` 0.25, facteur ~5 à 1 cm) : complet (~100) il éteint cette flamme de diffusion ;
+  nul, une poche de gaz du bois et d'air brûle d'un coup dans une maille, qui « pompe » (volume ±50 % d'un pas à l'autre) et dont le
+  reste de gaz, comprimé, monte à 2600–3800 K.
+- corrigé au passage (tout le solveur, CPU et GPU) : croissance du pas de temps bornée à ×2 d'un pas au suivant (`DT_GROWTH` ; ×1.25 enchaînait les retours arrière du braséro). Après
+  un pas court imposé par la chimie, les vitesses de la projection — calculées pour corriger l'erreur de volume en CE pas — servaient à
+  l'advection d'un pas 4× plus long et vidaient la maille à 92 % (pic à 3786 K sous la grille du feu de bois).
+- reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), rayonnement dans le tas (des
+  braises n'allument pas encore du bois froid posé dessus : le scénario part d'un feu établi), houille (matières volatiles du charbon),
+  séchage du bois, poudre à canon (KNO3/S/C → gaz chauds, oxydant intégré : brûle sans air).
 
 ## 7. Solidification (étape 5)
 
@@ -121,8 +141,8 @@ réutilise la mécanique du changement de phase (T_fusion au lieu de T_sat(p)). 
    relaxation thermique d'une trace sans débordement. Limite f32 connue (pas propre aux grains) : boîte fermée sans aucun gaz.
 3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5), puis : avalanche rapide (un défaut des faces de paroi
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
-4. **EN PARTIE (2026-11-22) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
-   et grilles, braséro (§ 6). Reste : fluidisation, matières volatiles (pyrolyse), poudre à canon, bois.
+4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
+   et grilles, braséro, pyrolyse du bois et feu de bois (§ 6). Reste : fluidisation, rayonnement dans le tas, houille, poudre à canon.
 5. Solidification.
 
 ## 9. Choix à valider

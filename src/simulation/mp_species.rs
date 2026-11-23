@@ -102,6 +102,10 @@ impl CellChem<'_> {
             return (self.surface_rate(j, sr, t), 0.0);
         }
         let r = &self.rx[j];
+        // réaction en volume d'une phase granulaire (pyrolyse) : opérateur à part, à la température du grain (`pyrolysis_step`)
+        if r.bulk {
+            return (0.0, 0.0);
+        }
         let k = r.k_forward(t) / if r.flame_thickness > 0.0 { self.f_eff } else { 1.0 };
         if k <= 0.0 {
             return (0.0, 0.0);
@@ -572,12 +576,108 @@ impl MultiphaseSim {
         self.dt_chem = if first { v } else { self.dt_chem.min(v) };
     }
 
+    // ================================================================ pyrolyse (réactions en volume des phases granulaires)
+    /// Réactions EN VOLUME des phases granulaires (pyrolyse du bois) pendant dt, hors de la chimie des cellules : vitesse k_eff(T_s) c_s à
+    /// la température du GRAIN (k_eff = k / (1 + k τ), τ : temps de conduction interne des morceaux, voir `Reaction::bulk_tau`), intégrée
+    /// exactement (premier ordre : avancement c_s (1 − e^(−ν k_eff dt)) / ν). Les produits naissent à la température du grain (gaz dans leur
+    /// groupe, résidu granulaire — charbon de bois — dans le sien) et le groupe du grain leur cède exactement leur énergie (chaleur de
+    /// réaction comprise) : énergie totale conservée. Dans la chimie des cellules (température commune des groupes qui réagissent), le bois
+    /// froid se mêlait aux braises de la même cellule : le gaz y passait d'un coup à ~900 K, se dilatait, et le calcul divergeait.
+    /// En parallèle (chaque cellule ne dépend que d'elle-même) ; avancements sommés ensuite dans l'ordre des cellules.
+    pub(crate) fn pyrolysis_step(&mut self, dt: f64) {
+        use super::mp_par::{for_ranges, MIN_HEAVY};
+        use super::multiphase::SyncPtr;
+        if !self.chemistry {
+            return;
+        }
+        let phases = &self.reg.phases;
+        // (réaction, réactif granulaire, ν, τ, rapport de masses réactifs / produits)
+        let bulk: Vec<(usize, usize, f64, f64, f64)> = self
+            .reg
+            .reactions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.bulk)
+            .filter_map(|(j, r)| {
+                let &(s, nu) = r.reactants.first().filter(|&&(k, _)| phases[k].is_granular())?;
+                let (a, b) = r.mass_balance(phases);
+                Some((j, s, nu, r.bulk_tau(phases), if b > 0.0 { a / b } else { 1.0 }))
+            })
+            .collect();
+        if bulk.is_empty() {
+            return;
+        }
+        let n = self.nx * self.ny;
+        let nb = bulk.len();
+        let mut xi_cell = vec![0.0f64; n * nb];
+        let mut touched = vec![false; n];
+        {
+            let mp: Vec<SyncPtr<f64>> = self.mass.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
+            let (xp, tp) = (SyncPtr(xi_cell.as_mut_ptr()), SyncPtr(touched.as_mut_ptr()));
+            let this = &*self;
+            let bulk = &bulk;
+            for_ranges(n, MIN_HEAVY, |lo, hi| {
+                for c in lo..hi {
+                    if this.is_solid(c) || this.pinned(c) {
+                        continue;
+                    }
+                    for (q, &(j, s, nu, tau, scale)) in bulk.iter().enumerate() {
+                        let r = &this.reg.reactions[j];
+                        // SAFETY (tout le bloc) : la cellule c n'est lue et écrite que par sa tranche
+                        unsafe {
+                            let ms = *mp[s].at(c);
+                            if ms <= 1e-12 {
+                                continue;
+                            }
+                            let gs = this.group_of[s];
+                            let ts = this.tg[gs][c];
+                            let k = r.k_forward(ts);
+                            if !(k > 0.0) {
+                                continue;
+                            }
+                            let keff = if tau > 0.0 { k / (1.0 + k * tau) } else { k };
+                            let ph = &this.reg.phases;
+                            let xi = ms / ph[s].molar_mass * (1.0 - (-nu * keff * dt).exp()) / nu;
+                            let dms = (nu * xi * ph[s].molar_mass).min(ms);
+                            let mut e_out = 0.0;
+                            for &(p, nup) in &r.products {
+                                let dm = xi * nup * ph[p].molar_mass * scale;
+                                let ep = dm * ph[p].e_int(ts);
+                                *mp[p].at(c) += dm;
+                                *egp[this.group_of[p]].at(c) += ep;
+                                e_out += ep;
+                            }
+                            *mp[s].at(c) -= dms;
+                            *egp[gs].at(c) -= e_out;
+                            *xp.at(c * nb + q) = xi;
+                            *tp.at(c) = true;
+                        }
+                    }
+                }
+            });
+        }
+        let a2 = self.dx * self.dx;
+        if self.reacted.len() != self.reg.reactions.len() {
+            self.reacted = vec![0.0; self.reg.reactions.len()];
+        }
+        for c in 0..n {
+            for (q, &(j, ..)) in bulk.iter().enumerate() {
+                let x = xi_cell[c * nb + q];
+                if x != 0.0 {
+                    self.reacted[j] += x * a2;
+                }
+            }
+        }
+        self.sync_cells(|c| touched[c]);
+    }
+
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir.
     /// groupes contenant au moins une phase qui intervient dans une réaction (réactif, produit, modulateur)
     pub(crate) fn reactive_groups(&self) -> Vec<bool> {
         let mut r = vec![false; self.groups.len()];
         for k in 0..self.reg.phases.len() {
-            if self.reg.is_reactive(k) {
+            if self.reg.is_cell_reactive(k) {
                 r[self.group_of[k]] = true;
             }
         }
