@@ -73,6 +73,8 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
     var pf = 0.0; var have_pf = false;
     var prev = -1;
     var prev_rhof = 0.0;
+    // traînée de percolation cumulée depuis le haut du massif (k_fl_drag ; nulle sans percolation)
+    var dacc = 0.0;
     for (var t = 0u; t < len; t++) {
         var s_ = t; if (down) { s_ = len - 1u - t; }
         var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
@@ -90,10 +92,14 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
                 // haut du massif : fluide de la cellule du dessus, ou demi-poids de la cellule au bord du domaine
                 if (prev >= 0) { pf = S[O_prel + u32(prev)] + 0.5 * (prev_rhof + fc.rhof) * gn * P.dx; } else { pf = pc - 0.5 * fc.w; }
                 have_pf = true;
+                dacc = 0.0;
             } else if (prev >= 0) {
                 pf += 0.5 * (prev_rhof + fc.rhof) * gn * P.dx;
             }
-            S[O_fr_ps + c] = max(pc - pf, 0.0);
+            // fluide des pores à p_hydro + D, et contacts déchargés d'autant (miroir de friction_geometry)
+            let dr = select(0.0, S[O_fl_drag + c], has(F_PERC));
+            S[O_fr_ps + c] = max(pc - pf - 2.0 * (dacc + 0.5 * dr), 0.0);
+            dacc += dr;
             prev = i32(c);
             prev_rhof = fc.rhof;
         }

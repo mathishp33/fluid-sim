@@ -1900,3 +1900,31 @@ fn gpu_freezes_water_wax_and_lava_like_the_cpu() {
     one_step_agreement("eau, cire et lave", super::mp_chem_tests::water_wax_lava_box(268.15, 323.15, 1323.15), 0, 3, 1e-4, 1e-2);
 }
 
+#[test]
+fn gpu_holds_and_fluidizes_a_blown_bed_like_the_cpu() {
+    // lit de sable de 2 mm soufflé par une grille (U_mf d'Ergun 1.08 m/s) : accord d'un pas une fois le débit établi ; à 0.9 m/s, le lit
+    // reste retenu (même perte de charge à 2 % près, sable immobile) ; à 1.2 m/s, il se fluidise et monte des deux côtés
+    use super::mp_percolation::fluidization_tests::{blown_sand_bed, sand_height};
+    let mut warm = blown_sand_bed(12, 40, 20, 0.9).0;
+    for _ in 0..40 {
+        warm.step();
+    }
+    one_step_agreement("lit soufflé retenu", warm, 0, 3, 1e-4, 1e-2);
+    let mk = || blown_sand_bed(12, 40, 20, 0.9).0;
+    let y0 = sand_height(&mk(), 1);
+    let Some((cpu, gs, _)) = compare("lit retenu", &mk, 0.5) else { return };
+    let dp = |s: &MultiphaseSim| {
+        let ps = s.grain_overburden();
+        let pf = |j: usize| (2..s.nx - 2).map(|i| { let q = s.idx(i, j); s.p[q] - ps[q] }).sum::<f64>() / (s.nx - 4) as f64;
+        pf(3) - pf(34)
+    };
+    eprintln!(" lit retenu : perte de charge CPU {:.0} GPU {:.0} Pa ; sable monté CPU {:.2} GPU {:.2} mm",
+        dp(&cpu), dp(&gs), 1e3 * (sand_height(&cpu, 1) - y0), 1e3 * (sand_height(&gs, 1) - y0));
+    assert!(rel(dp(&cpu), dp(&gs)) < 0.02, "perte de charge CPU {} GPU {}", dp(&cpu), dp(&gs));
+    assert!((sand_height(&gs, 1) - y0).abs() < 2e-3, "lit retenu soulevé sur le GPU");
+    let mk = || blown_sand_bed(12, 40, 20, 1.2).0;
+    let Some((cpu, gs, _)) = compare("lit fluidisé", &mk, 0.3) else { return };
+    let (dc, dg) = (sand_height(&cpu, 1) - y0, sand_height(&gs, 1) - y0);
+    eprintln!(" lit fluidisé : sable monté CPU {:.1} GPU {:.1} mm", 1e3 * dc, 1e3 * dg);
+    assert!(dc > 0.005 && dg > 0.005, "lit non fluidisé : CPU {dc} GPU {dg}");
+}

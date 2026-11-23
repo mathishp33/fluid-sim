@@ -100,7 +100,8 @@ fn k_dc_ps(@builtin(global_invocation_id) g: vec3<u32>) {
         var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
         let wv = dc_w(c);
         let support = prev_block || (prev_has && prev_ct && prev_packed);
-        let ct = wv.z > 0.5 && (wv.y > 0.5 || support);
+        // (contact = chaîne posée : une cellule tassée décollée de son appui n'est ni poreuse ni porteuse)
+        let ct = wv.z > 0.5 && support;
         S[O_dc_ct + c] = select(0.0, 1.0, ct);
         prev_ct = ct; prev_packed = wv.y > 0.5; prev_has = wv.z > 0.5; prev_block = is_solid(c) || is_grille(c);
     }
@@ -228,4 +229,128 @@ fn k_perc_delta(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
     S[O_sdm + np * n + c] = select(0.0, 1.0, touched);
+}
+
+// ===== fluidisation (miroir de percolation_drag, fluidization_state, hold_faces, add_forces) =====
+// traînée de percolation sur les grains de la cellule, le long de la gravité, comptée vers le haut (Pa par cellule)
+fn fl_drag_at(c: u32) -> f32 {
+    if (is_solid(c) || pinned(c) || is_grille(c)) { return 0.0; }
+    var as_ = 0.0; var ad = 0.0;
+    for (var k = 0u; k < P.np; k++) {
+        let a = select(0.0, max(alpha(k, c), 0.0), gran_k(k));
+        as_ += a; ad += a * max(grain_d(k), 1e-6);
+    }
+    if (as_ <= 1e-6 || ad / as_ < PERC_D_MIN) { return 0.0; }
+    let vert = abs(P.gy) >= abs(P.gx);
+    var down = P.gx < 0.0; if (vert) { down = P.gy < 0.0; }
+    let i = c % P.nx; let j = c / P.nx;
+    var qc = 0.5 * (S[O_qu + uidx(i, j)] + S[O_qu + uidx(i + 1u, j)]);
+    if (vert) { qc = 0.5 * (S[O_qv + vidx(i, j)] + S[O_qv + vidx(i, j + 1u)]); }
+    let pf = pore_fluid(c);
+    if (qc == 0.0 || pf.y <= 0.0) { return 0.0; }
+    let d = ad / as_; let eps = clamp(1.0 - as_, 0.05, 0.95);
+    let q = select(-qc, qc, down);
+    let b = ERGUN_B * pf.x * (1.0 - eps) / (eps * eps * eps * d);
+    return (pf.y / kozeny(d, eps) * q + b * abs(q) * q) * P.dx;
+}
+@compute @workgroup_size(64)
+fn k_fl_drag(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell()) { return; }
+    S[O_fl_drag + c] = select(0.0, fl_drag_at(c), perc_on() && grav_norm() > 0.0);
+}
+// (poids déjaugé w avec le fluide courant, tassé, a des grains)
+fn fl_w(c: u32) -> vec3<f32> {
+    var as_ = 0.0; var ms = 0.0; var am = 0.0;
+    for (var k = 0u; k < P.np; k++) {
+        let gr = gran_k(k);
+        let a = select(0.0, max(alpha(k, c), 0.0), gr);
+        as_ += a; ms += select(0.0, max(mass(k, c), 0.0), gr); am += a * grain_amax(k);
+    }
+    if (as_ <= 1e-6 || is_solid(c) || is_grille(c)) { return vec3<f32>(0.0, 0.0, 0.0); }
+    let w = max(ms / as_ - pore_fluid(c).x, 0.0) * as_ * grav_norm() * P.dx;
+    return vec3<f32>(w, select(0.0, 1.0, as_ >= am / as_ - 0.1), 1.0);
+}
+// par ligne de gravité : chaîne posée (du bas vers le haut), puis force de décharge f = [min(D + F, L + w) − min(D, L)] / dx et cellules
+// retenues (traînée > HOLD_DRAG w, pas fluidisée) du haut vers le bas
+@compute @workgroup_size(64)
+fn k_fl_state(@builtin(global_invocation_id) g: vec3<u32>) {
+    let vert = abs(P.gy) >= abs(P.gx);
+    var down = P.gx < 0.0; if (vert) { down = P.gy < 0.0; }
+    var lines = P.ny; var len = P.nx;
+    if (vert) { lines = P.nx; len = P.ny; }
+    let l = g.x;
+    if (l >= lines) { return; }
+    // du bas vers le haut : appui (fl_held sert d'abord à le noter)
+    var prev_ct = false; var prev_packed = false; var prev_has = false; var prev_block = true;
+    for (var t = 0u; t < len; t++) {
+        var s_ = t; if (!down) { s_ = len - 1u - t; }
+        var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
+        let wv = fl_w(c);
+        let support = prev_block || (prev_has && prev_ct && prev_packed);
+        let ct = wv.z > 0.5 && support;
+        S[O_fl_held + c] = select(0.0, 1.0, ct);
+        prev_ct = ct; prev_packed = wv.y > 0.5; prev_has = wv.z > 0.5; prev_block = is_solid(c) || is_grille(c);
+    }
+    // du haut vers le bas
+    var cd = 0.0; var cl = 0.0;
+    for (var tt = 0u; tt < len; tt++) {
+        let t = len - 1u - tt;
+        var s_ = t; if (!down) { s_ = len - 1u - t; }
+        var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
+        let ct = S[O_fl_held + c] > 0.5 && !is_solid(c) && !is_grille(c);
+        let w = fl_w(c).x;
+        let f = S[O_fl_drag + c];
+        S[O_fl_fc + c] = select(0.0, (min(cd + f, cl + w) - min(cd, cl)) / P.dx, ct);
+        S[O_fl_held + c] = select(0.0, 1.0, ct && f > HOLD_DRAG * w && cd + 0.5 * f < cl + 0.5 * w);
+        cd = select(0.0, cd + f, ct);
+        cl = select(0.0, cl + w, ct);
+    }
+}
+// faces entre deux cellules retenues : fermées au mélange (ajoutées aux faces imposées fixes)
+@compute @workgroup_size(64)
+fn k_fl_hold(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    if (f < nfu()) {
+        let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
+        var h = false;
+        if (i >= 1u && i < P.nx) { h = S[O_fl_held + cidx(i - 1u, j)] > 0.5 && S[O_fl_held + cidx(i, j)] > 0.5; }
+        let st = S[O_pfu_on0 + f] > 0.5;
+        S[O_pfu_on + f] = select(0.0, 1.0, st || h);
+        if (h && !st) { S[O_pfu + f] = 0.0; }
+    }
+    if (f < nfv()) {
+        let i = f % P.nx; let j = f / P.nx;
+        var h = false;
+        if (j >= 1u && j < P.ny) { h = S[O_fl_held + cidx(i, j - 1u)] > 0.5 && S[O_fl_held + cidx(i, j)] > 0.5; }
+        let st = S[O_pfv_on0 + f] > 0.5;
+        S[O_pfv_on + f] = select(0.0, 1.0, st || h);
+        if (h && !st) { S[O_pfv + f] = 0.0; }
+    }
+}
+// force de décharge des contacts sur les faces le long de la gravité (miroir de add_forces)
+@compute @workgroup_size(64)
+fn k_fl_force(@builtin(global_invocation_id) g: vec3<u32>) {
+    let f = g.x;
+    let vert = abs(P.gy) >= abs(P.gx);
+    if (vert && f < nfv()) {
+        let i = f % P.nx; let j = f / P.nx;
+        if (j >= 1u && j < P.ny) {
+            let a = cidx(i, j - 1u); let b = cidx(i, j);
+            let fa = S[O_fl_fc + a]; let fb = S[O_fl_fc + b];
+            if (!is_solid(a) && !is_solid(b) && (fa != 0.0 || fb != 0.0)) {
+                S[O_Fy + f] += sign(P.gy) * dtv() * 0.5 * (fa + fb) / frho_y(i, j);
+            }
+        }
+    }
+    if (!vert && f < nfu()) {
+        let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
+        if (i >= 1u && i < P.nx) {
+            let a = cidx(i - 1u, j); let b = cidx(i, j);
+            let fa = S[O_fl_fc + a]; let fb = S[O_fl_fc + b];
+            if (!is_solid(a) && !is_solid(b) && (fa != 0.0 || fb != 0.0)) {
+                S[O_Fx + f] += sign(P.gx) * dtv() * 0.5 * (fa + fb) / frho_x(i, j);
+            }
+        }
+    }
 }

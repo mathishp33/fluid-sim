@@ -203,7 +203,20 @@ impl MultiphaseSim {
     // ---------------------------------------------------------------- préparation d'un pas
     /// Reconstruit `pin`, `pf_u`, `pf_v` depuis les effets et les entrées de bord. Appelé au début de chaque pas.
     pub(crate) fn prepare_special(&mut self) {
-        let (pin, pf_u, pf_v) = self.special_tables();
+        let (pin, mut pf_u, mut pf_v) = self.special_tables();
+        // lits soufflés retenus par leur appui (sous la vitesse minimale de fluidisation) : faces fermées au mélange, comme une grille
+        if let Some((hu, hv)) = self.hold_faces() {
+            for (f, &h) in hu.iter().enumerate() {
+                if h && pf_u[f].is_nan() {
+                    pf_u[f] = 0.0;
+                }
+            }
+            for (f, &h) in hv.iter().enumerate() {
+                if h && pf_v[f].is_nan() {
+                    pf_v[f] = 0.0;
+                }
+            }
+        }
         self.pin = pin;
         self.pf_u = pf_u;
         self.pf_v = pf_v;

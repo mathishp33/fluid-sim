@@ -325,6 +325,9 @@ impl MultiphaseGpu {
         sl.add("pfu", nfu);
         sl.add("pfv_on", nfv);
         sl.add("pfv", nfv);
+        // faces imposées des effets et des entrées (copie fixe ; k_fl_hold y ajoute les faces des lits retenus par leur appui)
+        sl.add("pfu_on0", nfu);
+        sl.add("pfv_on0", nfv);
         for name in ["acc_on", "acc_x", "acc_y", "th_kind", "th_val", "heat_t", "ovl"] {
             sl.add(name, n);
         }
@@ -423,6 +426,10 @@ impl MultiphaseGpu {
             sl.add(name, nre.max(1) * n);
         }
         sl.add("dloc", npmax * n);
+        // fluidisation : traînée de percolation, force de décharge des contacts, cellules retenues (k_fl_drag, k_fl_state)
+        for name in ["fl_drag", "fl_fc", "fl_held"] {
+            sl.add(name, n);
+        }
         // surfusion : germes relevés avant le front de dendrites (k_fusion_germ)
         sl.add("fu_germ", nfus.max(1) * n);
         sl.add("ys", npmax * n);
@@ -468,8 +475,9 @@ impl MultiphaseGpu {
             1 + npmax
         );
         header += &format!(
-            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\n",
-            super::phases::FUSION_SEED_ALPHA as f32
+            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\nconst HOLD_DRAG: f32 = {:?};\n",
+            super::phases::FUSION_SEED_ALPHA as f32,
+            super::mp_percolation::HOLD_DRAG as f32
         );
         let mut source = format!("{header}{}", SHADERS.join("\n"));
         // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
@@ -1007,15 +1015,18 @@ impl MultiphaseGpu {
         }
         self.heat_on = sim.heat_active;
         let (o_pfuo, o_pfu, o_pfvo, o_pfv) = (o("pfu_on"), o("pfu"), o("pfv_on"), o("pfv"));
+        let (o_pfuo0, o_pfvo0) = (o("pfu_on0"), o("pfv_on0"));
         for f in 0..nfu {
             if !pf_u[f].is_nan() {
                 s[o_pfuo + f] = 1.0;
+                s[o_pfuo0 + f] = 1.0;
                 s[o_pfu + f] = pf_u[f] as f32;
             }
         }
         for f in 0..nfv {
             if !pf_v[f].is_nan() {
                 s[o_pfvo + f] = 1.0;
+                s[o_pfvo0 + f] = 1.0;
                 s[o_pfv + f] = pf_v[f] as f32;
             }
         }
@@ -1438,6 +1449,14 @@ impl MultiphaseGpu {
         let mut v: Vec<Op> = Vec::with_capacity(2048);
         let extras = self.has_extras;
         v.push(cell("k_refresh"));
+        // fluidisation (miroir de prepare_special / hold_faces) : traînée de percolation, état des colonnes, faces des lits retenus
+        let fluid_bed = percolation_possible(sim) && sim.has_granular();
+        if fluid_bed {
+            let vert = sim.gravity[1].abs() >= sim.gravity[0].abs();
+            v.push(cell("k_fl_drag"));
+            v.push(Op { k: "k_fl_state", wg: wg(if vert { nx } else { ny }), slot: 0 });
+            v.push(Op { k: "k_fl_hold", wg: wm, slot: 0 });
+        }
         if extras {
             v.push(face("k_apply_pf"));
             v.push(cell("k_pin_reset"));
@@ -1455,6 +1474,9 @@ impl MultiphaseGpu {
         v.push(face("k_copy_un"));
         // forces sur l'état n
         v.push(face("k_force_init"));
+        if fluid_bed {
+            v.push(face("k_fl_force"));
+        }
         if self.has_accel {
             v.push(face("k_accel"));
         }

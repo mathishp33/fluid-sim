@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::mp_cells::{MpEffect, MpThermal};
+use super::mp_cells::{MpEffect, MpInlet, MpThermal};
 use super::mp_materials::{MaterialLibrary, Roles, AIR_SEC, CH4, H2O_G, HOUILLE, MIX_CH4_AIR, MIX_H2_AIR};
 use super::multiphase::{Bc, MultiphaseSim};
 use super::phases::{Phase, Registry};
@@ -57,6 +57,8 @@ pub enum MpScenario {
     IceMelting,
     /// eau très pure surfondue à −8 °C et un germe de glace : le front de dendrites traverse l'eau, qui gèle d'un coup en neige fondante
     SupercooledWater,
+    /// lit de sable grossier soufflé par une grille : au-delà de la vitesse minimale de fluidisation, il bouillonne
+    FluidizedBed,
 }
 
 impl Default for MpScenario {
@@ -66,7 +68,7 @@ impl Default for MpScenario {
 }
 
 impl MpScenario {
-    pub const ALL: [MpScenario; 17] = [
+    pub const ALL: [MpScenario; 18] = [
         Self::DamBreak,
         Self::DropSplash,
         Self::Sloshing,
@@ -84,13 +86,21 @@ impl MpScenario {
         Self::Gunpowder,
         Self::IceMelting,
         Self::SupercooledWater,
+        Self::FluidizedBed,
     ];
     /// scénario de combustion : construit avec le préréglage combustion (O2, N2, CH4, H2, CO, CO2) et l'air sec comme ambiant
     /// scénario à grains : la bibliothèque reçoit une phase granulaire (le sable) si elle n'en a pas
     pub fn is_granular(self) -> bool {
         matches!(
             self,
-            Self::Sedimentation | Self::SandColumn | Self::CoalFire | Self::WoodFire | Self::Gunpowder | Self::IceMelting | Self::SupercooledWater
+            Self::Sedimentation
+                | Self::SandColumn
+                | Self::CoalFire
+                | Self::WoodFire
+                | Self::Gunpowder
+                | Self::IceMelting
+                | Self::SupercooledWater
+                | Self::FluidizedBed
         )
     }
     pub fn is_combustion(self) -> bool {
@@ -124,6 +134,7 @@ impl MpScenario {
             Self::Gunpowder => "Tas de poudre noire (déflagration sans air, fumée blanche)",
             Self::IceMelting => "Glace pilée dans l'eau tiède (fusion, chaleur latente)",
             Self::SupercooledWater => "Eau surfondue qui gèle d'un coup (germe de glace, front de dendrites)",
+            Self::FluidizedBed => "Lit fluidisé (sable grossier soufflé par une grille)",
         }
     }
 }
@@ -152,6 +163,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
         &lib_c
     } else if sc == MpScenario::SupercooledWater {
         lib_c = lib.with_supercooled_water();
+        &lib_c
+    } else if sc == MpScenario::FluidizedBed {
+        lib_c = lib.with_coarse_sand();
         &lib_c
 
     } else if sc.is_combustion() {
@@ -223,6 +237,27 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             }
             s.refresh();
             return Ok(s);
+        }
+        MpScenario::FluidizedBed => {
+            // lit de sable grossier (grains de 2 mm, tassé sur le quart de la hauteur) posé sur une grille (trous de 2 mm) au fond de la
+            // cuve ; air soufflé par le fond à 1.4 m/s, 1.3 fois la vitesse minimale de fluidisation (Ergun : 1.08 m/s) ; haut ouvert. Sous
+            // ~1 m/s, le lit reste posé : l'air traverse ses pores et porte une part de son poids (contacts déchargés). Au-delà, ils ne portent
+            // plus rien : le lit se soulève et bouillonne (vitesse réglable : entrée du bord du bas)
+            let air = need(roles.air, "un gaz")?;
+            let sg = need(built_index(&s, super::mp_materials::SABLE_GROSSIER), "du sable grossier (grains de 2 mm)")?;
+            let amax = s.reg.phases[sg].alpha_max;
+            let mut packed = vec![0.0; s.reg.phases.len()];
+            packed[air] = 1.0 - amax;
+            packed[sg] = amax;
+            let (y0, y1) = (3.0 * dx, 3.0 * dx + 0.25 * ly);
+            s.paint_mixture(move |_, y| if y > y0 && y < y1 { Some(packed.clone()) } else { None });
+            for i in 0..nx {
+                let c = s.idx(i, 2);
+                s.set_effect(c, Some(MpEffect::Grille { hole: 0.002, open: 0.4 }));
+            }
+            s.inlet[2] = Some(MpInlet { vx: 0.0, vy: 1.4, phase: air, temp: 293.15, offset: 0 });
+            s.bc[2] = Bc::Wall;
+            s.bc[3] = Bc::Open { p: P_ATM };
         }
         MpScenario::SupercooledWater => {
             // eau très pure surfondue à −8 °C (elle ne gèlerait seule que sous −20 °C) dans les 70 % du bas d'une cuve fermée, air à −8 °C

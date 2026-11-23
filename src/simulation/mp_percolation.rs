@@ -8,8 +8,16 @@
 //! rien (un tas de poudre fine ne respire pas : lits de grains de moins de 1 mm traités comme étanches, voir `PERC_D_MIN`) ; pour du
 //! charbon en morceaux de 1 cm, K ≈ 1e-7 m² : le tirage d'un feu.
 //!
-//! La pression du fluide des pores est p_f = p − p_s, p_s = poids déjaugé des grains au-dessus (contrainte portée par les contacts,
-//! colonne lithostatique) : au repos, p_f est hydrostatique et rien ne coule (le poids des grains ne pousse pas le gaz des pores).
+//! La pression du fluide des pores est p_f = p − p_s, p_s = poids déjaugé des grains au-dessus (colonne lithostatique, sur les chaînes
+//! de grains qui reposent sur un appui) : au repos, p_f est hydrostatique et rien ne coule (le poids des grains ne pousse pas le gaz des
+//! pores).
+//!
+//! Fluidisation : la traînée du fluide qui traverse un lit posé sur un appui (grille, fond, solide) passe par les contacts des grains
+//! jusqu'à l'appui, dans la limite du poids déjaugé du lit (`fluidization_force` : force rendue au mélange, la pression du mélange
+//! portant déjà tout le poids) — un lit soufflé par en dessous reste immobile tant que la traînée d'Ergun est inférieure à son poids ;
+//! au-delà, l'excédent le soulève : il se FLUIDISE à la vitesse minimale d'Ergun. Un lit décollé de son appui n'a plus de contacts :
+//! la percolation n'y compte pas de poids lithostatique, son poids agit, il retombe si la traînée est plus faible. Le frottement voit
+//! la pression de contact déchargée de la traînée (`friction_geometry`) : un lit fluidisé coule comme un liquide.
 //!
 //! Couplage : un flux de Darcy explicite serait instable (la pression d'un lit perméable diffuse avec D ~ K p/(μ ε) ~ 500 m²/s) ; il est
 //! donc résolu DANS la projection : chaque face d'un milieu poreux ajoute la conductance C/dx² au système de pression, et la divergence de
@@ -26,6 +34,9 @@ const ERGUN_B: f64 = 1.75;
 /// (K < 1e-9 m²) et le lit est traité comme étanche : la percolation y alignerait la pression sur le poids vertical des grains, ce qui
 /// raidit le frottement (contrainte moyenne surestimée — un tas de sable à 50° s'arrêtait à 42° au lieu de 30°)
 const PERC_D_MIN: f64 = 1e-3;
+/// part minimale du poids d'une cellule portée par la traînée de percolation pour que le lit soit retenu par son appui (faces fermées
+/// au mélange, `hold_faces`) : en dessous (tirage naturel d'un braséro : 0.05 %), le lit garde sa dynamique (avalanches)
+pub(crate) const HOLD_DRAG: f64 = 0.01;
 
 /// conductances (m²/(Pa·s)) et termes moteurs (m/s) de Darcy par face : q = −C (p_b − p_a)/dx + d, positif de a (gauche / bas) vers b
 pub(crate) struct DarcyFaces {
@@ -122,17 +133,162 @@ impl MultiphaseSim {
     }
 
     /// pression de contact lithostatique p_s (Pa) : poids déjaugé des grains au-dessus, le long de la gravité (axe dominant), sur les
-    /// colonnes de grains en contact (tassés, ou posés sur des grains tassés, une grille, un solide ou le fond)
+    /// colonnes de grains en contact (chaînes de grains qui reposent sur un appui : le fond, un solide, une grille, ou des grains tassés
+    /// eux-mêmes en contact)
     pub(crate) fn grain_overburden(&self) -> Vec<f64> {
         self.grain_contact().0
     }
 
+    /// Traînée du fluide de percolation sur les grains de chaque cellule, le long de la gravité (axe dominant), comptée positive vers le
+    /// haut (contre la pesanteur), par unité de surface de la cellule (Pa) : F = [(μ/K) q + b |q| q] dx, q = moyenne des flux de Darcy de
+    /// la dernière projection sur les deux faces de la cellule le long de l'axe, perméabilité et fluide des grains de la cellule (Ergun,
+    /// comme `Porous::conductance`). Nulle hors des lits perméables (grains de moins de `PERC_D_MIN`, grilles, cellules sans grains).
+    pub(crate) fn percolation_drag(&self) -> Vec<f64> {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let n = nx * ny;
+        let mut f = vec![0.0; n];
+        let gn = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
+        if !self.percolation || gn == 0.0 || self.q_u.len() != (nx + 1) * ny || self.q_v.len() != nx * (ny + 1) {
+            return f;
+        }
+        if !self.q_u.iter().chain(self.q_v.iter()).any(|&q| q != 0.0) {
+            return f;
+        }
+        let vertical = self.gravity[1].abs() >= self.gravity[0].abs();
+        let down = if vertical { self.gravity[1] < 0.0 } else { self.gravity[0] < 0.0 };
+        let up = if down { 1.0 } else { -1.0 };
+        for c in 0..n {
+            if self.is_solid(c) || self.pinned(c) || self.is_grille(c) {
+                continue;
+            }
+            let (mut a_s, mut ad) = (0.0, 0.0);
+            for (k, ph) in self.reg.phases.iter().enumerate() {
+                if ph.is_granular() {
+                    let a = self.alpha[k][c].max(0.0);
+                    a_s += a;
+                    ad += a * ph.grain_diameter.max(1e-6);
+                }
+            }
+            if a_s <= 1e-6 || ad / a_s < PERC_D_MIN {
+                continue;
+            }
+            let (i, j) = (c % nx, c / nx);
+            let qc = if vertical { 0.5 * (self.q_v[j * nx + i] + self.q_v[(j + 1) * nx + i]) } else { 0.5 * (self.q_u[j * (nx + 1) + i] + self.q_u[j * (nx + 1) + i + 1]) };
+            if qc == 0.0 {
+                continue;
+            }
+            let (rho, mu) = self.pore_fluid(c);
+            if mu <= 0.0 {
+                continue;
+            }
+            let (d, eps) = (ad / a_s, (1.0 - a_s).clamp(0.05, 0.95));
+            let q = up * qc;
+            let b = ERGUN_B * rho * (1.0 - eps) / (eps.powi(3) * d);
+            f[c] = (mu / kozeny(d, eps) * q + b * q.abs() * q) * dx;
+        }
+        f
+    }
+
+    /// Force de décharge des contacts (N/m³, dans le sens de la gravité) : la part de la traînée de percolation (`percolation_drag`)
+    /// que les contacts des grains transmettent à l'appui, cumulée depuis le haut de chaque colonne en contact et plafonnée au poids
+    /// déjaugé cumulé — f = [min(D + F, L + w) − min(D, L)] / dx. La pression du mélange porte déjà tout le poids du lit (p_s
+    /// lithostatique de la percolation) : sans cette force, la traînée soulevait le lit quel que soit son poids. Au-delà du poids
+    /// (vitesse minimale de fluidisation), l'excédent de traînée n'est plus repris : il soulève les grains.
+    pub(crate) fn fluidization_force(&self) -> Vec<f64> {
+        self.fluidization_state().0
+    }
+
+    /// (force de décharge des contacts `fluidization_force`, cellules RETENUES par leur appui) : une cellule est retenue quand elle est
+    /// en contact, percolée, que le fluide y porte au moins `HOLD_DRAG` de son poids et que la traînée cumulée depuis le haut de la colonne
+    /// reste sous le poids déjaugé cumulé (pas fluidisée). Les faces entre deux cellules retenues, le long de la gravité, sont fermées au
+    /// mélange (`hold_faces`, comme celles d'une grille : le fluide y passe par percolation) : un lit soufflé sous la vitesse minimale de
+    /// fluidisation ne bouge pas — sans cela, la force de décharge, calculée sur la traînée du pas précédent, laissait passer la poussée
+    /// d'un changement de débit et rien ne ramenait le lit sur son appui.
+    pub(crate) fn fluidization_state(&self) -> (Vec<f64>, Vec<bool>) {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let n = nx * ny;
+        let drag = self.percolation_drag();
+        let mut fc = vec![0.0; n];
+        let mut held = vec![false; n];
+        if !drag.iter().any(|&d| d != 0.0) {
+            return (fc, held);
+        }
+        let (_, _, contact) = self.grain_support();
+        let gn = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
+        let vertical = self.gravity[1].abs() >= self.gravity[0].abs();
+        let down = if vertical { self.gravity[1] < 0.0 } else { self.gravity[0] < 0.0 };
+        let (lines, len) = if vertical { (nx, ny) } else { (ny, nx) };
+        let at = |l: usize, s: usize| if vertical { l + s * nx } else { s + l * nx };
+        for l in 0..lines {
+            let (mut cd, mut cl) = (0.0f64, 0.0f64);
+            // du haut vers le bas
+            for tt in 0..len {
+                let s = if down { len - 1 - tt } else { tt };
+                let c = at(l, s);
+                if !contact[c] || self.is_solid(c) || self.is_grille(c) {
+                    cd = 0.0;
+                    cl = 0.0;
+                    continue;
+                }
+                let (mut a_s, mut ms) = (0.0, 0.0);
+                for (k, ph) in self.reg.phases.iter().enumerate() {
+                    if ph.is_granular() {
+                        a_s += self.alpha[k][c].max(0.0);
+                        ms += self.mass[k][c].max(0.0);
+                    }
+                }
+                let w = if a_s > 1e-6 { (ms / a_s - self.pore_fluid(c).0).max(0.0) * a_s * gn * dx } else { 0.0 };
+                fc[c] = ((cd + drag[c]).min(cl + w) - cd.min(cl)) / dx;
+                held[c] = drag[c] > HOLD_DRAG * w && cd + 0.5 * drag[c] < cl + 0.5 * w;
+                cd += drag[c];
+                cl += w;
+            }
+        }
+        (fc, held)
+    }
+
+    /// Faces entre deux cellules retenues par leur appui (`fluidization_state`), dans les deux directions : (faces u, faces v), à fermer
+    /// au mélange — le lit retenu est un bloc poreux immobile (une face latérale ouverte laissait les grains glisser d'une colonne retenue
+    /// à l'autre et le lit se tasser au-delà de son empilement maximal, le fluide chassé des pores)
+    pub(crate) fn hold_faces(&self) -> Option<(Vec<bool>, Vec<bool>)> {
+        if !self.percolation || !self.has_granular() {
+            return None;
+        }
+        let (_, held) = self.fluidization_state();
+        if !held.iter().any(|&h| h) {
+            return None;
+        }
+        let (nx, ny) = (self.nx, self.ny);
+        let (mut hu, mut hv) = (vec![false; (nx + 1) * ny], vec![false; nx * (ny + 1)]);
+        for j in 1..ny {
+            for i in 0..nx {
+                hv[j * nx + i] = held[self.idx(i, j - 1)] && held[self.idx(i, j)];
+            }
+        }
+        for j in 0..ny {
+            for i in 1..nx {
+                hu[j * (nx + 1) + i] = held[self.idx(i - 1, j)] && held[self.idx(i, j)];
+            }
+        }
+        Some((hu, hv))
+    }
+
     /// (p_s, contact) de chaque cellule (voir `grain_overburden`)
     pub(crate) fn grain_contact(&self) -> (Vec<f64>, Vec<bool>) {
+        let (ps, contact, _) = self.grain_support();
+        (ps, contact)
+    }
+
+    /// (p_s, contact, appui) de chaque cellule : contact = grains tassés, ou posés sur un appui (milieu poreux : la percolation les
+    /// traverse) ; appui = chaîne de grains qui repose sur un appui (le fond, un solide, une grille, ou des grains tassés eux-mêmes sur
+    /// un appui) : seules ces colonnes portent le poids lithostatique p_s et transmettent la traînée à l'appui — un paquet tassé décollé
+    /// (lit soulevé, paquet qui tombe) est perméable, sans poids porté par des contacts
+    pub(crate) fn grain_support(&self) -> (Vec<f64>, Vec<bool>, Vec<bool>) {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let n = nx * ny;
         let mut ps = vec![0.0; n];
         let mut contact_c = vec![false; n];
+        let mut support_c = vec![false; n];
         let gn = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
         if gn == 0.0 {
             // sans gravité : pas de poids ; « contact » = grains tassés
@@ -149,7 +305,7 @@ impl MultiphaseSim {
                 }
                 contact_c[c] = a_s > 1e-6 && a_s >= am / a_s - 0.1;
             }
-            return (ps, contact_c);
+            return (ps, contact_c, support_c);
         }
         let np = self.reg.phases.len();
         // poids déjaugé w et grains tassés
@@ -196,8 +352,12 @@ impl MultiphaseSim {
                     let b = at(l, if down { s - 1 } else { s + 1 });
                     self.is_solid(b) || self.is_grille(b) || (has[b] && contact[t - 1] && packed[b])
                 };
-                contact[t] = packed[c] || support;
-                contact_c[c] = contact[t];
+                // contact = appui : chaîne de grains posée (une cellule tassée décollée de son appui — lit soulevé, paquet qui tombe —
+                // n'est ni poreuse ni porteuse : la percolation y laissait le mélange se resserrer sans limite en chassant le fluide des
+                // pores, α jusqu'à 1)
+                contact[t] = support;
+                contact_c[c] = support;
+                support_c[c] = support;
             }
             // du haut vers le bas : cumul du poids sur les colonnes en contact
             let mut acc = 0.0;
@@ -212,7 +372,7 @@ impl MultiphaseSim {
                 acc += w[c];
             }
         }
-        (ps, contact_c)
+        (ps, contact_c, support_c)
     }
 
     /// Conductances et termes moteurs de Darcy des faces (voir l'en-tête), avec la correction d'Ergun évaluée sur la pression du pas
@@ -440,7 +600,7 @@ pub(crate) mod tests {
     #[test]
     fn air_blown_under_a_grate_percolates_through_a_coal_bed_at_the_ergun_pressure_drop() {
         // charbon en morceaux d'1 cm (ε = 0.4) : à 0.3 m/s, Ergun donne (μ/K) q + b q² ≈ 46 + 177 Pa/m ; le lit ne bouge pas
-        let (mut s, _air, c) = bed_on_grille(0.01, 0.3);
+        let (mut s, _air, c) = super::tests::bed_on_grille(0.01, 0.3);
         let col0: Vec<f64> = (0..s.ny).map(|j| s.alpha[c][s.idx(6, j)]).collect();
         let m0 = s.total_mass(c);
         while s.time < 1.0 && !s.diverged {
@@ -484,5 +644,183 @@ pub(crate) mod tests {
         let kl = lump.porous_cell(lump.idx(6, 14)).unwrap().k;
         assert!((kl / kozeny(0.01, 0.4) - 1.0).abs() < 1e-6, "K = {kl}");
         assert!(powder.porous_cell(powder.idx(6, 14)).is_none() && kozeny(3e-4, 0.4) < 1e-9, "poudre fine perméable");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fluidization_tests {
+    use super::super::mp_cells::{MpEffect, MpInlet};
+    use super::super::multiphase::{Bc, MultiphaseSim};
+    use super::super::phases::{Phase, Registry};
+    use super::{kozeny, ERGUN_B};
+
+    /// cuve d'air (nx × ny mailles d'1 cm) : grille au rang 2, lit de sable de 2 mm (2650 kg/m³) tassé sur h mailles posé dessus, air
+    /// soufflé par le fond à `vin` m/s, haut ouvert ; 293 K
+    pub(crate) fn blown_sand_bed(nx: usize, ny: usize, h: usize, vin: f64) -> (MultiphaseSim, usize) {
+        let mut r = Registry::new();
+        let air = r.add_phase(Phase::air());
+        let mut sand = Phase::sand();
+        sand.grain_diameter = 2e-3;
+        let amax = sand.alpha_max;
+        let c = r.add_phase(sand);
+        let mut s = MultiphaseSim::new(nx, ny, 0.01, r, air);
+        s.surface_tension = false;
+        let (y0, y1) = (0.03, 0.03 + h as f64 * 0.01);
+        s.paint_mixture(move |_, y| {
+            let mut m = vec![0.0; 2];
+            if y > y0 && y < y1 {
+                m[c] = amax;
+                m[air] = 1.0 - amax;
+            } else {
+                m[air] = 1.0;
+            }
+            Some(m)
+        });
+        s.finalize_init(|_, _| 293.15);
+        for i in 0..nx {
+            let q = s.idx(i, 2);
+            s.set_effect(q, Some(MpEffect::Grille { hole: 0.002, open: 0.4 }));
+        }
+        s.inlet[2] = Some(MpInlet { vx: 0.0, vy: vin, phase: air, temp: 293.15, offset: 0 });
+        s.bc[2] = Bc::Wall;
+        s.bc[3] = Bc::Open { p: 101325.0 };
+        s.refresh();
+        (s, c)
+    }
+
+    /// (a, b) d'Ergun du lit tassé (ε = 0.4, d = 2 mm, air) : gradient a q + b q², et poids déjaugé par unité de volume (N/m³)
+    fn ergun_and_weight() -> (f64, f64, f64) {
+        let air = Phase::air();
+        let (rho, mu) = (air.rho(101325.0, 293.15), air.mu(293.15));
+        let (d, eps) = (2e-3, 0.4);
+        let a = mu / kozeny(d, eps);
+        let b = ERGUN_B * rho * (1.0 - eps) / (eps.powi(3) * d);
+        (a, b, (1.0 - eps) * (Phase::sand().rho(101325.0, 293.15) - rho) * 9.81)
+    }
+
+    /// vitesse minimale de fluidisation d'Ergun du lit de sable de 2 mm dans l'air : a U + b U² = poids déjaugé (1.08 m/s)
+    pub(crate) fn ergun_umf() -> f64 {
+        let (a, b, w) = ergun_and_weight();
+        (-a + (a * a + 4.0 * b * w).sqrt()) / (2.0 * b)
+    }
+
+    /// hauteur du centre de masse du sable (m)
+    pub(crate) fn sand_height(s: &MultiphaseSim, c: usize) -> f64 {
+        let n = s.nx * s.ny;
+        let m: f64 = (0..n).map(|q| s.mass[c][q]).sum();
+        (0..n).map(|q| s.mass[c][q] * ((q / s.nx) as f64 + 0.5) * s.dx).sum::<f64>() / m.max(1e-300)
+    }
+
+    /// plus grande vitesse verticale des grains (faces voisines des cellules à plus de 10 % de grains)
+    fn grain_speed(s: &MultiphaseSim, c: usize) -> f64 {
+        (0..s.nx * s.ny)
+            .filter(|&q| s.alpha[c][q] > 0.1)
+            .map(|q| {
+                let (i, j) = (q % s.nx, q / s.nx);
+                s.v[j * s.nx + i].abs().max(s.v[(j + 1) * s.nx + i].abs())
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn a_bed_blown_below_minimum_fluidization_stays_put_and_unloads_its_contacts() {
+        // sable de 2 mm sur une grille, 20 cm de lit, soufflé à 0.5 et 0.9 m/s (U_mf d'Ergun : 1.08 m/s) : le lit ne bouge pas, la perte
+        // de charge est celle d'Ergun, et le fluide porte une part du poids — la pression de contact du frottement en est déchargée
+        // (p_s = poids déjaugé au-dessus − traînée cumulée) ; sans cela, la traînée la gonflait (frottement raidi) et poussait le lit
+        let (a, b, w) = ergun_and_weight();
+        for vin in [0.5, 0.9] {
+            let (mut s, c) = blown_sand_bed(12, 40, 20, vin);
+            while s.time < 1.0 && !s.diverged {
+                s.step();
+            }
+            assert!(!s.diverged && s.state_is_sane());
+            let ps = s.grain_overburden();
+            let (nx, dx) = (s.nx, s.dx);
+            let pf = |j: usize| (2..nx - 2).map(|i| { let q = s.idx(i, j); s.p[q] - ps[q] }).sum::<f64>() / (nx - 4) as f64;
+            let rho = Phase::air().rho(101325.0, 293.15);
+            // rangées 3 (bas du lit) et 34 (air au-dessus) : traînée sur 19.5 mailles de lit (du centre de la rangée 3 au haut, y = 0.23)
+            let dpf = pf(3) - pf(34) - rho * 9.81 * 31.0 * dx;
+            let g = a * vin + b * vin * vin;
+            let expect = g * 0.195;
+            let geo = s.friction_geometry();
+            // pression de contact au centre de la rangée 4 (18.5 mailles de lit au-dessus)
+            let psb = (2..nx - 2).map(|i| geo.ps[s.idx(i, 4)]).sum::<f64>() / (nx - 4) as f64;
+            let ps_expect = (w - g) * 0.185;
+            let v = grain_speed(&s, c);
+            eprintln!("U = {vin} m/s (U_mf {:.3}) : perte de charge {dpf:.0} Pa (Ergun {expect:.0}) ; contact au fond {psb:.0} Pa (poids − traînée {ps_expect:.0}, poids seul {:.0}) ; |v| grains {v:.2e}",
+                ergun_umf(), w * 0.185);
+            assert!((dpf / expect - 1.0).abs() < 0.05, "perte de charge {dpf} pour {expect}");
+            assert!((psb / ps_expect - 1.0).abs() < 0.15, "contact {psb} pour {ps_expect}");
+            assert!(v < 1e-2, "le lit bouge : {v} m/s");
+        }
+    }
+
+    #[test]
+    fn a_blown_bed_fluidizes_at_the_ergun_minimum_velocity() {
+        // seuil : à 0.92 m/s (0.85 U_mf) le lit reste posé, à 1.2 m/s (1.11 U_mf) les contacts ne portent plus rien, il se soulève — sans
+        // la décharge des contacts, un lit soufflé était poussé quelle que soit la vitesse (son poids ne s'y opposait pas). Juste sous U_mf
+        // (0.93 U_mf), la surface du lit se met déjà à bouillonner : l'écoulement se concentre là où le lit est le plus lâche
+        let umf = ergun_umf();
+        assert!((umf - 1.08).abs() < 0.01, "U_mf {umf}");
+        // (montée du centre de masse du sable en 0.5 s ; pression de contact au fond)
+        let run = |vin: f64| {
+            let (mut s, c) = blown_sand_bed(12, 40, 20, vin);
+            let y0 = sand_height(&s, c);
+            while s.time < 0.5 && !s.diverged {
+                s.step();
+            }
+            assert!(!s.diverged && s.state_is_sane());
+            let geo = s.friction_geometry();
+            let psb = (2..s.nx - 2).map(|i| geo.ps[s.idx(i, 4)]).sum::<f64>() / (s.nx - 4) as f64;
+            (sand_height(&s, c) - y0, psb)
+        };
+        let (dy_lo, ps_lo) = run(0.92);
+        let (dy_hi, ps_hi) = run(1.2);
+        eprintln!("U_mf {umf:.3} m/s : à 0.92 m/s le sable monte de {:.2} mm, contact {ps_lo:.0} Pa ; à 1.2 m/s de {:.1} mm, contact {ps_hi:.0} Pa",
+            1e3 * dy_lo, 1e3 * dy_hi);
+        assert!(dy_lo.abs() < 2e-3 && ps_lo > 50.0, "lit soulevé sous U_mf : {dy_lo} m, contact {ps_lo} Pa");
+        assert!(dy_hi > 0.01, "lit immobile au-dessus de U_mf : {dy_hi} m");
+    }
+
+    #[test]
+    fn a_wide_bed_blown_above_minimum_fluidization_bubbles_and_keeps_its_sand() {
+        // cuve de 40 cm, lit de 15 cm, 1.4 m/s (1.3 U_mf) : le lit fluidisé gonfle et bouillonne ; le sable reste dans la cuve
+        let (mut s, c) = blown_sand_bed(40, 60, 15, 1.4);
+        let m0 = s.total_mass(c);
+        let top = |s: &MultiphaseSim| (0..s.ny).rev().find(|&j| (0..s.nx).map(|i| s.alpha[c][s.idx(i, j)]).sum::<f64>() / s.nx as f64 > 0.05).unwrap_or(0);
+        let h0 = top(&s);
+        while s.time < 0.5 && !s.diverged {
+            s.step();
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let h1 = top(&s);
+        eprintln!("lit fluidisé : haut du lit rangée {h0} → {h1} ; sable {:.2} % ; {} pas", 100.0 * s.total_mass(c) / m0, s.step_count);
+        assert!(h1 >= h0 + 5, "le lit ne gonfle pas : {h0} → {h1}");
+        assert!(s.total_mass(c) > 0.999 * m0, "sable sorti de la cuve");
+    }
+
+    /// diagnostic : lit large fluidisé (MP_FL_U m/s, défaut 1.4 ; MP_FL_T s, défaut 2)
+    #[test]
+    #[ignore]
+    fn fluidized_bed_diag() {
+        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+        let (nx, ny, h) = (40, 60, 15);
+        let (mut s, c) = blown_sand_bed(nx, ny, h, env("MP_FL_U", 1.4));
+        let m0 = s.total_mass(c);
+        let w0 = m0 / (nx as f64 * s.dx) * 9.81;
+        let t0 = std::time::Instant::now();
+        let mut next = 0.0;
+        while s.time < env("MP_FL_T", 2.0) && !s.diverged {
+            s.step();
+            if s.time >= next {
+                next += 0.25;
+                let prof: Vec<String> = (2..ny).step_by(3).map(|j| format!("{:.2}", (0..nx).map(|i| s.alpha[c][s.idx(i, j)]).sum::<f64>() / nx as f64)).collect();
+                let ps = s.grain_overburden();
+                let pf = |j: usize| (0..nx).map(|i| { let q = s.idx(i, j); s.p[q] - ps[q] }).sum::<f64>() / nx as f64;
+                let dpf = pf(3) - pf(ny - 2) - 1.2 * 9.81 * (ny - 5) as f64 * s.dx;
+                eprintln!("t {:.2} ({} pas, {:.0} s) : sable {:.1} % ; Δp_f {dpf:.0} Pa (poids du lit {w0:.0} Pa) ; |u| max {:.2} ; α par 3 rangées {}",
+                    s.time, s.step_count, t0.elapsed().as_secs_f64(), 100.0 * s.total_mass(c) / m0, s.max_speed(), prof.join(" "));
+            }
+        }
     }
 }

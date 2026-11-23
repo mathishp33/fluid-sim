@@ -538,6 +538,7 @@ pub const RX_CHARCOAL_BOUD: &str = "réduction de CO2 par le charbon de bois (C 
 pub const HOUILLE: &str = "houille";
 pub const RX_HOUILLE: &str = "pyrolyse de la houille (houille → charbon + CH4, CO, CO2, H2O, H2)";
 pub const GLACE: &str = "glace";
+pub const SABLE_GROSSIER: &str = "sable grossier";
 pub const CIRE: &str = "cire";
 pub const CIRE_FONDUE: &str = "cire fondue";
 pub const LAVE: &str = "lave";
@@ -885,6 +886,15 @@ impl MaterialLibrary {
         }
         if !l.fusions.iter().any(|f| f.solid == GLACE) {
             l.fusions.push(FusionDef::new("eau", GLACE, 273.15, 333.55e3));
+        }
+        l
+    }
+
+    /// Sable grossier (grains de 2 mm : le lit est perméable et se fluidise, scénario « lit fluidisé »)
+    pub fn with_coarse_sand(&self) -> MaterialLibrary {
+        let mut l = self.clone();
+        if l.fluid_index(SABLE_GROSSIER).is_none() {
+            l.fluids.push(Phase::coarse_sand());
         }
         l
     }

@@ -6,7 +6,10 @@
 //! la contrainte de cisaillement vaut tan φ · p_s dès que le matériau s'écoule (|D| ≫ δ), le matériau est quasi rigide sous ce seuil.
 //! |D| = √(½ D:D). Cellules concernées : tassées, ou partiellement remplies posées sur une cellule tassée (surface d'un tas), au prorata
 //! α_s / α_max. Pression de contact p_s : pression du mélange moins celle du fluide des pores (comme Lagrée, Staron & Popinet 2011 avec
-//! la pression incompressible) — contrainte moyenne, nulle au bord libre ; le poids des grains au-dessus rendrait le sable cohésif.
+//! la pression incompressible) — contrainte moyenne, nulle au bord libre ; le poids des grains au-dessus rendrait le sable cohésif. Le
+//! fluide des pores est hydrostatique depuis le haut du massif ; un fluide qui traverse le lit (percolation) y ajoute sa traînée
+//! cumulée D, deux fois : la pression du mélange la contient (le fluide des pores est à p_hydro + D) et elle décharge les contacts
+//! d'autant (le fluide porte une part du poids) — à la vitesse minimale de fluidisation, plus de frottement.
 //! |D| est celui du pas précédent (des itérations de Picard avec |D| de la vitesse résolue ont été essayées : aucun effet mesurable,
 //! coût ×3). Non-glissement contre les parois ET les obstacles solides (le sable tient sur une étagère) ; chaleur de frottement
 //! Φ = τ : D rendue aux grains.
@@ -235,12 +238,15 @@ impl MultiphaseSim {
             });
         }
         // pression de contact p_s = pression du mélange (pas précédent : contrainte MOYENNE, nulle au bord libre d'une falaise) moins
-        // celle du fluide des pores (hydrostatique depuis le haut du massif), le long de la gravité (axe dominant)
+        // celle du fluide des pores (hydrostatique depuis le haut du massif, plus la traînée de percolation cumulée), le long de la
+        // gravité (axe dominant)
+        let drag = self.percolation_drag();
         let (lines, len) = if vertical { (nx, ny) } else { (ny, nx) };
         let psp = SyncPtr(g.ps.as_mut_ptr());
-        let (frac, rhof, w) = (&g.frac, &rhof, &w);
+        let (frac, rhof, w, drag) = (&g.frac, &rhof, &w, &drag);
         for_rows(lines, len, MIN_HEAVY, |l| {
             let mut pf = f64::NAN;
+            let mut dacc = 0.0;
             let mut prev: Option<usize> = None;
             for t in 0..len {
                 let s_ = if down { len - 1 - t } else { t };
@@ -252,10 +258,12 @@ impl MultiphaseSim {
                 }
                 if pf.is_nan() {
                     pf = match prev { Some(q) => self.p[q] + 0.5 * (rhof[q] + rhof[c]) * gn * dx, None => self.p[c] - 0.5 * w[c] };
+                    dacc = 0.0;
                 } else if let Some(q) = prev {
                     pf += 0.5 * (rhof[q] + rhof[c]) * gn * dx;
                 }
-                unsafe { *psp.at(c) = (self.p[c] - pf).max(0.0) };
+                unsafe { *psp.at(c) = (self.p[c] - pf - 2.0 * (dacc + 0.5 * drag[c])).max(0.0) };
+                dacc += drag[c];
                 prev = Some(c);
             }
         });

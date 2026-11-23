@@ -514,6 +514,14 @@ impl Phase {
         p.friction_angle = 30.0;
         p
     }
+    /// Sable grossier (grains de quartz de 2 mm) : le lit respire (percolation) et se fluidise dans l'air à 1.08 m/s (Ergun, ε = 0.4)
+    pub fn coarse_sand() -> Phase {
+        let mut p = Phase::sand();
+        p.name = "sable grossier".into();
+        p.grain_diameter = 2.0e-3;
+        p.color = [0.78, 0.66, 0.44];
+        p
+    }
     /// Cire de paraffine fondue : 775 kg/m³ à 70 °C (dilatation 9e-4 /K), c_p 2.3 kJ/(kg·K), k = 0.16 W/(m·K), viscosité 4 mPa·s à
     /// 70 °C (2 mPa·s à 100 °C), tension de surface 0.03 N/m ; elle flotte sur l'eau. Fige à 58 °C en paillettes de cire
     /// (`mp_materials::with_wax`, L_f = 200 kJ/kg)

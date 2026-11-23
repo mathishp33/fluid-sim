@@ -96,6 +96,26 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   identique (0.2978 m/s, 1016.07 Pa). Les lits de grains de moins de 1 mm (sable, poudres : K < 1e-9 m², rien ne passe) sont traités comme
   étanches : la percolation y alignerait la pression sur le poids vertical des grains, ce qui raidit le frottement (un tas de sable à 50°
   s'arrêtait à 42° au lieu de 30°).
+- **fluidisation** (lits de grains de 1 mm et plus) : la traînée du fluide qui traverse un lit posé sur un appui passe par les contacts
+  des grains jusqu'à l'appui, dans la limite du poids déjaugé du lit. La pression du mélange porte déjà tout le poids (p_s
+  lithostatique de la percolation) : une force rend au mélange la part de traînée que les contacts reprennent
+  (`fluidization_force`, f = [min(D + F, L + w) − min(D, L)] / dx, cumuls depuis le haut de la colonne). Un lit soufflé où le fluide
+  porte plus de 1 % du poids sans le dépasser est RETENU par son appui (`hold_faces` : faces fermées au mélange, comme une grille —
+  bloc poreux immobile ; la force seule, calculée sur la traînée du pas précédent, laissait la poussée d'un changement de débit le
+  soulever sans que rien ne l'y ramène). Le frottement voit la pression de contact déchargée de la traînée cumulée D (deux fois :
+  le fluide des pores est à p_hydro + D, et il porte autant de poids). Au-delà du poids — vitesse minimale de fluidisation d'Ergun —
+  les contacts ne portent plus rien : le lit est libéré et se soulève ; une cellule tassée décollée de son appui n'est ni poreuse ni
+  porteuse (perméable, la percolation y laissait le mélange se resserrer sans limite, α jusqu'à 1). Validé (sable de 2 mm dans l'air,
+  U_mf = 1.08 m/s) : à 0.5 et 0.9 m/s, lit immobile, perte de charge d'Ergun à 2 % (841 Pa pour 854, 2257 pour 2230), pression de
+  contact au fond = poids − traînée (2073 Pa pour 2074 ; poids seul 2884) ; à 0.85 U_mf le sable ne bouge pas (0.2 mm), à 1.11 U_mf il
+  monte de 4 cm en 0.5 s ; cuve large à 1.3 U_mf : le lit bouillonne, tout le sable reste dans la cuve. GPU : un pas à 1.5e-7, même
+  perte de charge du lit retenu (2300 Pa), lit fluidisé qui monte des deux côtés. Scénario « Lit fluidisé (sable grossier soufflé par
+  une grille) ». Limites : juste sous U_mf (0.93 U_mf), la surface du lit bouillonne déjà (l'écoulement se concentre là où le lit est
+  le plus lâche) ; fluidisé, le lit gonfle trop (×2 au lieu de ~×1.2) et s'agite trop (4–6 m/s) — une seule vitesse par cellule :
+  les paquets décollés, étanches, sont poussés comme des pistons, sans viscosité de la phase dense fluidisée ; dans une colonne
+  étroite, le lit monte en bouchons (pistonnage) qui peuvent sortir par le haut. Les lits de grains de moins de 1 mm restent étanches :
+  dans l'air, ils sont si perméables à l'échelle d'un pas (K/μ ≫ dt/ρ) que la percolation impose sa pression au mélange, qui perd sa
+  contrainte moyenne (le sable redevient « cohésif ») ; il faudrait une pression des pores à part (deux pressions, modèle de Biot).
 - **grille** (cellule spéciale `MpEffect::Grille`, « Grille » dans les cellules) : arrête les grains (le tas y repose, comme sur un
   solide : non-glissement, faces fermées au mélange), laisse passer le fluide par percolation (trous, fraction ouverte).
 - scénario « Feu de charbon sur grille (braséro) » : charbon en morceaux de 1.2 cm sur une grille entre deux parois, lit de 0.25 ly
@@ -250,8 +270,9 @@ que la mécanique liquide ↔ vapeur : ni pression partielle, ni volume de vapeu
    relaxation thermique d'une trace sans débordement. Limite f32 connue (pas propre aux grains) : boîte fermée sans aucun gaz.
 3. **FAIT (2026-11-22) — Frottement des grains (tas)**, CPU et GPU (voir § 5), puis : avalanche rapide (un défaut des faces de paroi
    faisait fluer les tas), non-glissement contre les obstacles solides, chaleur de frottement, viscosité implicite des fluides (miel).
-4. **EN PARTIE (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
-   et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas, poudre noire (§ 6). Reste : fluidisation.
+4. **FAIT (2026-11-23) — Réactions hétérogènes** : réactions de surface, charbon (CO, CO2, Boudouard), flamme de CO, percolation
+   et grilles, braséro, pyrolyse du bois et feu de bois, houille, rayonnement dans le tas, poudre noire, fluidisation des lits de
+   1 mm et plus (§ 6). Restent : lit fluidisé trop agité, lits fins étanches (voir § 6).
 5. **FAIT (2026-11-23) — Solidification** (eau ↔ glace, § 7) : méthode enthalpique, Stefan, glace pilée qui fond, CPU et GPU ;
    puis surfusion et front de dendrites (eau surfondue), cire de paraffine, lave basaltique.
 
