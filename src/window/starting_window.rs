@@ -70,12 +70,18 @@ pub struct StartingGui {
     editor: MaterialEditor,
 }
 
+/// Ce que lance l'écran de démarrage : la fenêtre de simulation, ou la fenêtre d'expérience (protocoles, mesures)
+pub enum Launch {
+    Simulation(SimulationSettings),
+    Experiment(SimulationSettings),
+}
+
 impl StartingGui {
     pub fn new(settings: SimulationSettings) -> Self {
         Self { settings, editor: MaterialEditor::default() }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<SimulationSettings> {
+    pub fn ui(&mut self, ctx: &egui::Context) -> Option<Launch> {
         let mut launch = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -175,10 +181,23 @@ impl StartingGui {
                 if let Some(e) = &problem {
                     ui.colored_label(egui::Color32::from_rgb(230, 80, 80), format!("✖ {e}"));
                 }
-                if ui.add_enabled(problem.is_none(), egui::Button::new("Launch Simulation")).clicked() {
-                    save_settings(&self.settings);
-                    launch = Some(self.settings.clone());
-                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(problem.is_none(), egui::Button::new("Launch Simulation")).clicked() {
+                        save_settings(&self.settings);
+                        launch = Some(Launch::Simulation(self.settings.clone()));
+                    }
+                    if ui
+                        .button("Fenêtre d'expérience")
+                        .on_hover_text(
+                            "Protocole écrit (conditions initiales, actions en temps simulé, mesures) exécuté pas à pas, résultats en CSV ; \
+                             part du scénario, de la grille et de la gravité choisis ici (solveur multiphasique)",
+                        )
+                        .clicked()
+                    {
+                        save_settings(&self.settings);
+                        launch = Some(Launch::Experiment(self.settings.clone()));
+                    }
+                });
             });
         });
 

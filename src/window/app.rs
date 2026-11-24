@@ -1,11 +1,13 @@
-use crate::window::main_window::{FluidWindow, WindowAction};
+use crate::window::experiment_window::ExperimentWindow;
+use crate::window::main_window::WindowAction;
 use crate::window::multiphase_window::MultiphaseWindow;
-use crate::window::starting_window::{load_settings, StartingGui};
+use crate::window::starting_window::{load_settings, Launch, StartingGui};
 
 
 pub struct App {
     starting: StartingGui,
     simulation: Option<MultiphaseWindow>,
+    experiment: Option<ExperimentWindow>,
     theme_set: bool,
 }
 
@@ -14,6 +16,7 @@ impl App {
         Self {
             starting: StartingGui::new(load_settings()),
             simulation: None,
+            experiment: None,
             theme_set: false,
         }
     }
@@ -31,9 +34,19 @@ impl eframe::App for App {
                 self.simulation = None;
                 ctx.request_repaint();
             }
-        } else if let Some(settings) = self.starting.ui(ctx) {
-            if settings.multiphase {
-                self.simulation = Some(MultiphaseWindow::new(&settings));
+        } else if let Some(exp) = &mut self.experiment {
+            if matches!(exp.ui(ctx), WindowAction::BackToSettings) {
+                self.experiment = None;
+                ctx.request_repaint();
+            }
+        } else if let Some(launch) = self.starting.ui(ctx) {
+            match launch {
+                Launch::Simulation(settings) => {
+                    if settings.multiphase {
+                        self.simulation = Some(MultiphaseWindow::new(&settings));
+                    }
+                }
+                Launch::Experiment(settings) => self.experiment = Some(ExperimentWindow::new(&settings)),
             }
             ctx.request_repaint();
         }

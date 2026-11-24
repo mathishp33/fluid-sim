@@ -1,0 +1,11 @@
+# Rupture de barrage : quand l'eau atteint-elle la paroi de droite, et avec quelle pression ?
+# Domaine 0.6 × 0.4 m ; colonne d'eau de 0.15 × 0.2 m à gauche (scénario « Rupture de barrage »).
+# Résultats : résultats/barrage/ (mesures.csv toutes les 10 ms, journal.txt, état final)
+#   fluid-sim experience experiences/barrage.exp
+
+départ scénario "Rupture de barrage" grille 120 x 80 maille 5 mm
+
+mesurer toutes les 10 ms : stats, masse "eau" dans rect (0.45, 0) (0.6, 0.4) comme "eau près de la paroi droite", max vitesse dans partout, p en (0.5975, 0.0025) comme "pression au pied de la paroi droite"
+
+simuler 1.5 s
+sauver état "barrage_1.5s"

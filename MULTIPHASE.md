@@ -3,6 +3,8 @@
 ## Fichiers (dans le même dossier que `materials.rs`)
 `phases.rs`, `vof.rs`, `multiphase.rs`, `mp_advect.rs`, `mp_pressure.rs`, `mp_force.rs`, `mp_thermo.rs`, `mp_step.rs`, `mp_tests.rs`
 GPU : `mp_gpu_params.rs`, `gpu_multiphase.rs`, `multiphase.template.wgsl` (généré par `python3 build_wgsl.py` à partir de `mpgpu/*.wgsl`), banc de test `gpu_run.js`
+Expériences reproductibles (protocoles, fenêtre d'expérience, ligne de commande) : `mp_experiment.rs`, `mp_script.rs`, `mp_fields.rs`,
+`window/experiment_window.rs` — voir EXPERIENCES.md. Solides mobiles (à venir) : voir SOLID.md.
 
 ```rust
 // simulation/mod.rs

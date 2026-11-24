@@ -1,0 +1,13 @@
+# Conditions initiales par champs de valeurs : une poche d'eau chaude dans l'eau froide, de l'air qui souffle au-dessus.
+# Les champs peuvent aussi venir d'un fichier : champ T fichier "carte.csv" (une rangée par ligne) ou "carte.png" (niveaux de gris).
+#   fluid-sim experience experiences/champs.exp
+
+départ scénario "Cuve vide" grille 80 x 60 maille 5 mm
+
+champ fraction "eau" formule "si(0.15 - y, 1, 0)"
+champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)" dans rect (0, 0) (0.4, 0.15)
+champ vx formule "0.2" dans rect (0, 0.2) (0.4, 0.3)
+
+mesurer toutes les 50 ms : max T dans partout, moyenne T dans disque (0.2, 0.06) rayon 3 cm comme "T de la poche", moyenne vitesse dans rect (0, 0.2) (0.4, 0.3)
+
+simuler 2 s

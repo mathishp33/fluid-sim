@@ -1,0 +1,14 @@
+# Couche d'eau chauffée par le fond, pour trois températures de chauffe (balayage).
+# Résultats : résultats/chauffage/T=330_K/, T=350_K/, T=370_K/
+#   fluid-sim experience experiences/chauffage.exp
+
+départ scénario "Cuve vide" grille 60 x 40 maille 5 mm
+balayage T = 330 K, 350 K, 370 K
+
+# conditions initiales : 10 cm d'eau à 20 °C
+remplir rect (0, 0) (0.3, 0.1) avec "eau" à 20 °C
+
+mesurer toutes les 100 ms : moyenne T dans rect (0, 0) (0.3, 0.1) comme "T moyenne de l'eau", max T dans partout, max vitesse dans rect (0, 0) (0.3, 0.1)
+
+chauffer rect (0.1, 0) (0.2, 0.01) à $T pendant 3 s
+simuler 5 s

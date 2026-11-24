@@ -1000,6 +1000,7 @@ dependencies = [
  "bytemuck",
  "eframe",
  "egui",
+ "png",
  "pollster 0.3.0",
  "rand 0.8.5",
  "rayon",
