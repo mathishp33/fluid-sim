@@ -260,7 +260,9 @@ fn combustion_scenarios_build_and_run_without_diverging() {
     for sc in [MpScenario::PremixedFlame, MpScenario::ConfinedExplosion, MpScenario::VentedExplosion, MpScenario::DiffusionFlame] {
         let mut s = build_scenario_with(&lib, sc, 48, 36, 4e-3, 9.81).unwrap();
         assert!(s.ambient_mix.len() == s.reg.phases.len(), "ambiant air sec attendu");
-        assert!(matches!(s.bc[0], Bc::Wall));
+        // fond gauche fermé (tube, pièces) ; le jet de méthane brûle à l'air libre (côtés ouverts)
+        let open_sides = sc == MpScenario::DiffusionFlame;
+        assert_eq!(matches!(s.bc[0], Bc::Open { .. }), open_sides, "{} : bord gauche", sc.name());
         for _ in 0..60 {
             s.step();
         }
@@ -373,6 +375,39 @@ fn hot_fuel_meeting_air_burns_at_the_mixing_rate_but_premixed_and_cold_mixtures_
     assert!(lit >= 18 && hot.iter().all(|&m| m == 0.0 || (m - rate).abs() < 1e-9 * rate), "couche de diffusion chaude : {lit} mailles");
     assert!(layer(300.0, false).iter().all(|&m| m == 0.0), "mélange froid");
     assert!(layer(1200.0, true).iter().all(|&m| m == 0.0), "front de prémélange");
+}
+
+#[test]
+fn a_methane_jet_diffusion_flame_keeps_burning_in_open_air() {
+    // scénario « Flamme de diffusion » (32 × 24 mailles de 6 mm) : la flamme du jet de méthane brûle encore après 1 s et consomme
+    // l'essentiel du méthane émis (PCI 50 MJ/kg). Dans une cuve fermée sur les côtés (l'air n'arrivait que par le haut, la buse baignait
+    // dans le méthane et les fumées), ou sans combustion au rythme du mélange des flammes de diffusion, elle s'éteignait en 0.3 à 0.9 s
+    use super::mp_cells::MpEffect;
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::DiffusionFlame, 32, 24, 6e-3, 9.81).unwrap();
+    let ch4 = idx(&s.reg, CH4);
+    let rho = s.reg.phases[ch4].rho(101325.0, 293.15);
+    // débit de méthane de la buse (émetteurs du fond) et puissance de sa combustion complète
+    let flow: f64 = (0..s.nx)
+        .filter_map(|i| match s.special[s.idx(i, 0)] {
+            Some(MpEffect::Emitter { vy, .. }) => Some(vy * s.dx),
+            _ => None,
+        })
+        .sum();
+    let p_full = flow * rho * 50.0e6;
+    let (mut q, mut tq) = (0.0, 0.0);
+    while s.time < 1.0 && !s.diverged {
+        let dt = s.step();
+        if s.time > 0.8 {
+            q += dt * s.heat_release.iter().map(|h| h.max(0.0)).sum::<f64>() * s.dx * s.dx;
+            tq += dt;
+        }
+    }
+    assert!(!s.diverged && s.state_is_sane());
+    let p = q / tq.max(1e-30);
+    eprintln!("jet de méthane : flamme {p:.3e} W/m la dernière 0.2 s, {:.0} % de la combustion complète du méthane émis ({p_full:.3e} W/m) ; {} pas",
+        100.0 * p / p_full, s.step_count);
+    assert!(p > 0.5 * p_full, "la flamme du jet s'est éteinte ou brûle mal : {p} W/m pour {p_full}");
 }
 
 #[test]
@@ -1803,5 +1838,51 @@ fn fire_persistence_diag() {
             let tmax = (0..s.nx * s.ny).filter(|&c| !s.is_solid(c)).map(|c| s.temp[c]).fold(0.0f64, f64::max);
             eprintln!("t {:.2} dt {:.1e} : chaleur {q:.3e} W/m, max en ({}, {}), T max {tmax:.0} K", s.time, s.last_dt, at % s.nx, at / s.nx);
         }
+    }
+}
+
+/// diagnostic : jet de méthane (scénario « Flamme de diffusion », MP_NX × MP_NY, MP_DX), base de la flamme, bord de la buse, mailles
+/// brûlées au rythme du mélange (MP_T s, défaut 2)
+#[test]
+#[ignore]
+fn methane_jet_anchor_diag() {
+    let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::DiffusionFlame, ev("MP_NX", 48.0) as usize, ev("MP_NY", 36.0) as usize, ev("MP_DX", 4e-3), 9.81).unwrap();
+    let (nx, ny) = (s.nx, s.ny);
+    let (ch4, o2) = (idx(&s.reg, CH4), idx(&s.reg, O2));
+    let x_of = |s: &MultiphaseSim, q: usize, k: usize| {
+        let n: f64 = (0..s.reg.phases.len()).filter(|&m| s.reg.phases[m].is_gas()).map(|m| s.mass[m][q].max(0.0) / s.reg.phases[m].molar_mass).sum();
+        s.mass[k][q].max(0.0) / s.reg.phases[k].molar_mass / n.max(1e-300)
+    };
+    // buse : cellules émettrices du fond
+    let noz: Vec<usize> = (0..nx).filter(|&i| s.special[s.idx(i, 0)].is_some()).collect();
+    let (i0, i1) = (*noz.first().unwrap(), *noz.last().unwrap());
+    eprintln!("buse : i {i0}..{i1}");
+    let t_end = ev("MP_T", 2.0);
+    let mut next = 0.0;
+    while s.time < t_end && !s.diverged {
+        s.step();
+        if s.time >= next {
+            next += 0.05;
+            let qmax = s.heat_release.iter().fold(0.0f64, |a, &b| a.max(b));
+            let qtot: f64 = s.heat_release.iter().map(|h| h.max(0.0)).sum::<f64>() * s.dx * s.dx;
+            let base = (0..ny).find(|&j| (0..nx).any(|i| s.heat_release[s.idx(i, j)] > 0.1 * qmax)).unwrap_or(ny);
+            let base_i: Vec<usize> = (0..nx).filter(|&i| base < ny && s.heat_release[s.idx(i, base)] > 0.1 * qmax).collect();
+            let mix = s.diffusion_mixing();
+            let lit = mix.iter().filter(|&&m| m > 0.0).count();
+            let rim: Vec<String> = [i0.saturating_sub(1), i1 + 1].iter().flat_map(|&i| (0..3).map(move |j| (i, j)))
+                .map(|(i, j)| { let q = s.idx(i, j); format!("({i},{j}) {:.0}K CH4 {:.2} O2 {:.2}", s.temp[q], x_of(&s, q, ch4), x_of(&s, q, o2)) }).collect();
+            eprintln!("t {:.2} dt {:.1e} : flamme {qtot:.2e} W/m, base j {base} (i {:?}) ; {lit} mailles au rythme du mélange ; bord de buse : {}",
+                s.time, s.last_dt, base_i, rim.join(" | "));
+        }
+    }
+    // carte : T (centaines de K) et zones qui brûlent (*), une maille sur deux
+    for j in (0..ny).rev().step_by(2) {
+        let row: String = (0..nx).step_by(2).map(|i| {
+            let q = s.idx(i, j);
+            if s.is_solid(q) { '#' } else if s.heat_release[q] > 1e6 { '*' } else { char::from_digit(((s.temp[q] / 200.0) as u32).min(9), 10).unwrap() }
+        }).collect();
+        eprintln!("carte j {j:2} {row}");
     }
 }

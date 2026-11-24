@@ -557,11 +557,13 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             t_fn = Box::new(move |x, y| if fuse(x, y) { 700.0 } else { 293.15 });
         }
         MpScenario::DiffusionFlame => {
-            // buse de méthane au centre du fond (émetteurs, 0.25 m/s), air au repos, haut ouvert ; un noyau chaud de prémélange au-dessus
-            // de la buse allume le jet : flamme de diffusion laminaire, panache de fumées chaudes porté par la flottabilité.
+            // buse de méthane au centre du fond (émetteurs, 0.25 m/s), air au repos à l'air libre (côtés et haut ouverts) ; un noyau chaud
+            // de prémélange au-dessus de la buse allume le jet : flamme de diffusion laminaire, panache de fumées chaudes porté par la
+            // flottabilité. L'air entre par les côtés et nourrit le pied de la flamme : dans une cuve fermée sur les côtés, il n'arrivait
+            // que par le haut, la buse baignait dans le méthane et les fumées, et la flamme s'éteignait en moins d'une seconde
             let ch4 = built_index(&s, CH4).ok_or("le scénario nécessite le méthane")?;
             let m = mix(MIX_CH4_AIR)?;
-            s.bc[3] = Bc::Open { p: P_ATM };
+            s.bc = [Bc::Open { p: P_ATM }, Bc::Open { p: P_ATM }, Bc::Wall, Bc::Open { p: P_ATM }];
             s.dt_max = 2e-3;
             let half = ((0.025 * nx as f64).round() as usize).max(2);
             let ic = nx / 2;
