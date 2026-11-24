@@ -85,15 +85,19 @@ impl MultiphaseSim {
             gam[g] = chi * gm + (1.0 - chi) * go;
             wpw[g] = (mcpg[g] * gam[g]).max(0.0);
         }
+        // corps rigides : volume incompressible ajouté à la fermeture (voir `cell_volume`)
+        let v = if self.has_bodies() { v + self.body_volume(c) } else { v };
         (v, kt_all - (chi * mix + (1.0 - chi) * own))
     }
 
     /// Volume de la cellule à la pression p avec les températures de groupe courantes (tg).
     pub(crate) fn cell_volume(&self, c: usize, p: f64) -> f64 {
-        (0..self.reg.phases.len())
+        let v: f64 = (0..self.reg.phases.len())
             .filter(|&k| self.mass[k][c] > 0.0)
             .map(|k| self.mass[k][c] / self.reg.phases[k].rho(p, self.phase_temp(k, c)))
-            .sum()
+            .sum();
+        // corps rigides (mp_bodies.rs) : leur volume compte dans la fermeture, Σ m/ρ + α_corps = 1 (sans corps : inchangé)
+        if self.has_bodies() { v + self.body_volume(c) } else { v }
     }
 
     /// Mise à jour de Newton δ d'une cellule CONTENANT DU GAZ quand |δp| > 50 % de p : la tangente V(p_k) − κ δp sous-estime

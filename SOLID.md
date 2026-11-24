@@ -5,8 +5,8 @@ qui coule, un projectile, un piston, une palette qui fait des vagues, un clapet 
 cellules spéciales du TODO), un agitateur qui tourne. Ce ne sont pas des poudres : la phase granulaire (GRANULAIRE.md) ne rend ni
 leur forme ni leur inertie propre.
 
-Document de conception (2026-11-24). Rien n'est codé ; la § 8 liste ce qu'on peut préparer dès maintenant sans changer un seul
-résultat, la § 9 les choix à valider.
+Document de conception (2026-11-24). Les choix du § 9 sont validés. L'étape 0 est faite (§ 8, `mp_bodies.rs`) : elle prépare
+l'architecture sans changer un seul résultat. Les corps ne sont pas encore couplés à l'écoulement.
 
 **En bref — recommandation**
 
@@ -274,33 +274,54 @@ monolithique (Gibou & Min 2012) : les vitesses des corps deviennent des inconnue
 
 | Étape | Contenu | Validation |
 |---|---|---|
-| 0 | préparer (§ 8), aucun résultat changé | empreintes des scénarios identiques au bit près, accord CPU / GPU inchangé |
-| 1 | corps fixes : géométrie exacte, fractions, rendu, outil | Σ α dx² = aire (1e-12), invariance par rotation ; écoulement autour d'un disque fixe |
+| 0 (faite) | préparer (§ 8) : géométrie exacte, fractions, contraintes, fermeture, état, rendu ; aucun résultat changé | Σ α dx² = aire (1e-12) quels que soient la position et l'angle ; empreintes physiques des 18 scénarios identiques au bit près |
+| 1 | corps fixes : poser un corps chasse le fluide (une trace reste dans les mailles entièrement couvertes), masse du corps dans ρ, rigidification à vitesse nulle, outil et commande `corps` | écoulement autour d'un disque fixe ; fermeture tenue (Σ m/ρ + α_c = 1) ; pas de fuite de fluide à travers le corps |
 | 2 | mouvement imposé | piston dans un tube de gaz fermé : p V^γ = cte en compression lente ; disque tiré à vitesse constante : traînée comparée à Tritton (1959) ; aucune pointe de pression quand le corps traverse les mailles |
 | 3 | mouvement libre + masque de DDL | flotteur : tirant d'eau = (ρ_c/ρ_eau) H, oscillation verticale amortie ; disque qui sédimente dans un canal (cas de Glowinski et al. 2001, repris par Wan & Turek 2006) ; corps léger (liège) stable ; clapet sur pivot |
 | 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
 
-## 8. Préparer l'architecture dès maintenant (sans changer un résultat)
+## 8. Préparer l'architecture (étape 0, faite le 2026-11-24, sans changer un résultat)
 
-1. `bodies: Vec<RigidBody>` dans `MultiphaseSim` (vide), état complet en version 12 ; formes, masse et inertie testées à part.
-2. Un champ `body_frac` (fraction de corps par maille, nul), compté dans la fermeture (Σ m/ρ + α_c) et dans les masses volumiques
-   de face : ajouter 0.0 ne change aucun bit.
-3. Un seul endroit qui dit si une face est fermée et à quelle vitesse (aujourd'hui 0). `face_velocities`, la viscosité, le frottement
-   et le transport PLIC le lisent au lieu de tester `is_solid` eux-mêmes.
-4. Le rendu des corps : contour exact par-dessus l'image.
-5. Les mêmes points côté GPU (tampons vides, paramètres à zéro).
+1. **`mp_bodies.rs`**, testé à part (6 tests) :
+   - corps rigide `RigidBody` (forme, matériau, position, angle, vitesses, axes libres `Dof`, pivot, mode `Motion` : libre, fixe,
+     imposé ; température) ;
+   - formes convexes : disque (polygone régulier de 96 côtés, de même aire : écart au cercle < 0.04 % du rayon), rectangle,
+     polygone convexe (vérifié, recentré sur son centre de masse) ;
+   - aire et moment d'inertie exacts ;
+   - fraction de chaque maille couverte, par découpage exact du polygone par le carré de la maille (Sutherland–Hodgman) :
+     Σ α dx² = aire à 1e-12 près, quels que soient la position et l'angle ;
+   - vitesse d'un point du corps, mouvement permis (`constrained_velocity` : axes bloqués, pivot avec le théorème de Huygens,
+     imposé, fixe), avance (rotation exacte autour d'un pivot).
+2. **`MultiphaseSim`** : `bodies` (vide), `body_frac` (nul), recalculée par `update_body_fractions` ; état complet en version 12
+   (corps et fractions enregistrés et vérifiés au chargement) ; instantané du pas (retour arrière du filet de sécurité).
+3. **Point d'entrée du domaine fictif dans le solveur** : la fraction de corps compte dans la fermeture, Σ m/ρ + α_c = 1. Elle
+   entre dans `cell_volume` (erreur héritée, changement de phase, cavités) et dans `cell_closure_g` (itérations de Newton),
+   seulement s'il y a des corps.
+4. **Rendu** : la part de chaque maille couverte par un corps prend la couleur de son matériau (ou de sa température), bords
+   lissés par la fraction. Les infos de maille donnent la fraction.
+5. **GPU** : `gpu_unsupported_reason` refuse les scènes avec des corps (calcul sur le CPU, la raison est affichée) jusqu'à
+   l'étape 5.
 
-Non-régression : les empreintes de l'état complet des scénarios (`cpu_state_fingerprints`) et l'accord CPU / GPU sont inchangés.
+**Écart au plan d'origine.** Le point « un seul endroit qui dit si une face est fermée et à quelle vitesse » n'a pas été fait : il
+ne sert pas le domaine fictif retenu au § 9. Dans un corps, les faces restent ouvertes et portent sa vitesse rigide ; c'est la
+rigidification (étape 1) qui l'impose. Ce point ne reviendrait qu'avec le repli monolithique.
 
-## 9. Choix à valider
+**Non-régression.** Les empreintes de l'état PHYSIQUE (masses, énergies, températures, pression, vitesses, grains, flammes, bilans)
+des 18 scénarios, en 80 × 60 et 160 × 120 après 20 pas (`cpu_physics_fingerprints`), sont identiques avant et après au bit près.
+Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent forcément : l'état a deux champs de plus.
 
-- Corps rigides seulement, en 2D, formes convexes (disque, rectangle, polygone) ?
-- Couplage par domaine fictif (phase rigide dans le mélange), avec repli monolithique si les corps légers posent problème ?
-- Ordre : mouvement imposé avant mouvement libre, contacts ensuite, une température par corps au début ?
-- Faut-il des corps de forme quelconque (dessinés au pinceau, ou lus dans une image) ? C'est possible plus tard, par décomposition
-  en polygones convexes.
+**Reste pour l'étape 1** : chasser le fluide du volume d'un corps posé, en gardant une trace dans les mailles entièrement couvertes
+(le solveur suppose du fluide dans toute maille non solide) ; la masse du corps dans la masse volumique des faces ; la
+rigidification à vitesse nulle après la projection ; un outil dans la fenêtre et une commande `corps` dans les protocoles.
+
+## 9. Choix (validés le 2026-11-24)
+
+- Corps rigides seulement, en 2D, formes convexes (disque, rectangle, polygone).
+- Couplage par domaine fictif (phase rigide dans le mélange), avec repli monolithique si les corps légers posent problème.
+- Ordre : corps fixes, puis mouvement imposé, puis mouvement libre, puis contacts ; une température par corps au début.
+- Pas de corps de forme quelconque au début : plus tard, par décomposition en polygones convexes.
 
 ## Références
 

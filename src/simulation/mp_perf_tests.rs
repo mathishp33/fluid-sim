@@ -125,6 +125,32 @@ fn cpu_state_fingerprints() {
     }
 }
 
+/// Empreintes de l'état PHYSIQUE seul (masses, fractions, énergies, températures, pression, vitesses, contraintes des grains,
+/// flammes, bilans, temps, pas) des scénarios après `MP_FP_STEPS` pas (20 par défaut) : contrairement à `cpu_state_fingerprints`,
+/// elles ne changent pas quand on ajoute un champ à l'état (corps rigides…) — non-régression d'un changement qui ne doit modifier
+/// aucun résultat. `cargo test --release cpu_physics_fingerprints -- --ignored --nocapture`, avant et après, puis comparer.
+#[test]
+#[ignore]
+fn cpu_physics_fingerprints() {
+    let steps: usize = std::env::var("MP_FP_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    for &sc in &scenes(&MpScenario::ALL) {
+        for &(nx, ny) in &sizes(vec![(80, 60), (160, 120)]) {
+            let mut s = build_scenario(sc, nx, ny, dx_for(nx), 9.81);
+            for _ in 0..steps {
+                s.step();
+            }
+            let phys = (
+                (&s.mass, &s.alpha, &s.e, &s.eg, &s.tg, &s.temp, &s.p),
+                (&s.u, &s.v, &s.rho_mix, &s.sigma, &s.skel),
+                (&s.flame_factor, &s.heat_release, s.chem_heat, &s.reacted, s.energy_input, s.radiated),
+                (s.time, s.last_dt, s.step_count, s.rollbacks),
+            );
+            let bytes = bincode::serialize(&phys).expect("sérialisation");
+            eprintln!("PFP {:<44} {:>9} {:016x}", sc.name().chars().take(44).collect::<String>(), format!("{nx}×{ny}"), fnv1a(&bytes));
+        }
+    }
+}
+
 /// Diagnostic du parallélisme (voir l'en-tête de `mp_par`) : débit d'un calcul pur (morceaux de ~0.85 ms) sur k fils, (a) en continu
 /// pendant 2 s (fils système), (b) en rafales de 16 morceaux avec le groupe du solveur (attente active). Sur un portable en mode
 /// équilibré, des rafales avec des fils qui s'endorment (rayon, fils système) ne vont pas plus vite qu'en séquentiel.

@@ -1016,6 +1016,27 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
             out[p + 3] = 255;
         }
     }
+    // corps rigides (mp_bodies.rs) : la part de chaque maille qu'ils couvrent prend leur couleur (fraction exacte : bords lissés)
+    for b in &sim.bodies {
+        let col: [f32; 3] = if o.display == MpDisplay::Temperature {
+            temp_rgb((b.temp - sim.t_ambient) / o.t_scale.max(1e-3))
+        } else if o.solids_white {
+            [1.0, 1.0, 1.0]
+        } else {
+            sim.reg.solids.get(b.material).map_or([0.8, 0.8, 0.8], |s| s.color)
+        };
+        let f = super::mp_bodies::body_fractions(std::slice::from_ref(b), nx, ny, sim.dx);
+        for (c, &a) in f.iter().enumerate() {
+            if a > 0.0 {
+                let (i, j) = (c % nx, c / nx);
+                let p = ((ny - 1 - j) * nx + i) * 4;
+                let a = a as f32;
+                for q in 0..3 {
+                    out[p + q] = ((1.0 - a) * out[p + q] as f32 + a * col[q].clamp(0.0, 1.0) * 255.0) as u8;
+                }
+            }
+        }
+    }
     if o.show_effects {
         let mut put = |c: usize, rgb: [u8; 3]| {
             let (i, j) = (c % nx, c / nx);
@@ -1126,6 +1147,9 @@ pub fn compute_stats(sim: &MultiphaseSim) -> MpStats {
 pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String)> {
     let c = sim.idx(i, j);
     let mut v = vec![("Position".to_string(), format!("{i}, {j}")), ("Température (K)".into(), format!("{:.2}", sim.temp[c]))];
+    if sim.has_bodies() && sim.body_frac[c] > 0.0 {
+        v.push(("Corps rigide (fraction)".into(), format!("{:.4}", sim.body_frac[c])));
+    }
     if sim.is_solid(c) {
         v.push(("Solide".into(), sim.reg.solids[sim.solid[c] as usize].name.clone()));
         match sim.thermal[c] {

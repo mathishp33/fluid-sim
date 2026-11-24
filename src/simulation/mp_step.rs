@@ -74,6 +74,8 @@ struct Snapshot {
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
     dt_phase: f64, pressure_clamped: Vec<bool>,
+    /// corps rigides et leur fraction de maille (vides sans corps : rien n'est copié)
+    bodies: Vec<super::mp_bodies::RigidBody>, body_frac: Vec<f64>,
 }
 
 impl MultiphaseSim {
@@ -184,6 +186,7 @@ impl MultiphaseSim {
             mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(),
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
             dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
+            bodies: self.bodies.clone(), body_frac: if self.has_bodies() { self.body_frac.clone() } else { vec![] },
         }
     }
 
@@ -200,6 +203,14 @@ impl MultiphaseSim {
         self.mfx.clone_from(&s.mfx); self.mfy.clone_from(&s.mfy); self.m_tot_old.clone_from(&s.m_tot_old);
         self.time = s.time; self.last_dt = s.last_dt; self.last_pressure_iters = s.last_pressure_iters; self.step_count = s.step_count;
         self.dt_phase = s.dt_phase; self.pressure_clamped.clone_from(&s.pressure_clamped);
+        if self.has_bodies() || !s.bodies.is_empty() {
+            self.bodies.clone_from(&s.bodies);
+            if s.body_frac.len() == self.body_frac.len() {
+                self.body_frac.clone_from(&s.body_frac);
+            } else {
+                self.update_body_fractions();
+            }
+        }
     }
 
     /// Un pas de temps protégé : si l'état obtenu est invalide (NaN, T aberrante, masse négative, vitesse > speed_limit) le pas est

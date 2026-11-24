@@ -60,6 +60,11 @@ pub struct MultiphaseSim {
     /// cellules à deux pressions de la dernière projection (lit perméable posé sur un appui : squelette des grains incompressible)
     pub skel: Vec<bool>,
     pub solid: Vec<i32>, // −1 = fluide, sinon indice dans reg.solids
+    /// corps rigides (solides mobiles, voir mp_bodies.rs et SOLID.md) — étape 0 : géométrie et fermeture seulement, pas encore couplés
+    /// à l'écoulement ; aucun scénario n'en pose
+    pub bodies: Vec<super::mp_bodies::RigidBody>,
+    /// fraction de chaque maille occupée par les corps (0 sans corps), comptée dans la fermeture Σ m/ρ + α_corps = 1
+    pub body_frac: Vec<f64>,
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
     pub k_cell: Vec<f64>,
@@ -309,6 +314,8 @@ impl MultiphaseSim {
             sigma: vec![0.0; n],
             skel: vec![false; n],
             solid: vec![-1; n],
+            bodies: vec![],
+            body_frac: vec![0.0; n],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
             k_cell: vec![0.0; n],
