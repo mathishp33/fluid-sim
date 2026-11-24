@@ -37,6 +37,11 @@ pub(crate) fn bed_rad_k(d: f64, ta: f64, tb: f64, fa: f64, fb: f64) -> f64 {
 use super::multiphase::{MultiphaseSim, SyncPtr};
 use super::phases::MAX_PHASES;
 
+/// fraction de grains en dessous de laquelle une cellule ne borne pas le pas de la sédimentation : la chute explicite d'une trace est
+/// bornée par le contenu de la cellule donneuse (stable), sa précision est sans objet — des traces de houille de 1e-9 arrachées au lit
+/// par la flamme d'un braséro (noix de 3 cm dans un gaz à 2200 K : 90 m/s) y fixaient le pas à 5e-5 s
+pub(crate) const SETTLE_TRACE: f64 = 1e-6;
+
 impl MultiphaseSim {
     /// la simulation contient-elle au moins une phase granulaire ?
     pub fn has_granular(&self) -> bool {
@@ -113,7 +118,7 @@ impl MultiphaseSim {
         wt * (1.0 - self.grain_fraction(c)).clamp(0.0, 1.0).powf(n)
     }
 
-    /// plus grande vitesse de chute du domaine (limite de pas : w·dt ≤ 0.5·dx)
+    /// plus grande vitesse de chute du domaine (limite de pas : w·dt ≤ 0.5·dx), hors traces de grains (α ≤ `SETTLE_TRACE`)
     pub(crate) fn max_settling_speed(&self) -> f64 {
         let mut w = 0.0f64;
         for (s, ph) in self.reg.phases.iter().enumerate() {
@@ -121,7 +126,7 @@ impl MultiphaseSim {
                 continue;
             }
             for c in 0..self.nx * self.ny {
-                if !self.is_solid(c) && self.alpha[s][c] > 1e-9 {
+                if !self.is_solid(c) && self.alpha[s][c] > SETTLE_TRACE {
                     w = w.max(self.settling_velocity(s, c).abs());
                 }
             }

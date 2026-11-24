@@ -1,10 +1,12 @@
-// ===== Percolation (miroir de mp_percolation.rs) : le fluide traverse les lits de grains tassés (grains de 1 mm et plus) et les grilles,
+// ===== Percolation (miroir de mp_percolation.rs) : le fluide traverse les lits de grains perméables posés sur un appui et les grilles,
 // loi d'Ergun résolue dans la projection (conductance C/dx² dans k_stencil, divergence de q dans k_rhs), transport du fluide seul au pas
-// suivant (k_perc_*). Faces : q = −C (p_b − p_a)/dx + d, de a (gauche / bas) vers b.
+// suivant (k_perc_*). Faces : q = −C (p_b − p_a)/dx + d, de a (gauche / bas) vers b. Lits perméables à deux pressions : p (prel) y est
+// la pression du fluide des pores, σ' (sig) celle des contacts, résolue une fois par pas (k_sk_*) ; le mélange est poussé par p + σ'.
 
 const ERGUN_A: f32 = 150.0;
 const ERGUN_B: f32 = 1.75;
-const PERC_D_MIN: f32 = 1e-3;
+// cellule de grains non poreuse d'au moins α_max − SEAL_GAP de grains : close au fluide des pores (miroir de mp_percolation::SEAL_GAP)
+const SEAL_GAP: f32 = 0.2;
 
 fn is_grille(c: u32) -> bool { return S[O_grl_d + c] > 0.0; }
 fn perc_on() -> bool { return has(F_PERC); }
@@ -43,9 +45,10 @@ fn k_dc_cell(@builtin(global_invocation_id) g: vec3<u32>) {
             let a = select(0.0, max(alpha(k, c), 0.0), gran_k(k));
             as_ += a; ad += a * max(grain_d(k), 1e-6); am += a * grain_amax(k);
         }
-        // (le contact — tassés, ou posés sur un appui — est vérifié dans dc_porous, après k_dc_ps)
-        if (as_ <= 1e-6 || ad / as_ < PERC_D_MIN) { return; }
+        // (le contact — chaîne posée sur un appui — est vérifié dans dc_porous, après k_dc_ps ; lit trop peu perméable : étanche)
+        if (as_ <= 1e-6) { return; }
         d = ad / as_; eps = clamp(1.0 - as_, 0.05, 0.95);
+        if (kozeny(d, eps) / pf.y < PERC_KMU_MIN) { return; }
     }
     S[O_dc_k + c] = kozeny(d, eps);
     S[O_dc_e + c] = eps; S[O_dc_d + c] = d; S[O_dc_mu + c] = pf.y;
@@ -62,7 +65,8 @@ fn dc_inv(c: u32, gm: f32) -> f32 {
     return 0.5 * (a + sqrt(a * a + 4.0 * b * abs(gm)));
 }
 
-// pression de contact lithostatique p_s (un fil par ligne de gravité, miroir de grain_overburden) ; contact dans dc_ct
+// pression de contact lithostatique p_s (un fil par ligne de gravité, miroir de grain_overburden : état d'une cellule qui entre dans un
+// lit perméable, k_sk_mark) ; contact dans dc_ct
 fn dc_w(c: u32) -> vec3<f32> {
     // (poids déjaugé w, tassé, a des grains)
     var as_ = 0.0; var ms = 0.0; var am = 0.0;
@@ -117,14 +121,40 @@ fn k_dc_ps(@builtin(global_invocation_id) g: vec3<u32>) {
         acc = select(0.0, acc + wv.x, ct);
     }
 }
-// conductance et terme moteur de la face entre a et b (composante de gravité gcomp le long de a → b)
+// (α_s, α_max) : fraction des grains et compacité maximale de leur mélange (1 sans grains ; miroir de grain_packing)
+fn grain_pack(c: u32) -> vec2<f32> {
+    var as_ = 0.0; var am = 0.0;
+    for (var k = 0u; k < P.np; k++) {
+        let a = select(0.0, max(alpha(k, c), 0.0), gran_k(k));
+        as_ += a; am += a * grain_amax(k);
+    }
+    if (as_ <= 1e-6) { return vec2<f32>(as_, 1.0); }
+    return vec2<f32>(as_, am / as_);
+}
+// cellule de grains non poreuse et dense, close au fluide des pores (miroir de sealed)
+fn dc_sealed(c: u32) -> bool {
+    if (dc_porous(c) || is_solid(c)) { return false; }
+    let pk = grain_pack(c);
+    return pk.x > 1e-6 && pk.x >= pk.y - SEAL_GAP;
+}
+// cellule à deux pressions (miroir de skeleton_of) : grains poreux en contact et tassés, hors grilles
+fn sk_now(c: u32) -> bool {
+    let pk = grain_pack(c);
+    return perc_on() && !is_solid(c) && !pinned(c) && !is_grille(c) && dc_porous(c) && pk.x >= pk.y - SKEL_GAP;
+}
+// pression de contact lithostatique des cellules poreuses à UNE pression (la pression du fluide de leurs pores est p − p_s)
+fn dc_ps1(c: u32) -> f32 {
+    return select(0.0, S[O_dc_ps + c], dc_porous(c) && !is_grille(c) && !sk_now(c));
+}
+// conductance et terme moteur de la face entre a et b (composante de gravité gcomp le long de a → b ; moteur : poids du fluide, et
+// pression de contact des cellules à une pression)
 fn dc_face(a: u32, b: u32, gcomp: f32) -> vec2<f32> {
     let pa = dc_porous(a); let pb = dc_porous(b);
-    if ((!pa && !pb) || is_solid(a) || is_solid(b) || pinned(a) || pinned(b)) { return vec2<f32>(0.0, 0.0); }
+    if ((!pa && !pb) || dc_sealed(a) || dc_sealed(b) || is_solid(a) || is_solid(b) || pinned(a) || pinned(b)) { return vec2<f32>(0.0, 0.0); }
     let ra = S[O_dc_rf + a]; let rb = S[O_dc_rf + b];
     var rf = rb;
     if (ra > 0.0 && rb > 0.0) { rf = 0.5 * (ra + rb); } else if (ra > 0.0) { rf = ra; }
-    let drive = (S[O_dc_ps + b] - S[O_dc_ps + a]) + rf * gcomp * P.dx;
+    let drive = rf * gcomp * P.dx + dc_ps1(b) - dc_ps1(a);
     let gm = abs((S[O_prel + b] - S[O_prel + a]) - drive) / P.dx;
     let c = 2.0 / (dc_inv(a, gm) + dc_inv(b, gm));
     return vec2<f32>(c, c * drive / P.dx);
@@ -231,126 +261,103 @@ fn k_perc_delta(@builtin(global_invocation_id) g: vec3<u32>) {
     S[O_sdm + np * n + c] = select(0.0, 1.0, touched);
 }
 
-// ===== fluidisation (miroir de percolation_drag, fluidization_state, hold_faces, add_forces) =====
-// traînée de percolation sur les grains de la cellule, le long de la gravité, comptée vers le haut (Pa par cellule)
-fn fl_drag_at(c: u32) -> f32 {
-    if (is_solid(c) || pinned(c) || is_grille(c)) { return 0.0; }
-    var as_ = 0.0; var ad = 0.0;
-    for (var k = 0u; k < P.np; k++) {
-        let a = select(0.0, max(alpha(k, c), 0.0), gran_k(k));
-        as_ += a; ad += a * max(grain_d(k), 1e-6);
-    }
-    if (as_ <= 1e-6 || ad / as_ < PERC_D_MIN) { return 0.0; }
-    let vert = abs(P.gy) >= abs(P.gx);
-    var down = P.gx < 0.0; if (vert) { down = P.gy < 0.0; }
-    let i = c % P.nx; let j = c / P.nx;
-    var qc = 0.5 * (S[O_qu + uidx(i, j)] + S[O_qu + uidx(i + 1u, j)]);
-    if (vert) { qc = 0.5 * (S[O_qv + vidx(i, j)] + S[O_qv + vidx(i, j + 1u)]); }
-    let pf = pore_fluid(c);
-    if (qc == 0.0 || pf.y <= 0.0) { return 0.0; }
-    let d = ad / as_; let eps = clamp(1.0 - as_, 0.05, 0.95);
-    let q = select(-qc, qc, down);
-    let b = ERGUN_B * pf.x * (1.0 - eps) / (eps * eps * eps * d);
-    return (pf.y / kozeny(d, eps) * q + b * abs(q) * q) * P.dx;
-}
+// ===== lits perméables à deux pressions (miroir de skeleton_transitions, solve_skeleton) =====
+// cellules qui entrent dans un lit perméable (σ' = poids déjaugé au-dessus, retiré de p) ou en sortent (σ' rendue à p) ; masque skel
 @compute @workgroup_size(64)
-fn k_fl_drag(@builtin(global_invocation_id) g: vec3<u32>) {
+fn k_sk_mark(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
     if (c >= ncell()) { return; }
-    S[O_fl_drag + c] = select(0.0, fl_drag_at(c), perc_on() && grav_norm() > 0.0);
-}
-// (poids déjaugé w avec le fluide courant, tassé, a des grains)
-fn fl_w(c: u32) -> vec3<f32> {
-    var as_ = 0.0; var ms = 0.0; var am = 0.0;
-    for (var k = 0u; k < P.np; k++) {
-        let gr = gran_k(k);
-        let a = select(0.0, max(alpha(k, c), 0.0), gr);
-        as_ += a; ms += select(0.0, max(mass(k, c), 0.0), gr); am += a * grain_amax(k);
+    let now = sk_now(c);
+    let was = S[O_skel + c] > 0.5;
+    if (now && !was) {
+        let pa = S[O_prel + c] + P.p0;
+        let s0 = clamp(S[O_dc_ps + c], 0.0, max(pa - 2.0 * P_FLOOR, 0.0));
+        S[O_sig + c] = s0;
+        S[O_prel + c] -= s0;
+    } else if (!now && was) {
+        S[O_prel + c] += S[O_sig + c];
+        S[O_sig + c] = 0.0;
+    } else if (!now) {
+        S[O_sig + c] = 0.0;
     }
-    if (as_ <= 1e-6 || is_solid(c) || is_grille(c)) { return vec3<f32>(0.0, 0.0, 0.0); }
-    let w = max(ms / as_ - pore_fluid(c).x, 0.0) * as_ * grav_norm() * P.dx;
-    return vec3<f32>(w, select(0.0, 1.0, as_ >= am / as_ - 0.1), 1.0);
+    S[O_skel + c] = select(0.0, 1.0, now);
 }
-// par ligne de gravité : chaîne posée (du bas vers le haut), puis force de décharge f = [min(D + F, L + w) − min(D, L)] / dx et cellules
-// retenues (traînée > HOLD_DRAG w, pas fluidisée) du haut vers le bas
+// matrice de la correction δσ' (niveau 0 : sd, sae, san, sact) : faces du mélange des cellules skel, Dirichlet vers les autres
 @compute @workgroup_size(64)
-fn k_fl_state(@builtin(global_invocation_id) g: vec3<u32>) {
-    let vert = abs(P.gy) >= abs(P.gx);
-    var down = P.gx < 0.0; if (vert) { down = P.gy < 0.0; }
-    var lines = P.ny; var len = P.nx;
-    if (vert) { lines = P.nx; len = P.ny; }
-    let l = g.x;
-    if (l >= lines) { return; }
-    // du bas vers le haut : appui (fl_held sert d'abord à le noter)
-    var prev_ct = false; var prev_packed = false; var prev_has = false; var prev_block = true;
-    for (var t = 0u; t < len; t++) {
-        var s_ = t; if (!down) { s_ = len - 1u - t; }
-        var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
-        let wv = fl_w(c);
-        let support = prev_block || (prev_has && prev_ct && prev_packed);
-        let ct = wv.z > 0.5 && support;
-        S[O_fl_held + c] = select(0.0, 1.0, ct);
-        prev_ct = ct; prev_packed = wv.y > 0.5; prev_has = wv.z > 0.5; prev_block = is_solid(c) || is_grille(c);
-    }
-    // du haut vers le bas
-    var cd = 0.0; var cl = 0.0;
-    for (var tt = 0u; tt < len; tt++) {
-        let t = len - 1u - tt;
-        var s_ = t; if (!down) { s_ = len - 1u - t; }
-        var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
-        let ct = S[O_fl_held + c] > 0.5 && !is_solid(c) && !is_grille(c);
-        let w = fl_w(c).x;
-        let f = S[O_fl_drag + c];
-        S[O_fl_fc + c] = select(0.0, (min(cd + f, cl + w) - min(cd, cl)) / P.dx, ct);
-        S[O_fl_held + c] = select(0.0, 1.0, ct && f > HOLD_DRAG * w && cd + 0.5 * f < cl + 0.5 * w);
-        cd = select(0.0, cd + f, ct);
-        cl = select(0.0, cl + w, ct);
-    }
-}
-// faces entre deux cellules retenues : fermées au mélange (ajoutées aux faces imposées fixes)
-@compute @workgroup_size(64)
-fn k_fl_hold(@builtin(global_invocation_id) g: vec3<u32>) {
-    let f = g.x;
-    if (f < nfu()) {
-        let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
-        var h = false;
-        if (i >= 1u && i < P.nx) { h = S[O_fl_held + cidx(i - 1u, j)] > 0.5 && S[O_fl_held + cidx(i, j)] > 0.5; }
-        let st = S[O_pfu_on0 + f] > 0.5;
-        S[O_pfu_on + f] = select(0.0, 1.0, st || h);
-        if (h && !st) { S[O_pfu + f] = 0.0; }
-    }
-    if (f < nfv()) {
-        let i = f % P.nx; let j = f / P.nx;
-        var h = false;
-        if (j >= 1u && j < P.ny) { h = S[O_fl_held + cidx(i, j - 1u)] > 0.5 && S[O_fl_held + cidx(i, j)] > 0.5; }
-        let st = S[O_pfv_on0 + f] > 0.5;
-        S[O_pfv_on + f] = select(0.0, 1.0, st || h);
-        if (h && !st) { S[O_pfv + f] = 0.0; }
-    }
-}
-// force de décharge des contacts sur les faces le long de la gravité (miroir de add_forces)
-@compute @workgroup_size(64)
-fn k_fl_force(@builtin(global_invocation_id) g: vec3<u32>) {
-    let f = g.x;
-    let vert = abs(P.gy) >= abs(P.gx);
-    if (vert && f < nfv()) {
-        let i = f % P.nx; let j = f / P.nx;
-        if (j >= 1u && j < P.ny) {
-            let a = cidx(i, j - 1u); let b = cidx(i, j);
-            let fa = S[O_fl_fc + a]; let fb = S[O_fl_fc + b];
-            if (!is_solid(a) && !is_solid(b) && (fa != 0.0 || fb != 0.0)) {
-                S[O_Fy + f] += sign(P.gy) * dtv() * 0.5 * (fa + fb) / frho_y(i, j);
-            }
+fn k_sk_stencil(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell() || newton_done()) { return; }
+    S[O_sae + c] = 0.0; S[O_san + c] = 0.0; S[O_sd + c] = 1.0; S[O_sact + c] = 0.0;
+    if (S[O_skel + c] < 0.5) { return; }
+    S[O_sact + c] = 1.0;
+    let i = c % P.nx; let j = c / P.nx;
+    let dx2 = P.dx * P.dx;
+    let dt = dtv();
+    let edge = 2.0 * dt / (S[O_rho_mix + c] * dx2);
+    var d = 0.0;
+    if (i + 1u < P.nx) {
+        if (link(c, c + 1u, S[O_pfu_on + uidx(i + 1u, j)] > 0.5) > 0u) {
+            let t = dt / (frho_x(i + 1u, j) * dx2);
+            d += t;
+            if (S[O_skel + c + 1u] > 0.5) { S[O_sae + c] = t; }
         }
-    }
-    if (!vert && f < nfu()) {
-        let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
-        if (i >= 1u && i < P.nx) {
-            let a = cidx(i - 1u, j); let b = cidx(i, j);
-            let fa = S[O_fl_fc + a]; let fb = S[O_fl_fc + b];
-            if (!is_solid(a) && !is_solid(b) && (fa != 0.0 || fb != 0.0)) {
-                S[O_Fx + f] += sign(P.gx) * dtv() * 0.5 * (fa + fb) / frho_x(i, j);
-            }
+    } else if (P.bc_r == 1u) { d += edge; }
+    if (i > 0u) {
+        if (link(c - 1u, c, S[O_pfu_on + uidx(i, j)] > 0.5) > 0u) { d += dt / (frho_x(i, j) * dx2); }
+    } else if (P.bc_l == 1u) { d += edge; }
+    if (j + 1u < P.ny) {
+        if (link(c, c + P.nx, S[O_pfv_on + vidx(i, j + 1u)] > 0.5) > 0u) {
+            let t = dt / (frho_y(i, j + 1u) * dx2);
+            d += t;
+            if (S[O_skel + c + P.nx] > 0.5) { S[O_san + c] = t; }
         }
+    } else if (P.bc_t == 1u) { d += edge; }
+    if (j > 0u) {
+        if (link(c - P.nx, c, S[O_pfv_on + vidx(i, j)] > 0.5) > 0u) { d += dt / (frho_y(i, j) * dx2); }
+    } else if (P.bc_b == 1u) { d += edge; }
+    S[O_sd + c] = max(d, 1e-30);
+}
+// second membre : ∇·u = 0 dans le lit (u : k_face_tmp à la pression courante)
+@compute @workgroup_size(64)
+fn k_sk_rhs(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell() || newton_done()) { return; }
+    if (S[O_skel + c] < 0.5) { S[O_rhs + c] = 0.0; return; }
+    let i = c % P.nx; let j = c / P.nx;
+    let dv = (S[O_Fx + uidx(i + 1u, j)] - S[O_Fx + uidx(i, j)] + S[O_Fy + vidx(i, j + 1u)] - S[O_Fy + vidx(i, j)]) / P.dx;
+    S[O_rhs + c] = -dv;
+}
+// σ' += δσ' (relâchée à 0 : le lit se décolle) ; |Δσ'| max rapporté au bruit d'arrondi (sommes partielles, quantité 0)
+@compute @workgroup_size(64)
+fn k_sk_update(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    let c = g.x;
+    var v: array<f32, 8>;
+    v[0] = 0.0;
+    if (c < ncell() && !newton_done() && S[O_skel + c] > 0.5) {
+        let s0 = S[O_sig + c];
+        let s1 = max(s0 + S[O_cx + c], 0.0);
+        S[O_sig + c] = s1;
+        v[0] = abs(s1 - s0) / max(0.1, 2e-6 * max(S[O_prel + c] + P.p0 + s1, 0.0));
+    }
+    wg_reduce(v, 1u, 1u, l.x, w.x, 0u);
+}
+// fin de la pré-résolution d'avant le frottement : itérations comptées, gradient conjugué remis à zéro pour la projection
+@compute @workgroup_size(64)
+fn k_sk_pre_final(@builtin(local_invocation_id) l: vec3<u32>) {
+    if (l.x == 0u) {
+        D[D_PCG_IT] += D[D_PCG_ITN];
+        D[D_MAXPCG_N] = max(D[D_MAXPCG_N], D[D_PCG_ITN]);
+        if (D[D_PCG_DONE] < 0.5) { D[D_PCG_UNCONV] = 1.0; }
+        D[D_PCG_DONE] = 0.0; D[D_PCG_ITN] = 0.0;
+    }
+}
+@compute @workgroup_size(256)
+fn k_sk_final(@builtin(local_invocation_id) l: vec3<u32>) {
+    let mx = final_reduce(0u, nwg_cells(), 1u, l.x);
+    if (l.x == 0u && D[D_NEWTON_DONE] < 0.5) {
+        D[D_SK_MOVED] = select(0.0, 1.0, mx >= 1.0);
+        D[D_PCG_IT] += D[D_PCG_ITN];
+        D[D_MAXPCG_N] = max(D[D_MAXPCG_N], D[D_PCG_ITN]);
+        if (D[D_PCG_DONE] < 0.5) { D[D_PCG_UNCONV] = 1.0; }
     }
 }

@@ -171,11 +171,11 @@ fn k_settle_apply(@builtin(global_invocation_id) g: vec3<u32>) {
     cell_sync(c);
 }
 
-// plus grande vitesse de chute dans la cellule c (borne de pas w·dt ≤ 0.5·dx, miroir de max_settling_speed)
+// plus grande vitesse de chute dans la cellule c (borne de pas w·dt ≤ 0.5·dx, hors traces ; miroir de max_settling_speed)
 fn max_settling_at(c: u32) -> f32 {
     var w = 0.0;
     for (var s = 0u; s < P.np; s++) {
-        let on = gran_k(s) && alpha(s, c) > 1e-9;
+        let on = gran_k(s) && alpha(s, c) > SETTLE_TRACE;
         w = max(w, select(0.0, abs(settling_w(s, c)), on));
     }
     return w;

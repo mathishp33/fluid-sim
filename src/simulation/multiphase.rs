@@ -52,6 +52,11 @@ pub struct MultiphaseSim {
     /// flux de percolation (Darcy, m/s) de la dernière projection, transportés au pas suivant (fluide seul ; voir mp_percolation.rs)
     pub q_u: Vec<f64>,
     pub q_v: Vec<f64>,
+    /// pression de CONTACT des grains σ' (Pa, ≥ 0) des lits perméables (cellules à deux pressions, `skel`) de la dernière projection :
+    /// la pression du mélange y vaut p + σ', p étant celle du fluide des pores (voir mp_percolation.rs) ; 0 ailleurs
+    pub sigma: Vec<f64>,
+    /// cellules à deux pressions de la dernière projection (lit perméable posé sur un appui : squelette des grains incompressible)
+    pub skel: Vec<bool>,
     pub solid: Vec<i32>, // −1 = fluide, sinon indice dans reg.solids
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
@@ -299,6 +304,8 @@ impl MultiphaseSim {
             v: vec![0.0; nx * (ny + 1)],
             q_u: vec![0.0; (nx + 1) * ny],
             q_v: vec![0.0; nx * (ny + 1)],
+            sigma: vec![0.0; n],
+            skel: vec![false; n],
             solid: vec![-1; n],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
@@ -544,6 +551,20 @@ impl MultiphaseSim {
                 self.mass[k][c] = self.alpha[k][c] * self.reg.phases[k].rho(p, t);
             }
             self.set_cell_temperature(c, t);
+        }
+        // lits perméables : la pression posée est celle du mélange ; le fluide des pores est à p − σ' (σ' : poids déjaugé des grains
+        // au-dessus ; sous une grille qui porte un lit, sans son poids), masses recalculées à cette pression
+        if self.init_contact_stress() {
+            for c in 0..nx * ny {
+                if self.is_solid(c) {
+                    continue;
+                }
+                let (p, t) = (self.p[c], self.temp[c]);
+                for k in 0..self.reg.phases.len() {
+                    self.mass[k][c] = self.alpha[k][c] * self.reg.phases[k].rho(p, t);
+                }
+                self.set_cell_temperature(c, t);
+            }
         }
         self.refresh();
     }

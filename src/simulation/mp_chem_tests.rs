@@ -405,15 +405,14 @@ fn coal_brasero_diag() {
     let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f64);
     let grate_j = (0..s.ny).find(|&j| (0..s.nx).any(|i| s.is_grille(s.idx(i, j)))).unwrap();
     let column = |s: &MultiphaseSim, tag: &str| {
-        let ps = s.grain_overburden();
         let i = s.nx / 2;
         let p0 = s.p[s.idx(i, grate_j + 8)];
-        eprintln!("-- {tag} : colonne centrale (j, p − p(j+8), p_s, p − p_s − p(j+8), ρ_f, T)");
+        eprintln!("-- {tag} : colonne centrale (j, p − p(j+8) [fluide], σ' [contact], p + σ' − p(j+8) [mélange], ρ_f, T)");
         for j in (grate_j.saturating_sub(3)..grate_j + 9).rev() {
             let q = s.idx(i, j);
             let rf: f64 = (0..s.reg.phases.len()).filter(|&k| !s.reg.phases[k].is_granular()).map(|k| s.mass[k][q]).sum::<f64>()
                 / (0..s.reg.phases.len()).filter(|&k| !s.reg.phases[k].is_granular()).map(|k| s.alpha[k][q]).sum::<f64>().max(1e-12);
-            eprintln!("   j {j:2} {}{:9.3} {:9.3} {:9.3} {:6.3} {:6.0}", if s.is_grille(q) { "G " } else { "  " }, s.p[q] - p0, ps[q], s.p[q] - ps[q] - p0, rf, s.temp[q]);
+            eprintln!("   j {j:2} {}{:9.3} {:9.3} {:9.3} {:6.3} {:6.0}", if s.is_grille(q) { "G " } else { "  " }, s.p[q] - p0, s.sigma[q], s.p[q] + s.sigma[q] - p0, rf, s.temp[q]);
         }
     };
     column(&s, "départ");
@@ -1621,5 +1620,42 @@ fn viscous_lava_resting_in_air_stays_calm() {
     eprintln!("lave dans l'air : {} pas, {} refaits, |u| max {umax:.3} m/s", s.step_count, s.rollbacks);
     assert!(!s.diverged && s.state_is_sane());
     assert!(umax < 10.0 && s.rollbacks == 0 && s.step_count < 1000, "|u| max {umax} m/s, {} pas refaits, {} pas", s.rollbacks, s.step_count);
+}
+
+
+/// diagnostic : braséro, cellule de la flamme la plus chaude au fil du temps (MP_COAL_T s, défaut 2 ; MP_DT_MAX : pas maximal)
+#[test]
+#[ignore]
+fn coal_brasero_hot_spot_diag() {
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
+    let k = |n: &str| idx(&s.reg, n);
+    let (c, o2, hou) = (k(super::mp_materials::COAL), k(O2), k(super::mp_materials::HOUILLE));
+    let gg = s.group_of[o2];
+    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
+    if let Some(d) = std::env::var("MP_DT_MAX").ok().and_then(|v| v.parse::<f64>().ok()) {
+        s.dt_max = d;
+    }
+    let mut next = 0.3;
+    let mut worst = (0.0f64, 0usize, 0.0f64);
+    while s.time < t_end && !s.diverged {
+        s.step();
+        if s.time > 0.3 {
+            let n = s.nx * s.ny;
+            for q in 0..n {
+                if !s.is_solid(q) && s.mass[c][q] + s.mass[hou][q] < 1.0 && s.group_mass(gg, q) > 0.0 && s.tg[gg][q] > worst.0 {
+                    worst = (s.tg[gg][q], q, s.time);
+                }
+            }
+        }
+        if s.time >= next {
+            next += 0.1;
+            let q = worst.1;
+            let gas: f64 = (0..s.reg.phases.len()).filter(|&kk| s.reg.phases[kk].is_gas()).map(|kk| s.alpha[kk][q]).sum();
+            eprintln!("t {:.2} dt {:.1e} : T gaz max {:.0} K en ({}, {}) à t {:.3} ; maintenant T_g {:.0} T {:.0} ; α charbon {:.2e} houille {:.2e} gaz {:.3} ; masse du groupe {:.2e} kg/m³ ; ρ_mix {:.3}",
+                s.time, s.last_dt, worst.0, q % s.nx, q / s.nx, worst.2, s.tg[gg][q], s.temp[q], s.alpha[c][q], s.alpha[hou][q], gas, s.group_mass(gg, q), s.rho_mix[q]);
+            worst = (0.0, 0, 0.0);
+        }
+    }
 }
 

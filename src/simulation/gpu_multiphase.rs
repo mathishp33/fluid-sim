@@ -138,11 +138,10 @@ fn fronts_possible(sim: &MultiphaseSim) -> bool {
     sim.phase_change && sim.reg.fusions.iter().any(|f| f.supercooling > 0.0)
 }
 
-/// La scène peut-elle percoler (miroir de `darcy_faces`) : grilles, ou phases granulaires de grains d'au moins 1 mm
+/// La scène peut-elle percoler (miroir de `darcy_faces`) : grilles, ou phases granulaires (la perméabilité d'un lit dépend aussi de
+/// son fluide : vérifiée par cellule)
 fn percolation_possible(sim: &MultiphaseSim) -> bool {
-    sim.percolation
-        && (sim.special.iter().any(|s| matches!(s, Some(MpEffect::Grille { .. })))
-            || sim.reg.phases.iter().any(|p| p.is_granular() && p.grain_diameter >= 1e-3))
+    sim.percolation && (sim.special.iter().any(|s| matches!(s, Some(MpEffect::Grille { .. }))) || sim.has_granular())
 }
 
 /// Pourquoi le GPU ne peut PAS simuler cette scène (None = il le peut).
@@ -290,6 +289,7 @@ fn wg(count: usize) -> u32 {
 
 impl MultiphaseGpu {
     pub fn try_new(sim: &MultiphaseSim) -> Result<Self, String> {
+        let _io = gpu_io();
         if let Some(why) = gpu_unsupported_reason(sim) {
             return Err(why);
         }
@@ -327,9 +327,6 @@ impl MultiphaseGpu {
         sl.add("pfu", nfu);
         sl.add("pfv_on", nfv);
         sl.add("pfv", nfv);
-        // faces imposées des effets et des entrées (copie fixe ; k_fl_hold y ajoute les faces des lits retenus par leur appui)
-        sl.add("pfu_on0", nfu);
-        sl.add("pfv_on0", nfv);
         for name in ["acc_on", "acc_x", "acc_y", "th_kind", "th_val", "heat_t", "ovl"] {
             sl.add(name, n);
         }
@@ -341,9 +338,12 @@ impl MultiphaseGpu {
         sl.add("prel", n);
         sl.add("U", nfu);
         sl.add("V", nfv);
-        // flux de percolation (Darcy) de la dernière projection, transportés au pas suivant
+        // flux de percolation (Darcy) de la dernière projection, transportés au pas suivant ; lits perméables : pression de contact σ'
+        // et cellules à deux pressions de la dernière projection
         sl.add("qu", nfu);
         sl.add("qv", nfv);
+        sl.add("sig", n);
+        sl.add("skel", n);
         sl.add("temp", n);
         sl.add("alpha", np * n);
         for name in ["rho_mix", "mu_cell", "k_cell", "clamped", "flame", "heat_rel"] {
@@ -428,10 +428,6 @@ impl MultiphaseGpu {
             sl.add(name, nre.max(1) * n);
         }
         sl.add("dloc", npmax * n);
-        // fluidisation : traînée de percolation, force de décharge des contacts, cellules retenues (k_fl_drag, k_fl_state)
-        for name in ["fl_drag", "fl_fc", "fl_held"] {
-            sl.add(name, n);
-        }
         // surfusion : germes relevés avant le front de dendrites (k_fusion_germ)
         sl.add("fu_germ", nfus.max(1) * n);
         sl.add("ys", npmax * n);
@@ -477,9 +473,11 @@ impl MultiphaseGpu {
             1 + npmax
         );
         header += &format!(
-            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\nconst HOLD_DRAG: f32 = {:?};\n",
+            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\nconst PERC_KMU_MIN: f32 = {:?};\nconst SKEL_GAP: f32 = {:?};\nconst SETTLE_TRACE: f32 = {:?};\n",
             super::phases::FUSION_SEED_ALPHA as f32,
-            super::mp_percolation::HOLD_DRAG as f32
+            super::mp_percolation::PERC_KMU_MIN as f32,
+            super::mp_percolation::SKEL_GAP as f32,
+            super::mp_granular::SETTLE_TRACE as f32
         );
         let mut source = format!("{header}{}", SHADERS.join("\n"));
         // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
@@ -695,6 +693,7 @@ impl MultiphaseGpu {
     // ================================================================ envoi de l'état
     /// Envoie l'état CPU complet (et les tables) vers le GPU. À appeler après toute modification de `sim` hors du GPU (outils, scène).
     pub fn upload(&mut self, sim: &MultiphaseSim) {
+        let _io = gpu_io();
         trace("upload");
         let (nx, ny, np) = (self.nx, self.ny, self.np);
         let n = nx * ny;
@@ -1001,18 +1000,15 @@ impl MultiphaseGpu {
         }
         self.heat_on = sim.heat_active;
         let (o_pfuo, o_pfu, o_pfvo, o_pfv) = (o("pfu_on"), o("pfu"), o("pfv_on"), o("pfv"));
-        let (o_pfuo0, o_pfvo0) = (o("pfu_on0"), o("pfv_on0"));
         for f in 0..nfu {
             if !pf_u[f].is_nan() {
                 s[o_pfuo + f] = 1.0;
-                s[o_pfuo0 + f] = 1.0;
                 s[o_pfu + f] = pf_u[f] as f32;
             }
         }
         for f in 0..nfv {
             if !pf_v[f].is_nan() {
                 s[o_pfvo + f] = 1.0;
-                s[o_pfvo0 + f] = 1.0;
                 s[o_pfv + f] = pf_v[f] as f32;
             }
         }
@@ -1062,6 +1058,11 @@ impl MultiphaseGpu {
             }
         }
         let (o_qu, o_qv) = (o("qu"), o("qv"));
+        let (o_sig, o_skel) = (o("sig"), o("skel"));
+        for c in 0..n {
+            s[o_sig + c] = sim.sigma.get(c).copied().unwrap_or(0.0) as f32;
+            s[o_skel + c] = if sim.skel.get(c).copied().unwrap_or(false) { 1.0 } else { 0.0 };
+        }
         for f in 0..nfu {
             s[o_u + f] = sim.u[f] as f32;
             s[o_qu + f] = sim.q_u.get(f).copied().unwrap_or(0.0) as f32;
@@ -1105,6 +1106,7 @@ impl MultiphaseGpu {
 
     /// Envoie seulement les cibles du pinceau « Chauffer » (sans toucher à l'état).
     pub fn sync_heat_targets(&mut self, sim: &MultiphaseSim) {
+        let _io = gpu_io();
         if !sim.heat_active && !self.heat_on {
             return;
         }
@@ -1125,6 +1127,7 @@ impl MultiphaseGpu {
 
     /// Relit l'état complet du GPU dans `sim` (masses, énergie, pression, vitesses, propriétés, flammes, bilans).
     pub fn download(&mut self, sim: &mut MultiphaseSim) {
+        let _io = gpu_io();
         trace("download");
         let (nx, ny, np) = (self.nx, self.ny, self.np);
         let n = nx * ny;
@@ -1185,6 +1188,9 @@ impl MultiphaseGpu {
             sim.q_u = vec![0.0; nfu];
             sim.q_v = vec![0.0; nfv];
         }
+        let (o_sig, o_skel) = (o("sig"), o("skel"));
+        sim.sigma = (0..n).map(|c| data[o_sig + c] as f64).collect();
+        sim.skel = (0..n).map(|c| data[o_skel + c] > 0.5).collect();
         for f in 0..nfu {
             sim.u[f] = data[o_u + f] as f64;
             sim.q_u[f] = data[o_qu + f] as f64;
@@ -1435,14 +1441,6 @@ impl MultiphaseGpu {
         let mut v: Vec<Op> = Vec::with_capacity(2048);
         let extras = self.has_extras;
         v.push(cell("k_refresh"));
-        // fluidisation (miroir de prepare_special / hold_faces) : traînée de percolation, état des colonnes, faces des lits retenus
-        let fluid_bed = percolation_possible(sim) && sim.has_granular();
-        if fluid_bed {
-            let vert = sim.gravity[1].abs() >= sim.gravity[0].abs();
-            v.push(cell("k_fl_drag"));
-            v.push(Op { k: "k_fl_state", wg: wg(if vert { nx } else { ny }), slot: 0 });
-            v.push(Op { k: "k_fl_hold", wg: wm, slot: 0 });
-        }
         if extras {
             v.push(face("k_apply_pf"));
             v.push(cell("k_pin_reset"));
@@ -1460,9 +1458,6 @@ impl MultiphaseGpu {
         v.push(face("k_copy_un"));
         // forces sur l'état n
         v.push(face("k_force_init"));
-        if fluid_bed {
-            v.push(face("k_fl_force"));
-        }
         if self.has_accel {
             v.push(face("k_accel"));
         }
@@ -1614,10 +1609,46 @@ impl MultiphaseGpu {
         }
         // pression : Newton + MG-PCG
         v.push(cell("k_refresh"));
+        let last = self.levels.len() - 1;
+        // matrice courante (niveau 0 : sd, sae, san, sact) → hiérarchie multigrille ; gradient conjugué sur rhs → cx
+        let coarsen = |v: &mut Vec<Op>| {
+            for l in 0..last {
+                let (a, b) = self.levels[l + 1];
+                v.push(Op { k: "k_mg_coarsen_links", wg: wg(a * b), slot: self.slot(l, 0) });
+                v.push(Op { k: "k_mg_coarsen_diag", wg: wg(a * b), slot: self.slot(l + 1, 0) });
+            }
+        };
+        let pcg = |v: &mut Vec<Op>| {
+            v.push(cell("k_pcg_init"));
+            v.push(one("k_pcg_bb"));
+            self.vcycle(v);
+            v.push(cell("k_pcg_rz"));
+            v.push(cell("k_pcg_p0"));
+            for it in 0..self.pcg_budget {
+                let sl = self.slot(it % 2, 0);
+                v.push(cell("k_pcg_apply"));
+                v.push(Op { k: "k_pcg_update", wg: wn, slot: sl });
+                v.push(one("k_pcg_rr"));
+                self.vcycle(v);
+                v.push(cell("k_pcg_rz"));
+                v.push(Op { k: "k_pcg_dir", wg: wn, slot: sl });
+            }
+        };
         // viscosité implicite (frottement des grains tassés, fluides très visqueux) sur u*, avant la projection (miroir de
         // apply_implicit_viscosity)
         if implicit_viscosity_needed(sim, self.nx) {
             let (vert, wuv) = (sim.gravity[1].abs() >= sim.gravity[0].abs(), wg(nfu + nfv));
+            // lits perméables : pression de contact du pas courant, résolue sur u* avec les cellules à deux pressions du pas précédent
+            // (miroir de presolve_contact_stress)
+            if perc && sim.has_friction() {
+                v.push(face("k_face_tmp"));
+                v.push(cell("k_sk_stencil"));
+                coarsen(&mut v);
+                v.push(cell("k_sk_rhs"));
+                pcg(&mut v);
+                v.push(cell("k_sk_update"));
+                v.push(one("k_sk_pre_final"));
+            }
             if sim.has_friction() {
                 v.push(Op { k: "k_fr_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
             }
@@ -1637,40 +1668,37 @@ impl MultiphaseGpu {
             }
             v.push(Op { k: "k_fr_apply", wg: wuv, slot: 0 });
         }
-        // percolation : milieu poreux, pression de contact, conductances de Darcy (Ergun sur la pression du pas précédent)
+        // percolation : milieu poreux, contacts, conductances de Darcy (Ergun sur la pression du pas précédent), puis cellules qui
+        // entrent dans un lit perméable ou en sortent (miroir de skeleton_transitions, aussi sans percolation : les lits en sortent)
         if perc {
             let vert = sim.gravity[1].abs() >= sim.gravity[0].abs();
             v.push(cell("k_dc_cell"));
             v.push(Op { k: "k_dc_ps", wg: wg(if vert { nx } else { ny }), slot: 0 });
             v.push(face("k_dc_faces"));
         }
+        if perc || sim.has_granular() {
+            v.push(cell("k_sk_mark"));
+        }
         v.push(cell("k_save_p"));
-        let last = self.levels.len() - 1;
-        for _ in 0..self.newton_budget {
+        for nit in 0..self.newton_budget {
             v.push(cell("k_closure"));
             v.push(cell("k_stencil"));
-            for l in 0..last {
-                let (a, b) = self.levels[l + 1];
-                v.push(Op { k: "k_mg_coarsen_links", wg: wg(a * b), slot: self.slot(l, 0) });
-                v.push(Op { k: "k_mg_coarsen_diag", wg: wg(a * b), slot: self.slot(l + 1, 0) });
-            }
+            coarsen(&mut v);
             v.push(face("k_face_tmp"));
             v.push(cell("k_rhs"));
-            v.push(cell("k_pcg_init"));
-            v.push(one("k_pcg_bb"));
-            self.vcycle(&mut v);
-            v.push(cell("k_pcg_rz"));
-            v.push(cell("k_pcg_p0"));
-            for it in 0..self.pcg_budget {
-                let sl = self.slot(it % 2, 0);
-                v.push(cell("k_pcg_apply"));
-                v.push(Op { k: "k_pcg_update", wg: wn, slot: sl });
-                v.push(one("k_pcg_rr"));
-                self.vcycle(&mut v);
-                v.push(cell("k_pcg_rz"));
-                v.push(Op { k: "k_pcg_dir", wg: wn, slot: sl });
-            }
+            pcg(&mut v);
             v.push(cell("k_p_update"));
+            v.push(one("k_newton_dp"));
+            // squelette des lits perméables, après la première itération (miroir de solve_skeleton) : pression de contact σ'
+            if nit == 0 && perc {
+                v.push(face("k_face_tmp"));
+                v.push(cell("k_sk_stencil"));
+                coarsen(&mut v);
+                v.push(cell("k_sk_rhs"));
+                pcg(&mut v);
+                v.push(cell("k_sk_update"));
+                v.push(one("k_sk_final"));
+            }
             v.push(one("k_newton_check"));
         }
         v.push(face("k_face_final"));
@@ -1710,6 +1738,7 @@ impl MultiphaseGpu {
     /// Un pas complet sur le GPU, protégé comme `MultiphaseSim::step` (retour arrière + dt/4, jusqu'à 5 fois). Met à jour le temps,
     /// les compteurs et les diagnostics scalaires de `sim` ; les champs de `sim` ne sont relus que par `ensure_host` / `download`.
     pub fn step(&mut self, sim: &mut MultiphaseSim) -> f64 {
+        let _io = gpu_io();
         trace("step");
         if sim.diverged {
             return 0.0;
@@ -1819,6 +1848,7 @@ impl MultiphaseGpu {
     /// instantané ni contrôle ; l'état GPU est alors celui du milieu du pas (à relire par `download`).
     #[cfg(test)]
     pub(crate) fn debug_partial_step(&mut self, sim: &MultiphaseSim, stop: &str, occ: usize) {
+        let _io = gpu_io();
         let p = self.params(sim, sim.dt_max);
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
         let ops = self.plan_step(sim);
@@ -1843,6 +1873,7 @@ impl MultiphaseGpu {
     /// Diagnostic : relit la tranche `name` du tampon d'état S (tous les champs, persistants ou de travail)
     #[cfg(test)]
     pub(crate) fn debug_read_slice(&self, name: &str) -> Vec<f32> {
+        let _io = gpu_io();
         let (off, len) = self.sl.map[name];
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("debug slice"),
@@ -1861,6 +1892,7 @@ impl MultiphaseGpu {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_raw_step(&mut self, sim: &mut MultiphaseSim, dt_cap: f64, relax_scale: f64) -> (bool, f64) {
+        let _io = gpu_io();
         self.relax_scale = relax_scale;
         let p = self.params(sim, dt_cap);
         self.relax_scale = 1.0;
@@ -1893,6 +1925,7 @@ impl MultiphaseGpu {
     /// Diagnostic : exécute le plan d'un pas noyau par noyau en attendant la fin de chacun (repère un noyau fautif).
     #[cfg(test)]
     pub(crate) fn debug_step_one_by_one(&mut self, sim: &MultiphaseSim) {
+        let _io = gpu_io();
         let p = self.params(sim, sim.dt_max);
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&p));
         let ops = self.plan_step(sim);
@@ -1910,6 +1943,7 @@ impl MultiphaseGpu {
     /// invalide ou manque de budget, la série est annulée puis refaite pas à pas avec `step` (retours arrière compris). Retourne le
     /// temps simulé avancé (0 si la simulation a divergé).
     pub fn step_batch(&mut self, sim: &mut MultiphaseSim, k: usize) -> f64 {
+        let _io = gpu_io();
         trace(&format!("step_batch {k}"));
         if k <= 1 || sim.diverged {
             return self.step(sim);
@@ -2010,6 +2044,7 @@ impl MultiphaseGpu {
     // ================================================================ rendu
     /// Rend l'image (mêmes couleurs que `mp_view::render_rgba`) sur le GPU et la relit dans `out` (nx·ny·4 octets, ligne 0 = haut).
     pub fn render(&mut self, sim: &MultiphaseSim, o: &super::mp_view::RenderOpts, out: &mut Vec<u8>) {
+        let _io = gpu_io();
         trace(&format!("render {:?}", o.display));
         use super::mp_view::MpDisplay as M;
         let n = self.nx * self.ny;
@@ -2058,6 +2093,7 @@ impl Drop for MultiphaseGpu {
     /// solveurs créés, avancés puis détruits : 82 → 440 Mo réservés et 439 → 2085 Mo partagés, même en détruisant tampons et
     /// périphérique ; puis « Not enough memory left » à la création d'un tampon, ou arrêt net du processus (code 0xc0000409)
     fn drop(&mut self) {
+        let _io = gpu_io();
         trace("drop");
         self.device.poll(wgpu::Maintain::Wait);
         for b in [
@@ -2087,6 +2123,32 @@ struct SharedGpu {
 static SHARED_GPU: std::sync::Mutex<Option<Arc<SharedGpu>>> = std::sync::Mutex::new(None);
 /// une création de solveur à la fois : les portées d'erreur (compilation, initialisation) sont celles du périphérique partagé
 static GPU_CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Accès au périphérique partagé : un fil à la fois (envois, soumissions, attentes, relectures d'un solveur). Plusieurs solveurs
+/// utilisés depuis des fils différents (tests en parallèle : tests GPU et fenêtre en GPU) se bloquaient parfois tous ensemble pour
+/// toujours, sans calcul (attente du périphérique dans `poll(Wait)` / relecture, suite complète figée deux fois sur dix tests GPU). Un
+/// seul solveur dans l'application : aucun coût. Réentrant (un pas qui relit l'état ne se bloque pas lui-même).
+static GPU_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    static GPU_IO_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// jeton d'accès au périphérique partagé (voir `GPU_IO`) ; rendu à sa disparition
+struct GpuIo {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+impl Drop for GpuIo {
+    fn drop(&mut self) {
+        GPU_IO_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+fn gpu_io() -> GpuIo {
+    let depth = GPU_IO_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    GpuIo { _guard: if depth == 0 { Some(GPU_IO.lock().unwrap_or_else(|e| e.into_inner())) } else { None } }
+}
 
 fn shared_gpu() -> Result<Arc<SharedGpu>, String> {
     let mut g = SHARED_GPU.lock().unwrap_or_else(|e| e.into_inner());

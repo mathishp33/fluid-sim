@@ -6,10 +6,10 @@
 //! la contrainte de cisaillement vaut tan φ · p_s dès que le matériau s'écoule (|D| ≫ δ), le matériau est quasi rigide sous ce seuil.
 //! |D| = √(½ D:D). Cellules concernées : tassées, ou partiellement remplies posées sur une cellule tassée (surface d'un tas), au prorata
 //! α_s / α_max. Pression de contact p_s : pression du mélange moins celle du fluide des pores (comme Lagrée, Staron & Popinet 2011 avec
-//! la pression incompressible) — contrainte moyenne, nulle au bord libre ; le poids des grains au-dessus rendrait le sable cohésif. Le
-//! fluide des pores est hydrostatique depuis le haut du massif ; un fluide qui traverse le lit (percolation) y ajoute sa traînée
-//! cumulée D, deux fois : la pression du mélange la contient (le fluide des pores est à p_hydro + D) et elle décharge les contacts
-//! d'autant (le fluide porte une part du poids) — à la vitesse minimale de fluidisation, plus de frottement.
+//! la pression incompressible) — contrainte moyenne, nulle au bord libre ; le poids des grains au-dessus rendrait le sable cohésif.
+//! Lits perméables (deux pressions, mp_percolation.rs) : p_s = σ', multiplicateur du squelette incompressible, déchargée de la part du
+//! poids que porte le fluide qui traverse le lit (à la vitesse minimale de fluidisation, plus de frottement). Lits étanches : fluide des
+//! pores hydrostatique depuis le haut du massif.
 //! |D| est celui du pas précédent (des itérations de Picard avec |D| de la vitesse résolue ont été essayées : aucun effet mesurable,
 //! coût ×3). Non-glissement contre les parois ET les obstacles solides (le sable tient sur une étagère) ; chaleur de frottement
 //! Φ = τ : D rendue aux grains.
@@ -237,16 +237,15 @@ impl MultiphaseSim {
                 }
             });
         }
-        // pression de contact p_s = pression du mélange (pas précédent : contrainte MOYENNE, nulle au bord libre d'une falaise) moins
-        // celle du fluide des pores (hydrostatique depuis le haut du massif, plus la traînée de percolation cumulée), le long de la
-        // gravité (axe dominant)
-        let drag = self.percolation_drag();
+        // pression de contact p_s (pas précédent) : lits perméables, σ' de la projection ; lits étanches, pression du mélange (contrainte
+        // MOYENNE, nulle au bord libre d'une falaise) moins celle du fluide des pores (hydrostatique depuis le haut du massif), le long
+        // de la gravité (axe dominant)
         let (lines, len) = if vertical { (nx, ny) } else { (ny, nx) };
         let psp = SyncPtr(g.ps.as_mut_ptr());
-        let (frac, rhof, w, drag) = (&g.frac, &rhof, &w, &drag);
+        let (frac, rhof, w) = (&g.frac, &rhof, &w);
+        let two_p = self.skel.len() == n && self.sigma.len() == n;
         for_rows(lines, len, MIN_HEAVY, |l| {
             let mut pf = f64::NAN;
-            let mut dacc = 0.0;
             let mut prev: Option<usize> = None;
             for t in 0..len {
                 let s_ = if down { len - 1 - t } else { t };
@@ -258,12 +257,11 @@ impl MultiphaseSim {
                 }
                 if pf.is_nan() {
                     pf = match prev { Some(q) => self.p[q] + 0.5 * (rhof[q] + rhof[c]) * gn * dx, None => self.p[c] - 0.5 * w[c] };
-                    dacc = 0.0;
                 } else if let Some(q) = prev {
                     pf += 0.5 * (rhof[q] + rhof[c]) * gn * dx;
                 }
-                unsafe { *psp.at(c) = (self.p[c] - pf - 2.0 * (dacc + 0.5 * drag[c])).max(0.0) };
-                dacc += drag[c];
+                let ps = if two_p && self.skel[c] { self.sigma[c] } else { self.p[c] - pf };
+                unsafe { *psp.at(c) = ps.max(0.0) };
                 prev = Some(c);
             }
         });
@@ -321,6 +319,10 @@ impl MultiphaseSim {
             return 0;
         }
         let friction = self.has_friction();
+        // lits perméables : pression de contact du pas courant (voir `presolve_contact_stress`), dont dépendent p_s et u_f
+        if friction && self.percolation {
+            self.presolve_contact_stress(us, vs, dt);
+        }
         let geom = self.friction_geometry();
         let mg = if friction { self.friction_mu(&geom, &self.u, &self.v, dt) } else { vec![0.0; self.nx * self.ny] };
         let mi = self.implicit_fluid_mu(dt);
@@ -358,8 +360,9 @@ impl MultiphaseSim {
                 }
             }
         }
-        // vitesse qui équilibre déjà la pression du pas précédent : u_f = u* − dt ∇pⁿ / ρ_f ; faces fixes (parois, solides) à 0 — u* y
-        // porte encore dt·g (la projection les annule), qui fausserait le cisaillement de la couche voisine (et la chaleur de frottement)
+        // vitesse qui équilibre déjà la pression du pas précédent : u_f = u* − dt ∇pⁿ / ρ_f (pression du mélange : p + σ' dans les lits
+        // perméables) ; faces fixes (parois, solides) à 0 — u* y porte encore dt·g (la projection les annule), qui fausserait le
+        // cisaillement de la couche voisine (et la chaleur de frottement)
         let mut uf = us.to_vec();
         let mut vf = vs.to_vec();
         for j in 0..ny {
@@ -383,7 +386,8 @@ impl MultiphaseSim {
             }
         }
         {
-            let p = &self.p;
+            let pt: Vec<f64> = if self.sigma.len() == self.p.len() { self.p.iter().zip(&self.sigma).map(|(a, b)| a + b).collect() } else { self.p.clone() };
+            let p = &pt;
             for j in 0..ny {
                 for i in 1..nx {
                     let f = j * (nx + 1) + i;
@@ -792,7 +796,12 @@ pub(crate) mod tests {
                 let up = c + s.nx < s.nx * s.ny && s.alpha[k][c + s.nx] > 0.3;
                 eprintln!("   |u| médiane {:.2e}, 90 % {:.2e}, max {mx:.2e} en ({}, {}) α {:.2} (cellule de sable au-dessus : {up})", v[v.len() / 2].0, v[v.len() * 9 / 10].0, c % s.nx, c / s.nx, s.alpha[k][c]);
             }
-            eprintln!("θ = {theta}° : angle {a0:.1}° → {a1:.1}°, écart de hauteur max {:.2} mm, |u| max dans le sable {um:.2e} m/s", dh * 1e3);
+            // sable de 0.3 mm dans l'air : lit perméable, ses cellules tassées sont à deux pressions (pression de contact résolue)
+            let packed: Vec<usize> = (0..s.nx * s.ny).filter(|&c| s.alpha[k][c] > 0.55).collect();
+            let two_p = packed.iter().filter(|&&c| s.skel[c]).count() as f64 / packed.len().max(1) as f64;
+            eprintln!("θ = {theta}° : angle {a0:.1}° → {a1:.1}°, écart de hauteur max {:.2} mm, |u| max dans le sable {um:.2e} m/s, cellules tassées à deux pressions {:.0} %",
+                dh * 1e3, 100.0 * two_p);
+            assert!(two_p > 0.9, "tas étanche : {two_p}");
             (a1, dh, um)
         };
         let (_, dh, um) = run(20.0, 1.0);
@@ -937,13 +946,16 @@ pub(crate) mod tests {
         assert!(!s.diverged && s.state_is_sane());
         let a = flank_angle(&s);
         eprintln!("scénario colonne de sable : flancs à {a:.1}° après {} pas", s.step_count);
-        assert!(a > 15.0 && a < 40.0, "flancs à {a}°");
+        // colonne 6 fois plus haute que sa demi-largeur : dépôt de pente moyenne ~16° (Lube et al. 2005), sans frottement ~3°
+        assert!(a > 10.0 && a < 40.0, "flancs à {a}°");
     }
 
     #[test]
     fn a_sand_column_collapses_into_a_pile_at_the_angle_of_repose() {
-        // colonne de 4 cm × 8 cm de sable sec (φ = 32°) dans 30 × 15 cm d'air : avec frottement, un tas aux flancs proches de φ ;
-        // sans frottement, une nappe presque plate
+        // colonne de 4 cm × 8 cm de sable sec (φ = 32°) dans 30 × 15 cm d'air : avec frottement, un tas ; sans frottement, une nappe
+        // presque plate. Chaque moitié s'effondre comme une colonne 2D de largeur L = 2 cm et de rapport a = H/L = 4 : expériences de
+        // Lube et al. (2005), hauteur finale H_f = L a^0.4 (3.5 cm) et avancée ΔL = 1.9 L a^(2/3) (9.6 cm) — dépôt de pente moyenne
+        // ~17°, bien moins raide que φ (l'élan de l'effondrement)
         let run = |phi: f64| {
             let mut s = sand_column(60, 30, 0.005, 0.04, 0.08, phi);
             let m0 = s.total_mass(1);
@@ -961,8 +973,10 @@ pub(crate) mod tests {
         };
         let (a0, h0) = run(0.0);
         let (a1, h1) = run(32.0);
+        let hf = 0.02 * 4.0f64.powf(0.4);
         assert!(a0 < 10.0, "sans frottement le sable doit s'étaler : {a0}°");
-        assert!(a1 > 20.0 && a1 < 40.0, "angle du tas {a1}° (φ = 32°)");
+        assert!(a1 > 14.0 && a1 < 30.0, "angle du tas {a1}° (φ = 32°, ~17° attendus)");
+        assert!((h1 / hf - 1.0).abs() < 0.3, "hauteur du tas {h1} m (Lube : {hf} m)");
         assert!(h1 > 1.5 * h0, "le tas doit rester plus haut qu'une nappe : {h1} vs {h0}");
     }
 }

@@ -104,34 +104,6 @@ impl MultiphaseSim {
         for f in vs.iter_mut() {
             *f += dt * self.gravity[1];
         }
-        // fluidisation : la part de la traînée de percolation que les contacts transmettent à l'appui (mp_percolation.rs)
-        if self.percolation && self.has_granular() {
-            let fc = self.fluidization_force();
-            if fc.iter().any(|&f| f != 0.0) {
-                let gn = (self.gravity[0].powi(2) + self.gravity[1].powi(2)).sqrt();
-                let vertical = self.gravity[1].abs() >= self.gravity[0].abs();
-                let sg = if vertical { self.gravity[1].signum() } else { self.gravity[0].signum() };
-                if gn > 0.0 && vertical {
-                    for j in 1..ny {
-                        for i in 0..nx {
-                            let (a, b) = (self.idx(i, j - 1), self.idx(i, j));
-                            if !self.is_solid(a) && !self.is_solid(b) && (fc[a] != 0.0 || fc[b] != 0.0) {
-                                vs[j * nx + i] += sg * dt * 0.5 * (fc[a] + fc[b]) / self.face_rho_y(i, j);
-                            }
-                        }
-                    }
-                } else if gn > 0.0 {
-                    for j in 0..ny {
-                        for i in 1..nx {
-                            let (a, b) = (self.idx(i - 1, j), self.idx(i, j));
-                            if !self.is_solid(a) && !self.is_solid(b) && (fc[a] != 0.0 || fc[b] != 0.0) {
-                                us[j * (nx + 1) + i] += sg * dt * 0.5 * (fc[a] + fc[b]) / self.face_rho_x(i, j);
-                            }
-                        }
-                    }
-                }
-            }
-        }
         // accélérateurs (cellules spéciales)
         self.add_accelerators(dt, us, vs);
         // tension de surface (CSF équilibré) : a = σ κ ∇ℓ / ρ_f

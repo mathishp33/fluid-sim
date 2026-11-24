@@ -56,7 +56,8 @@ Sans friction, un tas s'étale comme un liquide lourd (sable tassé + air : ρ �
   prorata α_s / α_max — sans cela la surface d'un tas s'écoule comme un liquide et le tas finit à plat ;
 - **pression de contact p_s = pression du mélange (contrainte moyenne) − pression du fluide des pores** (hydrostatique depuis le haut
   du massif ; dans l'eau : poids déjaugé). Le poids des grains au-dessus (contrainte verticale) avait été essayé d'abord : il rend le
-  sable cohésif — une falaise verticale tient dès que tan φ > ½ (colonne figée à 68°) ;
+  sable cohésif — une falaise verticale tient dès que tan φ > ½ (colonne figée à 68°). Dans un lit perméable (deux pressions, § 6),
+  p_s = σ', résolue sur la vitesse prédite juste avant le frottement ;
 - implicite : (ρ_f/dt)(u − u_f) = ∇·[μ(∇u + ∇uᵀ)], gradient conjugué préconditionné (Jacobi), 40–150 itérations ; u_f = u* − dt∇pⁿ/ρ
   (le frottement équilibre la force NETTE, sinon un tas au repos glisse d'un dt·g par pas), faces fixes (parois, solides) mises à 0 —
   u* y porte encore dt·g, annulé par la projection : ce défaut cisaillait à tort la couche du fond et faisait fluer les tas ;
@@ -73,7 +74,9 @@ Sans friction, un tas s'étale comme un liquide lourd (sable tassé + air : ρ �
 
 Validation (φ = 32°) : colonne 4 × 8 cm → tas aux flancs de 21.4° (inertie : un dépôt d'effondrement est sous l'angle de talus),
 hauteur 0.42 H₀ ; sans frottement : nappe à 5°. Tas à 20° : tient (|u| < 1e-4 m/s). Tas à 50° : **avalanche, 29.8° en 0.35 s**, puis
-immobile. Étagère d'acier : 90 % du sable d'une colonne y reste. GPU : mêmes formules, accord d'un pas 3e-7 (masses), tas 21.7°,
+immobile. Étagère d'acier : 90 % du sable d'une colonne y reste. Depuis les deux pressions (sable de 0.3 mm perméable dans l'air, § 6) :
+colonne → flancs à 17°, hauteur 3.0 cm (Lube et al. 2005 : 3.5 cm, pente moyenne ~17° pour ce rapport 4), tas à 50° → 28.9°, étagère
+85 %. GPU : mêmes formules, accord d'un pas 3e-7 (masses), tas 21.7°,
 étagère 90.3 % des deux côtés, tourbillon visqueux identique.
 
 ## 6. Réactions hétérogènes et percolation (étape 4, en partie faite : charbon, feu sur grille)
@@ -88,36 +91,51 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   C + CO2 → 2 CO (endothermique, Ea = 250 kJ/mol, 1e5 fois plus lent que C–O2 à 1073 K) dans la zone chaude privée d'oxygène ; le CO
   brûle dans le gaz (CO + ½O2 ⇌ CO2, catalysé par l'humidité de l'air).
 - **percolation** (`mp_percolation.rs`, `mp_gpu/percolation.wgsl`) : le fluide traverse les pores des lits de grains EN CONTACT (tassés
-  ou posés sur un appui) de 1 mm et plus et les grilles, loi d'Ergun (Kozeny–Carman K = d² ε³ / (150 (1 − ε)²) + terme inertiel),
-  moteur −∇(p − p_s) + ρ_f g avec p_s = poids lithostatique des grains (au repos : rien ne coule). Résolue DANS la projection (conductance
-  C/dx² ajoutée au système de pression, ∇·q au second membre ; un flux explicite serait instable, D ~ 500 m²/s), puis transport du fluide
-  seul au pas suivant ; fermeture et travail de pression comptent ∇·(u + q). Validé : air soufflé à 0.3 m/s sous un lit de morceaux de
-  1 cm → 0.298 m/s à travers le lit, perte de charge 222.1 Pa/m (Ergun 222.0), lit immobile ; lit au repos : |q| < 2e-5 m/s ; GPU
-  identique (0.2978 m/s, 1016.07 Pa). Les lits de grains de moins de 1 mm (sable, poudres : K < 1e-9 m², rien ne passe) sont traités comme
-  étanches : la percolation y alignerait la pression sur le poids vertical des grains, ce qui raidit le frottement (un tas de sable à 50°
-  s'arrêtait à 42° au lieu de 30°).
-- **fluidisation** (lits de grains de 1 mm et plus) : la traînée du fluide qui traverse un lit posé sur un appui passe par les contacts
-  des grains jusqu'à l'appui, dans la limite du poids déjaugé du lit. La pression du mélange porte déjà tout le poids (p_s
-  lithostatique de la percolation) : une force rend au mélange la part de traînée que les contacts reprennent
-  (`fluidization_force`, f = [min(D + F, L + w) − min(D, L)] / dx, cumuls depuis le haut de la colonne). Un lit soufflé où le fluide
-  porte plus de 1 % du poids sans le dépasser est RETENU par son appui (`hold_faces` : faces fermées au mélange, comme une grille —
-  bloc poreux immobile ; la force seule, calculée sur la traînée du pas précédent, laissait la poussée d'un changement de débit le
-  soulever sans que rien ne l'y ramène). Le frottement voit la pression de contact déchargée de la traînée cumulée D (deux fois :
-  le fluide des pores est à p_hydro + D, et il porte autant de poids). Au-delà du poids — vitesse minimale de fluidisation d'Ergun —
-  les contacts ne portent plus rien : le lit est libéré et se soulève ; une cellule tassée décollée de son appui n'est ni poreuse ni
-  porteuse (perméable, la percolation y laissait le mélange se resserrer sans limite, α jusqu'à 1). Validé (sable de 2 mm dans l'air,
-  U_mf = 1.08 m/s) : à 0.5 et 0.9 m/s, lit immobile, perte de charge d'Ergun à 2 % (841 Pa pour 854, 2257 pour 2230), pression de
-  contact au fond = poids − traînée (2073 Pa pour 2074 ; poids seul 2884) ; à 0.85 U_mf le sable ne bouge pas (0.2 mm), à 1.11 U_mf il
-  monte de 4 cm en 0.5 s ; cuve large à 1.3 U_mf : le lit bouillonne, tout le sable reste dans la cuve. GPU : un pas à 1.5e-7, même
-  perte de charge du lit retenu (2300 Pa), lit fluidisé qui monte des deux côtés. Scénario « Lit fluidisé (sable grossier soufflé par
-  une grille) ». Limites : juste sous U_mf (0.93 U_mf), la surface du lit bouillonne déjà (l'écoulement se concentre là où le lit est
-  le plus lâche) ; fluidisé, le lit gonfle trop (×2 au lieu de ~×1.2) et s'agite trop (4–6 m/s, même à 1.11 U_mf) — une seule
-  vitesse par cellule : les paquets denses décollés, étanches, sont poussés comme des pistons (essayés sans effet notable : place des
-  receveuses de la sédimentation comptée sur le bilan des cellules, viscosité de la phase dense jusqu'à 2 Pa·s ; il faut deux
-  vitesses, gaz et grains) ; dans une colonne étroite, le lit monte en bouchons (pistonnage) qui peuvent sortir par le haut. Les lits
-  de grains de moins de 1 mm restent étanches : dans l'air, ils sont si perméables à l'échelle d'un pas (K/μ ≫ dt/ρ) que la percolation
-  impose sa pression au mélange, qui perd sa contrainte moyenne (le sable redevient « cohésif ») ; il faudrait une pression des pores à
-  part (deux pressions, modèle de Biot).
+  ou posés sur un appui) assez perméables — mobilité de Darcy K/μ ≥ 5e-7 m²/(Pa·s) (`PERC_KMU_MIN` : dans l'air, grains de 0.1 mm et
+  plus ; dans l'eau, de 0.6 mm et plus ; en dessous, poudres fines, le lit est étanche) — et les grilles, loi d'Ergun (Kozeny–Carman
+  K = d² ε³ / (150 (1 − ε)²) + terme inertiel), moteur −∇p + ρ_f g sur la pression du FLUIDE des pores (deux pressions, ci-dessous).
+  Résolue DANS la projection (conductance C/dx² ajoutée au système de pression, ∇·q au second membre ; un flux explicite serait instable,
+  D ~ 500 m²/s), puis transport du fluide seul au pas suivant ; fermeture et travail de pression comptent ∇·(u + q). Une cellule de grains
+  dense NON poreuse (paquet décollé de son appui) est close au fluide des pores (`SEAL_GAP`) : sinon l'air en sortait par la face d'une
+  voisine poreuse et rien n'arrêtait son tassement (α_s jusqu'à 1, 3e8 Pa sur l'effondrement sans frottement d'une colonne de sable).
+  Validé : air soufflé à 0.3 m/s sous un lit de morceaux de 1 cm → 0.3000 m/s à travers le lit, perte de charge 223.7 Pa/m (Ergun 223.7),
+  lit immobile ; lit au repos (grains de 1 cm ou de 0.3 mm) : |q| < 1e-9 m/s ; GPU identique.
+- **deux pressions** (lits perméables : cellules `skel`, `MultiphaseSim::sigma` ; `solve_skeleton`, `k_sk_*` sur le GPU) : dans les
+  cellules poreuses TASSÉES (α_s ≥ α_max − 0.1), p est la pression du fluide des pores (fermeture, thermodynamique, Ergun) et σ' ≥ 0 la
+  pression de CONTACT des grains (contrainte effective de Terzaghi) ; le mélange est poussé par p + σ'. σ' est le multiplicateur d'un
+  squelette incompressible (∇·u = 0 dans le lit) : système de Poisson SPD sur les faces du mélange, Dirichlet δσ' = 0 vers les cellules à
+  une pression, résolu après la première itération de Newton de la projection et relâché à 0 s'il devient négatif (le lit se décolle :
+  fluidisation) — et une première fois AVANT le frottement, sur la vitesse prédite (`presolve_contact_stress`) : le frottement (§ 5, qui
+  prend p_s = σ') voit ainsi le σ' des charges du moment. Avec celui du pas précédent, sa viscosité retirait l'écart de σ' avant que la
+  projection ne le corrige, et le lit restait figé dans son état passé : 70 % de contact de trop dans un lit soufflé par de l'eau, σ'
+  accumulé jusqu'à 2e4 Pa au fond d'un lit de braises de 750 Pa de poids. Cellules qui entrent dans le lit : σ' = poids lithostatique
+  au-dessus, retiré de p ; qui en sortent : σ' rendu à p (pression du mélange inchangée). État initial (`init_contact_stress`) : σ'
+  lithostatique, et sous un lit posé sur une grille le gaz est déchargé de son poids (sans cela, 600 Pa de trop sous la grille du braséro
+  soufflaient le lit au premier pas — les scénarios posent leur grille avant l'initialisation). Les cellules de SURFACE (partiellement
+  remplies, posées sur le lit) restent poreuses mais à une seule pression, celle du mélange : dans la loi d'Ergun, leur fluide est à
+  p − p_s (sinon le poids de leurs grains poussait 2 cm/s d'air dans un tas de sable de 0.3 mm, qui coulait à 0.5 m/s). À deux pressions
+  jusqu'à 0.01 % de grains, la détente des gaz d'une flamme juste au-dessus d'un lit de braises (∇·u ~ 1000 /s) y devenait une pression
+  de contact de 1e7 Pa (pas de 2e-5 s). Pas de dilatation d'un squelette tassé au-delà de α_max : le frottement l'empêche, et σ'
+  accumulait d'un pas à l'autre l'impulsion qui la relançait (surtassement mesuré sans elle : 3e-5 sur 1 s de tas).
+  Validé : lit au repos, contact = poids au-dessus (1523 Pa pour 1523, grains de 1 cm ou de 0.3 mm) ; sable de 0.3 mm dans l'air (U_mf
+  d'Ergun 8.9 cm/s) soufflé à 0.5 U_mf : perte de charge d'Ergun à 1 % (1507 Pa pour 1495), contact = poids − traînée à 1 % (1454 pour
+  1466), lit immobile ; à 1.4 U_mf : contacts à 0, le lit gonfle (centre de masse +7.5 mm en 1 s ; Kozeny : ~7 mm à l'équilibre) ; sable
+  de 2 mm dans l'eau (U_mf 2.4 cm/s) à 0.84 U_mf, entrée montée en 0.2 s : perte de charge à 0.5 %, contact 419 Pa pour 411 (le fluide
+  porte 77 % du poids) ; sable de 2 mm dans l'air à 0.5 et 0.9 m/s : 2073 Pa pour 2074, 732 pour 768. Tas de sable de 0.3 mm : à 20°, il
+  tient (|u| < 1e-4 m/s, toutes ses cellules tassées à deux pressions ; sous le sommet, le contact est moindre que le poids — la voûte
+  des tas) ; à 50°, avalanche jusqu'à 28.9° ; colonne de 4 × 8 cm (φ = 32°) : tas de 3.0 cm aux flancs à 17° (expériences de Lube et al.
+  2005 pour ce rapport 4 : hauteur 3.5 cm, pente moyenne ~17° — l'élan étale le dépôt ; 21° avant les deux pressions, où le frottement
+  amortissait aussi la divergence fictive de la vitesse prédite) ; 85 % du sable d'une colonne reste sur une étagère (90 % avant).
+  GPU : accord d'un pas à 1.5e-7 près (masses), 5e-3 Pa sur p et σ' ; lit retenu à 0.9 m/s, même perte de charge (2272 Pa) et sable
+  immobile ; fluidisé à 1.2 m/s, il monte de 67.6 mm (CPU) et 68.4 mm (GPU) en 0.3 s.
+- **fluidisation** : avec les deux pressions, le fluide qui traverse un lit posé sur un appui en porte une part du poids (gradient de p) et
+  σ' en est déchargé ; à la vitesse minimale de fluidisation d'Ergun, σ' = 0 : les contacts ne portent plus rien, le lit se soulève (avant :
+  force de décharge rendue au mélange et lit retenu par son appui, `fluidization_force`, `hold_faces`, retirés). Validé (sable de 2 mm
+  dans l'air, U_mf = 1.08 m/s) : à 0.85 U_mf le sable ne bouge pas (0.03 mm), à 1.11 U_mf il monte de 5 cm en 0.5 s ; cuve large à
+  1.3 U_mf : le lit bouillonne, tout le sable reste dans la cuve ; sable de 0.3 mm : voir ci-dessus. Scénario « Lit fluidisé (sable
+  grossier soufflé par une grille) ». Limites : fluidisé, le lit gonfle trop (haut du lit de la rangée 17 à 45 dans la cuve large) et
+  s'agite trop — une seule vitesse par cellule, les paquets denses décollés sont poussés comme des pistons (il faudrait deux vitesses,
+  gaz et grains) ; dans une colonne étroite, le lit monte en bouchons.
 - **grille** (cellule spéciale `MpEffect::Grille`, « Grille » dans les cellules) : arrête les grains (le tas y repose, comme sur un
   solide : non-glissement, faces fermées au mélange), laisse passer le fluide par percolation (trous, fraction ouverte).
 - scénario « Feu de charbon sur grille (braséro) » : charbon en morceaux de 1.2 cm sur une grille entre deux parois, lit de 0.25 ly
@@ -146,8 +164,12 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - braséro avec houille (feu établi) : braises sur les 60 % du bas du lit, houille en noix (3 cm) déjà chaude (700 K) sur les 40 % du
   haut, flamme d'allumage au-dessus du lit (gaz à 1600 K sur 4 cm), épaississement de flamme modéré comme le feu de bois. La houille
   dégaze à 0.83 %/s (la chaleur met ~2 min à gagner le cœur d'un morceau de 3 cm) ; ses matières volatiles sortent du lit sans oxygène
-  et brûlent en grande flamme au contact de l'air (2230 K à 40 × 40, sur 3 s) ; braises à 1450 K, tirage moyen 2.6e-3 m²/s ; carbone (charbon +
-  houille + CO + CO2 + CH4 + sorties) conservé à 1e-6. GPU : premier pas à 1e-7 près (masses) ; sur 1 s, houille dégazée à 0.04 %,
+  et brûlent en grande flamme au contact de l'air (vers 2100 K à 40 × 40) ; braises à 1450 K, tirage moyen 2.9e-3 m²/s ; carbone
+  (charbon + houille + CO + CO2 + CH4 + sorties) conservé à 1e-6. Mais la flamme ne s'accroche pas au lit : vers 1.3 s elle monte
+  jusqu'au haut du domaine et s'éteint (déjà avant les deux pressions, et aussi à pas plafonné) ; des poches de gaz y brûlent d'un coup
+  dans une maille (pointes de 2800 à 3800 K au pas de la borne des flammes, 4e-4 s ; 2190 K au plus à 1.4e-4 s). Le pas n'est plus
+  fixé par les traces de houille arrachées au lit par la flamme (α ~ 1e-9, noix de 3 cm qui y tombent à 90 m/s : pas de 5e-5 s ;
+  `SETTLE_TRACE`) : 6500 pas pour 2 s au lieu de 14600. GPU : premier pas à 1e-7 près (masses) ; sur 1 s, houille dégazée à 0.04 %,
   carbone passé dans le gaz à 0.2 %, CO2 formé à 0.3 %, flamme 2087 K (CPU 2102 K). Une charge FROIDE (293 K) fume : ses gaz,
   refroidis en traversant la charge, sortent sous le seuil d'allumage, l'oxygène des pores tombe à 0 en 1.3 s, le tirage s'annule.
   Corrigé au passage (GPU) : `k_pyrolysis` calculait 1 − e^(−ν k dt) en f32, qui n'a que 2 ou 3 chiffres justes pour k dt ~ 1e-5
@@ -199,8 +221,7 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
 - corrigé au passage (CPU) : l'inversion e → T d'un groupe (`temp_from_parts`) élevait au carré sa capacité ; pour une trace de 1e-165
   kg (poudre dispersée par le souffle jusqu'au bord du domaine), C² sortait de la plage f64, le discriminant s'annulait et T valait
   298 − c/s = −802 K : pas refusés en cascade. Forme adimensionnée, celle de `tau_from` sur le GPU (qui avait le même défaut en f32).
-- reste : fluidisation (la pression de contact lithostatique ne baisse pas sous un soufflage vers le haut), séchage du bois, allumage
-  d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), inertie propre des grains
+- reste : séchage du bois, allumage d'une charge froide (il faudrait une cheminée, ou moins de bois, pour que le tirage nourrisse les braises), inertie propre des grains
   (le souffle d'une poudre emporte ses grains), délai d'allumage d'un grain dans un gaz chaud.
 
 ## 7. Solidification (étape 5, faite : eau ↔ glace, surfusion, cire, lave)

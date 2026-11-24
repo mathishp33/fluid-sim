@@ -182,6 +182,9 @@ fn clone_sim(s: &MultiphaseSim) -> MultiphaseSim {
     c.v = s.v.clone();
     c.q_u = s.q_u.clone();
     c.q_v = s.q_v.clone();
+    // lits perméables : pression de contact et cellules à deux pressions (sans elles, p n'est plus que celle du fluide des pores)
+    c.sigma = s.sigma.clone();
+    c.skel = s.skel.clone();
     c.percolation = s.percolation;
     c.implicit_viscosity = s.implicit_viscosity;
     c.solid = s.solid.clone();
@@ -1948,8 +1951,7 @@ fn gpu_holds_and_fluidizes_a_blown_bed_like_the_cpu() {
     let y0 = sand_height(&mk(), 1);
     let Some((cpu, gs, _)) = compare("lit retenu", &mk, 0.5) else { return };
     let dp = |s: &MultiphaseSim| {
-        let ps = s.grain_overburden();
-        let pf = |j: usize| (2..s.nx - 2).map(|i| { let q = s.idx(i, j); s.p[q] - ps[q] }).sum::<f64>() / (s.nx - 4) as f64;
+        let pf = |j: usize| (2..s.nx - 2).map(|i| s.p[s.idx(i, j)]).sum::<f64>() / (s.nx - 4) as f64;
         pf(3) - pf(34)
     };
     eprintln!(" lit retenu : perte de charge CPU {:.0} GPU {:.0} Pa ; sable monté CPU {:.2} GPU {:.2} mm",
@@ -1980,5 +1982,46 @@ fn gpu_create_and_drop_many_solvers_diag() {
         if k % 10 == 0 {
             eprintln!("solveur GPU {k} créé, avancé et détruit");
         }
+    }
+}
+
+/// diagnostic : lit soufflé retenu (deux pressions), un pas CPU et un pas GPU depuis le même état (40 pas CPU) : écarts de p, σ', skel,
+/// vitesses et flux de Darcy
+#[test]
+#[ignore]
+fn gpu_blown_bed_step_diag() {
+    use super::mp_percolation::fluidization_tests::blown_sand_bed;
+    let warm: usize = std::env::var("MP_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let mut cpu = blown_sand_bed(12, 40, 20, 0.9).0;
+    for _ in 0..warm {
+        cpu.step();
+    }
+    let Some(mut g) = gpu_or_skip(&cpu) else { return };
+    let mut gs = clone_sim(&cpu);
+    g.upload(&gs);
+    cpu.step();
+    g.step(&mut gs);
+    g.download(&mut gs);
+    let n = cpu.nx * cpu.ny;
+    let mx = |a: &[f64], b: &[f64]| a.iter().zip(b).enumerate().map(|(i, (x, y))| ((x - y).abs(), i)).fold((0.0f64, 0usize), |m, v| if v.0 > m.0 { v } else { m });
+    let skd = (0..n).filter(|&c| cpu.skel[c] != gs.skel[c]).count();
+    let (dp, cp) = mx(&cpu.p, &gs.p);
+    let (ds, cs) = mx(&cpu.sigma, &gs.sigma);
+    let (dt_, ct) = mx(&cpu.temp, &gs.temp);
+    let (du, cu) = mx(&cpu.u, &gs.u);
+    let (dv, cv) = mx(&cpu.v, &gs.v);
+    let (dqv, cq) = mx(&cpu.q_v, &gs.q_v);
+    eprintln!("dt CPU {:.4e} GPU {:.4e} ; skel différents {skd}", cpu.last_dt, gs.last_dt);
+    eprintln!("|Δp| {dp:.3e} en {cp} ; |Δσ'| {ds:.3e} en {cs} ; |ΔT| {dt_:.3e} en {ct} ; |Δu| {du:.3e} en {cu} ; |Δv| {dv:.3e} en {cv} ; |Δq_v| {dqv:.3e} en {cq}");
+    let i = ct % cpu.nx;
+    for j in (0..8).rev() {
+        let c = cpu.idx(i, j);
+        eprintln!(" j {j} : p {:.3} / {:.3} ; σ' {:.3} / {:.3} ; T {:.4} / {:.4} ; v bas {:.4e} / {:.4e} ; q_v bas {:.4e} / {:.4e} ; skel {} / {} ; grille {}",
+            cpu.p[c], gs.p[c], cpu.sigma[c], gs.sigma[c], cpu.temp[c], gs.temp[c], cpu.v[cpu.vidx(i, j)], gs.v[gs.vidx(i, j)],
+            cpu.q_v[cpu.vidx(i, j)], gs.q_v[gs.vidx(i, j)], cpu.skel[c] as u8, gs.skel[c] as u8, cpu.is_grille(c) as u8);
+    }
+    for j in 0..3 {
+        let row: Vec<String> = (0..cpu.nx).map(|i| format!("{:+.3}", gs.temp[cpu.idx(i, j)] - cpu.temp[cpu.idx(i, j)])).collect();
+        eprintln!(" ΔT rangée {j} : {}", row.join(" "));
     }
 }

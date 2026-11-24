@@ -66,7 +66,7 @@ impl StepProfile {
 
 struct Snapshot {
     mass: Vec<Vec<f64>>, alpha: Vec<Vec<f64>>, e: Vec<f64>, temp: Vec<f64>, p: Vec<f64>, u: Vec<f64>, v: Vec<f64>,
-    q_u: Vec<f64>, q_v: Vec<f64>,
+    q_u: Vec<f64>, q_v: Vec<f64>, sigma: Vec<f64>, skel: Vec<bool>,
     eg: Vec<Vec<f64>>, tg: Vec<Vec<f64>>,
     rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>, frozen: Vec<f64>, fusion_front: Vec<Vec<f64>>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
@@ -176,7 +176,7 @@ impl MultiphaseSim {
             mass: self.mass.clone(), alpha: self.alpha.clone(), e: self.e.clone(), temp: self.temp.clone(), p: self.p.clone(),
             eg: self.eg.clone(), tg: self.tg.clone(),
             u: self.u.clone(), v: self.v.clone(), rho_mix: self.rho_mix.clone(), mu_cell: self.mu_cell.clone(), k_cell: self.k_cell.clone(),
-            q_u: self.q_u.clone(), q_v: self.q_v.clone(),
+            q_u: self.q_u.clone(), q_v: self.q_v.clone(), sigma: self.sigma.clone(), skel: self.skel.clone(),
             boundary_flux: self.boundary_flux.clone(), transferred: self.transferred.clone(), frozen: self.frozen.clone(), fusion_front: self.fusion_front.clone(),
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
             flame_factor: self.flame_factor.clone(), heat_release: self.heat_release.clone(), chem_heat: self.chem_heat,
@@ -191,7 +191,7 @@ impl MultiphaseSim {
         self.mass.clone_from(&s.mass); self.alpha.clone_from(&s.alpha); self.e.clone_from(&s.e); self.temp.clone_from(&s.temp);
         self.eg.clone_from(&s.eg); self.tg.clone_from(&s.tg);
         self.p.clone_from(&s.p); self.u.clone_from(&s.u); self.v.clone_from(&s.v); self.rho_mix.clone_from(&s.rho_mix);
-        self.q_u.clone_from(&s.q_u); self.q_v.clone_from(&s.q_v);
+        self.q_u.clone_from(&s.q_u); self.q_v.clone_from(&s.q_v); self.sigma.clone_from(&s.sigma); self.skel.clone_from(&s.skel);
         self.mu_cell.clone_from(&s.mu_cell); self.k_cell.clone_from(&s.k_cell);
         self.boundary_flux.clone_from(&s.boundary_flux); self.transferred.clone_from(&s.transferred); self.frozen.clone_from(&s.frozen); self.fusion_front.clone_from(&s.fusion_front);
         self.energy_input = s.energy_input; self.tp_mix.clone_from(&s.tp_mix);
@@ -427,7 +427,7 @@ impl MultiphaseSim {
         }
         eprintln!("{line}");
     }
-    fn face_speed(&self, c: usize) -> f64 {
+    pub(crate) fn face_speed(&self, c: usize) -> f64 {
         let (i, j) = (c % self.nx, c / self.nx);
         [self.u[self.uidx(i, j)], self.u[self.uidx(i + 1, j)], self.v[self.vidx(i, j)], self.v[self.vidx(i, j + 1)]].iter().fold(0.0f64, |a, &b| a.max(b.abs()))
     }

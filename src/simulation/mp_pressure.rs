@@ -8,6 +8,10 @@
 //! uⁿ⁺¹ = Ũ − dt/ρ_f ∇δp. Le terme acoustique κ/dt est implicite : le pas de temps n'est PAS limité par c ≈ 1480 m/s.
 //! Matrice SPD résolue par gradients conjugués préconditionnés par un V-cycle multigrille (`mp_mg`, défaut) ou par Cholesky incomplet
 //! IC(0) (`multigrid = false`, séquentiel, ~10× plus d'itérations).
+//! Lits perméables (mp_percolation.rs) : p y est la pression du fluide des pores, le mélange est poussé par p + σ' ; la pression de
+//! contact σ' (squelette des grains incompressible) est résolue après la première itération de Newton (`solve_skeleton`), les
+//! itérations suivantes rétablissant le volume (blocs de Gauss–Seidel p / σ'), et une première fois avant le frottement, sur la vitesse
+//! prédite (`presolve_contact_stress`).
 
 use super::mp_par::{for_ranges, for_rows, map_ranges, MIN_HEAVY, MIN_LIGHT};
 use super::multiphase::{Bc, MultiphaseSim, SyncPtr};
@@ -290,19 +294,23 @@ impl MultiphaseSim {
     /// Résout A x = b (PCG + IC(0)). Retourne le nombre d'itérations.
     fn pcg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
         if self.multigrid {
-            self.pcg_mg(st, b, x)
+            self.pcg_mg(st, b, x, None)
         } else {
             self.pcg_ic0(st, b, x)
         }
     }
 
-    /// Gradient conjugué préconditionné par multigrille (vecteurs et opérateur parallèles).
-    fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
+    /// Gradient conjugué préconditionné par multigrille (vecteurs et opérateur parallèles). `mask` : lignes actives (les autres sont
+    /// des lignes identité) ; défaut : cellules ni solides ni épinglées.
+    fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64], mask: Option<&[bool]>) -> usize {
         use super::mp_mg::{Level, Multigrid};
         use super::mp_par::{collect, dot, for_ranges, MIN_LIGHT};
         use super::multiphase::SyncPtr;
         let n = b.len();
-        let active: Vec<bool> = collect(n, MIN_LIGHT, |c| !(self.is_solid(c) || self.pinned(c)));
+        let active: Vec<bool> = match mask {
+            Some(m) => m.to_vec(),
+            None => collect(n, MIN_LIGHT, |c| !(self.is_solid(c) || self.pinned(c))),
+        };
         let fine = Level { nx: self.nx, ny: self.ny, diag: st.diag.clone(), ae: st.ae.clone(), an: st.an.clone(), active };
         let mut mg = Multigrid::new(fine);
         let mut r = vec![0.0; n];
@@ -454,6 +462,122 @@ impl MultiphaseSim {
         it
     }
 
+    /// Cellules qui entrent dans un lit perméable ou en sortent depuis la projection précédente (lit posé sur une grille, grains qui se
+    /// déposent, fluide des pores qui change…) : la pression de la cellule est partagée au mieux, la pression totale du mélange restant
+    /// la même. Entrée : σ' = poids déjaugé des grains au-dessus (colonne lithostatique), retiré de p (sans cela le poids passait aux
+    /// contacts au fil des pas, le lit tassé se posant entre-temps sur les parois : 75 % du poids porté par les contacts après 25 pas de
+    /// 10 ms dans un lit de grains de 0.3 mm) ; sortie : σ' rendue à p.
+    fn skeleton_transitions(&mut self, skel: &[bool]) {
+        let n = self.nx * self.ny;
+        if self.sigma.len() != n || self.skel.len() != n {
+            self.sigma = vec![0.0; n];
+            self.skel = vec![false; n];
+        }
+        let entering = (0..n).any(|c| skel[c] && !self.skel[c]);
+        let ps = if entering { self.grain_overburden() } else { vec![] };
+        for c in 0..n {
+            if skel[c] && !self.skel[c] {
+                self.sigma[c] = ps[c].max(0.0).min((self.p[c] - 2.0 * P_FLOOR).max(0.0));
+                self.p[c] -= self.sigma[c];
+            } else if !skel[c] && self.skel[c] {
+                self.p[c] += self.sigma[c];
+                self.sigma[c] = 0.0;
+            } else if !skel[c] {
+                self.sigma[c] = 0.0;
+            }
+        }
+        self.skel.copy_from_slice(skel);
+    }
+
+    /// Pression de contact du pas courant, AVANT le frottement : squelette des lits perméables résolu sur la vitesse prédite (us, vs),
+    /// avec les cellules à deux pressions de la projection précédente. Le frottement (`apply_implicit_viscosity`) voit ainsi le σ' qui
+    /// équilibre les charges du moment : avec celui du pas précédent, sa viscosité retirait l'écart de σ' avant que la projection ne le
+    /// corrige, et le lit restait figé dans son état passé — un lit de sable dans l'eau portait encore 40 % de contact de trop 2 s après
+    /// la mise en route du courant, un lit de braises sous une flamme accumulait σ'. Renvoie les itérations du gradient conjugué.
+    pub(crate) fn presolve_contact_stress(&mut self, us: &[f64], vs: &[f64], dt: f64) -> usize {
+        let n = self.nx * self.ny;
+        if self.skel.len() != n || self.sigma.len() != n || !self.skel.iter().any(|&s| s) {
+            return 0;
+        }
+        let skel = self.skel.clone();
+        let pt: Vec<f64> = self.p.iter().zip(&self.sigma).map(|(a, b)| a + b).collect();
+        let (uf, vf) = self.face_velocities(us, vs, &pt, dt);
+        let (ds, it) = self.solve_skeleton(&skel, &uf, &vf, dt);
+        for c in 0..n {
+            if skel[c] {
+                self.sigma[c] = (self.sigma[c] + ds[c]).max(0.0);
+            }
+        }
+        it
+    }
+
+    /// Correction δσ' de la pression de CONTACT des lits perméables (cellules `skel`, voir mp_percolation.rs) qui rend leur squelette
+    /// incompressible : ∇·u = 0 dans chaque cellule du lit, u = (uf, vf) − dt/ρ_f ∇δσ' sur les faces du mélange (δσ' = 0 hors du lit :
+    /// Dirichlet vers le fluide libre et les lits étanches, dont la pression est celle du mélange ; rien à travers les parois et les faces
+    /// à vitesse imposée). Matrice SPD, mêmes coefficients que la projection (sans compressibilité ni percolation : le fluide des pores
+    /// est déjà passé). Renvoie (δσ', itérations du gradient conjugué).
+    fn solve_skeleton(&self, skel: &[bool], uf: &[f64], vf: &[f64], dt: f64) -> (Vec<f64>, usize) {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let n = nx * ny;
+        let mut st = Stencil { diag: vec![1.0; n], ae: vec![0.0; n], an: vec![0.0; n] };
+        let mut b = vec![0.0; n];
+        let open = |side: usize| matches!(self.bc[side], Bc::Open { .. });
+        for j in 0..ny {
+            for i in 0..nx {
+                let c = j * nx + i;
+                if !skel[c] {
+                    continue;
+                }
+                let mut d = 0.0;
+                let edge = 2.0 * dt / (self.rho_mix[c] * dx * dx);
+                if i + 1 < nx {
+                    if self.link(c, c + 1, self.face_u_fixed(self.uidx(i + 1, j))) > 0 {
+                        let t = dt / (self.face_rho_x(i + 1, j) * dx * dx);
+                        d += t;
+                        if skel[c + 1] {
+                            st.ae[c] = t;
+                        }
+                    }
+                } else if open(1) {
+                    d += edge;
+                }
+                if i > 0 {
+                    if self.link(c - 1, c, self.face_u_fixed(self.uidx(i, j))) > 0 {
+                        d += dt / (self.face_rho_x(i, j) * dx * dx);
+                    }
+                } else if open(0) {
+                    d += edge;
+                }
+                if j + 1 < ny {
+                    if self.link(c, c + nx, self.face_v_fixed(self.vidx(i, j + 1))) > 0 {
+                        let t = dt / (self.face_rho_y(i, j + 1) * dx * dx);
+                        d += t;
+                        if skel[c + nx] {
+                            st.an[c] = t;
+                        }
+                    }
+                } else if open(3) {
+                    d += edge;
+                }
+                if j > 0 {
+                    if self.link(c - nx, c, self.face_v_fixed(self.vidx(i, j))) > 0 {
+                        d += dt / (self.face_rho_y(i, j) * dx * dx);
+                    }
+                } else if open(2) {
+                    d += edge;
+                }
+                // (lit entièrement clos, sans voisin de Dirichlet : matrice singulière — très légère compressibilité du squelette)
+                st.diag[c] = (d * (1.0 + 1e-9)).max(1e-300);
+                // (pas de dilatation d'un squelette tassé au-delà de α_max : le frottement l'empêche, et σ' accumulait d'un pas à
+                // l'autre l'impulsion qui la relançait — 2e4 Pa au fond d'un lit de braises de 750 Pa de poids après 110 pas)
+                b[c] = -self.divergence_of(uf, vf, i, j);
+            }
+        }
+        let mut x = vec![0.0; n];
+        let it = if self.multigrid { self.pcg_mg(&st, &b, &mut x, Some(skel)) } else { self.pcg_ic0(&st, &b, &mut x) };
+        (x, it)
+    }
+
     /// Projette (u*, v*) : met à jour self.p et self.u/self.v (u^{n+1}). `un`, `vn` = vitesses du début de pas (celles qui ont
     /// servi à advecter les masses). Retourne le nombre total d'itérations PCG.
     pub(crate) fn solve_pressure(&mut self, dt: f64, us: &[f64], vs: &[f64], un: &[f64], vn: &[f64], err0: &[f64]) -> usize {
@@ -462,6 +586,10 @@ impl MultiphaseSim {
         let gas_ids: Vec<usize> = (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].is_gas()).collect();
         let (nx, ny) = (self.nx, self.ny);
         let n = nx * ny;
+        // percolation : conductances de Darcy (Ergun évalué sur p du pas précédent) ; cellules à deux pressions (lits perméables)
+        let darcy = self.darcy_faces();
+        let skel: Vec<bool> = darcy.as_ref().map_or_else(|| vec![false; n], |d| d.skel.clone());
+        self.skeleton_transitions(&skel);
         let p_start = self.p.clone();
         let ng = self.groups.len();
         // températures de groupe du début de la projection et dT_g/dp adiabatique (fixes pendant les itérations de Newton)
@@ -509,9 +637,13 @@ impl MultiphaseSim {
         let mut clamped = vec![false; n];
         let mut tkv = t_star.clone();
         let mut newton = 0;
-        // percolation : conductances de Darcy (Ergun évalué sur p du pas précédent) ; divergence du flux de Darcy qui a servi à ce pas
-        let darcy = self.darcy_faces();
+        // divergence du flux de Darcy qui a servi à ce pas
         let (q_old_u, q_old_v) = (self.q_u.clone(), self.q_v.clone());
+        // lits perméables : pression de contact σ' (celle du pas précédent pour commencer ; nulle hors des cellules à deux pressions) ;
+        // le mélange est poussé par la pression totale p + σ'
+        let mut sig: Vec<f64> = (0..n).map(|c| if skel[c] { self.sigma[c].max(0.0) } else { 0.0 }).collect();
+        let mut skel_pending = skel.iter().any(|&s| s);
+        let total = |pk: &[f64], sig: &[f64]| -> Vec<f64> { pk.iter().zip(sig).map(|(a, b)| a + b).collect() };
         for _newton in 0..4 {
             newton += 1;
             let mut vol = vec![1.0; n];
@@ -544,7 +676,7 @@ impl MultiphaseSim {
                 });
             }
             let st = self.build_stencil(&kappa, dt, darcy.as_ref());
-            let (ut, vt) = self.face_velocities(us, vs, &pk, dt);
+            let (ut, vt) = self.face_velocities(us, vs, &total(&pk, &sig), dt);
             let qt = darcy.as_ref().map(|df| self.darcy_flux(df, &pk));
             let mut b = vec![0.0; n];
             let bp = SyncPtr(b.as_mut_ptr());
@@ -613,15 +745,33 @@ impl MultiphaseSim {
                 .into_iter()
                 .fold(0.0f64, f64::max)
             };
-            if dmax < 1e-3 {
+            // squelette des lits perméables (une fois par pas, après la première itération) : σ' rend ∇·u nul dans le lit, relâchée à
+            // 0 où elle deviendrait négative (le lit se décolle) ; les itérations suivantes rétablissent le volume des cellules
+            let mut sig_moved = false;
+            if skel_pending {
+                skel_pending = false;
+                let (uf, vf) = self.face_velocities(us, vs, &total(&pk, &sig), dt);
+                let (ds, it) = self.solve_skeleton(&skel, &uf, &vf, dt);
+                total_it += it;
+                for c in 0..n {
+                    if skel[c] {
+                        let s1 = (sig[c] + ds[c]).max(0.0);
+                        sig_moved |= (s1 - sig[c]).abs() >= 1e-3;
+                        sig[c] = s1;
+                    }
+                }
+            }
+            if dmax < 1e-3 && !sig_moved {
                 break;
             }
         }
         self.last_newton_iters = newton;
         self.pressure_clamped = clamped;
-        let (uf, vf) = self.face_velocities(us, vs, &pk, dt);
+        let (uf, vf) = self.face_velocities(us, vs, &total(&pk, &sig), dt);
         self.u = uf;
         self.v = vf;
+        self.sigma = sig;
+        self.skel = skel;
         // flux de Darcy de la pression finale : transportés au pas suivant (`percolate`)
         match &darcy {
             Some(df) => (self.q_u, self.q_v) = self.darcy_flux(df, &pk),

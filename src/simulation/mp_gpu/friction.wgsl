@@ -60,7 +60,8 @@ fn fr_frac(c: u32, fc: FrCell) -> f32 {
     return 0.0;
 }
 
-// pression de contact p_s le long de chaque ligne de gravité (un fil par ligne) : pression du mélange moins celle du fluide des pores
+// pression de contact p_s le long de chaque ligne de gravité (un fil par ligne) : lits perméables, σ' (sig) ; ailleurs, pression du
+// mélange moins celle du fluide des pores (hydrostatique depuis le haut du massif)
 @compute @workgroup_size(64)
 fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
     let vert = fr_vertical();
@@ -73,8 +74,6 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
     var pf = 0.0; var have_pf = false;
     var prev = -1;
     var prev_rhof = 0.0;
-    // traînée de percolation cumulée depuis le haut du massif (k_fl_drag ; nulle sans percolation)
-    var dacc = 0.0;
     for (var t = 0u; t < len; t++) {
         var s_ = t; if (down) { s_ = len - 1u - t; }
         var c = cidx(s_, l); if (vert) { c = cidx(l, s_); }
@@ -92,14 +91,10 @@ fn k_fr_ps(@builtin(global_invocation_id) g: vec3<u32>) {
                 // haut du massif : fluide de la cellule du dessus, ou demi-poids de la cellule au bord du domaine
                 if (prev >= 0) { pf = S[O_prel + u32(prev)] + 0.5 * (prev_rhof + fc.rhof) * gn * P.dx; } else { pf = pc - 0.5 * fc.w; }
                 have_pf = true;
-                dacc = 0.0;
             } else if (prev >= 0) {
                 pf += 0.5 * (prev_rhof + fc.rhof) * gn * P.dx;
             }
-            // fluide des pores à p_hydro + D, et contacts déchargés d'autant (miroir de friction_geometry)
-            let dr = select(0.0, S[O_fl_drag + c], has(F_PERC));
-            S[O_fr_ps + c] = max(pc - pf - 2.0 * (dacc + 0.5 * dr), 0.0);
-            dacc += dr;
+            S[O_fr_ps + c] = max(select(pc - pf, S[O_sig + c], S[O_skel + c] > 0.5), 0.0);
             prev = i32(c);
             prev_rhof = fc.rhof;
         }
@@ -289,14 +284,14 @@ fn k_fr_uf(@builtin(global_invocation_id) g: vec3<u32>) {
     if (f < nfu()) {
         us = S[O_Us + f];
         let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
-        if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i - 1u, j)]; }
+        if (fr_unknown(f)) { dp = ptot(cidx(i, j)) - ptot(cidx(i - 1u, j)); }
         let solid_side = (i > 0u && fr_blocked(cidx(i - 1u, j))) || (i < P.nx && fr_blocked(cidx(i, j)));
         fixed = (i == 0u && P.bc_l == 0u) || (i == P.nx && P.bc_r == 0u) || (i > 0u && i < P.nx && !fr_unknown(f)) || solid_side;
     } else {
         let fv = f - nfu();
         us = S[O_Vs + fv];
         let i = fv % P.nx; let j = fv / P.nx;
-        if (fr_unknown(f)) { dp = S[O_prel + cidx(i, j)] - S[O_prel + cidx(i, j - 1u)]; }
+        if (fr_unknown(f)) { dp = ptot(cidx(i, j)) - ptot(cidx(i, j - 1u)); }
         let solid_side = (j > 0u && fr_blocked(cidx(i, j - 1u))) || (j < P.ny && fr_blocked(cidx(i, j)));
         fixed = (j == 0u && P.bc_b == 0u) || (j == P.ny && P.bc_t == 0u) || (j > 0u && j < P.ny && !fr_unknown(f)) || solid_side;
     }

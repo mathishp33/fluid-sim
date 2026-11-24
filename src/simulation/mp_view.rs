@@ -282,8 +282,9 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             return Ok(s);
         }
         MpScenario::SandColumn => {
-            // colonne de sable sec tassé (α_max de grains, le reste d'air) au milieu : elle s'effondre en un tas dont les flancs
-            // tiennent à l'angle de frottement (≈ 25° pour un effondrement, ≈ φ pour un tas qui s'affaisse lentement)
+            // colonne de sable sec tassé (α_max de grains, le reste d'air) au milieu : elle s'effondre en un tas, moins raide que l'angle
+            // de frottement — l'élan de l'effondrement l'étale (colonne 6 fois plus haute que sa demi-largeur : pente moyenne ~16°, comme
+            // dans les expériences de Lube et al. 2005) ; un tas qui s'affaisse lentement s'arrête, lui, près de φ
             let air = need(roles.air, "un gaz")?;
             let sable = need(roles.grains, "une phase granulaire (sable)")?;
             let amax = s.reg.phases[sable].alpha_max;
@@ -358,7 +359,8 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             t_fn = Box::new(move |x, y| {
                 if on_top(x, y) { 700.0 } else if in_bed(x, y) { 1450.0 } else if pilot(x, y) { 1600.0 } else { 293.15 }
             });
-            s.finalize_init(&*t_fn);
+            // grille posée avant l'initialisation : le lit y repose dès le départ, ses contacts portent son poids et le gaz sous la grille
+            // n'en est pas chargé (`init_contact_stress` ; sinon 600 Pa de trop sous la grille soufflaient le lit au premier pas)
             for j in 0..ny {
                 for i in 0..nx {
                     let (x, y) = s.center(i, j);
@@ -368,6 +370,7 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
                     }
                 }
             }
+            s.finalize_init(&*t_fn);
             s.refresh();
             return Ok(s);
         }
@@ -422,7 +425,8 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             t_fn = Box::new(move |x, y| {
                 if in_bed(x, y) && y < y_emb { 1450.0 } else if in_bed(x, y) { 750.0 } else if pilot(x, y) { 1600.0 } else { 293.15 }
             });
-            s.finalize_init(&*t_fn);
+            // grille posée avant l'initialisation : le lit y repose dès le départ, ses contacts portent son poids et le gaz sous la grille
+            // n'en est pas chargé (`init_contact_stress` ; sinon 600 Pa de trop sous la grille soufflaient le lit au premier pas)
             for j in 0..ny {
                 for i in 0..nx {
                     let (x, y) = s.center(i, j);
@@ -432,6 +436,7 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
                     }
                 }
             }
+            s.finalize_init(&*t_fn);
             s.refresh();
             return Ok(s);
         }

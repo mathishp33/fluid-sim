@@ -38,7 +38,7 @@ const F_MACC: u32 = 1024u;   // MacCormack (advection semi-lagrangienne)
 const F_GRAN: u32 = 2048u;   // au moins une phase granulaire (granular.wgsl)
 const F_IMPVISC: u32 = 4096u; // viscosité implicite au-delà de la borne explicite (friction.wgsl)
 const F_FRIC: u32 = 8192u;   // frottement des grains (friction.wgsl)
-const F_PERC: u32 = 16384u;  // percolation : lits de grains tassés de 1 mm et plus, grilles (percolation.wgsl)
+const F_PERC: u32 = 16384u;  // percolation : lits de grains perméables (deux pressions), grilles (percolation.wgsl)
 const F_FUS: u32 = 32768u;   // gel / fusion actifs (paires de fusion, changement de phase coché)
 
 // paramètres par lancement (décalage dynamique, groupe 1)
@@ -423,4 +423,6 @@ const D_FR_DONE: u32 = 63u;
 const D_FR_IT: u32 = 64u;
 const D_FR_UNCONV: u32 = 65u;
 const D_DTBURN: u32 = 66u;   // borne du pas des poudres (k_burn_dt ; 0 ou 3e38 : aucune)
+const D_NEWTON_DP: u32 = 67u; // |δp| max de l'itération de Newton (rapporté au bruit d'arrondi, k_newton_dp)
+const D_SK_MOVED: u32 = 68u;  // la pression de contact des lits perméables a bougé (k_sk_final) : encore une itération
 const D_LEN: u32 = 72u;

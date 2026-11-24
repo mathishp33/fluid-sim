@@ -123,7 +123,7 @@ fn k_dt_final(@builtin(local_invocation_id) l: vec3<u32>) {
         D[D_DT] = dt;
         D[D_DTF] = 1.0;
         D[D_SUB_C] = 0.0; D[D_SUB_S] = 0.0;
-        D[D_NEWTON_DONE] = 0.0; D[D_NEWTON_IT] = 0.0; D[D_NEWTON_MAX] = 0.0;
+        D[D_NEWTON_DONE] = 0.0; D[D_NEWTON_IT] = 0.0; D[D_NEWTON_MAX] = 0.0; D[D_NEWTON_DP] = 0.0; D[D_SK_MOVED] = 0.0;
         D[D_PCG_DONE] = 0.0; D[D_PCG_IT] = 0.0; D[D_PCG_ITN] = 0.0; D[D_MAXPCG_N] = 0.0;
         D[D_DTCHEM_NEW] = 3.0e38; D[D_DTPHASE_NEW] = 3.0e38;
         D[D_REDO] = 0.0; D[D_NSUB_S_MAX] = 0.0; D[D_PCG_UNCONV] = 0.0; D[D_NSUB_C] = 0.0; D[D_NSUB_S] = 0.0;
@@ -965,6 +965,8 @@ fn k_closure(@builtin(global_invocation_id) g: vec3<u32>) {
     S[O_vol + c] = cl.x;
     S[O_kappa + c] = max(cl.y, 1e-30);
 }
+// pression (relative) qui pousse le mélange : p + σ' (lits perméables : fluide des pores + contacts ; σ' = 0 ailleurs)
+fn ptot(c: u32) -> f32 { return S[O_prel + c] + S[O_sig + c]; }
 fn face_u(f: u32) -> f32 {
     if (S[O_pfu_on + f] > 0.5) { return S[O_pfu + f]; }
     let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
@@ -972,15 +974,15 @@ fn face_u(f: u32) -> f32 {
     if (i > 0u && i < P.nx) {
         let a = cidx(i - 1u, j); let b = cidx(i, j);
         if (is_solid(a) || is_solid(b)) { return 0.0; }
-        return us - dtv() / frho_x(i, j) * (S[O_prel + b] - S[O_prel + a]) / P.dx;
+        return us - dtv() / frho_x(i, j) * (ptot(b) - ptot(a)) / P.dx;
     }
     if (i == 0u) {
         let b = cidx(0u, j);
-        if (P.bc_l == 1u && !is_solid(b)) { return us - dtv() / S[O_rho_mix + b] * (S[O_prel + b] - P.pb_l) / (0.5 * P.dx); }
+        if (P.bc_l == 1u && !is_solid(b)) { return us - dtv() / S[O_rho_mix + b] * (ptot(b) - P.pb_l) / (0.5 * P.dx); }
         return 0.0;
     }
     let a = cidx(P.nx - 1u, j);
-    if (P.bc_r == 1u && !is_solid(a)) { return us - dtv() / S[O_rho_mix + a] * (P.pb_r - S[O_prel + a]) / (0.5 * P.dx); }
+    if (P.bc_r == 1u && !is_solid(a)) { return us - dtv() / S[O_rho_mix + a] * (P.pb_r - ptot(a)) / (0.5 * P.dx); }
     return 0.0;
 }
 fn face_v(f: u32) -> f32 {
@@ -990,15 +992,15 @@ fn face_v(f: u32) -> f32 {
     if (j > 0u && j < P.ny) {
         let a = cidx(i, j - 1u); let b = cidx(i, j);
         if (is_solid(a) || is_solid(b)) { return 0.0; }
-        return vs - dtv() / frho_y(i, j) * (S[O_prel + b] - S[O_prel + a]) / P.dx;
+        return vs - dtv() / frho_y(i, j) * (ptot(b) - ptot(a)) / P.dx;
     }
     if (j == 0u) {
         let b = cidx(i, 0u);
-        if (P.bc_b == 1u && !is_solid(b)) { return vs - dtv() / S[O_rho_mix + b] * (S[O_prel + b] - P.pb_b) / (0.5 * P.dx); }
+        if (P.bc_b == 1u && !is_solid(b)) { return vs - dtv() / S[O_rho_mix + b] * (ptot(b) - P.pb_b) / (0.5 * P.dx); }
         return 0.0;
     }
     let a = cidx(i, P.ny - 1u);
-    if (P.bc_t == 1u && !is_solid(a)) { return vs - dtv() / S[O_rho_mix + a] * (P.pb_t - S[O_prel + a]) / (0.5 * P.dx); }
+    if (P.bc_t == 1u && !is_solid(a)) { return vs - dtv() / S[O_rho_mix + a] * (P.pb_t - ptot(a)) / (0.5 * P.dx); }
     return 0.0;
 }
 @compute @workgroup_size(64)
@@ -1121,17 +1123,25 @@ fn k_p_update(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invoca
     }
     wg_reduce(v, 1u, 1u, l.x, w.x, 0u);
 }
+// |δp| max de l'itération (sommes partielles de k_p_update), itérations du gradient conjugué de la pression
 @compute @workgroup_size(256)
-fn k_newton_check(@builtin(local_invocation_id) l: vec3<u32>) {
+fn k_newton_dp(@builtin(local_invocation_id) l: vec3<u32>) {
     let dmax = final_reduce(0u, nwg_cells(), 1u, l.x);
+    if (l.x == 0u && D[D_NEWTON_DONE] < 0.5) {
+        D[D_NEWTON_DP] = dmax;
+        D[D_PCG_IT] += D[D_PCG_ITN];
+        D[D_MAXPCG_N] = max(D[D_MAXPCG_N], D[D_PCG_ITN]);
+        if (D[D_PCG_DONE] < 0.5) { D[D_PCG_UNCONV] = 1.0; }
+    }
+}
+@compute @workgroup_size(64)
+fn k_newton_check(@builtin(local_invocation_id) l: vec3<u32>) {
     if (l.x == 0u) {
         if (D[D_NEWTON_DONE] < 0.5) {
             D[D_NEWTON_IT] += 1.0;
-            D[D_PCG_IT] += D[D_PCG_ITN];
-            D[D_MAXPCG_N] = max(D[D_MAXPCG_N], D[D_PCG_ITN]);
-            if (D[D_PCG_DONE] < 0.5) { D[D_PCG_UNCONV] = 1.0; }
-            // f32 : |δp| < max(0.1 Pa, 2e-6 p) (le CPU f64 utilise 1e-3 Pa)
-            if (dmax < 1.0) { D[D_NEWTON_DONE] = 1.0; }
+            // f32 : |δp| < max(0.1 Pa, 2e-6 p) (le CPU f64 utilise 1e-3 Pa), et pression de contact des lits perméables stable
+            if (D[D_NEWTON_DP] < 1.0 && D[D_SK_MOVED] < 0.5) { D[D_NEWTON_DONE] = 1.0; }
+            D[D_SK_MOVED] = 0.0;
         }
         D[D_PCG_DONE] = 0.0; D[D_PCG_ITN] = 0.0;
     }
