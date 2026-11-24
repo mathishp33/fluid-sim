@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Bc {
     Wall,
-    /// Bord ouvert à pression imposée (atmosphère). L'air/fluide entrant est la phase `ambient_phase` à `t_ambient`.
+    /// Bord ouvert à pression imposée (atmosphère). L'air/fluide entrant est la phase `ambient_phase` à `t_ambient`. `p` est la
+    /// pression au point le plus haut du domaine (selon la gravité) : le long du bord, la pression suit l'hydrostatique du fluide
+    /// ambiant (`MultiphaseSim::open_face_pressure`) — le bord du haut est à `p`.
     Open { p: f64 },
 }
 
@@ -782,6 +784,23 @@ impl MultiphaseSim {
             (0..np).map(|k| if k == self.ambient_phase { 1.0 } else { 0.0 }).collect()
         }
     }
+    /// masse volumique du fluide ambiant (celui qui entre par les bords ouverts) à la pression p et à `t_ambient`
+    pub(crate) fn ambient_density(&self, p: f64) -> f64 {
+        self.ambient_alpha().iter().enumerate().map(|(k, a)| a * self.reg.phases[k].rho(p, self.t_ambient)).sum()
+    }
+
+    /// Pression imposée à une face de bord ouvert de centre (x, y) : celle du bord, `po`, plus le poids de la colonne de fluide AMBIANT
+    /// (masse volumique `rho_a`) depuis le coin le plus haut du domaine selon la gravité — le bord du haut reste à `po`, les bords
+    /// latéraux suivent l'hydrostatique de l'air extérieur. À pression constante, un bord latéral ouvert poussait sous la gravité un
+    /// courant parasite (ρ g H ≈ 5 Pa sur 40 cm d'air : l'air sortait en bas et rentrait en haut).
+    pub(crate) fn open_face_pressure(&self, po: f64, rho_a: f64, x: f64, y: f64) -> f64 {
+        let (lx, ly) = (self.nx as f64 * self.dx, self.ny as f64 * self.dx);
+        let (gx, gy) = (self.gravity[0], self.gravity[1]);
+        let xr = if gx < 0.0 { lx } else { 0.0 };
+        let yr = if gy < 0.0 { ly } else { 0.0 };
+        po + rho_a * (gx * (x - xr) + gy * (y - yr))
+    }
+
     pub fn liquid_phases(&self) -> Vec<usize> {
         (0..self.reg.phases.len()).filter(|&k| self.reg.phases[k].kind == PhaseKind::Liquid).collect()
     }

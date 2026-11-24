@@ -53,7 +53,7 @@ const D_FR_UNCONV: usize = 65;
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
 const SLOT_BYTES: u64 = 256;
-const PARAMS_WORDS: usize = 64;
+const PARAMS_WORDS: usize = 68;
 /// groupes de travail des copies d'instantané du prédicteur-correcteur (boucle à pas SNAP_STRIDE = 1024 × 64 dans k_pc_save / k_pc_restore)
 const PC_GROUPS: u32 = 1024;
 
@@ -413,7 +413,7 @@ impl MultiphaseGpu {
         sl.add("mfy", nfv);
         for name in [
             "mtot_old", "p_start", "floor", "vol", "kappa", "err0", "chi", "rhs", "sd", "sae", "san", "sact", "cx", "cr", "cz", "cp", "cap",
-            "sx_dm", "sx_tgt", "sx_e", "mgs", "newe", "omega", "mask", "mtmp",
+            "sx_dm", "sx_tgt", "sx_e", "mgs", "newe", "omega", "mask", "mtmp", "dmix",
         ] {
             sl.add(name, n);
         }
@@ -473,11 +473,12 @@ impl MultiphaseGpu {
             1 + npmax
         );
         header += &format!(
-            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\nconst PERC_KMU_MIN: f32 = {:?};\nconst SKEL_GAP: f32 = {:?};\nconst SETTLE_TRACE: f32 = {:?};\n",
+            "const NFU: u32 = {nfus}u;\nconst FU_STRIDE: u32 = {FU_STRIDE}u;\nconst FU_SEED: f32 = {:?};\nconst PERC_KMU_MIN: f32 = {:?};\nconst SKEL_GAP: f32 = {:?};\nconst SETTLE_TRACE: f32 = {:?};\nconst DIFF_T_LIT: f32 = {:?};\n",
             super::phases::FUSION_SEED_ALPHA as f32,
             super::mp_percolation::PERC_KMU_MIN as f32,
             super::mp_percolation::SKEL_GAP as f32,
-            super::mp_granular::SETTLE_TRACE as f32
+            super::mp_granular::SETTLE_TRACE as f32,
+            super::mp_species::DIFF_T_LIT as f32
         );
         let mut source = format!("{header}{}", SHADERS.join("\n"));
         // diagnostic : substitutions dans le source (« ancien=>nouveau@@… »)
@@ -1359,6 +1360,13 @@ impl MultiphaseGpu {
         w[61] = f(sim.flame_speed_floor);
         w[62] = self.thermo_k(sim) as u32;
         w[63] = self.ntd as u32;
+        // bords ouverts : masse volumique de l'ambiant (pression hydrostatique le long du bord, miroir de open_face_pressure)
+        for s in 0..4 {
+            w[64 + s] = f(match sim.bc[s] {
+                Bc::Open { p } => sim.ambient_density(p),
+                Bc::Wall => 0.0,
+            });
+        }
         w
     }
 
@@ -1564,6 +1572,8 @@ impl MultiphaseGpu {
                 }
             }
             if chem {
+                // mailles de flamme de diffusion (miroir de diffusion_mixing, recalculées à chaque appel de la chimie)
+                v.push(cell("k_diff_mix"));
                 v.push(Op { k: "k_chem", wg: wn, slot: self.slot(if kth > 1 { 1 } else { 0 }, 0) });
                 v.push(one("k_chem_final"));
             }
@@ -1571,6 +1581,7 @@ impl MultiphaseGpu {
         if kth > 1 {
             v.push(one("k_dtf_one"));
             if chem {
+                v.push(cell("k_diff_mix"));
                 v.push(Op { k: "k_chem", wg: wn, slot: self.slot(2, 0) });
                 v.push(one("k_chem_final"));
             }

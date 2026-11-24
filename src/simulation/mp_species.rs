@@ -20,6 +20,12 @@
 //!   la flamme est résolue sur ≈ `flame_resolution` mailles. Hors de la flamme (senseur : dégagement de chaleur, dilaté sur l'épaisseur),
 //!   F = 1 : l'auto-allumage et le mélange ne sont pas modifiés.
 //!
+//! * Flammes de DIFFUSION (`diffusion_mixing`) : sur ces mailles, la cinétique globale évaluée à la température moyenne d'une maille où
+//!   la flamme se mêle à l'air froid est trop lente — le combustible et l'air s'y côtoyaient sans brûler (une flamme de méthane seule
+//!   décrochait et s'éteignait). Dans une maille chaude (≥ `DIFF_T_LIT`) où le combustible et le comburant arrivent de part et d'autre
+//!   (indice de flamme de Takeno négatif), les réactions de flamme irréversibles avancent au moins au rythme du mélange τ = √(2Δ/g),
+//!   comme dans les codes d'incendie ; fronts de prémélange et mélanges froids gardent leur cinétique.
+//!
 //! * Rayonnement (`radiate`) : modèle optiquement mince (TNF Workshop) q = 4σ Σ_k p_k a_P,k(T) (T⁴ − T_amb⁴), coefficients moyens de
 //!   Planck de H2O et CO2. Pertes des gaz brûlés (refroidissement des fumées) ; surestime les pertes des très grandes flammes (opaques).
 
@@ -42,6 +48,10 @@ const C_FLOOR: f64 = 1e-3;
 const TRACE_DT: f64 = 5.0;
 /// nombre maximal de sous-pas chimiques par cellule et par pas
 const MAX_CHEM_SUBSTEPS: usize = 4000;
+/// température (K) au-dessus de laquelle une maille de flamme de diffusion brûle au rythme du mélange (voir `diffusion_mixing`) :
+/// l'auto-inflammation du méthane (~810 K). Plus haut (1000 K), la couche de mélange à la base de la flamme des matières volatiles d'un
+/// braséro, entre 700 et 1000 K, ne se rallumait pas depuis les braises du bord : la flamme décollait et s'éteignait en 2 à 4 s
+pub(crate) const DIFF_T_LIT: f64 = 800.0;
 
 /// résultat de l'intégration chimique d'une cellule
 struct ChemOut {
@@ -68,6 +78,9 @@ struct CellChem<'a> {
     /// réactions de surface (réactif granulaire) ; pression de la cellule (masse volumique des grains, diffusivité de l'oxydant)
     surf: &'a [Option<SurfaceRx>],
     p: f64,
+    /// flamme de DIFFUSION allumée dans la cellule : 1/τ_mél (1/s) — les réactions de flamme irréversibles y avancent au moins de
+    /// leur avancement possible en τ_mél (voir `diffusion_mixing`) ; 0 ailleurs
+    mix: f64,
 }
 
 impl CellChem<'_> {
@@ -126,6 +139,10 @@ impl CellChem<'_> {
             rf *= if c <= 0.0 { 0.0 } else if o < 0.0 { c.max(C_FLOOR).powf(o) } else if o == 0.0 { 1.0 } else { c.powf(o) };
         }
         if !r.reversible {
+            // flamme de diffusion allumée : au moins le débit du mélange (voir `diffusion_mixing`)
+            if self.mix > 0.0 && r.flame_thickness > 0.0 {
+                rf = rf.max(self.bounds(j).1 * self.mix);
+            }
             return (rf, 0.0);
         }
         // vitesse inverse k/Kc · Π c_prod^ν · Π c_réac^(o−ν) : l'équilibre Q = Kc est exact quels que soient les ordres
@@ -448,6 +465,7 @@ impl MultiphaseSim {
                 scale: vec![1.0; rx.len()],
                 surf: &surf,
                 p: self.p[c],
+                mix: 0.0,
             };
             let mut w = 0.0;
             for &j in &flames {
@@ -483,6 +501,72 @@ impl MultiphaseSim {
         for c in 0..n {
             self.flame_factor[c] = if self.is_solid(c) { 1.0 } else { 1.0 + (f_max - 1.0) * mask[c] };
         }
+    }
+
+    /// Mailles où brûle une flamme de DIFFUSION : 1/τ_mél, 0 ailleurs. Sur ces mailles (4 mm à 1 cm), la cinétique globale évaluée à la
+    /// température MOYENNE d'une maille, où la flamme se mêle à l'air froid, est trop lente : le combustible et l'air s'y côtoyaient sans
+    /// brûler — une flamme de méthane seule décrochait et s'éteignait (jet en 0.3 à 0.9 s, matières volatiles d'un braséro en 1.3 s),
+    /// et les poches ainsi mêlées explosaient d'un coup. Comme dans les codes d'incendie (FDS), le combustible et le comburant réunis
+    /// dans une telle maille brûlent au moins au rythme de leur mélange, τ_mél = √(2 Δ / g) (≈ 45 ms pour Δ = 1 cm). Critères : maille
+    /// chaude (≥ `DIFF_T_LIT`), combustible et comburant présents, et flamme de diffusion — indice de Takeno ξ = ∇Y_c·∇Y_ox /
+    /// (|∇Y_c| |∇Y_ox|) < −0.2 (ils arrivent de part et d'autre) : les fronts de PRÉMÉLANGE (ξ > 0, vitesse de flamme) et les mélanges
+    /// froids (explosions, allumage) gardent leur cinétique.
+    pub(crate) fn diffusion_mixing(&self) -> Vec<f64> {
+        let (nx, ny) = (self.nx, self.ny);
+        let n = nx * ny;
+        let rx = &self.reg.reactions;
+        let flames: Vec<usize> = (0..rx.len()).filter(|&j| rx[j].flame_thickness > 0.0 && !rx[j].reversible && rx[j].reactants.len() >= 2).collect();
+        if !self.chemistry || flames.is_empty() {
+            return vec![0.0; n];
+        }
+        let ox = rx[flames[0]].reactants[1].0;
+        let mut fuels: Vec<usize> = flames.iter().map(|&j| rx[j].reactants[0].0).filter(|&k| k != ox).collect();
+        fuels.sort_unstable();
+        fuels.dedup();
+        let np = self.reg.phases.len();
+        let frac = |c: usize, ks: &[usize]| -> f64 {
+            let tot: f64 = (0..np).map(|k| self.mass[k][c].max(0.0)).sum();
+            if tot > 0.0 { ks.iter().map(|&k| self.mass[k][c].max(0.0)).sum::<f64>() / tot } else { 0.0 }
+        };
+        let yf: Vec<f64> = (0..n).map(|c| if self.is_solid(c) { 0.0 } else { frac(c, &fuels) }).collect();
+        let yo: Vec<f64> = (0..n).map(|c| if self.is_solid(c) { 0.0 } else { frac(c, &[ox]) }).collect();
+        let grad = |y: &[f64], i: usize, j: usize| -> (f64, f64) {
+            let c = j * nx + i;
+            let at = |q: usize| if self.is_solid(q) { y[c] } else { y[q] };
+            let gx = match (i > 0, i + 1 < nx) {
+                (true, true) => 0.5 * (at(c + 1) - at(c - 1)),
+                (false, true) => at(c + 1) - y[c],
+                (true, false) => y[c] - at(c - 1),
+                _ => 0.0,
+            };
+            let gy = match (j > 0, j + 1 < ny) {
+                (true, true) => 0.5 * (at(c + nx) - at(c - nx)),
+                (false, true) => at(c + nx) - y[c],
+                (true, false) => y[c] - at(c - nx),
+                _ => 0.0,
+            };
+            (gx, gy)
+        };
+        let rate = 1.0 / (2.0 * self.dx / 9.81).sqrt();
+        let mut mix = vec![0.0; n];
+        for j in 0..ny {
+            for i in 0..nx {
+                let c = j * nx + i;
+                if self.is_solid(c) || self.pinned(c) || yf[c] <= 1e-9 || yo[c] <= 1e-9 || self.phase_temp(ox, c) < DIFF_T_LIT {
+                    continue;
+                }
+                let (fx, fy) = grad(&yf, i, j);
+                let (ox_, oy) = grad(&yo, i, j);
+                let (nf, no) = (fx.hypot(fy), ox_.hypot(oy));
+                if nf < 1e-6 || no < 1e-6 {
+                    continue;
+                }
+                if (fx * ox_ + fy * oy) / (nf * no) < -0.2 {
+                    mix[c] = rate;
+                }
+            }
+        }
+        mix
     }
 
     // ================================================================ cinétique
@@ -528,10 +612,11 @@ impl MultiphaseSim {
             }
         }
         let reactive = self.reactive_groups();
+        let mix = self.diffusion_mixing();
         // intégration indépendante cellule par cellule : en parallèle, puis application des résultats dans l'ordre des cellules (sommes
         // globales inchangées) ; températures recalculées ensuite, en parallèle
         let this = &*self;
-        let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &surf, &reactive) } else { None };
+        let cell = |c: usize| if selected(this, c) { this.integrate_cell(c, dt, target, &phases, &rx, &scale, &surf, &reactive, &mix) } else { None };
         let out: Vec<ChemOut> =
             super::mp_par::map_ranges(n, super::mp_par::MIN_HEAVY, |lo, hi| (lo..hi).filter_map(cell).collect::<Vec<ChemOut>>()).into_iter().flatten().collect();
         let mut touched = vec![false; n];
@@ -787,8 +872,10 @@ impl MultiphaseSim {
     /// Intègre la chimie d'une cellule pendant dt (lecture seule de l'état) ; None si rien ne peut réagir. Seuls les groupes
     /// réactifs participent (masses et énergie) : de l'eau liquide voisine ne sert pas de puits de chaleur instantané à une flamme.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn integrate_cell(
         &self, c: usize, dt: f64, target: f64, phases: &[Phase], rx: &[Reaction], scale: &[f64], surf: &[Option<SurfaceRx>], reactive: &[bool],
+        mix: &[f64],
     ) -> Option<ChemOut> {
         let np = phases.len();
         let nre = rx.len();
@@ -806,7 +893,7 @@ impl MultiphaseSim {
             }
             let m_r: Vec<f64> = (0..np).map(|k| if reactive[self.group_of[k]] { self.mass[k][c] } else { 0.0 }).collect();
             let e_r: f64 = (0..self.groups.len()).filter(|&g| reactive[g]).map(|g| self.eg[g][c]).sum();
-            let mut cc = CellChem { phases, rx, m: m_r, e: e_r, f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec(), surf, p: self.p[c] };
+            let mut cc = CellChem { phases, rx, m: m_r, e: e_r, f_eff: self.flame_factor[c].max(1.0), scale: scale.to_vec(), surf, p: self.p[c], mix: mix[c] };
             let t0 = cc.temp();
             // cellule « gelée » ou déjà à l'équilibre ? (aucune réaction n'avancerait de 1e-7 de sa masse disponible pendant dt)
             let active = (0..nre).any(|j| {

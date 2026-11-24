@@ -341,10 +341,46 @@ fn coal_burns_at_the_grain_surface_kinetic_then_diffusion_limited() {
 }
 
 #[test]
+fn hot_fuel_meeting_air_burns_at_the_mixing_rate_but_premixed_and_cold_mixtures_keep_their_kinetics() {
+    // couche de mélange méthane | air (boîte 12 × 3, sans gravité) : à 1200 K, ses mailles sont des mailles de flamme de DIFFUSION
+    // (combustible et oxygène y arrivent de part et d'autre) — elles brûlent au moins au rythme du mélange 1/√(2Δ/g) ; à 300 K, rien
+    // (mélange froid : allumage et explosions gardent leur cinétique) ; un front de PRÉMÉLANGE (gaz brûlés | méthane–air frais : le
+    // combustible et l'oxygène croissent du même côté), rien non plus (vitesse de flamme inchangée)
+    let lib = MaterialLibrary::default().with_combustion();
+    let b = lib.build().unwrap();
+    let fresh = b.mixtures.iter().find(|m| m.0 == MIX_CH4_AIR).unwrap().1.clone();
+    let burnt = super::mp_species::complete_combustion(&b.registry, &fresh);
+    let air = b.ambient_mix.clone();
+    let ch4 = idx(&b.registry, CH4);
+    let np = b.registry.phases.len();
+    let layer = |t: f64, premixed: bool| -> Vec<f64> {
+        let mut s = MultiphaseSim::new(12, 3, 0.01, b.registry.clone(), b.ambient);
+        s.ambient_mix = air.clone();
+        s.gravity = [0.0, 0.0];
+        let (fresh, burnt, air) = (fresh.clone(), burnt.clone(), air.clone());
+        s.paint_mixture(move |x, _| {
+            // 0 à gauche, 1 à droite : rampe sur 8 cm
+            let f = ((x - 0.02) / 0.08).clamp(0.0, 1.0);
+            Some((0..np).map(|k| if premixed { (1.0 - f) * burnt[k] + f * fresh[k] } else { (1.0 - f) * if k == ch4 { 1.0 } else { 0.0 } + f * air[k] }).collect())
+        });
+        s.finalize_init(move |_, _| t);
+        s.refresh();
+        s.diffusion_mixing()
+    };
+    let rate = 1.0 / (2.0 * 0.01 / 9.81f64).sqrt();
+    let hot = layer(1200.0, false);
+    let lit = hot.iter().filter(|&&m| m > 0.0).count();
+    assert!(lit >= 18 && hot.iter().all(|&m| m == 0.0 || (m - rate).abs() < 1e-9 * rate), "couche de diffusion chaude : {lit} mailles");
+    assert!(layer(300.0, false).iter().all(|&m| m == 0.0), "mélange froid");
+    assert!(layer(1200.0, true).iter().all(|&m| m == 0.0), "front de prémélange");
+}
+
+#[test]
 fn a_coal_fire_keeps_burning_and_conserves_carbon() {
-    // braséro, feu établi : braises (1450 K) sous une charge de houille chaude (700 K). Les braises restent chaudes, l'air traverse la
-    // grille (tirage), la houille dégaze et ses matières volatiles brûlent en flamme ; carbone (charbon + houille + CO + CO2 + CH4 +
-    // sorties) conservé
+    // braséro, feu établi : braises (1450 K) sous une charge de houille chaude (700 K) posée au centre. Les braises restent chaudes, l'air
+    // traverse la grille (tirage), la houille dégaze et ses matières volatiles brûlent en flamme, toujours allumée à la fin (accrochée par
+    // les braises à nu le long des parois ; charge sur toute la largeur, elle s'éteignait en 1.3 s) ; carbone (charbon + houille + CO +
+    // CO2 + CH4 + sorties) conservé
     let lib = MaterialLibrary::default();
     let mut s = build_scenario_with(&lib, MpScenario::CoalFire, 40, 40, 0.01, 9.81).unwrap();
     let k = |n: &str| idx(&s.reg, n);
@@ -361,11 +397,18 @@ fn a_coal_fire_keeps_burning_and_conserves_carbon() {
     let draft_of = |s: &MultiphaseSim| (0..s.nx).filter(|&i| s.is_grille(s.idx(i, gj))).map(|i| s.q_v[(gj + 1) * s.nx + i]).sum::<f64>() * s.dx;
     let gg = s.group_of[o2];
     let (mut d_int, mut d_t, mut t_flame) = (0.0, 0.0, 0.0f64);
+    // chaleur dégagée par la flamme (hors du lit) pendant la dernière demi-seconde
+    let (mut q_late, mut t_late) = (0.0, 0.0);
     while s.time < t_end && !s.diverged {
         let dt = s.step();
         if s.time > 0.5 * t_end {
             d_int += dt * draft_of(&s);
             d_t += dt;
+        }
+        if s.time > t_end - 0.5 {
+            let q: f64 = (0..s.nx * s.ny).filter(|&q| !s.is_solid(q) && s.mass[c][q] + s.mass[hou][q] < 1.0).map(|q| s.heat_release[q].max(0.0)).sum();
+            q_late += dt * q * s.dx * s.dx;
+            t_late += dt;
         }
         if s.time > 0.3 {
             let n = s.nx * s.ny;
@@ -382,7 +425,8 @@ fn a_coal_fire_keeps_burning_and_conserves_carbon() {
     let burnt = (gas_carbon(&s) - g_c0) * 0.012011;
     let tmax = t_hot.last().map_or(0.0, |x| x.1);
     let draft = d_int / d_t.max(1e-30);
-    eprintln!("feu de charbon : {} pas en {:.1} s ; carbone passé dans le gaz {:.3e} kg/m ({:.2} % du charbon), CO2 {:.3e} kg/m, CO {:.3e}, CH4 {:.3e}, O2 {:.3e} ; houille dégazée {:.3} % ; flamme {t_flame:.0} K ; tirage moyen {draft:.4} m²/s ; T max des braises {:?}",
+    let flame_late = q_late / t_late.max(1e-30);
+    eprintln!("feu de charbon : {} pas en {:.1} s ; carbone passé dans le gaz {:.3e} kg/m ({:.2} % du charbon), CO2 {:.3e} kg/m, CO {:.3e}, CH4 {:.3e}, O2 {:.3e} ; houille dégazée {:.3} % ; flamme {t_flame:.0} K, {flame_late:.3e} W/m la dernière demi-seconde ; tirage moyen {draft:.4} m²/s ; T max des braises {:?}",
         s.step_count, t_start.elapsed().as_secs_f64(), burnt, 100.0 * burnt / m_c0, s.total_mass(co2), s.total_mass(co), s.total_mass(ch4), s.total_mass(o2),
         100.0 * (1.0 - s.total_mass(hou) / m_h0.max(1e-300)), t_hot.iter().map(|(t, x)| format!("{t:.1}s:{x:.0}K")).collect::<Vec<_>>());
     assert!(burnt > 1e-5 * m_c0, "le charbon n'a pas brûlé");
@@ -391,6 +435,7 @@ fn a_coal_fire_keeps_burning_and_conserves_carbon() {
     // les matières volatiles de la houille (0.8 %/s de sa masse) brûlent en grande flamme au-dessus du lit
     assert!(m_h0 - s.total_mass(hou) > 0.01 * m_h0, "la houille ne dégaze pas : {} → {}", m_h0, s.total_mass(hou));
     assert!(t_flame > 1700.0, "pas de flamme au-dessus du lit : {t_flame} K");
+    assert!(flame_late > 1e4, "la flamme s'est éteinte : {flame_late} W/m la dernière demi-seconde");
     assert!((carbon(&s) / n_c0 - 1.0).abs() < 1e-6, "carbone (charbon + houille + CO + CO2 + CH4 + sorties) : {} → {}", n_c0, carbon(&s));
 }
 
@@ -1659,3 +1704,104 @@ fn coal_brasero_hot_spot_diag() {
     }
 }
 
+
+/// diagnostic : braséro, accrochage de la flamme des matières volatiles au fil du temps (MP_COAL_T s, défaut 2) : chaleur dégagée hors
+/// du lit, base et centre de la flamme, gaz qui sort du lit (T, CH4, O2, vitesse), houille du haut du lit
+#[test]
+#[ignore]
+fn coal_brasero_flame_anchor_diag() {
+    let lib = MaterialLibrary::default();
+    let nn = std::env::var("MP_COAL_N").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(40);
+    let mut s = build_scenario_with(&lib, MpScenario::CoalFire, nn, nn, 0.4 / nn as f64, 9.81).unwrap();
+    if let Some(r) = std::env::var("MP_FLAME_RES").ok().and_then(|v| v.parse::<f64>().ok()) {
+        s.flame_resolution = r;
+    }
+    let k = |n: &str| idx(&s.reg, n);
+    let (c, o2, hou, ch4) = (k(super::mp_materials::COAL), k(O2), k(super::mp_materials::HOUILLE), k(CH4));
+    let gg = s.group_of[o2];
+    let gh = s.group_of[hou];
+    let t_end = std::env::var("MP_COAL_T").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
+    let (nx, ny) = (s.nx, s.ny);
+    // haut du lit (dernière rangée de grains au milieu) et rangées des parois
+    let top = |s: &MultiphaseSim| (0..ny).rev().find(|&j| s.alpha[c][s.idx(nx / 2, j)] + s.alpha[hou][s.idx(nx / 2, j)] > 0.3).unwrap_or(0);
+    let x_frac = |s: &MultiphaseSim, q: usize, kk: usize| {
+        let n: f64 = (0..s.reg.phases.len()).filter(|&m| s.reg.phases[m].is_gas()).map(|m| s.mass[m][q].max(0.0) / s.reg.phases[m].molar_mass).sum();
+        s.mass[kk][q].max(0.0) / s.reg.phases[kk].molar_mass / n.max(1e-300)
+    };
+    let mut next = 0.0;
+    while s.time < t_end && !s.diverged {
+        s.step();
+        if s.time >= next {
+            next += 0.05;
+            let jt = top(&s);
+            // chaleur dégagée hors du lit (rangées au-dessus du haut du lit) : total, maximum, base (rangée la plus basse à 10 % du max)
+            let (mut qtot, mut qmax, mut qmax_at, mut yc) = (0.0f64, 0.0f64, 0usize, 0.0f64);
+            for j in jt + 1..ny {
+                for i in 0..nx {
+                    let q = s.idx(i, j);
+                    let h = s.heat_release[q].max(0.0);
+                    qtot += h;
+                    yc += h * j as f64;
+                    if h > qmax {
+                        qmax = h;
+                        qmax_at = q;
+                    }
+                }
+            }
+            let base = (jt + 1..ny).find(|&j| (0..nx).any(|i| s.heat_release[s.idx(i, j)] > 0.1 * qmax)).unwrap_or(ny);
+            let q_bed: f64 = (0..=jt).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| s.heat_release[s.idx(i, j)].max(0.0)).sum();
+            let a = s.idx(nx / 2, jt + 1);
+            let b = s.idx(nx / 2, jt);
+            // air autour du foyer : colonnes hors des parois (x < 0.3 lx ou > 0.7 lx), du haut des parois (j 20) à j 30 ; et au ras du haut
+            // des parois (j 20–21) au-dessus du foyer
+            let outside = |s: &MultiphaseSim, f: &dyn Fn(&MultiphaseSim, usize) -> f64| {
+                let v: Vec<f64> = (20..31).flat_map(|j| (0..nx).filter(|&i| (i as f64 + 0.5) / (nx as f64) < 0.27 || (i as f64 + 0.5) / (nx as f64) > 0.73).map(move |i| (i, j)))
+                    .map(|(i, j)| f(s, s.idx(i, j))).collect();
+                v.iter().sum::<f64>() / v.len().max(1) as f64
+            };
+            let o2_out = outside(&s, &|s: &MultiphaseSim, q: usize| x_frac(s, q, o2));
+            let t_out = outside(&s, &|s: &MultiphaseSim, q: usize| s.tg[gg][q]);
+            let rim: Vec<String> = [11usize, 13, 20, 26, 28].iter().map(|&i| format!("{:.2}", x_frac(&s, s.idx(i, 21), o2))).collect();
+            let top_in: f64 = (0..nx).map(|i| s.v[ny * nx + i].min(0.0)).sum::<f64>() * s.dx;
+            let top_out: f64 = (0..nx).map(|i| s.v[ny * nx + i].max(0.0)).sum::<f64>() * s.dx;
+            eprintln!("      air autour : x O2 {o2_out:.3}, T {t_out:.0} K ; x O2 à j 21 (i 11 13 20 26 28) {} ; bord du haut : entrée {top_in:.4}, sortie {top_out:.4} m²/s", rim.join(" "));
+            eprintln!(
+                "t {:.2} dt {:.1e} : haut du lit j {jt} ; flamme {:.2e} W/m (lit {:.2e}), max {:.2e} W/m³ en ({}, {}), base j {base}, centre j {:.1} | sortie du lit : T {:.0} K, x CH4 {:.3}, x O2 {:.3}, v {:+.3} m/s | houille du haut {:.0} K (α {:.2})",
+                s.time, s.last_dt, qtot * s.dx * s.dx, q_bed * s.dx * s.dx, qmax, qmax_at % nx, qmax_at / nx, yc / qtot.max(1e-30),
+                s.tg[gg][a], x_frac(&s, a, ch4), x_frac(&s, a, o2), s.v[(jt + 2) * nx + nx / 2], s.tg[gh][b], s.alpha[hou][b]
+            );
+        }
+    }
+}
+
+/// diagnostic : chaleur dégagée au fil du temps d'un scénario de feu (MP_SC = indice du scénario, MP_NX, MP_NY, MP_DX, MP_T)
+#[test]
+#[ignore]
+fn fire_persistence_diag() {
+    let ev = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let sc = MpScenario::from_index(ev("MP_SC", 0.0) as usize);
+    let lib = MaterialLibrary::default();
+    let mut s = build_scenario_with(&lib, sc, ev("MP_NX", 48.0) as usize, ev("MP_NY", 36.0) as usize, ev("MP_DX", 4e-3), 9.81).unwrap();
+    if let Some(r) = std::env::var("MP_FLAME_RES").ok().and_then(|v| v.parse::<f64>().ok()) {
+        s.flame_resolution = r;
+    }
+    let t_end = ev("MP_T", 3.0);
+    let mut next = 0.0;
+    eprintln!("scénario {} : flame_resolution {}", sc.name(), s.flame_resolution);
+    while s.time < t_end && !s.diverged {
+        s.step();
+        if s.time >= next {
+            next += 0.1;
+            let q: f64 = s.heat_release.iter().map(|h| h.max(0.0)).sum::<f64>() * s.dx * s.dx;
+            let (mut qm, mut at) = (0.0f64, 0usize);
+            for (c, &h) in s.heat_release.iter().enumerate() {
+                if h > qm {
+                    qm = h;
+                    at = c;
+                }
+            }
+            let tmax = (0..s.nx * s.ny).filter(|&c| !s.is_solid(c)).map(|c| s.temp[c]).fold(0.0f64, f64::max);
+            eprintln!("t {:.2} dt {:.1e} : chaleur {q:.3e} W/m, max en ({}, {}), T max {tmax:.0} K", s.time, s.last_dt, at % s.nx, at / s.nx);
+        }
+    }
+}

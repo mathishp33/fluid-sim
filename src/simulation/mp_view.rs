@@ -301,10 +301,11 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             // il brûle à la surface des morceaux (C + ½O2 → CO surtout, C + O2 → CO2 ; zone d'oxydation au-dessus de la grille), le CO
             // brûle dans les pores tant qu'il y reste de l'oxygène ; plus haut, sans oxygène, le CO2 est réduit en CO (Boudouard), qui
             // brûle au-dessus des braises au contact de l'air (petite flamme bleue ; l'humidité de l'air, 1 %, catalyse son oxydation).
-            // Sur les braises (60 % du bas du lit), une charge de houille en noix (3 cm, 40 % du haut) déjà chaude (700 K, feu établi) :
+            // Sur les braises (60 % du bas du lit), au centre, une charge de houille en noix (3 cm, 40 % du haut) déjà chaude (700 K) :
             // elle dégage ses matières volatiles (surtout du méthane, ~0.8 %/s de sa masse : la chaleur met ~2 min à gagner le cœur d'un
-            // morceau), qui sortent du lit sans oxygène et brûlent en grande flamme (~2200 K) au contact de l'air, au-dessus du lit
-            // (allumée par une flamme d'allumage : gaz à 1600 K sur 4 cm au-dessus du lit) ; elle laisse son char, qui devient braise à son
+            // morceau), qui sortent du lit sans oxygène et brûlent en grande flamme (~2200 K) au contact de l'air, au-dessus du lit,
+            // accrochée par les braises restées à nu le long des parois (allumée au départ par une flamme d'allumage : gaz à 1600 K sur
+            // 4 cm au-dessus du lit) ; elle laisse son char, qui devient braise à son
             // tour. Une charge FROIDE fume : ses gaz, refroidis en la traversant, sortent sous le seuil d'allumage et étouffent les braises.
             // Sans houille dans la bibliothèque : tout le lit en braises
             let coal = need(roles.coal, "une phase granulaire combustible (charbon) et sa réaction de surface")?;
@@ -342,7 +343,11 @@ pub fn build_scenario_with(lib: &MaterialLibrary, sc: MpScenario, nx: usize, ny:
             let in_bed = move |x: f64, y: f64| x > x0 && x < x1 && y >= yb0 && y < yb1;
             let walls = move |x: f64, y: f64| y >= yg && y < ytop && ((x > x0 - wall && x <= x0) || (x >= x1 && x < x1 + wall));
             let y_load = if load.is_some() { yb0 + 0.6 * (yb1 - yb0) } else { yb1 };
-            let on_top = move |x: f64, y: f64| in_bed(x, y) && y >= y_load;
+            // charge rechargée au CENTRE (60 % de la largeur) : le long des parois, les braises restent à nu — elles allument sans cesse
+            // les matières volatiles qui s'y mêlent à l'air. Charge sur toute la largeur, la flamme décollait du lit et s'éteignait en
+            // 1.3 s : le gaz sort de la houille à 670 K, sous l'allumage du méthane, et une flamme de diffusion de méthane ne se tient
+            // pas seule sur ces mailles (cinétique globale à la température moyenne d'une maille de 1 cm, trop froide à sa base)
+            let on_top = move |x: f64, y: f64| in_bed(x, y) && y >= y_load && (x - 0.5 * (x0 + x1)).abs() < 0.3 * (x1 - x0);
             s.paint_mixture(move |x, y| {
                 Some(match (&load, on_top(x, y)) {
                     (Some(l), true) => l.clone(),

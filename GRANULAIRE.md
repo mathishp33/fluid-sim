@@ -162,14 +162,19 @@ Validé : vitesse = loi à 1e-5 près ; diamètre ÷ 2 → ×2.01 à 1000 K (cin
   35 % de matières volatiles (CH4 21 %, CO 8 %, CO2 3 %, eau 2.6 %, H2 0.1 % ; goudrons comptés en CH4). Validé : vitesse = loi à 2e-6
   près, 65.01 % de char, CH4/CO = 4.675, PCS 34.0 MJ/kg. Froide, elle se conserve (loi extrapolée : 4e-8 s⁻¹ à 300 K).
 - braséro avec houille (feu établi) : braises sur les 60 % du bas du lit, houille en noix (3 cm) déjà chaude (700 K) sur les 40 % du
-  haut, flamme d'allumage au-dessus du lit (gaz à 1600 K sur 4 cm), épaississement de flamme modéré comme le feu de bois. La houille
-  dégaze à 0.83 %/s (la chaleur met ~2 min à gagner le cœur d'un morceau de 3 cm) ; ses matières volatiles sortent du lit sans oxygène
-  et brûlent en grande flamme au contact de l'air (vers 2100 K à 40 × 40) ; braises à 1450 K, tirage moyen 2.9e-3 m²/s ; carbone
-  (charbon + houille + CO + CO2 + CH4 + sorties) conservé à 1e-6. Mais la flamme ne s'accroche pas au lit : vers 1.3 s elle monte
-  jusqu'au haut du domaine et s'éteint (déjà avant les deux pressions, et aussi à pas plafonné) ; des poches de gaz y brûlent d'un coup
-  dans une maille (pointes de 2800 à 3800 K au pas de la borne des flammes, 4e-4 s ; 2190 K au plus à 1.4e-4 s). Le pas n'est plus
-  fixé par les traces de houille arrachées au lit par la flamme (α ~ 1e-9, noix de 3 cm qui y tombent à 90 m/s : pas de 5e-5 s ;
-  `SETTLE_TRACE`) : 6500 pas pour 2 s au lieu de 14600. GPU : premier pas à 1e-7 près (masses) ; sur 1 s, houille dégazée à 0.04 %,
+  haut, rechargée au CENTRE (60 % de la largeur : le long des parois, les braises restent à nu), flamme d'allumage au-dessus du lit
+  (gaz à 1600 K sur 4 cm), épaississement de flamme modéré comme le feu de bois. La houille dégaze à 0.83 %/s (la chaleur met ~2 min à
+  gagner le cœur d'un morceau de 3 cm) ; ses matières volatiles sortent du lit sans oxygène, à 670 K, et brûlent en grande flamme au
+  contact de l'air, accrochée au lit par les braises du bord ; braises à 1450 K, tirage moyen 3e-3 m²/s ; carbone (charbon + houille +
+  CO + CO2 + CH4 + sorties) conservé à 1e-6. Flamme de 5e4 à 1e5 W/m pendant 6 s, base au ras du lit. Avant, la charge couvrait toute
+  la largeur et la flamme s'éteignait en 1.3 s (déjà avant les deux pressions) : décollée du lit, emportée par le panache, puis
+  soufflée par des poches de méthane et d'air qui explosaient d'un coup — le gaz qui sort de la houille est sous l'auto-inflammation
+  du méthane, et une flamme de diffusion de méthane ne brûlait pas sur ces mailles le combustible qu'elle mêlait à l'air (15 % des
+  matières volatiles) ; corrigés : braises à nu, combustion au rythme du mélange des flammes de diffusion (`diffusion_mixing`, voir
+  mp_species.rs). Essayés sans effet : parois plus basses, houille plus chaude (900 K), bords latéraux ouverts, épaississement plus
+  fort ou réservé aux zones de prémélange (indice de flamme : sur ces mailles la base de la flamme est une couche de mélange, ξ < 0).
+  Reste des poches qui s'enflamment d'un coup (pointes de 3000–3600 K, ponctuelles). Le pas n'est plus fixé par les traces de houille
+  arrachées au lit par la flamme (α ~ 1e-9, noix de 3 cm qui y tombent à 90 m/s : pas de 5e-5 s ; `SETTLE_TRACE`). GPU : premier pas à 1e-7 près (masses) ; sur 1 s, houille dégazée à 0.04 %,
   carbone passé dans le gaz à 0.2 %, CO2 formé à 0.3 %, flamme 2087 K (CPU 2102 K). Une charge FROIDE (293 K) fume : ses gaz,
   refroidis en traversant la charge, sortent sous le seuil d'allumage, l'oxygène des pores tombe à 0 en 1.3 s, le tirage s'annule.
   Corrigé au passage (GPU) : `k_pyrolysis` calculait 1 − e^(−ν k dt) en f32, qui n'a que 2 ou 3 chiffres justes pour k dt ~ 1e-5

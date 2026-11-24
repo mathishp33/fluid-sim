@@ -140,6 +140,12 @@ impl MultiphaseSim {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let mut un = vec![0.0; (nx + 1) * ny];
         let mut vn = vec![0.0; nx * (ny + 1)];
+        // bords ouverts : pression hydrostatique du fluide ambiant le long du bord (voir `open_face_pressure`)
+        let rho_open: [f64; 4] = std::array::from_fn(|s| match self.bc[s] {
+            Bc::Open { p } => self.ambient_density(p),
+            Bc::Wall => 0.0,
+        });
+        let (lx, ly) = (nx as f64 * dx, ny as f64 * dx);
         let up = SyncPtr(un.as_mut_ptr());
         for_rows(ny, nx + 1, MIN_LIGHT, |j| {
             for i in 0..=nx {
@@ -150,11 +156,17 @@ impl MultiphaseSim {
                         if self.is_solid(a) || self.is_solid(b) { 0.0 } else { us[f] - dt / self.face_rho_x(i, j) * (p[b] - p[a]) / dx }
                     }
                     (None, Some(b)) => match (self.bc[0], self.is_solid(b)) {
-                        (Bc::Open { p: po }, false) => us[f] - dt / self.rho_mix[b] * (p[b] - po) / (0.5 * dx),
+                        (Bc::Open { p: po }, false) => {
+                            let pb = self.open_face_pressure(po, rho_open[0], 0.0, (j as f64 + 0.5) * dx);
+                            us[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx)
+                        }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[1], self.is_solid(a)) {
-                        (Bc::Open { p: po }, false) => us[f] - dt / self.rho_mix[a] * (po - p[a]) / (0.5 * dx),
+                        (Bc::Open { p: po }, false) => {
+                            let pb = self.open_face_pressure(po, rho_open[1], lx, (j as f64 + 0.5) * dx);
+                            us[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx)
+                        }
                         _ => 0.0,
                     },
                     _ => 0.0,
@@ -173,11 +185,17 @@ impl MultiphaseSim {
                         if self.is_solid(a) || self.is_solid(b) { 0.0 } else { vs[f] - dt / self.face_rho_y(i, j) * (p[b] - p[a]) / dx }
                     }
                     (None, Some(b)) => match (self.bc[2], self.is_solid(b)) {
-                        (Bc::Open { p: po }, false) => vs[f] - dt / self.rho_mix[b] * (p[b] - po) / (0.5 * dx),
+                        (Bc::Open { p: po }, false) => {
+                            let pb = self.open_face_pressure(po, rho_open[2], (i as f64 + 0.5) * dx, 0.0);
+                            vs[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx)
+                        }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[3], self.is_solid(a)) {
-                        (Bc::Open { p: po }, false) => vs[f] - dt / self.rho_mix[a] * (po - p[a]) / (0.5 * dx),
+                        (Bc::Open { p: po }, false) => {
+                            let pb = self.open_face_pressure(po, rho_open[3], (i as f64 + 0.5) * dx, ly);
+                            vs[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx)
+                        }
                         _ => 0.0,
                     },
                     _ => 0.0,

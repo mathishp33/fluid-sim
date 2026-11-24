@@ -37,6 +37,7 @@ Convention : j croît vers le **haut** (gravité (0, −9.81)) ; l'affichage doi
 | Énergie | énergie interne conservative, conduction (k harmonique, fluides + solides), travail −p∇·u |
 | Changement de phase | p_sat(T) Clausius–Clapeyron avec chaleur latente de Kirchhoff cohérente avec les enthalpies (h_v − h_l = L(T) exactement) ; interface résolue : ancrage de Hardt–Wondra à T_sat ; germes : Schnerr–Sauer ; limité par la masse, l'énergie et le retour à p = p_sat |
 | Solides | cellules étanches avec ρ, cp, k propres (conduction fluide↔solide) |
+| Bords | parois (glissement libre) ou ouverts : `Bc::Open { p }`, p au point le plus haut du domaine, la pression du bord suivant l'hydrostatique du fluide AMBIANT (`open_face_pressure`) ; ce qui entre est l'ambiant à `t_ambient`. À pression constante, une boîte d'air ouverte sur les côtés sous la gravité se mettait à 9 m/s (ρ g H d'écart entre le haut et le bas d'un côté) |
 
 ## Validation (tests, `cargo test --release`)
 hydrostatique (courants 5e-11 m/s, p_fond exact) · Δp = β/κ·ΔT de l'eau confinée (0,25 %) · ballottement ω² = gk·tanh(kh) (+1 %) ·

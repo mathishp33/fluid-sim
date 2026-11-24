@@ -171,6 +171,8 @@ fn powc(c: f32, o: f32) -> f32 {
 var<private> cc_c: u32;
 var<private> ceps: f32;
 var<private> cfe: f32;
+// flamme de diffusion allumée dans la cellule : 1/τ_mél (0 ailleurs ; miroir de CellChem::mix)
+var<private> cc_mix: f32;
 fn chm(k: u32) -> f32 { return S[O_ch_m + k * ncell() + cc_c]; }
 fn ch_set(k: u32, v: f32) { S[O_ch_m + k * ncell() + cc_c] = v; }
 // copie des masses de travail : tampon src → dst (décalages O_ch_*)
@@ -281,6 +283,8 @@ fn cc_rate_parts(j: u32, t: f32) -> vec2<f32> {
     }
     var rf = 0.0;
     if (!rzero) { rf = exp(min(lrf, 80.0)); }
+    // flamme de diffusion allumée : au moins le débit du mélange (miroir de CellChem::rate_parts)
+    if (!rx_rev(j) && rx_flame(j) && cc_mix > 0.0) { rf = max(rf, cc_bounds(j).y * cc_mix); }
     var lrr = lk + lmod - ln_kc(j, t);
     var pzero = zero || !rx_rev(j);
     for (var i = 0u; i < rx_np(j); i++) {
@@ -344,6 +348,7 @@ fn cc_load(c: u32, feff: f32) {
     for (var g = 0u; g < P.ng; g++) { e += select(0.0, epsg(g, c), reactive_k(gmember(g, 0u))); }
     ceps = e;
     cfe = feff;
+    cc_mix = S[O_dmix + c];
 }
 fn chx(o: u32, j: u32) -> f32 { return S[o + j * ncell() + cc_c]; }
 fn chx_set(o: u32, j: u32, v: f32) { S[o + j * ncell() + cc_c] = v; }
@@ -358,6 +363,8 @@ fn k_flame_omega(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_inv
         var wsum = 0.0;
         if (!is_solid(c)) {
             cc_load(c, 1.0);
+            // (capteur de flamme : cinétique seule, sans le débit de mélange — miroir de update_flame_factor)
+            cc_mix = 0.0;
             for (var j = 0u; j < P.nre; j++) {
                 if (!rx_flame(j)) { continue; }
                 var skip = false;
@@ -417,6 +424,57 @@ fn k_flame_dil_y(@builtin(global_invocation_id) g: vec3<u32>) {
 fn k_flame_one(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = g.x;
     if (c < ncell()) { S[O_flame + c] = 1.0; }
+}
+// ---------------------------------------------------------------- flammes de diffusion (miroir de diffusion_mixing)
+// réaction de flamme irréversible à deux réactifs ou plus
+fn dm_rx(j: u32) -> bool { return rx_flame(j) && !rx_rev(j) && rx_nr(j) >= 2u; }
+// comburant : second réactif de la première de ces réactions (P.np si aucune)
+fn dm_ox() -> u32 {
+    for (var j = 0u; j < P.nre; j++) { if (dm_rx(j)) { return rx_rs(j, 1u); } }
+    return P.np;
+}
+// fractions massiques (combustibles, comburant) de la cellule q
+fn dm_y(q: u32, ox: u32) -> vec2<f32> {
+    var tot = 0.0; var yf = 0.0;
+    for (var k = 0u; k < P.np; k++) { tot += max(mass(k, q), 0.0); }
+    if (tot <= 0.0) { return vec2<f32>(0.0, 0.0); }
+    for (var j = 0u; j < P.nre; j++) {
+        if (!dm_rx(j)) { continue; }
+        let f = rx_rs(j, 0u);
+        if (f == ox) { continue; }
+        // (combustible compté une fois)
+        var seen = false;
+        for (var i = 0u; i < j; i++) { if (dm_rx(i) && rx_rs(i, 0u) == f) { seen = true; } }
+        if (!seen) { yf += max(mass(f, q), 0.0); }
+    }
+    return vec2<f32>(yf / tot, max(mass(ox, q), 0.0) / tot);
+}
+// valeur de la voisine (celle de la cellule contre un solide)
+fn dm_at(q: u32, own: vec2<f32>, ox: u32) -> vec2<f32> {
+    if (is_solid(q)) { return own; }
+    return dm_y(q, ox);
+}
+@compute @workgroup_size(64)
+fn k_diff_mix(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.x;
+    if (c >= ncell()) { return; }
+    S[O_dmix + c] = 0.0;
+    let ox = dm_ox();
+    if (ox >= P.np || is_solid(c) || pinned(c)) { return; }
+    let y = dm_y(c, ox);
+    if (y.x <= 1e-9 || y.y <= 1e-9 || ptemp(ox, c) < DIFF_T_LIT) { return; }
+    let i = c % P.nx; let j = c / P.nx;
+    var gx = vec2<f32>(0.0, 0.0); var gy = vec2<f32>(0.0, 0.0);
+    if (i > 0u && i + 1u < P.nx) { gx = 0.5 * (dm_at(c + 1u, y, ox) - dm_at(c - 1u, y, ox)); }
+    else if (i + 1u < P.nx) { gx = dm_at(c + 1u, y, ox) - y; }
+    else if (i > 0u) { gx = y - dm_at(c - 1u, y, ox); }
+    if (j > 0u && j + 1u < P.ny) { gy = 0.5 * (dm_at(c + P.nx, y, ox) - dm_at(c - P.nx, y, ox)); }
+    else if (j + 1u < P.ny) { gy = dm_at(c + P.nx, y, ox) - y; }
+    else if (j > 0u) { gy = y - dm_at(c - P.nx, y, ox); }
+    let nf = sqrt(gx.x * gx.x + gy.x * gy.x);
+    let no = sqrt(gx.y * gx.y + gy.y * gy.y);
+    if (nf < 1e-6 || no < 1e-6) { return; }
+    if ((gx.x * gx.y + gy.x * gy.y) / (nf * no) < -0.2) { S[O_dmix + c] = 1.0 / sqrt(2.0 * P.dx / 9.81); }
 }
 @compute @workgroup_size(64)
 fn k_heat_zero(@builtin(global_invocation_id) g: vec3<u32>) {
