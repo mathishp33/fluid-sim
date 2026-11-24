@@ -279,9 +279,58 @@ pub enum FieldSource {
     Formula(String),
 }
 
+/// Forme d'un corps rigide posé par un protocole (mètres, repère du domaine).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BodySpec {
+    Disc { c: [f64; 2], r: f64 },
+    /// rectangle donné par deux coins (avant rotation de `angle` autour de son centre)
+    Rect { a: [f64; 2], b: [f64; 2] },
+    /// polygone convexe (sommets dans n'importe quel sens)
+    Polygon(Vec<[f64; 2]>),
+}
+
+impl BodySpec {
+    /// zone approchée (affichage sur l'image)
+    pub fn zone(&self) -> Zone {
+        match self {
+            BodySpec::Disc { c, r } => Zone::Disque { c: *c, r: *r },
+            BodySpec::Rect { a, b } => Zone::Rect { a: *a, b: *b },
+            BodySpec::Polygon(p) => {
+                let mut pts = p.clone();
+                if let Some(&f) = p.first() {
+                    pts.push(f);
+                }
+                Zone::Trait { pts, r: 0.0 }
+            }
+        }
+    }
+
+    /// corps rigide FIXE (étape 1 des solides mobiles) de matériau `material`, tourné de `angle` (rad) autour de son centre de masse
+    pub fn body(&self, material: usize, angle: f64, temp: f64) -> Result<super::mp_bodies::RigidBody, String> {
+        use super::mp_bodies::{Motion, RigidBody, Shape};
+        let (shape, pos) = match self {
+            BodySpec::Disc { c, r } => (Shape::Disc { r: *r }, *c),
+            BodySpec::Rect { a, b } => {
+                let (w, h) = ((b[0] - a[0]).abs(), (b[1] - a[1]).abs());
+                if !(w > 0.0 && h > 0.0) {
+                    return Err("rectangle plat : ses deux coins doivent différer en x et en y".into());
+                }
+                (Shape::Rect { w, h }, [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])])
+            }
+            BodySpec::Polygon(p) => Shape::polygon(p)?,
+        };
+        let mut b = RigidBody::new(shape, material, pos, temp);
+        b.angle = angle;
+        b.motion = Motion::Fixed;
+        Ok(b)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Fill { zone: Zone, fluid: String, temp: Option<f64> },
+    /// corps rigide fixe (solides mobiles, étape 1 : voir SOLID.md)
+    Body { shape: BodySpec, material: String, angle: f64 },
     SetTemp { zone: Zone, temp: f64 },
     Solid { zone: Zone, material: String, thermal: ThermalSpec, temp: Option<f64> },
     Clear { zone: Zone },
@@ -503,7 +552,7 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
             Action::Emitter { fluid: f, .. } => fluid(f, *line, true, &mut errs),
             Action::Boundary { spec: BoundarySpec::Inlet { fluid: Some(f), .. }, .. } => fluid(f, *line, true, &mut errs),
             Action::Field { qty: FieldQty::Fraction(f), .. } => fluid(f, *line, false, &mut errs),
-            Action::Solid { material, .. } | Action::Field { qty: FieldQty::Solid(material), .. } => {
+            Action::Solid { material, .. } | Action::Body { material, .. } | Action::Field { qty: FieldQty::Solid(material), .. } => {
                 if let Err(e) = find_solid(sim, material) {
                     errs.push((*line, e));
                 }
@@ -600,6 +649,12 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             let cs = cells(sim, zone);
             apply_tool_with(sim, MpTool::ClearCell, &cs, &tool_opts(t_amb, MpThermal::Passive));
             Ok(cs.len())
+        }
+        Action::Body { shape, material, angle } => {
+            let s = find_solid(sim, material)?;
+            let b = shape.body(s, *angle, t_amb)?;
+            sim.add_body(b)?;
+            Ok(sim.body_frac.iter().filter(|&&a| a > 0.0).count())
         }
         Action::Velocity { zone, v } => {
             let cs = cells(sim, zone);
@@ -1375,6 +1430,15 @@ fn describe(a: &Action) -> String {
         Action::SetTemp { zone, temp } => format!("température {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Solid { zone, material, .. } => format!("solide « {material} » {}", zone.label()),
         Action::Clear { zone } => format!("effacer {}", zone.label()),
+        Action::Body { shape, material, angle } => {
+            let f = match shape {
+                BodySpec::Disc { c, r } => format!("disque {} rayon {}", fmt_point(*c), fmt_num(*r)),
+                BodySpec::Rect { a, b } => format!("rect {} {}", fmt_point(*a), fmt_point(*b)),
+                BodySpec::Polygon(p) => format!("polygone de {} sommets", p.len()),
+            };
+            let a = if *angle != 0.0 { format!(", tourné de {}°", fmt_num(angle.to_degrees())) } else { String::new() };
+            format!("corps fixe « {material} » {f}{a}")
+        }
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),
         Action::Ignite { zone, temp } => format!("allumer {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Sink { zone, rate } => format!("puits {} ({} m/s)", zone.label(), fmt_num(*rate)),

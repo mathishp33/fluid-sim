@@ -37,6 +37,10 @@ impl MultiphaseSim {
         let gd: Vec<f64> = (0..ng).map(|g| if gran[g] { self.reg.phases[self.groups[g][0]].grain_diameter.max(1e-6) } else { 0.0 }).collect();
         let gmx: Vec<f64> = (0..ng).map(|g| if gran[g] { self.reg.phases[self.groups[g][0]].alpha_max.max(1e-6) } else { 1.0 }).collect();
         let (gran, gd, gmx) = (&gran, &gd, &gmx);
+        // corps rigides : la chaleur ne passe que par la part ouverte des faces (comme le fluide, voir `face_velocities`) ; une maille
+        // couverte à 1 − φ a toutes ses faces ouvertes à φ au plus, d'où conductance / capacité bornée comme dans le fluide pur (sans cela
+        // la trace de fluide d'une maille couverte, de capacité quasi nulle, imposait 2000 sous-pas et divergeait). Sans corps : 1.
+        let bodies = self.has_bodies();
         // nœuds : conductivité (×F_eff des flammes épaissies), fraction, capacité, température
         let mut kg = vec![vec![0.0; n]; ng];
         let mut ag = vec![vec![0.0; n]; ng];
@@ -64,6 +68,7 @@ impl MultiphaseSim {
                             continue;
                         }
                         let ff = this.flame_factor[c].max(1.0);
+                        let open = if bodies { this.cell_open_max(c) } else { 1.0 };
                         for g in 0..ng {
                             if this.group_mass(g, c) <= 0.0 {
                                 continue;
@@ -75,13 +80,13 @@ impl MultiphaseSim {
                             *kgp[g].at(c) = k;
                             *cgp[g].at(c) = cap;
                             if cap > 0.0 && a > 0.0 {
-                                amax = amax.max(k * a / cap);
+                                amax = amax.max(open * (k * a / cap));
                                 // rayonnement dans le tas : conductance de face ≤ k_rad à la température du nœud le plus chaud, f/C ne
                                 // dépend que du matériau ; marge 2 (miroir de k_cond_prep)
                                 if gran[g] {
                                     let tg = this.tg[g][c];
                                     let f = (a / gmx[g]).min(1.0);
-                                    amax = amax.max(2.0 * super::mp_granular::bed_rad_k(gd[g], tg, tg, f, 1.0) / cap);
+                                    amax = amax.max(open * (2.0 * super::mp_granular::bed_rad_k(gd[g], tg, tg, f, 1.0) / cap));
                                 }
                             }
                         }
@@ -115,7 +120,8 @@ impl MultiphaseSim {
                         let c = j * nx + i;
                         let mut dsc = 0.0;
                         acc[..ng].fill(0.0);
-                        let mut face = |a: usize, b: usize| match (this.is_solid(a), this.is_solid(b)) {
+                        // `op` : ouverture de la face aux corps rigides (1 sans corps)
+                        let mut face = |a: usize, b: usize, op: f64| match (this.is_solid(a), this.is_solid(b)) {
                             (true, true) => {
                                 let q = harm(ks[a], ks[b]) * (ts[b] - ts[a]) / dx2;
                                 if c == a {
@@ -130,7 +136,7 @@ impl MultiphaseSim {
                                     if ag[h][fc] <= 0.0 {
                                         continue;
                                     }
-                                    let q = harm(ks[sc], kg[h][fc]) * ag[h][fc] * (tgn[h][fc] - ts[sc]) / dx2; // vers le solide
+                                    let q = op * (harm(ks[sc], kg[h][fc]) * ag[h][fc] * (tgn[h][fc] - ts[sc]) / dx2); // vers le solide
                                     if c == sc {
                                         dsc += q
                                     } else {
@@ -152,7 +158,7 @@ impl MultiphaseSim {
                                             let (fa, fb) = ((ag[g][a] / gmx[g]).min(1.0), (ag[h][b] / gmx[h]).min(1.0));
                                             kf += super::mp_granular::bed_rad_k(0.5 * (gd[g] + gd[h]), tgn[g][a], tgn[h][b], fa, fb);
                                         }
-                                        let q = kf * (tgn[h][b] - tgn[g][a]) / dx2;
+                                        let q = op * (kf * (tgn[h][b] - tgn[g][a]) / dx2);
                                         if c == a {
                                             acc[g] += q
                                         } else {
@@ -162,17 +168,19 @@ impl MultiphaseSim {
                                 }
                             }
                         };
+                        let ou = |ii: usize, jj: usize| if bodies { this.u_open(ii, jj) } else { 1.0 };
+                        let ov = |ii: usize, jj: usize| if bodies { this.v_open(ii, jj) } else { 1.0 };
                         if j > 0 {
-                            face(c - nx, c);
+                            face(c - nx, c, ov(i, j));
                         }
                         if i > 0 {
-                            face(c - 1, c);
+                            face(c - 1, c, ou(i, j));
                         }
                         if i + 1 < nx {
-                            face(c, c + 1);
+                            face(c, c + 1, ou(i + 1, j));
                         }
                         if j + 1 < ny {
-                            face(c, c + nx);
+                            face(c, c + nx, ov(i, j + 1));
                         }
                         // SAFETY : la cellule c n'est écrite que par sa ligne
                         unsafe {

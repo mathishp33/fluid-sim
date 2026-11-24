@@ -4,7 +4,7 @@
 //! noms (fluides, matériaux, fichiers) entre guillemets ; nombres avec un POINT décimal ; unités facultatives (SI par défaut :
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
-use super::mp_experiment::{norm, Action, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone};
+use super::mp_experiment::{norm, Action, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone};
 use super::mp_view::T_IGNITION;
 
 const P_ATM: f64 = 101325.0;
@@ -57,6 +57,8 @@ enum Dim {
     Accel,
     Pressure,
     Power,
+    /// angle : DEGRÉS sans unité (°, deg ou rad écrits)
+    Angle,
     Plain,
 }
 
@@ -69,6 +71,7 @@ fn dim_name(d: Dim) -> &'static str {
         Dim::Accel => "une accélération (m/s²)",
         Dim::Pressure => "une pression (Pa, kPa, bar, atm)",
         Dim::Power => "une puissance volumique (W/m³)",
+        Dim::Angle => "un angle (°, rad)",
         Dim::Plain => "un nombre sans unité",
     }
 }
@@ -103,6 +106,8 @@ fn unit_of(w: &str) -> Option<(Dim, f64, f64)> {
         "w/m3" => (Dim::Power, 1.0, 0.0),
         "kw/m3" => (Dim::Power, 1e3, 0.0),
         "mw/m3" => (Dim::Power, 1e6, 0.0),
+        "°" | "deg" => (Dim::Angle, std::f64::consts::PI / 180.0, 0.0),
+        "rad" => (Dim::Angle, 1.0, 0.0),
         _ => return None,
     })
 }
@@ -629,6 +634,55 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             p.end()?;
             push(proto, Action::Clear { zone }, ln);
         }
+        "corps" => {
+            let shape = match p.word("la forme du corps (disque, rect, polygone)")?.as_str() {
+                "disque" | "cercle" => {
+                    let c = p.point()?;
+                    if !(p.eat_w("rayon") || p.eat_w("r")) {
+                        return p.err(format!("il faut « rayon <r> » après le centre du disque{}", p.here()));
+                    }
+                    let r = p.quantity(Dim::Length, "le rayon")?;
+                    if !(r > 0.0) {
+                        return p.err("le rayon d'un corps doit être positif");
+                    }
+                    BodySpec::Disc { c, r }
+                }
+                "rect" | "rectangle" => {
+                    let a = p.point()?;
+                    p.eat_w("a");
+                    let b = p.point()?;
+                    BodySpec::Rect { a, b }
+                }
+                "polygone" => {
+                    let mut pts = vec![p.point()?];
+                    while p.peek() == Some(&Tok::LP) {
+                        pts.push(p.point()?);
+                    }
+                    if pts.len() < 3 {
+                        return p.err("un polygone a au moins 3 sommets");
+                    }
+                    BodySpec::Polygon(pts)
+                }
+                o => return p.err(format!("forme « {o} » : disque (x, y) rayon r, rect (x1, y1) (x2, y2) ou polygone (x1, y1) (x2, y2) (x3, y3)…")),
+            };
+            let material = p.string("le matériau solide")?;
+            let mut angle = 0.0;
+            while !p.done() {
+                match p.word("une option (angle, fixe)")?.as_str() {
+                    "angle" => {
+                        let v = p.number("l'angle")?;
+                        let (v, unit) = p.opt_unit(Dim::Angle, v)?;
+                        angle = if unit { v } else { v.to_radians() };
+                    }
+                    "fixe" => {}
+                    "libre" | "impose" | "pivot" | "bloque" => {
+                        return p.err("mouvement libre, imposé ou sur pivot : pas encore (solides mobiles, étapes 2 et 3) ; les corps sont fixes")
+                    }
+                    o => return p.err(format!("option « {o} » inconnue après « corps » : angle <a> (degrés par défaut), fixe")),
+                }
+            }
+            push(proto, Action::Body { shape, material, angle }, ln);
+        }
         "chauffer" | "refroidir" => {
             let zone = p.zone()?;
             p.eat_w("a");
@@ -813,7 +867,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         "balayage" => return p.err("un seul « balayage » par protocole"),
         o => {
             return p.err(format!(
-                "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, effacer, chauffer, accélérer, vitesse, \
+                "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, bord, champ, gravité, pas max, sauver état, marque, pause, calcul, matériaux, balayage)"
             ))
         }

@@ -401,6 +401,23 @@ impl MultiphaseSim {
                 (df.cv[f], df.dv[f]) = face(self.idx(i, j - 1), self.idx(i, j), self.gravity[1]);
             }
         }
+        // corps fixes : la percolation passe par la part ouverte des faces (voir `face_velocities`)
+        if self.has_bodies() {
+            for j in 0..ny {
+                for i in 1..nx {
+                    let (f, a) = (j * (nx + 1) + i, self.u_open(i, j));
+                    df.cu[f] *= a;
+                    df.du[f] *= a;
+                }
+            }
+            for j in 1..ny {
+                for i in 0..nx {
+                    let (f, a) = (j * nx + i, self.v_open(i, j));
+                    df.cv[f] *= a;
+                    df.dv[f] *= a;
+                }
+            }
+        }
         Some(df)
     }
 

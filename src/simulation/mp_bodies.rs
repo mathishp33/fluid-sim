@@ -1,11 +1,19 @@
 //! Corps rigides — solides mobiles (conception et choix : SOLID.md).
 //!
-//! ÉTAPE 0 (préparation, aucun résultat changé) : les corps existent dans l'état (`MultiphaseSim::bodies`), leur géométrie est
-//! exacte et testée, et la fraction de chaque maille qu'ils occupent (`MultiphaseSim::body_frac`) entre dans la fermeture :
-//! Σ m/ρ + α_corps = 1 (`cell_volume`, `cell_closure_g`) — seulement s'il y a des corps, sans corps le calcul est inchangé au bit
-//! près. Ils ne sont pas encore couplés à l'écoulement : chasser le fluide du volume qu'ils occupent (mailles entièrement couvertes),
-//! masse du corps dans ρ, rigidification de la vitesse et mouvement viennent aux étapes 1 à 3 (SOLID.md § 7). Aucun scénario ni
-//! outil n'en pose, et le GPU refuse les scènes qui en ont.
+//! ÉTAPES 0 ET 1 (SOLID.md § 7–8) : corps rigides FIXES, posés par la commande `corps` des protocoles ou l'outil « Corps » de la
+//! fenêtre d'expérience. Sans corps, le calcul est inchangé au bit près (empreintes physiques des scénarios identiques).
+//!
+//! * La fraction de chaque maille occupée par les corps (`MultiphaseSim::body_frac`) entre dans la fermeture : Σ m/ρ + α_corps = 1
+//!   (`cell_volume`, `cell_closure_g`).
+//! * Poser un corps chasse le fluide de son volume (`add_body`) : une maille entièrement couverte n'en garde qu'une trace
+//!   (`FLUID_TRACE`).
+//! * Chaque face n'est ouverte au fluide qu'à 1 − α (de la plus couverte de ses deux mailles ; 0 si l'une est entièrement couverte :
+//!   `u_open`, `v_open`). La projection (`face_velocities`, `build_stencil`) en tient compte, et la vitesse de la part couverte est
+//!   celle du corps, nulle. La fermeture reste exacte autour des corps : pas de bruit de pression dans l'eau, très raide, où une erreur
+//!   de volume de 1e-6 fausserait la pression de 2 kPa. La percolation, la conduction et la diffusion des espèces passent par la même
+//!   ouverture ; sans cela, la trace de fluide d'une maille couverte, de capacité quasi nulle, rendait la conduction explicite
+//!   instable.
+//! * Ce qui reste (corps mobiles, chaleur du corps, grains, GPU) : SOLID.md § 7. Le GPU refuse les scènes avec des corps.
 //!
 //! * Formes convexes : disque (polygone régulier de `DISC_SIDES` côtés, de même aire que le disque : écart au cercle < 0.04 % du
 //!   rayon), rectangle, polygone convexe quelconque (recentré sur son centre de masse).
@@ -19,6 +27,9 @@ use serde::{Deserialize, Serialize};
 
 /// côtés du polygone qui représente un disque
 pub const DISC_SIDES: usize = 96;
+/// fraction de volume de fluide gardée dans une maille entièrement couverte par un corps (le solveur suppose du fluide dans toute
+/// maille non solide) ; une face dont une maille est couverte au-delà de 1 − FLUID_TRACE est fermée
+pub const FLUID_TRACE: f64 = 1e-6;
 
 fn cross(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[1] - a[1] * b[0]
@@ -331,14 +342,121 @@ impl super::multiphase::MultiphaseSim {
         self.body_frac = body_fractions(&self.bodies, self.nx, self.ny, self.dx);
     }
 
-    /// Volume occupé par les corps dans la maille c, ajouté au volume des fluides dans la fermeture (0 sans corps).
+    /// Volume occupé par les corps dans la maille c, ajouté au volume des fluides dans la fermeture (0 sans corps) ; plafonné à
+    /// 1 − FLUID_TRACE (la trace de fluide d'une maille entièrement couverte).
     #[inline]
     pub(crate) fn body_volume(&self, c: usize) -> f64 {
         if self.bodies.is_empty() {
             0.0
         } else {
-            self.body_frac[c]
+            self.body_frac[c].min(1.0 - FLUID_TRACE)
         }
+    }
+
+    /// Ouverture au fluide d'une face entre deux mailles de fractions de corps a et b : 1 − max(a, b), 0 si l'une est entièrement
+    /// couverte. Le maximum garantit qu'une face ne débite jamais plus que la place de fluide de la plus couverte de ses mailles.
+    #[inline]
+    fn opening(a: f64, b: f64) -> f64 {
+        let m = a.max(b);
+        if m >= 1.0 - FLUID_TRACE {
+            0.0
+        } else {
+            1.0 - m
+        }
+    }
+
+    /// Ouverture de la face u (i, j) — entre les mailles (i − 1, j) et (i, j) ; face de bord : sa seule maille. 1 sans corps.
+    pub(crate) fn u_open(&self, i: usize, j: usize) -> f64 {
+        if self.bodies.is_empty() {
+            return 1.0;
+        }
+        let f = &self.body_frac;
+        match (i > 0, i < self.nx) {
+            (true, true) => Self::opening(f[self.idx(i - 1, j)], f[self.idx(i, j)]),
+            (false, true) => Self::opening(f[self.idx(0, j)], 0.0),
+            (true, false) => Self::opening(f[self.idx(self.nx - 1, j)], 0.0),
+            _ => 1.0,
+        }
+    }
+
+    /// Ouverture de la face v (i, j) — entre les mailles (i, j − 1) et (i, j). 1 sans corps.
+    pub(crate) fn v_open(&self, i: usize, j: usize) -> f64 {
+        if self.bodies.is_empty() {
+            return 1.0;
+        }
+        let f = &self.body_frac;
+        match (j > 0, j < self.ny) {
+            (true, true) => Self::opening(f[self.idx(i, j - 1)], f[self.idx(i, j)]),
+            (false, true) => Self::opening(f[self.idx(i, 0)], 0.0),
+            (true, false) => Self::opening(f[self.idx(i, self.ny - 1)], 0.0),
+            _ => 1.0,
+        }
+    }
+
+    /// Plus grande ouverture des quatre faces de la maille c (≤ 1 − α_corps de c) : borne des échanges de la maille.
+    pub(crate) fn cell_open_max(&self, c: usize) -> f64 {
+        let (i, j) = (c % self.nx, c / self.nx);
+        self.u_open(i, j).max(self.u_open(i + 1, j)).max(self.v_open(i, j)).max(self.v_open(i, j + 1))
+    }
+
+    /// Pose un corps (étape 1 : corps fixes). Sa fraction de maille est calculée et le fluide qu'il recouvre est chassé : dans chaque
+    /// maille, masses et énergies sont ramenées à la place restante 1 − α_corps (composition et température gardées ; une trace
+    /// FLUID_TRACE reste dans les mailles entièrement couvertes). Le fluide chassé disparaît, comme quand on peint un solide.
+    /// Retourne l'indice du corps.
+    pub fn add_body(&mut self, b: RigidBody) -> Result<usize, String> {
+        if b.material >= self.reg.solids.len() {
+            return Err(format!("matériau n° {} inconnu ({} solides)", b.material, self.reg.solids.len()));
+        }
+        let ok = match &b.shape {
+            Shape::Disc { r } => *r > 0.0 && r.is_finite(),
+            Shape::Rect { w, h } => *w > 0.0 && *h > 0.0 && w.is_finite() && h.is_finite(),
+            Shape::Polygon { pts } => pts.len() >= 3 && polygon_area(pts) > 0.0,
+        };
+        if !ok || !b.pos.iter().chain([b.angle].iter()).all(|x| x.is_finite()) {
+            return Err("corps de forme ou de position invalide".into());
+        }
+        let old = self.body_frac.clone();
+        self.bodies.push(b);
+        self.update_body_fractions();
+        self.displace_fluid(&old);
+        Ok(self.bodies.len() - 1)
+    }
+
+    /// Retire tous les corps ; le fluide resté dans les mailles qu'ils couvraient reprend toute la place (inverse exact de
+    /// `add_body` sur un état qui n'a pas bougé, aux arrondis près).
+    pub fn clear_bodies(&mut self) {
+        if self.bodies.is_empty() {
+            return;
+        }
+        let old = self.body_frac.clone();
+        self.bodies.clear();
+        self.body_frac.iter_mut().for_each(|a| *a = 0.0);
+        self.displace_fluid(&old);
+    }
+
+    /// Ramène le fluide de chaque maille à la place que lui laissent les corps (anciennes fractions `old` → `body_frac`) :
+    /// masses et énergies multipliées par (1 − α_nouveau) / (1 − α_ancien), température et composition gardées.
+    fn displace_fluid(&mut self, old: &[f64]) {
+        let (np, ng) = (self.reg.phases.len(), self.eg.len());
+        let cap = 1.0 - FLUID_TRACE;
+        for c in 0..self.nx * self.ny {
+            if self.is_solid(c) {
+                continue;
+            }
+            let (a0, a1) = (old[c].min(cap), self.body_frac[c].min(cap));
+            if a0 == a1 {
+                continue;
+            }
+            let f = (1.0 - a1) / (1.0 - a0);
+            for k in 0..np {
+                self.mass[k][c] *= f;
+            }
+            for g in 0..ng {
+                self.eg[g][c] *= f;
+            }
+            self.e[c] *= f;
+        }
+        self.refresh();
     }
 }
 
@@ -454,9 +572,10 @@ mod tests {
         b.dof = Dof { x: false, y: true, rot: true };
         s.bodies.push(b);
         s.update_body_fractions();
-        // maille du centre entièrement couverte : son volume compte en plus de celui du fluide (que l'étape 1 chassera)
+        // maille du centre entièrement couverte : son volume (plafonné pour la trace de fluide) compte en plus de celui du fluide,
+        // qui n'a pas été chassé (corps ajouté à la main, sans `add_body`)
         assert!((s.body_frac[c] - 1.0).abs() < 1e-12);
-        assert!((s.cell_volume(c, p) - v0 - 1.0).abs() < 1e-12);
+        assert!((s.cell_volume(c, p) - v0 - (1.0 - FLUID_TRACE)).abs() < 1e-12);
         let total: f64 = s.body_frac.iter().sum::<f64>() * s.dx * s.dx;
         assert!((total / (PI * 0.0025) - 1.0).abs() < 1e-12);
         // le GPU refuse la scène, en disant pourquoi
@@ -479,6 +598,151 @@ mod tests {
         s.update_body_fractions();
         assert_eq!(s.cell_volume(c, p), v0);
         assert!(s.body_frac.iter().all(|&a| a == 0.0));
+    }
+
+    /// scène construite par un protocole (conditions initiales : départ + actions avant le premier « simuler »)
+    fn scene(text: &str) -> crate::simulation::multiphase::MultiphaseSim {
+        let p = crate::simulation::mp_script::parse_all(text).unwrap_or_else(|e| panic!("{e:?}")).remove(0);
+        crate::simulation::mp_experiment::initial_state(&p, std::path::Path::new(".")).unwrap_or_else(|e| panic!("{e}")).0
+    }
+
+    fn run_to(s: &mut crate::simulation::multiphase::MultiphaseSim, t: f64) {
+        while s.time < t && !s.diverged {
+            s.step();
+        }
+        assert!(!s.diverged && s.state_is_sane(), "état invalide à t = {}", s.time);
+    }
+
+    #[test]
+    fn placing_a_fixed_body_displaces_the_fluid_and_keeps_the_closure() {
+        use crate::simulation::mp_view::{build_scenario, MpScenario};
+        let mut s = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let (m0, mass0) = (s.total_mass(eau), s.mass.clone());
+        let mut b = RigidBody::new(Shape::Disc { r: 0.03 }, 0, [0.05, 0.06], 293.15);
+        b.motion = Motion::Fixed;
+        s.add_body(b).unwrap();
+        // fermeture tenue partout : fluide + corps = 1
+        for c in 0..s.nx * s.ny {
+            if !s.is_solid(c) {
+                let v = s.cell_volume(c, s.p[c]);
+                assert!((v - 1.0).abs() < 1e-9, "maille {c} : volume {v}");
+            }
+        }
+        // l'eau chassée : celle du volume du disque (entièrement dans la colonne d'eau)
+        let rho_w = s.reg.phases[eau].rho(s.p[s.idx(5, 5)], 293.15);
+        let removed = m0 - s.total_mass(eau);
+        assert!((removed / (rho_w * PI * 9e-4) - 1.0).abs() < 1e-3, "eau chassée {removed} kg/m");
+        // une maille entièrement couverte garde une trace
+        let c = s.idx(5, 5);
+        assert!(s.body_frac[c] == 1.0 && s.mass[eau][c] > 0.0 && s.mass[eau][c] < 2e-3);
+        // retirer le corps rend le fluide (aux arrondis près)
+        s.clear_bodies();
+        for k in 0..s.mass.len() {
+            for c in 0..s.nx * s.ny {
+                assert!((s.mass[k][c] - mass0[k][c]).abs() <= 1e-9 * mass0[k][c].abs().max(1e-12), "phase {k}, maille {c}");
+            }
+        }
+    }
+
+    const STILL: &str = "départ scénario \"cuve vide\" grille 40 x 40 maille 1 cm\n\
+                         remplir rect (0, 0) (0.4, 0.3) avec \"eau\" à 20 °C\n";
+
+    #[test]
+    fn still_water_stays_still_around_fixed_bodies() {
+        let mut with = scene(&format!("{STILL}corps disque (0.2, 0.15) rayon 4 cm \"acier\"\ncorps rect (0.06, 0.05) (0.12, 0.09) \"verre\" angle 30\n"));
+        let mut without = scene(STILL);
+        assert_eq!(with.bodies.len(), 2);
+        run_to(&mut with, 0.5);
+        run_to(&mut without, 0.5);
+        let eau = with.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let inside: f64 = (0..with.nx * with.ny).filter(|&c| with.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| with.mass[eau][c]).fold(0.0, f64::max);
+        let pmax_err = (0..with.nx * with.ny)
+            .filter(|&c| !with.is_solid(c) && with.body_frac[c] < 1.0 - FLUID_TRACE)
+            .map(|c| (with.p[c] - without.p[c]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "eau au repos : vitesse max {:.3e} m/s avec corps, {:.3e} sans ; eau dans les mailles couvertes ≤ {inside:.3e} kg/m³ ; écart de pression ≤ {pmax_err:.3e} Pa ; {} pas",
+            with.max_speed(),
+            without.max_speed(),
+            with.step_count
+        );
+        // mesuré : 1.8e-7 m/s, 3e-3 Pa (sans corps : 1.5e-11 m/s)
+        assert!(with.max_speed() < 1e-5, "courants parasites {}", with.max_speed());
+        assert!(pmax_err < 1.0, "la pression hydrostatique change autour des corps : {pmax_err} Pa");
+        assert!(inside < 2e-3, "eau entrée dans un corps : {inside}");
+    }
+
+    #[test]
+    fn a_dam_break_flows_around_a_fixed_body_without_entering_it() {
+        // colonne d'eau à gauche (x < 0.15, y < 0.2, 29.9 kg/m) ; muret incliné posé sur le fond, puis un disque
+        let mut s = scene(
+            "départ scénario \"barrage\" grille 60 x 40 maille 1 cm\n\
+             corps rect (0.3, 0) (0.33, 0.05) \"acier\" angle 20\n\
+             corps disque (0.45, 0.04) rayon 2.5 cm \"verre\"\n",
+        );
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        run_to(&mut s, 0.6);
+        let (nx, ny) = (s.nx, s.ny);
+        let inside: f64 = (0..nx * ny).filter(|&c| s.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| s.mass[eau][c]).fold(0.0, f64::max);
+        // eau passée au-delà du muret (x > 0.36 m) et du disque (x > 0.5 m)
+        let beyond = |x0: usize| (0..ny).flat_map(|j| (x0..nx).map(move |i| (i, j))).map(|(i, j)| s.mass[eau][s.idx(i, j)]).sum::<f64>() * s.dx * s.dx;
+        let (past_wall, past_disc) = (beyond(36), beyond(50));
+        let dm = (s.total_mass(eau) / m0 - 1.0).abs();
+        eprintln!(
+            "barrage contre deux corps : eau dans les corps ≤ {inside:.2e} kg/m³, au-delà du muret {past_wall:.2} kg/m, du disque {past_disc:.2} kg/m (sur {m0:.1}), masse d'eau à {dm:.1e} près, vitesse max {:.2} m/s, {} pas, {} refaits",
+            s.max_speed(),
+            s.step_count,
+            s.rollbacks
+        );
+        assert!(inside < 2e-3, "eau entrée dans un corps : {inside}");
+        assert!(past_wall > 2.0 && past_disc > 0.5, "l'eau n'a pas franchi les obstacles ({past_wall} / {past_disc} kg/m)");
+        assert!(dm < 1e-6, "masse d'eau non conservée ({dm})");
+        assert!(s.max_speed() < 5.0);
+    }
+
+    #[test]
+    fn a_channel_flow_goes_around_a_fixed_disc_and_not_through_it() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 60 x 30 maille 1 cm\n\
+             gravité (0, 0)\n\
+             remplir partout avec \"eau\" à 20 °C\n\
+             bord gauche entrée (0.2, 0) m/s à 20 °C \"eau\"\n\
+             bord droite ouvert\n\
+             bord haut mur\n\
+             corps disque (0.25, 0.15) rayon 4 cm \"acier\"\n",
+        );
+        run_to(&mut s, 0.6);
+        let (nx, ny) = (s.nx, s.ny);
+        // faces fermées par le corps : vitesse nulle
+        let mut closed = 0;
+        for j in 0..ny {
+            for i in 0..=nx {
+                if s.u_open(i, j) == 0.0 {
+                    closed += 1;
+                    assert_eq!(s.u[s.uidx(i, j)], 0.0, "face u ({i}, {j}) fermée mais traversée");
+                }
+            }
+        }
+        assert!(closed > 20);
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let inside: f64 = (0..nx * ny).filter(|&c| s.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| s.mass[eau][c]).fold(0.0, f64::max);
+        // débit : entrée 0.2 m/s × 0.3 m ; sortie à droite ; par la section du disque (faces u en x = 0.25 m)
+        let q = |i: usize| (0..ny).map(|j| s.u[s.uidx(i, j)]).sum::<f64>() * s.dx;
+        let (q_in, q_mid, q_out) = (q(0), q(25), q(nx));
+        // vitesse dans les passages au-dessus et au-dessous du disque (faces de la section du centre, hors corps)
+        let gap: Vec<f64> = (0..ny).filter(|&j| s.u_open(25, j) == 1.0).map(|j| s.u[s.uidx(25, j)]).collect();
+        let gap_mean = gap.iter().sum::<f64>() / gap.len() as f64;
+        eprintln!(
+            "canal : débits entrée {q_in:.4} m²/s, section du disque {q_mid:.4}, sortie {q_out:.4} ; vitesse moyenne des passages {gap_mean:.3} m/s ; eau dans le corps ≤ {inside:.2e} kg/m³ ; {} faces fermées ; {} pas",
+            closed, s.step_count
+        );
+        assert!((q_in - 0.06).abs() < 1e-9, "entrée {q_in}");
+        // mesuré : 0.0600 partout ; passages à 0.284 m/s (débit / section libre : 0.2 × 0.30 / 0.22 = 0.273)
+        assert!((q_out / q_in - 1.0).abs() < 1e-3 && (q_mid / q_in - 1.0).abs() < 1e-3, "débits {q_in} {q_mid} {q_out}");
+        assert!(gap_mean > 0.25 && gap_mean < 0.32, "l'eau n'accélère pas comme il faut autour du disque : {gap_mean}");
+        assert!(inside < 2e-3, "eau entrée dans le corps : {inside}");
     }
 
     #[test]

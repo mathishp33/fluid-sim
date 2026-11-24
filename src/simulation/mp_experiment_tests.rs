@@ -397,6 +397,34 @@ fn the_initial_state_is_the_start_plus_the_actions_before_the_first_simulate() {
 }
 
 #[test]
+fn the_corps_command_places_fixed_rigid_bodies() {
+    let text = "\
+départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+corps disque (0.1, 0.1) rayon 2 cm \"acier\"
+corps rect (0.15, 0.05) (0.25, 0.08) \"verre\" angle 45
+corps polygone (0.05, 0.2) (0.12, 0.2) (0.08, 0.27) \"acier\" fixe
+simuler 5 ms
+";
+    let p = proto(text);
+    let (s, _, _) = initial_state(&p, Path::new(".")).unwrap();
+    assert_eq!(s.bodies.len(), 3);
+    assert!((s.bodies[1].angle - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+    let area: f64 = s.body_frac.iter().sum::<f64>() * s.dx * s.dx;
+    let expect = std::f64::consts::PI * 4e-4 + 0.1 * 0.03 + 0.5 * 0.07 * 0.07;
+    assert!((area - expect).abs() < 1e-9, "aire {area} pour {expect}");
+    // le protocole tourne (le GPU refuse les scènes avec des corps : voir mp_bodies)
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert!((r.sim.time - 0.005).abs() < 1e-9 && r.sim.bodies.len() == 3);
+    assert!(r.log.iter().any(|l| l.contains("corps fixe « verre »") && l.contains("tourné de 45°")), "{}", r.log.join("\n"));
+    // pas encore de corps mobiles ; matériau inconnu signalé avec sa ligne
+    let e = parse("départ scénario \"cuve vide\"\ncorps disque (0.1, 0.1) rayon 2 cm \"acier\" libre", None).unwrap_err();
+    assert!(e[0].line == 2 && e[0].msg.contains("pas encore"), "{e:?}");
+    let e = Runner::new(proto("départ scénario \"cuve vide\" grille 16 x 16\ncorps disque (0.05, 0.05) rayon 1 cm \"bois flotté\"\n"), Path::new("."), None, Some(false)).err().unwrap();
+    assert!(e.starts_with("ligne 2") && e.contains("acier"), "{e}");
+}
+
+#[test]
 fn the_example_protocols_read_and_start() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("experiences");
     let mut n = 0;

@@ -37,6 +37,7 @@ enum Tab {
 enum CiTool {
     Fill,
     Solid,
+    Body,
     Temperature,
     Clear,
     Ignite,
@@ -46,11 +47,13 @@ enum CiTool {
 }
 
 impl CiTool {
-    const ALL: [CiTool; 8] = [CiTool::Fill, CiTool::Solid, CiTool::Temperature, CiTool::Clear, CiTool::Ignite, CiTool::Sink, CiTool::Emitter, CiTool::Grille];
+    const ALL: [CiTool; 9] =
+        [CiTool::Fill, CiTool::Solid, CiTool::Body, CiTool::Temperature, CiTool::Clear, CiTool::Ignite, CiTool::Sink, CiTool::Emitter, CiTool::Grille];
     fn name(self) -> &'static str {
         match self {
             CiTool::Fill => "Remplir d'un fluide ou d'un mélange",
             CiTool::Solid => "Solide",
+            CiTool::Body => "Corps rigide fixe (disque au clic, rectangle tiré)",
             CiTool::Temperature => "Température (composition gardée)",
             CiTool::Clear => "Effacer (solides, cellules spéciales)",
             CiTool::Ignite => "Allumer (noyau de gaz brûlés)",
@@ -99,6 +102,8 @@ ZONES
 CONDITIONS INITIALES ET ACTIONS (instantanées)
   remplir <zone> avec \"eau\" [à 20 °C]           température <zone> 350 K
   solide <zone> \"acier\" [isotherme 400 K | chauffant 1e6 W/m³] [à T]
+  corps disque (x, y) rayon r \"acier\" | corps rect (x1, y1) (x2, y2) \"verre\" [angle 30] | corps polygone (x1, y1) (x2, y2) (x3, y3) \"acier\"
+        (corps rigide FIXE, bords lissés ; angle en degrés)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"]
@@ -705,8 +710,11 @@ impl ExperimentWindow {
         };
         match self.tool {
             CiTool::Fill | CiTool::Emitter => pick(ui, "Fluide", &mut self.fluid, &fluids),
-            CiTool::Solid => pick(ui, "Matériau", &mut self.solid, &solids),
+            CiTool::Solid | CiTool::Body => pick(ui, "Matériau", &mut self.solid, &solids),
             _ => {}
+        }
+        if self.tool == CiTool::Body {
+            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille) ; fixe pour l'instant — le mouvement viendra (SOLID.md).");
         }
         if matches!(self.tool, CiTool::Fill | CiTool::Temperature | CiTool::Emitter | CiTool::Solid) {
             ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));
@@ -821,6 +829,12 @@ impl ExperimentWindow {
                 SolidThermal::Passive => format!("solide {z} \"{}\" à {t}", self.solid),
                 SolidThermal::Isothermal => format!("solide {z} \"{}\" isotherme {}", self.solid, Self::temp_text(self.thermal_temp)),
                 SolidThermal::Heater => format!("solide {z} \"{}\" chauffant {} W/m³ à {t}", self.solid, fmt_num(self.thermal_power)),
+            },
+            CiTool::Body => match zone {
+                Zone::Rect { a, b } => format!("corps rect {} {} \"{}\"", fmt_point(*a), fmt_point(*b), self.solid),
+                Zone::Disque { c, r } => format!("corps disque {} rayon {} \"{}\"", fmt_point(*c), fmt_num(*r), self.solid),
+                Zone::Trait { pts, r } if !pts.is_empty() => format!("corps disque {} rayon {} \"{}\"", fmt_point(pts[0]), fmt_num(*r), self.solid),
+                _ => format!("# corps : forme non prise en charge ({z})"),
             },
             CiTool::Clear => format!("effacer {z}"),
             CiTool::Ignite => format!("allumer {z} à {t}"),
@@ -1123,6 +1137,13 @@ impl ExperimentWindow {
         if left_down {
             if let Some(c) = self.hovered {
                 match self.shape {
+                    Shape::Brush if self.tool == CiTool::Body => {
+                        // corps : un disque au point d'appui (pas de trait)
+                        if self.stroke.is_empty() {
+                            let p = self.center_of(c);
+                            self.stroke.push(p);
+                        }
+                    }
                     Shape::Brush => {
                         let p = self.center_of(c);
                         if self.stroke.last() != Some(&p) {
@@ -1154,9 +1175,10 @@ impl ExperimentWindow {
                 Shape::Brush => {
                     if !self.stroke.is_empty() {
                         let dx = self.preview.as_ref().map_or(0.01, |s| s.dx);
-                        let r = self.radius as f64 * dx;
+                        let body = self.tool == CiTool::Body;
+                        let r = if body { self.radius.max(1) } else { self.radius } as f64 * dx;
                         let pts = std::mem::take(&mut self.stroke);
-                        let zone = if pts.len() == 1 { Zone::Disque { c: pts[0], r } } else { Zone::Trait { pts, r } };
+                        let zone = if pts.len() == 1 || body { Zone::Disque { c: pts[0], r } } else { Zone::Trait { pts, r } };
                         let line = self.tool_line(&zone);
                         self.commit_line(line);
                     }
@@ -1208,6 +1230,9 @@ impl ExperimentWindow {
         let Some(p) = &self.parsed else { return };
         for (s, _) in &p.steps {
             if let Step::Do(a) = s {
+                if let Action::Body { shape, .. } = a {
+                    self.draw_zone(painter, rect, &shape.zone(), Color32::from_rgb(150, 190, 255));
+                }
                 if let Some(z) = a.zone() {
                     let col = if matches!(a, Action::Heat { .. } | Action::Accelerate { .. }) { Color32::from_rgb(255, 160, 40) } else { Color32::from_gray(220) };
                     self.draw_zone(painter, rect, z, col);
@@ -1373,6 +1398,39 @@ mod tests {
         assert_eq!(s.temp[s.idx(5, 3)], 500.0);
         assert!(s.temp[s.idx(20, 20)] < 400.0);
         assert!(w.errors.is_empty(), "{:?}", w.errors);
+    }
+
+    #[test]
+    fn the_body_tool_places_a_fixed_rigid_body_by_click_or_rectangle() {
+        let ctx = egui::Context::default();
+        let mut w = window("départ scénario \"cuve vide\" grille 40 x 30 maille 1 cm\nsimuler 10 ms\n");
+        w.tab = Tab::Initial;
+        w.tool = CiTool::Body;
+        w.solid = "acier".into();
+        w.radius = 3;
+        frame(&ctx, &mut w, vec![]);
+        frame(&ctx, &mut w, vec![]);
+        // clic (même glissé) : un disque au point d'appui
+        let path = [at(&w, 10, 10), at(&w, 14, 12)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("corps disque (0.105, 0.105) rayon 0.03 \"acier\""), "{}", w.text);
+        assert_eq!(w.preview.as_ref().unwrap().bodies.len(), 1);
+        // rectangle tiré
+        w.shape = Shape::Rect;
+        w.solid = "verre".into();
+        let path = [at(&w, 25, 5), at(&w, 30, 8)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("corps rect (0.25, 0.05) (0.31, 0.09) \"verre\""), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        assert_eq!(s.bodies.len(), 2);
+        let area: f64 = s.body_frac.iter().sum::<f64>() * s.dx * s.dx;
+        assert!((area - (std::f64::consts::PI * 9e-4 + 0.06 * 0.04)).abs() < 1e-9, "aire {area}");
+        assert!(w.errors.is_empty(), "{:?}", w.errors);
+        // l'image se rend avec les corps
+        for d in [MpDisplay::Phases, MpDisplay::Temperature] {
+            w.display = d;
+            frame(&ctx, &mut w, vec![]);
+        }
     }
 
     #[test]

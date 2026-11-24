@@ -5,8 +5,8 @@ qui coule, un projectile, un piston, une palette qui fait des vagues, un clapet 
 cellules spéciales du TODO), un agitateur qui tourne. Ce ne sont pas des poudres : la phase granulaire (GRANULAIRE.md) ne rend ni
 leur forme ni leur inertie propre.
 
-Document de conception (2026-11-24). Les choix du § 9 sont validés. L'étape 0 est faite (§ 8, `mp_bodies.rs`) : elle prépare
-l'architecture sans changer un seul résultat. Les corps ne sont pas encore couplés à l'écoulement.
+Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé) et 1 (corps
+FIXES : l'eau les contourne sans y entrer) sont faites (§ 8, `mp_bodies.rs`). Les corps mobiles viennent ensuite (§ 7).
 
 **En bref — recommandation**
 
@@ -239,6 +239,23 @@ incompressible. À chaque pas :
 **À vérifier tôt** : un corps nettement plus léger que l'eau (liège). Si ce n'est pas stable, on se replie sur le couplage
 monolithique (Gibou & Min 2012) : les vitesses des corps deviennent des inconnues de la projection (trois par corps).
 
+**Ce que l'étape 1 a changé à ce schéma : les ouvertures des faces.** La limite ci-dessus (rigidifier APRÈS une projection qui ne
+voit pas le corps laisse une erreur de volume à la paroi) est grave ici. Dans l'eau, très raide (Tait), une erreur de volume de 1e-6
+fausse la pression de 2 kPa. La projection sait donc où est le corps :
+- chaque face est ouverte au fluide à A = 1 − α (α de la plus couverte de ses deux mailles ; 0 si l'une est entièrement couverte) ;
+- la vitesse corrigée de la face est A (u* − dt/ρ ∇p) + (1 − A) V_corps (avec V_corps = 0 pour un corps fixe), et la matrice de
+  pression a les mêmes coefficients A dt/ρ ;
+- la fermeture Σ m/ρ + α = 1 est donc exacte autour des corps, comme en porosité FAVOR. Le « une seule place où la face est fermée
+  et à quelle vitesse » écarté à l'étape 0 revient sous cette forme fractionnaire.
+
+La vitesse de face est alors la vitesse débitante : le flux de volume par unité de face. Le transport (PLIC), la percolation, la
+conduction et la diffusion passent par les mêmes ouvertures. Comme une maille couverte à 1 − φ a toutes ses faces ouvertes au plus à
+φ, conductance et capacité y diminuent ensemble, et les schémas explicites gardent le pas du fluide pur (sans cela, la conduction
+s'emballait sur la trace d'une maille couverte).
+
+Pour les corps MOBILES, il reste à choisir comment la vitesse du corps est obtenue : rigidification de la quantité de mouvement
+(domaine fictif) ou inconnue de la projection (monolithique). Ce sera l'étape 3.
+
 ### 6.3 Contacts
 
 - Une force de ressort-amortisseur s'applique, comme dans la méthode des éléments discrets, quand le corps pénètre une paroi, un
@@ -275,14 +292,14 @@ monolithique (Gibou & Min 2012) : les vitesses des corps deviennent des inconnue
 | Étape | Contenu | Validation |
 |---|---|---|
 | 0 (faite) | préparer (§ 8) : géométrie exacte, fractions, contraintes, fermeture, état, rendu ; aucun résultat changé | Σ α dx² = aire (1e-12) quels que soient la position et l'angle ; empreintes physiques des 18 scénarios identiques au bit près |
-| 1 | corps fixes : poser un corps chasse le fluide (une trace reste dans les mailles entièrement couvertes), masse du corps dans ρ, rigidification à vitesse nulle, outil et commande `corps` | écoulement autour d'un disque fixe ; fermeture tenue (Σ m/ρ + α_c = 1) ; pas de fuite de fluide à travers le corps |
+| 1 (faite) | corps fixes : poser un corps chasse le fluide (trace dans les mailles couvertes) ; ouvertures des faces dans la projection, le transport, la percolation, la conduction et la diffusion ; commande `corps`, outil de la fenêtre d'expérience | fermeture à 1e-9 après la pose ; eau au repos autour de deux corps : 1.8e-7 m/s, pression à 3 mPa près ; canal autour d'un disque : débit identique entrée / disque / sortie, passages à 0.284 m/s (0.273 attendus), rien n'entre dans le corps ; barrage contre un muret et un disque : masse d'eau à 4e-16, aucun pas refait |
 | 2 | mouvement imposé | piston dans un tube de gaz fermé : p V^γ = cte en compression lente ; disque tiré à vitesse constante : traînée comparée à Tritton (1959) ; aucune pointe de pression quand le corps traverse les mailles |
 | 3 | mouvement libre + masque de DDL | flotteur : tirant d'eau = (ρ_c/ρ_eau) H, oscillation verticale amortie ; disque qui sédimente dans un canal (cas de Glowinski et al. 2001, repris par Wan & Turek 2006) ; corps léger (liège) stable ; clapet sur pivot |
 | 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
 
-## 8. Préparer l'architecture (étape 0, faite le 2026-11-24, sans changer un résultat)
+## 8. Ce qui est fait : étape 0 (préparer l'architecture sans changer un résultat) et étape 1 (corps fixes)
 
 1. **`mp_bodies.rs`**, testé à part (6 tests) :
    - corps rigide `RigidBody` (forme, matériau, position, angle, vitesses, axes libres `Dof`, pivot, mode `Motion` : libre, fixe,
@@ -312,9 +329,19 @@ rigidification (étape 1) qui l'impose. Ce point ne reviendrait qu'avec le repli
 des 18 scénarios, en 80 × 60 et 160 × 120 après 20 pas (`cpu_physics_fingerprints`), sont identiques avant et après au bit près.
 Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent forcément : l'état a deux champs de plus.
 
-**Reste pour l'étape 1** : chasser le fluide du volume d'un corps posé, en gardant une trace dans les mailles entièrement couvertes
-(le solveur suppose du fluide dans toute maille non solide) ; la masse du corps dans la masse volumique des faces ; la
-rigidification à vitesse nulle après la projection ; un outil dans la fenêtre et une commande `corps` dans les protocoles.
+**Étape 1 (corps fixes, faite le 2026-11-24).**
+- `add_body` chasse le fluide du volume du corps : masses et énergies ramenées à 1 − α, composition et température gardées, une
+  trace de 1e-6 dans les mailles entièrement couvertes. `clear_bodies` rend le fluide.
+- Les ouvertures des faces (§ 6.2) entrent dans la projection, le transport, la percolation, la conduction et la diffusion des
+  espèces.
+- La commande `corps disque | rect | polygone … "matériau" [angle a]` des protocoles (EXPERIENCES.md) et l'outil « Corps rigide
+  fixe » de la fenêtre d'expérience (disque au clic, rectangle tiré) posent les corps.
+- La « masse du corps dans ρ » prévue au départ n'est pas utile pour un corps fixe : la part couverte ne bouge pas, seule l'inertie
+  du fluide compte. Elle reviendra avec les corps libres.
+- Le corps n'échange pas encore de chaleur avec le fluide : la trace des mailles couvertes est isolée et le corps garde sa
+  température (étape 5). Les grains ne le voient pas encore : leur sédimentation ignore les corps.
+- Tests (`mp_bodies.rs`) : fermeture après la pose, eau au repos, canal autour d'un disque, barrage contre deux corps ; commande et
+  outil ; empreintes physiques des 18 scénarios toujours identiques au bit près.
 
 ## 9. Choix (validés le 2026-11-24)
 

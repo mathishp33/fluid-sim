@@ -333,8 +333,20 @@ impl MultiphaseSim {
                 // flux à travers la face (a, b), a < b, de a vers b : même calcul vu des deux cellules ⇒ conservation exacte
                 let this = &*self;
                 let (mg_, y_, dl_) = (&mg, &y, &dloc);
+                let bodies = this.has_bodies();
                 let face = |a: usize, b: usize, out: &mut [f64; super::phases::MAX_PHASES], ef: &mut f64| -> bool {
                     if this.is_solid(a) || this.is_solid(b) || mg_[a] <= 1e-12 || mg_[b] <= 1e-12 {
+                        return false;
+                    }
+                    // corps rigides : diffusion par la part ouverte de la face (b voisine de droite ou du haut de a) ; sans corps : 1
+                    let op = if !bodies {
+                        1.0
+                    } else if b == a + 1 {
+                        this.u_open(b % nx, b / nx)
+                    } else {
+                        this.v_open(b % nx, b / nx)
+                    };
+                    if op == 0.0 {
                         return false;
                     }
                     let mbar = 0.5 * (mg_[a] + mg_[b]);
@@ -342,7 +354,7 @@ impl MultiphaseSim {
                     for q in 0..ng {
                         let (da, db) = (dl_[q][a], dl_[q][b]);
                         let dk = 2.0 * da * db / (da + db).max(1e-300);
-                        out[q] = dk * mbar * (y_[q][a] - y_[q][b]) / (dx * dx) * ds;
+                        out[q] = op * (dk * mbar * (y_[q][a] - y_[q][b]) / (dx * dx) * ds);
                         jsum += out[q];
                     }
                     let mut scale = 1.0f64;

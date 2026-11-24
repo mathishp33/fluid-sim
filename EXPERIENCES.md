@@ -93,6 +93,7 @@ d'expérience.
 | `remplir <zone> avec "fluide" [à T]` | fluide pur ou mélange nommé, à T (par défaut la température ambiante) ; un liquide au-dessus de son ébullition est posé en vapeur |
 | `température <zone> T` | change la température, composition gardée (les masses suivent : la fermeture reste juste) |
 | `solide <zone> "matériau" [isotherme T \| chauffant P] [à T]` | solide passif, à température imposée, ou chauffant (W/m³) |
+| `corps disque (x, y) rayon r "matériau"`, `corps rect (x1, y1) (x2, y2) "matériau" [angle a]`, `corps polygone (x1, y1) (x2, y2) (x3, y3) … "matériau"` | corps rigide FIXE aux bords lissés (fraction exacte de chaque maille, voir SOLID.md) : le fluide de son volume est chassé, l'écoulement le contourne ; angle en degrés (ou `rad`) ; polygone convexe. Les corps mobiles viendront |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) |
 | `vitesse <zone> (vx, vy)` | impose la vitesse des faces intérieures de la zone ; la projection du pas suivant la rend admissible |
@@ -197,7 +198,8 @@ chauffer rect (0.1, 0) (0.2, 0.01) à $T pendant 3 s
   - résumé : nombre de conditions initiales et d'actions, mesures, fin prévue ;
   - dossier des résultats.
 - **Onglet « Conditions initiales »**, comme les pinceaux de la fenêtre multiphasique :
-  - remplir, solide (passif, isotherme, chauffant), température, effacer, allumer, puits, émetteur, grille ;
+  - remplir, solide (passif, isotherme, chauffant), corps rigide fixe (disque au clic, rectangle tiré : ligne `corps`), température,
+    effacer, allumer, puits, émetteur, grille ;
   - au pinceau rond (rayon en mailles, affiché en mètres) ou au rectangle tiré à la souris.
 - **Chaque geste devient une ligne du protocole**, insérée avant le premier `simuler`, par exemple
   `remplir trait (0.055, 0.055) (0.155, 0.085) rayon 0.02 avec "eau" à 293.15 K`.
@@ -267,4 +269,5 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   sortie (PNG).
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
-- Les solides mobiles, à venir, entreront dans le protocole par une commande `corps` (voir SOLID.md, § 6.5).
+- La commande `corps` pose des corps FIXES ; le mouvement imposé puis libre viendra (options `imposé`, `libre`, `pivot`… : voir
+  SOLID.md § 5 et § 7).
