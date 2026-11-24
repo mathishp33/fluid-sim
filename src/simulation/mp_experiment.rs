@@ -279,6 +279,25 @@ pub enum FieldSource {
     Formula(String),
 }
 
+/// Mouvement d'un corps posé par un protocole : fixe (tout à zéro) ou imposé — vitesse et rotation constantes, plus une oscillation
+/// sinusoïdale de période `period`, éventuellement autour d'un pivot (rotation seule).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BodyMotion {
+    pub v: [f64; 2],
+    /// rad/s
+    pub omega: f64,
+    pub osc_v: [f64; 2],
+    pub osc_omega: f64,
+    pub period: f64,
+    pub pivot: Option<[f64; 2]>,
+}
+
+impl BodyMotion {
+    pub fn is_fixed(&self) -> bool {
+        self.v == [0.0, 0.0] && self.omega == 0.0 && self.osc_v == [0.0, 0.0] && self.osc_omega == 0.0
+    }
+}
+
 /// Forme d'un corps rigide posé par un protocole (mètres, repère du domaine).
 #[derive(Clone, Debug, PartialEq)]
 pub enum BodySpec {
@@ -305,8 +324,8 @@ impl BodySpec {
         }
     }
 
-    /// corps rigide FIXE (étape 1 des solides mobiles) de matériau `material`, tourné de `angle` (rad) autour de son centre de masse
-    pub fn body(&self, material: usize, angle: f64, temp: f64) -> Result<super::mp_bodies::RigidBody, String> {
+    /// corps rigide de matériau `material`, tourné de `angle` (rad) autour de son centre de masse, fixe ou à mouvement imposé
+    pub fn body(&self, material: usize, angle: f64, temp: f64, motion: &BodyMotion) -> Result<super::mp_bodies::RigidBody, String> {
         use super::mp_bodies::{Motion, RigidBody, Shape};
         let (shape, pos) = match self {
             BodySpec::Disc { c, r } => (Shape::Disc { r: *r }, *c),
@@ -321,7 +340,13 @@ impl BodySpec {
         };
         let mut b = RigidBody::new(shape, material, pos, temp);
         b.angle = angle;
-        b.motion = Motion::Fixed;
+        if motion.is_fixed() {
+            b.motion = Motion::Fixed;
+        } else {
+            let m = motion;
+            b.motion = Motion::Imposed { v: m.v, omega: m.omega, osc_v: m.osc_v, osc_omega: m.osc_omega, period: m.period };
+            b.pivot = m.pivot;
+        }
         Ok(b)
     }
 }
@@ -329,8 +354,8 @@ impl BodySpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Fill { zone: Zone, fluid: String, temp: Option<f64> },
-    /// corps rigide fixe (solides mobiles, étape 1 : voir SOLID.md)
-    Body { shape: BodySpec, material: String, angle: f64 },
+    /// corps rigide, fixe ou à mouvement imposé (solides mobiles : voir SOLID.md)
+    Body { shape: BodySpec, material: String, angle: f64, motion: BodyMotion },
     SetTemp { zone: Zone, temp: f64 },
     Solid { zone: Zone, material: String, thermal: ThermalSpec, temp: Option<f64> },
     Clear { zone: Zone },
@@ -650,9 +675,9 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             apply_tool_with(sim, MpTool::ClearCell, &cs, &tool_opts(t_amb, MpThermal::Passive));
             Ok(cs.len())
         }
-        Action::Body { shape, material, angle } => {
+        Action::Body { shape, material, angle, motion } => {
             let s = find_solid(sim, material)?;
-            let b = shape.body(s, *angle, t_amb)?;
+            let b = shape.body(s, *angle, t_amb, motion)?;
             sim.add_body(b)?;
             Ok(sim.body_frac.iter().filter(|&&a| a > 0.0).count())
         }
@@ -1430,14 +1455,32 @@ fn describe(a: &Action) -> String {
         Action::SetTemp { zone, temp } => format!("température {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Solid { zone, material, .. } => format!("solide « {material} » {}", zone.label()),
         Action::Clear { zone } => format!("effacer {}", zone.label()),
-        Action::Body { shape, material, angle } => {
+        Action::Body { shape, material, angle, motion } => {
             let f = match shape {
                 BodySpec::Disc { c, r } => format!("disque {} rayon {}", fmt_point(*c), fmt_num(*r)),
                 BodySpec::Rect { a, b } => format!("rect {} {}", fmt_point(*a), fmt_point(*b)),
                 BodySpec::Polygon(p) => format!("polygone de {} sommets", p.len()),
             };
             let a = if *angle != 0.0 { format!(", tourné de {}°", fmt_num(angle.to_degrees())) } else { String::new() };
-            format!("corps fixe « {material} » {f}{a}")
+            if motion.is_fixed() {
+                format!("corps fixe « {material} » {f}{a}")
+            } else {
+                let m = motion;
+                let mut parts = vec![];
+                if m.v != [0.0, 0.0] {
+                    parts.push(format!("vitesse {} m/s", fmt_point(m.v)));
+                }
+                if m.omega != 0.0 {
+                    parts.push(format!("rotation {} °/s", fmt_num(m.omega.to_degrees())));
+                }
+                if m.osc_v != [0.0, 0.0] || m.osc_omega != 0.0 {
+                    parts.push(format!("oscillation {} m/s, {} °/s sur {} s", fmt_point(m.osc_v), fmt_num(m.osc_omega.to_degrees()), fmt_num(m.period)));
+                }
+                if let Some(q) = m.pivot {
+                    parts.push(format!("pivot {}", fmt_point(q)));
+                }
+                format!("corps « {material} » {f}{a}, mouvement imposé : {}", parts.join(", "))
+            }
         }
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),
         Action::Ignite { zone, temp } => format!("allumer {} à {} K", zone.label(), fmt_num(*temp)),

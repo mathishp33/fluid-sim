@@ -103,7 +103,8 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   remplir <zone> avec \"eau\" [à 20 °C]           température <zone> 350 K
   solide <zone> \"acier\" [isotherme 400 K | chauffant 1e6 W/m³] [à T]
   corps disque (x, y) rayon r \"acier\" | corps rect (x1, y1) (x2, y2) \"verre\" [angle 30] | corps polygone (x1, y1) (x2, y2) (x3, y3) \"acier\"
-        (corps rigide FIXE, bords lissés ; angle en degrés)
+        (corps rigide aux bords lissés ; angle en degrés) — fixe, ou mouvement imposé :
+        vitesse (vx, vy) · rotation 90 (°/s, rad/s, tr/min) · oscillation (vx, vy) période 1 s · oscillation rotation 30 période 2 s · pivot (x, y)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"]
@@ -1205,7 +1206,7 @@ impl ExperimentWindow {
 
     fn draw_zone(&self, painter: &egui::Painter, rect: Rect, z: &Zone, color: Color32) {
         let px = rect.width() / self.shown().map_or(1.0, |s| (s.nx as f64 * s.dx) as f32);
-        let st = Stroke::new(1.5, color);
+        let st = Stroke::new(1.5_f32, color);
         match z {
             Zone::Partout => {}
             Zone::Point(p) => {
@@ -1228,11 +1229,18 @@ impl ExperimentWindow {
 
     fn draw_zones(&self, painter: &egui::Painter, rect: Rect) {
         let Some(p) = &self.parsed else { return };
+        // corps rigides : leur contour à leur position courante (ils peuvent bouger pendant l'expérience)
+        if let Some(s) = self.shown() {
+            for b in &s.bodies {
+                let mut pts: Vec<Pos2> = b.world_vertices().iter().map(|p| self.to_screen(rect, *p)).collect();
+                if let Some(&f) = pts.first() {
+                    pts.push(f);
+                }
+                painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, Color32::from_rgb(150, 190, 255))));
+            }
+        }
         for (s, _) in &p.steps {
             if let Step::Do(a) = s {
-                if let Action::Body { shape, .. } = a {
-                    self.draw_zone(painter, rect, &shape.zone(), Color32::from_rgb(150, 190, 255));
-                }
                 if let Some(z) = a.zone() {
                     let col = if matches!(a, Action::Heat { .. } | Action::Accelerate { .. }) { Color32::from_rgb(255, 160, 40) } else { Color32::from_gray(220) };
                     self.draw_zone(painter, rect, z, col);
@@ -1287,7 +1295,7 @@ fn plot(ui: &mut egui::Ui, rows: &[Vec<f64>], col: usize) {
         )
     };
     let line: Vec<Pos2> = pts.iter().map(|&(t, v)| map(t, v)).collect();
-    painter.add(egui::Shape::line(line, Stroke::new(1.5, Color32::from_rgb(90, 200, 255))));
+    painter.add(egui::Shape::line(line, Stroke::new(1.5_f32, Color32::from_rgb(90, 200, 255))));
     let font = egui::FontId::monospace(10.0);
     painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, format!("{v1:.4e}"), font.clone(), Color32::GRAY);
     painter.text(rect.left_bottom() + egui::vec2(4.0, -2.0), egui::Align2::LEFT_BOTTOM, format!("{v0:.4e}"), font.clone(), Color32::GRAY);

@@ -1,0 +1,12 @@
+# Batteur à vagues : une palette oscille au bord gauche d'un bassin de 20 cm d'eau (course ± 1.6 cm, période 1 s) et fait des vagues.
+# La sonde compte l'eau au-dessus de 18 cm au bout du bassin : elle oscille quand les vagues arrivent.
+#   fluid-sim experience experiences/vagues.exp
+
+départ scénario "Cuve vide" grille 120 x 40 maille 1 cm
+remplir rect (0, 0) (1.2, 0.2) avec "eau" à 20 °C
+
+corps rect (0.03, 0) (0.05, 0.35) "acier" oscillation (0.1, 0) m/s période 1 s
+
+mesurer toutes les 20 ms : masse "eau" dans rect (1.0, 0.18) (1.2, 0.4) comme "eau au-dessus de 18 cm au bout du bassin", max vitesse dans partout
+
+simuler 5 s

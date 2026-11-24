@@ -1,0 +1,15 @@
+# Piston qui comprime l'air d'un tube fermé : la compression lente suit l'adiabatique p V^1.4 = cte (et T V^0.4 = cte).
+# Tube de 40 × 10 cm ouvert à gauche (1 atm), fermé à droite ; piston de 4 cm poussé à 5 cm/s pendant 2 s : le gaz passe de 34 à
+# 24 cm, sa pression doit monter de × 1.63 et sa température de × 1.15 (γ = 1.4).
+#   fluid-sim experience experiences/piston.exp
+
+départ scénario "Cuve vide" grille 40 x 10 maille 1 cm
+gravité (0, 0)
+bord haut mur
+bord gauche ouvert
+
+corps rect (0.02, 0) (0.06, 0.1) "acier" vitesse (5 cm/s, 0)
+
+mesurer toutes les 50 ms : moyenne p dans rect (0.3, 0) (0.4, 0.1) comme "pression du gaz", moyenne T dans rect (0.3, 0) (0.4, 0.1) comme "température du gaz"
+
+simuler 2 s

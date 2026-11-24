@@ -4,7 +4,9 @@
 //! noms (fluides, matériaux, fichiers) entre guillemets ; nombres avec un POINT décimal ; unités facultatives (SI par défaut :
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
-use super::mp_experiment::{norm, Action, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone};
+use super::mp_experiment::{
+    norm, Action, BodyMotion, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
+};
 use super::mp_view::T_IGNITION;
 
 const P_ATM: f64 = 101325.0;
@@ -59,6 +61,8 @@ enum Dim {
     Power,
     /// angle : DEGRÉS sans unité (°, deg ou rad écrits)
     Angle,
+    /// vitesse angulaire : DEGRÉS PAR SECONDE sans unité (°/s, rad/s, tr/min, tr/s écrits)
+    AngSpeed,
     Plain,
 }
 
@@ -72,6 +76,7 @@ fn dim_name(d: Dim) -> &'static str {
         Dim::Pressure => "une pression (Pa, kPa, bar, atm)",
         Dim::Power => "une puissance volumique (W/m³)",
         Dim::Angle => "un angle (°, rad)",
+        Dim::AngSpeed => "une vitesse de rotation (°/s, rad/s, tr/min)",
         Dim::Plain => "un nombre sans unité",
     }
 }
@@ -108,6 +113,10 @@ fn unit_of(w: &str) -> Option<(Dim, f64, f64)> {
         "mw/m3" => (Dim::Power, 1e6, 0.0),
         "°" | "deg" => (Dim::Angle, std::f64::consts::PI / 180.0, 0.0),
         "rad" => (Dim::Angle, 1.0, 0.0),
+        "°/s" | "deg/s" => (Dim::AngSpeed, std::f64::consts::PI / 180.0, 0.0),
+        "rad/s" => (Dim::AngSpeed, 1.0, 0.0),
+        "tr/min" => (Dim::AngSpeed, 2.0 * std::f64::consts::PI / 60.0, 0.0),
+        "tr/s" => (Dim::AngSpeed, 2.0 * std::f64::consts::PI, 0.0),
         _ => return None,
     })
 }
@@ -667,21 +676,58 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             };
             let material = p.string("le matériau solide")?;
             let mut angle = 0.0;
+            let mut motion = BodyMotion::default();
+            let mut osc = false;
+            // vitesse angulaire : degrés par seconde sans unité
+            let ang_speed = |p: &mut P| -> R<f64> {
+                let v = p.number("la vitesse de rotation")?;
+                let (v, unit) = p.opt_unit(Dim::AngSpeed, v)?;
+                Ok(if unit { v } else { v.to_radians() })
+            };
             while !p.done() {
-                match p.word("une option (angle, fixe)")?.as_str() {
+                match p.word("une option (angle, fixe, vitesse, rotation, oscillation, période, pivot)")?.as_str() {
                     "angle" => {
                         let v = p.number("l'angle")?;
                         let (v, unit) = p.opt_unit(Dim::Angle, v)?;
                         angle = if unit { v } else { v.to_radians() };
                     }
                     "fixe" => {}
-                    "libre" | "impose" | "pivot" | "bloque" => {
-                        return p.err("mouvement libre, imposé ou sur pivot : pas encore (solides mobiles, étapes 2 et 3) ; les corps sont fixes")
+                    "vitesse" => motion.v = p.vector(Dim::Speed, "la vitesse du corps")?,
+                    "rotation" => motion.omega = ang_speed(p)?,
+                    "oscillation" => {
+                        if p.eat_w("rotation") {
+                            motion.osc_omega = ang_speed(p)?;
+                        } else {
+                            motion.osc_v = p.vector(Dim::Speed, "l'amplitude de la vitesse")?;
+                        }
+                        osc = true;
                     }
-                    o => return p.err(format!("option « {o} » inconnue après « corps » : angle <a> (degrés par défaut), fixe")),
+                    "periode" => {
+                        motion.period = p.quantity(Dim::Time, "la période")?;
+                        if !(motion.period > 0.0) {
+                            return p.err("la période doit être positive");
+                        }
+                    }
+                    "pivot" => motion.pivot = Some(p.point()?),
+                    "libre" | "bloque" => return p.err("mouvement libre (poussé par l'écoulement) : pas encore (solides mobiles, étape 3)"),
+                    o => {
+                        return p.err(format!(
+                            "option « {o} » inconnue après « corps » : angle <a>, fixe, vitesse (vx, vy), rotation <ω>, oscillation (vx, vy) | \
+                             oscillation rotation <ω> avec période <T>, pivot (x, y)"
+                        ))
+                    }
                 }
             }
-            push(proto, Action::Body { shape, material, angle }, ln);
+            if osc && !(motion.period > 0.0) {
+                return p.err("une oscillation demande sa « période <T> »");
+            }
+            if motion.period > 0.0 && !osc {
+                return p.err("« période » sans « oscillation »");
+            }
+            if motion.pivot.is_some() && (motion.v != [0.0, 0.0] || motion.osc_v != [0.0, 0.0]) {
+                return p.err("sur un pivot, seul le mouvement de rotation compte (rotation, oscillation rotation)");
+            }
+            push(proto, Action::Body { shape, material, angle, motion }, ln);
         }
         "chauffer" | "refroidir" => {
             let zone = p.zone()?;

@@ -19,7 +19,7 @@ use super::multiphase::MultiphaseSim;
 /// en-tête d'un fichier d'état complet
 pub const MAGIC: &[u8; 8] = b"FSIMMPST";
 /// version du format (voir l'en-tête du module)
-pub const VERSION: u32 = 12; // 2 : rayon de la destination des téléporteurs ; 3 : phases granulaires ; 4 : frottement des grains ; 5 : viscosité implicite ; 6 : percolation, grilles ; 7 : réactions en volume (pyrolyse) ; 8 : combustion des poudres (loi de Vieille) ; 9 : gel / fusion (eau ↔ glace) ; 10 : surfusion (front de dendrites) ; 11 : lits perméables à deux pressions (pression de contact des grains) ; 12 : corps rigides (solides mobiles, étape 0)
+pub const VERSION: u32 = 13; // 2 : rayon de la destination des téléporteurs ; 3 : phases granulaires ; 4 : frottement des grains ; 5 : viscosité implicite ; 6 : percolation, grilles ; 7 : réactions en volume (pyrolyse) ; 8 : combustion des poudres (loi de Vieille) ; 9 : gel / fusion (eau ↔ glace) ; 10 : surfusion (front de dendrites) ; 11 : lits perméables à deux pressions (pression de contact des grains) ; 12 : corps rigides (solides mobiles, étape 0) ; 13 : mouvement imposé des corps (vitesse du corps aux faces)
 
 /// Contenu d'un fichier d'état complet.
 #[derive(Serialize, Deserialize)]
@@ -109,6 +109,9 @@ fn check(s: &MultiphaseSim) -> Result<(), String> {
     }
     if s.bodies.iter().any(|b| b.material >= s.reg.solids.len()) {
         return bad("matériau d'un corps rigide");
+    }
+    if (!s.body_vel_u.is_empty() && s.body_vel_u.len() != (nx + 1) * ny) || (!s.body_vel_v.is_empty() && s.body_vel_v.len() != nx * (ny + 1)) {
+        return bad("faces des corps rigides");
     }
     if s.u.len() != (nx + 1) * ny || s.v.len() != nx * (ny + 1) {
         return bad("vitesses");

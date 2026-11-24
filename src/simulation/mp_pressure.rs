@@ -139,14 +139,18 @@ impl MultiphaseSim {
         }
     }
 
-    /// vitesse de face corrigée Ũ = u* − dt/ρ_f ∇p (0 sur parois/solides). Corps fixes (mp_bodies.rs) : Ũ est multipliée par
-    /// l'ouverture de la face au fluide, 1 − α_corps (vitesse débitante : la part couverte de la face est à la vitesse du corps,
-    /// nulle) ; la matrice (`build_stencil`) l'est de même, d'où une fermeture exacte autour des corps. Sans corps : facteur 1.
+    /// vitesse de face corrigée Ũ = u* − dt/ρ_f ∇p (0 sur parois/solides). Corps rigides (mp_bodies.rs) : Ũ est la vitesse
+    /// DÉBITANTE du fluide, A (u* − dt/ρ_f ∇p) avec A l'ouverture d'écoulement de la face (la part couverte appartient au corps) ; la
+    /// matrice (`build_stencil`) a les mêmes coefficients A, d'où une fermeture exacte autour des corps. Corps en mouvement imposé :
+    /// + A (1 − A) V_corps, le fluide de la face partiellement couverte est entraîné à la vitesse du corps (non-glissement étalé sur
+    /// une maille). Sans corps : facteur 1.
     fn face_velocities(&self, us: &[f64], vs: &[f64], p: &[f64], dt: f64) -> (Vec<f64>, Vec<f64>) {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let bodies = self.has_bodies();
+        let moving = self.has_moving_bodies();
         let ou = |i: usize, j: usize| if bodies { self.u_open(i, j) } else { 1.0 };
         let ov = |i: usize, j: usize| if bodies { self.v_open(i, j) } else { 1.0 };
+        let bf = |a: f64, x: f64, ub: f64| if moving { a * x + a * (1.0 - a) * ub } else { a * x };
         let mut un = vec![0.0; (nx + 1) * ny];
         let mut vn = vec![0.0; nx * (ny + 1)];
         // bords ouverts : pression hydrostatique du fluide ambiant le long du bord (voir `open_face_pressure`)
@@ -162,19 +166,23 @@ impl MultiphaseSim {
                 let (l, r) = (if i > 0 { Some(j * nx + i - 1) } else { None }, if i < nx { Some(j * nx + i) } else { None });
                 let val = match (l, r) {
                     (Some(a), Some(b)) => {
-                        if self.is_solid(a) || self.is_solid(b) { 0.0 } else { ou(i, j) * (us[f] - dt / self.face_rho_x(i, j) * (p[b] - p[a]) / dx) }
+                        if self.is_solid(a) || self.is_solid(b) {
+                            0.0
+                        } else {
+                            bf(ou(i, j), us[f] - dt / self.face_rho_x(i, j) * (p[b] - p[a]) / dx, self.u_body_vel(f))
+                        }
                     }
                     (None, Some(b)) => match (self.bc[0], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
                             let pb = self.open_face_pressure(po, rho_open[0], 0.0, (j as f64 + 0.5) * dx);
-                            ou(i, j) * (us[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx))
+                            bf(ou(i, j), us[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[1], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
                             let pb = self.open_face_pressure(po, rho_open[1], lx, (j as f64 + 0.5) * dx);
-                            ou(i, j) * (us[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx))
+                            bf(ou(i, j), us[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
                     },
@@ -191,19 +199,23 @@ impl MultiphaseSim {
                 let (l, r) = (if j > 0 { Some((j - 1) * nx + i) } else { None }, if j < ny { Some(j * nx + i) } else { None });
                 let val = match (l, r) {
                     (Some(a), Some(b)) => {
-                        if self.is_solid(a) || self.is_solid(b) { 0.0 } else { ov(i, j) * (vs[f] - dt / self.face_rho_y(i, j) * (p[b] - p[a]) / dx) }
+                        if self.is_solid(a) || self.is_solid(b) {
+                            0.0
+                        } else {
+                            bf(ov(i, j), vs[f] - dt / self.face_rho_y(i, j) * (p[b] - p[a]) / dx, self.v_body_vel(f))
+                        }
                     }
                     (None, Some(b)) => match (self.bc[2], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
                             let pb = self.open_face_pressure(po, rho_open[2], (i as f64 + 0.5) * dx, 0.0);
-                            ov(i, j) * (vs[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx))
+                            bf(ov(i, j), vs[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[3], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
                             let pb = self.open_face_pressure(po, rho_open[3], (i as f64 + 0.5) * dx, ly);
-                            ov(i, j) * (vs[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx))
+                            bf(ov(i, j), vs[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,
                     },

@@ -166,8 +166,16 @@ pub enum Motion {
     /// couplé à l'écoulement (dans les limites de `dof` et du pivot)
     Free,
     Fixed,
-    /// vitesse et rotation imposées (le corps pousse le fluide, le fluide ne le pousse pas)
-    Imposed { v: [f64; 2], omega: f64 },
+    /// Mouvement imposé : le corps pousse le fluide, le fluide ne le pousse pas. Vitesse V(t) = v + osc_v sin(2πt/period) et rotation
+    /// ω(t) = omega + osc_omega sin(2πt/period) (sans oscillation si period ≤ 0) ; sur un pivot, seule la rotation compte.
+    Imposed { v: [f64; 2], omega: f64, osc_v: [f64; 2], osc_omega: f64, period: f64 },
+}
+
+impl Motion {
+    /// vitesse et rotation constantes
+    pub fn imposed(v: [f64; 2], omega: f64) -> Motion {
+        Motion::Imposed { v, omega, osc_v: [0.0, 0.0], osc_omega: 0.0, period: 0.0 }
+    }
 }
 
 /// Corps rigide.
@@ -226,7 +234,7 @@ impl RigidBody {
     pub fn constrained_velocity(&self, m: f64, i: f64, p: [f64; 2], l: f64) -> ([f64; 2], f64) {
         match self.motion {
             Motion::Fixed => ([0.0, 0.0], 0.0),
-            Motion::Imposed { v, omega } => (v, omega),
+            Motion::Imposed { .. } => (self.vel, self.omega),
             Motion::Free => match self.pivot {
                 Some(q) => {
                     let r = sub(self.pos, q);
@@ -246,18 +254,65 @@ impl RigidBody {
     /// Avance la position de dt avec (vel, omega) ; autour d'un pivot, rotation exacte (la distance au pivot est gardée).
     pub fn advance(&mut self, dt: f64) {
         let a = self.omega * dt;
+        self.displace(self.vel[0] * dt, self.vel[1] * dt, a);
+    }
+
+    /// translation (dx, dy) puis rotation da autour du centre de masse ; sur un pivot, rotation da autour du pivot seulement
+    fn displace(&mut self, dx: f64, dy: f64, da: f64) {
         match self.pivot {
             Some(q) => {
                 let r = sub(self.pos, q);
-                let (s, c) = a.sin_cos();
+                let (s, c) = da.sin_cos();
                 self.pos = [q[0] + c * r[0] - s * r[1], q[1] + s * r[0] + c * r[1]];
             }
             None => {
-                self.pos[0] += self.vel[0] * dt;
-                self.pos[1] += self.vel[1] * dt;
+                self.pos[0] += dx;
+                self.pos[1] += dy;
             }
         }
-        self.angle += a;
+        self.angle += da;
+    }
+
+    /// corps dont le mouvement est imposé ?
+    pub fn is_imposed(&self) -> bool {
+        matches!(self.motion, Motion::Imposed { .. })
+    }
+
+    /// Vitesse du centre de masse et rotation imposées à l'instant t (sur un pivot : la vitesse du centre est ω × (G − pivot)).
+    pub fn rates(&self, t: f64) -> ([f64; 2], f64) {
+        match &self.motion {
+            Motion::Fixed => ([0.0, 0.0], 0.0),
+            Motion::Free => (self.vel, self.omega),
+            Motion::Imposed { v, omega, osc_v, osc_omega, period } => {
+                let s = if *period > 0.0 { (2.0 * std::f64::consts::PI * t / period).sin() } else { 0.0 };
+                let w = omega + osc_omega * s;
+                match self.pivot {
+                    Some(q) => {
+                        let r = sub(self.pos, q);
+                        ([-w * r[1], w * r[0]], w)
+                    }
+                    None => ([v[0] + osc_v[0] * s, v[1] + osc_v[1] * s], w),
+                }
+            }
+        }
+    }
+
+    /// Mouvement imposé de t0 à t1 : intégrale EXACTE de la loi (la partie sinusoïdale revient pile à son point de départ à chaque
+    /// période, quel que soit le pas) ; vitesses mises à celles de t1.
+    pub fn move_imposed(&mut self, t0: f64, t1: f64) {
+        let Motion::Imposed { v, omega, osc_v, osc_omega, period } = self.motion.clone() else { return };
+        let dt = t1 - t0;
+        // ∫ sin(2πt/P) dt = P/(2π) (cos(2π t0/P) − cos(2π t1/P))
+        let k = if period > 0.0 {
+            let w = 2.0 * std::f64::consts::PI / period;
+            ((w * t0).cos() - (w * t1).cos()) / w
+        } else {
+            0.0
+        };
+        self.displace(v[0] * dt + osc_v[0] * k, v[1] * dt + osc_v[1] * k, omega * dt + osc_omega * k);
+        let (vv, w) = self.rates(t1);
+        self.vel = vv;
+        self.omega = w;
     }
 }
 
@@ -291,9 +346,16 @@ fn clip_to_box(poly: &[[f64; 2]], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f6
 
 /// Fraction de chaque maille (nx × ny, pas dx) occupée par les corps ; la somme de corps qui se chevauchent est plafonnée à 1.
 pub fn body_fractions(bodies: &[RigidBody], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
+    body_fractions_owned(bodies, nx, ny, dx).0
+}
+
+/// Comme `body_fractions`, avec pour chaque maille l'indice du corps qui la couvre le plus (−1 : aucun).
+pub fn body_fractions_owned(bodies: &[RigidBody], nx: usize, ny: usize, dx: f64) -> (Vec<f64>, Vec<i32>) {
     let mut f = vec![0.0; nx * ny];
+    let mut owner = vec![-1i32; nx * ny];
+    let mut best = vec![0.0f64; nx * ny];
     let cell_area = dx * dx;
-    for b in bodies {
+    for (bi, b) in bodies.iter().enumerate() {
         let poly = b.world_vertices();
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for p in &poly {
@@ -313,7 +375,12 @@ pub fn body_fractions(bodies: &[RigidBody], nx: usize, ny: usize, dx: f64) -> Ve
                 let part = clip_to_box(&poly, cx0, cy0, cx0 + dx, cy0 + dx);
                 let a = polygon_area(&part);
                 if a > 0.0 {
-                    f[j * nx + i] += a / cell_area;
+                    let c = j * nx + i;
+                    f[c] += a / cell_area;
+                    if a > best[c] {
+                        best[c] = a;
+                        owner[c] = bi as i32;
+                    }
                 }
             }
         }
@@ -321,7 +388,7 @@ pub fn body_fractions(bodies: &[RigidBody], nx: usize, ny: usize, dx: f64) -> Ve
     for a in &mut f {
         *a = a.clamp(0.0, 1.0);
     }
-    f
+    (f, owner)
 }
 
 impl super::multiphase::MultiphaseSim {
@@ -331,15 +398,52 @@ impl super::multiphase::MultiphaseSim {
         !self.bodies.is_empty()
     }
 
-    /// Recalcule `body_frac` depuis la position des corps (à appeler après en avoir ajouté, retiré ou déplacé).
+    /// Recalcule `body_frac` depuis la position des corps (à appeler après en avoir ajouté, retiré ou déplacé), et, s'il y a des corps
+    /// en mouvement, la vitesse normale du corps aux faces bordées par une maille couverte (celle du corps qui couvre le plus la plus
+    /// couverte des deux mailles, au centre de la face).
     pub fn update_body_fractions(&mut self) {
         if self.bodies.is_empty() {
             if self.body_frac.iter().any(|&a| a != 0.0) {
                 self.body_frac.iter_mut().for_each(|a| *a = 0.0);
             }
+            self.body_vel_u.clear();
+            self.body_vel_v.clear();
             return;
         }
-        self.body_frac = body_fractions(&self.bodies, self.nx, self.ny, self.dx);
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let (frac, owner) = body_fractions_owned(&self.bodies, nx, ny, dx);
+        self.body_frac = frac;
+        if !self.has_moving_bodies() {
+            self.body_vel_u.clear();
+            self.body_vel_v.clear();
+            return;
+        }
+        let pick = |a: Option<usize>, b: Option<usize>| -> Option<usize> {
+            let fa = a.map_or(0.0, |c| self.body_frac[c]);
+            let fb = b.map_or(0.0, |c| self.body_frac[c]);
+            let c = if fa >= fb { a } else { b }?;
+            (self.body_frac[c] > 0.0 && owner[c] >= 0).then(|| owner[c] as usize)
+        };
+        let mut vu = vec![0.0; (nx + 1) * ny];
+        for j in 0..ny {
+            for i in 0..=nx {
+                let (a, b) = ((i > 0).then(|| j * nx + i - 1), (i < nx).then(|| j * nx + i));
+                if let Some(k) = pick(a, b) {
+                    vu[j * (nx + 1) + i] = self.bodies[k].velocity_at([i as f64 * dx, (j as f64 + 0.5) * dx])[0];
+                }
+            }
+        }
+        let mut vv = vec![0.0; nx * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..nx {
+                let (a, b) = ((j > 0).then(|| (j - 1) * nx + i), (j < ny).then(|| j * nx + i));
+                if let Some(k) = pick(a, b) {
+                    vv[j * nx + i] = self.bodies[k].velocity_at([(i as f64 + 0.5) * dx, j as f64 * dx])[1];
+                }
+            }
+        }
+        self.body_vel_u = vu;
+        self.body_vel_v = vv;
     }
 
     /// Volume occupé par les corps dans la maille c, ajouté au volume des fluides dans la fermeture (0 sans corps) ; plafonné à
@@ -353,8 +457,10 @@ impl super::multiphase::MultiphaseSim {
         }
     }
 
-    /// Ouverture au fluide d'une face entre deux mailles de fractions de corps a et b : 1 − max(a, b), 0 si l'une est entièrement
-    /// couverte. Le maximum garantit qu'une face ne débite jamais plus que la place de fluide de la plus couverte de ses mailles.
+    /// Ouverture d'une face entre deux mailles de fractions de corps a et b : 1 − max(a, b), 0 si l'une est entièrement couverte.
+    /// Une maille couverte à 1 − φ a ainsi toutes ses faces ouvertes à φ au plus : une face ne débite jamais plus que la place de
+    /// fluide de ses mailles, conductance et capacité y diminuent ensemble (les schémas explicites gardent le pas du fluide pur). Le
+    /// fluide qu'un corps en mouvement balaie n'a donc pas à sortir par une face presque fermée : il est déplacé (`push_fluid`).
     #[inline]
     fn opening(a: f64, b: f64) -> f64 {
         let m = a.max(b);
@@ -365,18 +471,34 @@ impl super::multiphase::MultiphaseSim {
         }
     }
 
-    /// Ouverture de la face u (i, j) — entre les mailles (i − 1, j) et (i, j) ; face de bord : sa seule maille. 1 sans corps.
+    /// fractions de corps des deux mailles de la face u (i, j) (une face de bord : sa seule maille)
+    fn u_cells(&self, i: usize, j: usize) -> (f64, f64) {
+        let f = &self.body_frac;
+        match (i > 0, i < self.nx) {
+            (true, true) => (f[self.idx(i - 1, j)], f[self.idx(i, j)]),
+            (false, true) => (f[self.idx(0, j)], 0.0),
+            (true, false) => (f[self.idx(self.nx - 1, j)], 0.0),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    fn v_cells(&self, i: usize, j: usize) -> (f64, f64) {
+        let f = &self.body_frac;
+        match (j > 0, j < self.ny) {
+            (true, true) => (f[self.idx(i, j - 1)], f[self.idx(i, j)]),
+            (false, true) => (f[self.idx(i, 0)], 0.0),
+            (true, false) => (f[self.idx(i, self.ny - 1)], 0.0),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Ouverture de la face u (i, j) — entre les mailles (i − 1, j) et (i, j). 1 sans corps.
     pub(crate) fn u_open(&self, i: usize, j: usize) -> f64 {
         if self.bodies.is_empty() {
             return 1.0;
         }
-        let f = &self.body_frac;
-        match (i > 0, i < self.nx) {
-            (true, true) => Self::opening(f[self.idx(i - 1, j)], f[self.idx(i, j)]),
-            (false, true) => Self::opening(f[self.idx(0, j)], 0.0),
-            (true, false) => Self::opening(f[self.idx(self.nx - 1, j)], 0.0),
-            _ => 1.0,
-        }
+        let (a, b) = self.u_cells(i, j);
+        Self::opening(a, b)
     }
 
     /// Ouverture de la face v (i, j) — entre les mailles (i, j − 1) et (i, j). 1 sans corps.
@@ -384,19 +506,152 @@ impl super::multiphase::MultiphaseSim {
         if self.bodies.is_empty() {
             return 1.0;
         }
-        let f = &self.body_frac;
-        match (j > 0, j < self.ny) {
-            (true, true) => Self::opening(f[self.idx(i, j - 1)], f[self.idx(i, j)]),
-            (false, true) => Self::opening(f[self.idx(i, 0)], 0.0),
-            (true, false) => Self::opening(f[self.idx(i, self.ny - 1)], 0.0),
-            _ => 1.0,
-        }
+        let (a, b) = self.v_cells(i, j);
+        Self::opening(a, b)
+    }
+
+    /// Vitesse normale du corps à la face u / v bordée par une maille couverte (0 sans corps ou corps fixe).
+    #[inline]
+    pub(crate) fn u_body_vel(&self, f: usize) -> f64 {
+        self.body_vel_u.get(f).copied().unwrap_or(0.0)
+    }
+    #[inline]
+    pub(crate) fn v_body_vel(&self, f: usize) -> f64 {
+        self.body_vel_v.get(f).copied().unwrap_or(0.0)
     }
 
     /// Plus grande ouverture des quatre faces de la maille c (≤ 1 − α_corps de c) : borne des échanges de la maille.
     pub(crate) fn cell_open_max(&self, c: usize) -> f64 {
         let (i, j) = (c % self.nx, c / self.nx);
         self.u_open(i, j).max(self.u_open(i + 1, j)).max(self.v_open(i, j)).max(self.v_open(i, j + 1))
+    }
+
+    /// un corps au moins a-t-il un mouvement imposé ?
+    pub fn has_moving_bodies(&self) -> bool {
+        self.bodies.iter().any(|b| b.is_imposed())
+    }
+
+    /// Avance les corps à mouvement imposé de t0 à t1 (intégrale exacte de leur loi), recalcule fractions et faces, puis déplace le
+    /// fluide qu'ils ont balayé (`push_fluid`).
+    pub(crate) fn move_bodies(&mut self, t0: f64, t1: f64) {
+        let old = self.body_frac.clone();
+        for b in &mut self.bodies {
+            b.move_imposed(t0, t1);
+        }
+        self.update_body_fractions();
+        self.push_fluid(&old);
+    }
+
+    /// Le fluide que les corps viennent de balayer dans une maille passe à la maille voisine du côté opposé au corps (direction
+    /// −∇α_corps) ; une maille qu'ils découvrent prend le sien à cette voisine. Masses et énergies sont transférées telles quelles :
+    /// conservatif, et la fermeture de la maille balayée reste exacte. La projection n'a plus qu'à évacuer le petit excédent (au plus
+    /// le volume balayé en un pas) d'une maille bien ouverte. Sans cela, ce fluide devait sortir par une face de plus en plus fermée à
+    /// mesure que la maille se couvrait : pression qui tend vers l'infini.
+    fn push_fluid(&mut self, old: &[f64]) {
+        let (nx, ny) = (self.nx, self.ny);
+        let cap = 1.0 - FLUID_TRACE;
+        let al = |s: &Self, i: isize, j: isize, own: f64| -> f64 {
+            if i < 0 || j < 0 || i >= nx as isize || j >= ny as isize { own } else { s.body_frac[j as usize * nx + i as usize] }
+        };
+        for c in 0..nx * ny {
+            if self.is_solid(c) {
+                continue;
+            }
+            let (a0, a1) = (old[c].min(cap), self.body_frac[c].min(cap));
+            let d = a1 - a0;
+            if d.abs() < 1e-12 {
+                continue;
+            }
+            let (i, j) = ((c % nx) as isize, (c / nx) as isize);
+            let own = self.body_frac[c];
+            // direction qui s'éloigne du corps
+            let g = [-(al(self, i + 1, j, own) - al(self, i - 1, j, own)), -(al(self, i, j + 1, own) - al(self, i, j - 1, own))];
+            if g[0].abs() + g[1].abs() < 1e-12 {
+                continue;
+            }
+            let mut best: Option<(usize, f64)> = None;
+            for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+                let (ii, jj) = (i + di, j + dj);
+                if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
+                    continue;
+                }
+                let n = jj as usize * nx + ii as usize;
+                if self.is_solid(n) || self.body_frac[n] >= cap {
+                    continue;
+                }
+                let score = g[0] * di as f64 + g[1] * dj as f64;
+                if score > 0.0 && best.map_or(true, |(_, s)| score > s) {
+                    best = Some((n, score));
+                }
+            }
+            let Some((n, _)) = best else { continue };
+            if d > 0.0 {
+                // pousser la part balayée du fluide de c vers n
+                self.transfer_fluid(c, n, (d / (1.0 - a0)).min(1.0));
+            } else {
+                // reprendre à n de quoi remplir la place libérée (au plus la moitié de son fluide ; la projection fait le reste)
+                let phi_n = 1.0 - self.body_frac[n].min(cap);
+                self.transfer_fluid(n, c, ((-d) / phi_n).min(0.5));
+            }
+            // travail du corps sur le fluide, p·ΔV : le déplacement n'en porte pas (la projection répartit ensuite l'excédent ou le
+            // manque de n sans travail net), sans lui le gaz qu'un piston comprime ne chauffait pas comme une adiabatique
+            let w = self.p[n] * d;
+            self.add_body_work(n, w);
+        }
+        self.refresh();
+    }
+
+    /// Énergie `de` (J/m³) apportée au fluide de la maille c par le travail d'un corps, répartie entre ses groupes comme le travail
+    /// de pression (`pressure_work` : au prorata de C_g dT_g/dp — c'est le gaz qui se comprime, pas le liquide qui l'entoure).
+    fn add_body_work(&mut self, c: usize, de: f64) {
+        use super::phases::MAX_PHASES;
+        if de == 0.0 || !de.is_finite() {
+            return;
+        }
+        let ng = self.groups.len();
+        let mut t = [0.0f64; MAX_PHASES];
+        for g in 0..ng {
+            t[g] = self.tg[g][c];
+        }
+        let (mut gam, mut ks) = ([0.0f64; MAX_PHASES], [0.0f64; MAX_PHASES]);
+        self.cell_closure_g(c, self.p[c], &t[..ng], 1.0, &mut gam[..ng], &mut ks[..ng]);
+        let ksum: f64 = ks[..ng].iter().map(|k| k.max(0.0)).sum();
+        let asum: f64 = (0..ng).filter(|&g| self.group_mass(g, c) > 0.0).map(|g| self.group_alpha(g, c)).sum::<f64>().max(1e-300);
+        let mut used = 0.0;
+        for g in 0..ng {
+            if self.group_mass(g, c) <= 0.0 {
+                continue;
+            }
+            let w = if ksum > 0.0 { ks[g].max(0.0) / ksum } else { self.group_alpha(g, c) / asum };
+            self.eg[g][c] += de * w;
+            used += de * w;
+        }
+        self.e[c] += used;
+    }
+
+    /// transfère la fraction q du fluide (masses, énergies) de la maille `from` à la maille `to`
+    fn transfer_fluid(&mut self, from: usize, to: usize, q: f64) {
+        if !(q > 0.0) {
+            return;
+        }
+        for k in 0..self.mass.len() {
+            let m = self.mass[k][from] * q;
+            self.mass[k][from] -= m;
+            self.mass[k][to] += m;
+        }
+        for g in 0..self.eg.len() {
+            let e = self.eg[g][from] * q;
+            self.eg[g][from] -= e;
+            self.eg[g][to] += e;
+        }
+        let e = self.e[from] * q;
+        self.e[from] -= e;
+        self.e[to] += e;
+    }
+
+    /// vitesse maximale d'un point de la surface d'un corps (CFL)
+    pub(crate) fn body_surface_speed(&self) -> f64 {
+        self.bodies.iter().map(|b| b.vel[0].hypot(b.vel[1]) + b.omega.abs() * b.shape.radius()).fold(0.0, f64::max)
     }
 
     /// Pose un corps (étape 1 : corps fixes). Sa fraction de maille est calculée et le fluide qu'il recouvre est chassé : dans chaque
@@ -414,6 +669,13 @@ impl super::multiphase::MultiphaseSim {
         };
         if !ok || !b.pos.iter().chain([b.angle].iter()).all(|x| x.is_finite()) {
             return Err("corps de forme ou de position invalide".into());
+        }
+        let mut b = b;
+        if b.is_imposed() {
+            // vitesses de la loi à l'instant de la pose (faces du premier pas)
+            let (v, w) = b.rates(self.time);
+            b.vel = v;
+            b.omega = w;
         }
         let old = self.body_frac.clone();
         self.bodies.push(b);
@@ -547,7 +809,10 @@ mod tests {
         assert!((w - 1.0 / 0.15).abs() < 1e-12 && v[0].abs() < 1e-15 && (v[1] + 2.0 / 3.0).abs() < 1e-12, "{v:?} {w}");
         b.dof.rot = false;
         assert_eq!(b.constrained_velocity(m, i, [0.0, -m], 0.0), ([0.0, -0.0], 0.0));
-        b.motion = Motion::Imposed { v: [0.1, 0.0], omega: 0.0 };
+        // imposé : la loi (vitesses du moment, tenues par `move_imposed`)
+        b.motion = Motion::imposed([0.1, 0.0], 0.0);
+        b.pivot = None;
+        (b.vel, b.omega) = b.rates(0.0);
         assert_eq!(b.constrained_velocity(m, i, p, l), ([0.1, 0.0], 0.0));
         b.motion = Motion::Fixed;
         assert_eq!(b.constrained_velocity(m, i, p, l), ([0.0, 0.0], 0.0));
@@ -734,15 +999,164 @@ mod tests {
         // vitesse dans les passages au-dessus et au-dessous du disque (faces de la section du centre, hors corps)
         let gap: Vec<f64> = (0..ny).filter(|&j| s.u_open(25, j) == 1.0).map(|j| s.u[s.uidx(25, j)]).collect();
         let gap_mean = gap.iter().sum::<f64>() / gap.len() as f64;
+        let closure = (0..nx * ny).filter(|&c| !s.is_solid(c)).map(|c| (s.cell_volume(c, s.p[c]) - 1.0).abs()).fold(0.0, f64::max);
+        let qs: Vec<String> = (20..=31).map(|i| format!("{:.5}", q(i))).collect();
         eprintln!(
-            "canal : débits entrée {q_in:.4} m²/s, section du disque {q_mid:.4}, sortie {q_out:.4} ; vitesse moyenne des passages {gap_mean:.3} m/s ; eau dans le corps ≤ {inside:.2e} kg/m³ ; {} faces fermées ; {} pas",
-            closed, s.step_count
+            "canal : débits entrée {q_in:.5} m²/s, section du disque {q_mid:.5}, sortie {q_out:.5} ; vitesse moyenne des passages {gap_mean:.3} m/s ; eau dans le corps ≤ {inside:.2e} kg/m³ ; {} faces fermées ; fermeture ≤ {closure:.1e} ; débits des sections 20 à 31 : {} ; {} pas",
+            closed,
+            qs.join(" "),
+            s.step_count
         );
         assert!((q_in - 0.06).abs() < 1e-9, "entrée {q_in}");
         // mesuré : 0.0600 partout ; passages à 0.284 m/s (débit / section libre : 0.2 × 0.30 / 0.22 = 0.273)
         assert!((q_out / q_in - 1.0).abs() < 1e-3 && (q_mid / q_in - 1.0).abs() < 1e-3, "débits {q_in} {q_mid} {q_out}");
         assert!(gap_mean > 0.25 && gap_mean < 0.32, "l'eau n'accélère pas comme il faut autour du disque : {gap_mean}");
         assert!(inside < 2e-3, "eau entrée dans le corps : {inside}");
+    }
+
+    #[test]
+    fn imposed_laws_are_integrated_exactly_whatever_the_steps() {
+        // translation constante + oscillation verticale de période 0.5 s : après deux périodes, en pas irréguliers, le corps est pile à
+        // (0.1, 0) — l'oscillation revient à son départ
+        let mut b = RigidBody::new(Shape::Rect { w: 0.1, h: 0.02 }, 0, [0.0, 0.0], 300.0);
+        b.motion = Motion::Imposed { v: [0.1, 0.0], omega: 0.0, osc_v: [0.0, 0.05], osc_omega: 0.0, period: 0.5 };
+        let (mut t, mut k) = (0.0f64, 0usize);
+        while t < 1.0 - 1e-15 {
+            let dt = (0.013 + 0.017 * (k % 3) as f64).min(1.0 - t);
+            b.move_imposed(t, t + dt);
+            t += dt;
+            k += 1;
+        }
+        assert!((b.pos[0] - 0.1).abs() < 1e-12 && b.pos[1].abs() < 1e-12, "{:?}", b.pos);
+        // à un quart de période, la vitesse verticale est au maximum : déplacement ∫ = A P/(2π)
+        let mut q = RigidBody::new(Shape::Disc { r: 0.01 }, 0, [0.0, 0.0], 300.0);
+        q.motion = Motion::Imposed { v: [0.0, 0.0], omega: 0.0, osc_v: [0.0, 0.05], osc_omega: 0.0, period: 0.5 };
+        q.move_imposed(0.0, 0.25);
+        assert!((q.pos[1] - 0.05 * 0.5 / PI).abs() < 1e-12 && (q.vel[1] - 0.0).abs() < 1e-12);
+        // rotation de 90 °/s sur un pivot au bout de la palette : 180° en 2 s, la palette passe de l'autre côté du pivot
+        let mut c = RigidBody::new(Shape::Rect { w: 0.1, h: 0.02 }, 0, [0.05, 0.0], 300.0);
+        c.pivot = Some([0.0, 0.0]);
+        c.motion = Motion::imposed([0.0, 0.0], PI / 2.0);
+        let mut t = 0.0;
+        for k in 0..97 {
+            let dt = if k < 96 { 0.02 + 0.001 * (k % 5) as f64 } else { 2.0 - t };
+            if dt <= 0.0 {
+                break;
+            }
+            c.move_imposed(t, t + dt);
+            t += dt;
+        }
+        c.move_imposed(t, 2.0);
+        assert!((c.angle - PI).abs() < 1e-12 && (c.pos[0] + 0.05).abs() < 1e-12 && c.pos[1].abs() < 1e-12, "{:?} {}", c.pos, c.angle);
+        assert!((c.vel[0]).abs() < 1e-12 && (c.vel[1] + PI / 2.0 * 0.05).abs() < 1e-12, "vitesse du centre {:?}", c.vel);
+    }
+
+    #[test]
+    fn a_piston_compresses_the_air_like_an_adiabat() {
+        // tube de 40 × 10 cm fermé à droite, ouvert à gauche (1 atm) ; piston de 4 cm sur toute la hauteur, poussé à 5 cm/s pendant 2 s :
+        // le gaz de droite passe de 34 à 24 cm. Compression lente (Mach 1.5e-4), parois adiabatiques : p V^γ et T V^(γ−1) constants.
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 40 x 10 maille 1 cm\n\
+             gravité (0, 0)\n\
+             bord haut mur\n\
+             bord gauche ouvert\n\
+             corps rect (0.02, 0) (0.06, 0.1) \"acier\" vitesse (0.05, 0) m/s\n",
+        );
+        let air = s.ambient_phase;
+        let region = |s: &crate::simulation::multiphase::MultiphaseSim, i0: usize| -> Vec<usize> {
+            (0..s.ny).flat_map(|j| (i0..s.nx).map(move |i| j * 40 + i)).collect()
+        };
+        let mass = |s: &crate::simulation::multiphase::MultiphaseSim, cs: &[usize]| cs.iter().map(|&c| s.mass[air][c]).sum::<f64>() * s.dx * s.dx;
+        let (c0, m0, p0, t0) = { let cs = region(&s, 6); (cs.clone(), mass(&s, &cs), s.p[cs[100]], s.temp[cs[100]]) };
+        let _ = c0;
+        run_to(&mut s, 2.0);
+        assert!((s.bodies[0].pos[0] - 0.14).abs() < 1e-9, "piston en {}", s.bodies[0].pos[0]);
+        let cs = region(&s, 16);
+        let n = cs.len() as f64;
+        let p = cs.iter().map(|&c| s.p[c]).sum::<f64>() / n;
+        let t = cs.iter().map(|&c| s.temp[c]).sum::<f64>() / n;
+        let pspread = cs.iter().map(|&c| (s.p[c] - p).abs()).fold(0.0, f64::max);
+        let r = (0.34f64 / 0.24).ln();
+        let (g_p, g_t) = ((p / p0).ln() / r, 1.0 + (t / t0).ln() / r);
+        let m1 = mass(&s, &cs);
+        let inside: f64 = (0..s.nx * s.ny).filter(|&c| s.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| s.mass[air][c]).fold(0.0, f64::max);
+        eprintln!(
+            "piston : p = {:.0} Pa (p0 {p0:.0}, ×{:.4}), T = {t:.2} K (×{:.4}) → γ par la pression {g_p:.4}, par la température {g_t:.4} ; écart de pression dans le gaz {pspread:.1} Pa ; masse du gaz comprimé {:.6e} → {:.6e} ; air dans le piston ≤ {inside:.2e} ; {} pas, {} refaits",
+            p, p / p0, t / t0, m0, m1, s.step_count, s.rollbacks
+        );
+        assert!((g_p - 1.4).abs() < 0.02 && (g_t - 1.4).abs() < 0.02, "pas l'adiabatique : γ {g_p} / {g_t}");
+        assert!(((m1 - m0) / m0).abs() < 1e-3, "fuite autour du piston : {m0} → {m1}");
+        assert!(pspread < 0.01 * p, "pression non uniforme dans le gaz comprimé : {pspread} Pa");
+    }
+
+    #[test]
+    fn a_disc_towed_through_still_water_pushes_it_aside_without_pressure_jumps() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 50 x 30 maille 1 cm\n\
+             remplir rect (0, 0) (0.5, 0.25) avec \"eau\" à 20 °C\n\
+             corps disque (0.1, 0.12) rayon 3 cm \"acier\" vitesse (0.1, 0) m/s\n",
+        );
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        // sonde sous la trajectoire : sa pression ne doit pas sauter quand le disque traverse les mailles
+        let probe = s.idx(25, 4);
+        let (mut last, mut jump, mut pmin, mut pmax) = (f64::NAN, 0.0f64, f64::MAX, f64::MIN);
+        while s.time < 2.0 && !s.diverged {
+            s.step();
+            let p = s.p[probe];
+            if s.time > 0.1 {
+                if last.is_finite() {
+                    jump = jump.max((p - last).abs());
+                }
+                pmin = pmin.min(p);
+                pmax = pmax.max(p);
+            }
+            last = p;
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let inside: f64 = (0..s.nx * s.ny).filter(|&c| s.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| s.mass[eau][c]).fold(0.0, f64::max);
+        let dm = (s.total_mass(eau) / m0 - 1.0).abs();
+        eprintln!(
+            "disque tiré dans l'eau : en x = {:.3} m ; sonde {pmin:.1} … {pmax:.1} Pa, plus grand saut d'un pas {jump:.2} Pa ; eau dans le disque ≤ {inside:.2e} ; masse d'eau à {dm:.1e} ; vitesse max {:.3} m/s ; {} pas, {} refaits",
+            s.bodies[0].pos[0], s.max_speed(), s.step_count, s.rollbacks
+        );
+        assert!((s.bodies[0].pos[0] - (0.1 + 0.1 * s.time)).abs() < 1e-9);
+        assert!(dm < 1e-6, "masse d'eau {dm}");
+        assert!(inside < 5e-2, "eau restée dans le disque : {inside}");
+        assert!(jump < 50.0, "saut de pression de {jump} Pa quand le disque traverse les mailles");
+        assert!(s.max_speed() < 1.0);
+    }
+
+    #[test]
+    fn a_paddle_spinning_on_its_pivot_stirs_the_water() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 40 x 40 maille 1 cm\n\
+             remplir rect (0, 0) (0.4, 0.35) avec \"eau\" à 20 °C\n\
+             corps rect (0.12, 0.19) (0.28, 0.21) \"acier\" pivot (0.2, 0.2) rotation 90\n",
+        );
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        run_to(&mut s, 2.0);
+        let b = &s.bodies[0];
+        assert!((b.angle - 0.5 * PI * s.time).abs() < 1e-9 && (b.pos[0] - 0.2).abs() < 1e-12 && (b.pos[1] - 0.2).abs() < 1e-12, "{:?} {}", b.pos, b.angle);
+        // eau mise en mouvement près des bouts de la palette (ω r = 0.11 m/s à 7 cm du pivot)
+        let near: f64 = (0..s.ny)
+            .flat_map(|j| (0..s.nx).map(move |i| (i, j)))
+            .filter(|&(i, j)| {
+                let (x, y) = ((i as f64 + 0.5) * 0.01 - 0.2, (j as f64 + 0.5) * 0.01 - 0.2);
+                let r = x.hypot(y);
+                r > 0.05 && r < 0.1
+            })
+            .map(|(i, j)| {
+                let (a, bb) = crate::simulation::mp_view::cell_velocity(&s, i, j);
+                a.hypot(bb)
+            })
+            .fold(0.0, f64::max);
+        let inside: f64 = (0..s.nx * s.ny).filter(|&c| s.body_frac[c] >= 1.0 - FLUID_TRACE).map(|c| s.mass[eau][c]).fold(0.0, f64::max);
+        let dm = (s.total_mass(eau) / m0 - 1.0).abs();
+        eprintln!("palette sur pivot : eau près des bouts jusqu'à {near:.3} m/s ; eau dans la palette ≤ {inside:.2e} ; masse d'eau à {dm:.1e} ; {} pas, {} refaits", s.step_count, s.rollbacks);
+        assert!(near > 0.02 && near < 0.5, "l'eau n'est pas brassée comme il faut : {near} m/s");
+        assert!(dm < 1e-6, "masse d'eau {dm}");
     }
 
     #[test]

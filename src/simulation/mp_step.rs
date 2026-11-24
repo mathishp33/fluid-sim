@@ -74,15 +74,16 @@ struct Snapshot {
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
     dt_phase: f64, pressure_clamped: Vec<bool>,
-    /// corps rigides et leur fraction de maille (vides sans corps : rien n'est copié)
-    bodies: Vec<super::mp_bodies::RigidBody>, body_frac: Vec<f64>,
+    /// corps rigides (vide sans corps ; leurs fractions et faces se recalculent depuis leur position)
+    bodies: Vec<super::mp_bodies::RigidBody>,
 }
 
 impl MultiphaseSim {
     pub fn choose_dt(&self) -> f64 {
         let n = self.nx * self.ny;
         let dx = self.dx;
-        let umax = self.max_speed();
+        // corps à mouvement imposé : la vitesse de leur surface entre dans le CFL
+        let umax = if self.has_moving_bodies() { self.max_speed().max(self.body_surface_speed()) } else { self.max_speed() };
         let mut dt = self.dt_max.min(self.dt_chem).min(self.dt_phase).min(self.burn_dt_bound()).min(self.front_dt_bound());
         // chauffage au pinceau : au plus ~20 K par pas (dilatation thermique progressive des liquides, ébullition suivie pas à pas)
         let gap = self.heat_gap();
@@ -186,7 +187,7 @@ impl MultiphaseSim {
             mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(),
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
             dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
-            bodies: self.bodies.clone(), body_frac: if self.has_bodies() { self.body_frac.clone() } else { vec![] },
+            bodies: self.bodies.clone(),
         }
     }
 
@@ -204,12 +205,9 @@ impl MultiphaseSim {
         self.time = s.time; self.last_dt = s.last_dt; self.last_pressure_iters = s.last_pressure_iters; self.step_count = s.step_count;
         self.dt_phase = s.dt_phase; self.pressure_clamped.clone_from(&s.pressure_clamped);
         if self.has_bodies() || !s.bodies.is_empty() {
+            // fractions et faces : fonction exacte de la position des corps
             self.bodies.clone_from(&s.bodies);
-            if s.body_frac.len() == self.body_frac.len() {
-                self.body_frac.clone_from(&s.body_frac);
-            } else {
-                self.update_body_fractions();
-            }
+            self.update_body_fractions();
         }
     }
 
@@ -340,6 +338,11 @@ impl MultiphaseSim {
             lap(&mut prof, P_ADVECT_MASS);
             us = a;
             vs = b;
+        }
+        // corps à mouvement imposé (mp_bodies.rs) : ils avancent pendant que le fluide est transporté (les flux de ce pas ont été
+        // calculés par la projection précédente pour faire place au volume qu'ils balaient)
+        if self.has_moving_bodies() {
+            self.move_bodies(self.time, self.time + dt);
         }
         // percolation : le fluide traverse les lits tassés et les grilles avec les flux de Darcy de la dernière projection
         self.percolate(dt);

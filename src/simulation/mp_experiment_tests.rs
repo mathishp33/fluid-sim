@@ -417,9 +417,29 @@ simuler 5 ms
     run_to_end(&mut r);
     assert!((r.sim.time - 0.005).abs() < 1e-9 && r.sim.bodies.len() == 3);
     assert!(r.log.iter().any(|l| l.contains("corps fixe « verre »") && l.contains("tourné de 45°")), "{}", r.log.join("\n"));
-    // pas encore de corps mobiles ; matériau inconnu signalé avec sa ligne
-    let e = parse("départ scénario \"cuve vide\"\ncorps disque (0.1, 0.1) rayon 2 cm \"acier\" libre", None).unwrap_err();
-    assert!(e[0].line == 2 && e[0].msg.contains("pas encore"), "{e:?}");
+    // mouvements imposés : vitesse, rotation (°/s par défaut), oscillation sur une période, pivot
+    let m = proto(
+        "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm\n\
+         corps rect (0.02, 0.05) (0.04, 0.25) \"acier\" oscillation (0.1, 0) m/s période 1 s\n\
+         corps disque (0.2, 0.2) rayon 2 cm \"acier\" vitesse (5 cm/s, 0)\n\
+         corps rect (0.1, 0.19) (0.2, 0.21) \"verre\" pivot (0.15, 0.2) rotation 30 tr/min\n",
+    );
+    let (s, _, _) = initial_state(&m, Path::new(".")).unwrap();
+    use super::mp_bodies::Motion;
+    assert!(matches!(s.bodies[0].motion, Motion::Imposed { osc_v, period, .. } if osc_v == [0.1, 0.0] && period == 1.0));
+    assert!(matches!(s.bodies[1].motion, Motion::Imposed { v, .. } if (v[0] - 0.05).abs() < 1e-15));
+    assert!(matches!(s.bodies[2].motion, Motion::Imposed { omega, .. } if (omega - std::f64::consts::PI).abs() < 1e-12));
+    assert_eq!(s.bodies[2].pivot, Some([0.15, 0.2]));
+    assert!(s.has_moving_bodies());
+    for (bad, what) in [
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" libre", "pas encore"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" oscillation (0.1, 0)", "période"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" période 1 s", "oscillation"),
+        ("corps rect (0, 0) (0.1, 0.02) \"acier\" pivot (0, 0) vitesse (1, 0)", "pivot"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
     let e = Runner::new(proto("départ scénario \"cuve vide\" grille 16 x 16\ncorps disque (0.05, 0.05) rayon 1 cm \"bois flotté\"\n"), Path::new("."), None, Some(false)).err().unwrap();
     assert!(e.starts_with("ligne 2") && e.contains("acier"), "{e}");
 }

@@ -93,7 +93,11 @@ d'expérience.
 | `remplir <zone> avec "fluide" [à T]` | fluide pur ou mélange nommé, à T (par défaut la température ambiante) ; un liquide au-dessus de son ébullition est posé en vapeur |
 | `température <zone> T` | change la température, composition gardée (les masses suivent : la fermeture reste juste) |
 | `solide <zone> "matériau" [isotherme T \| chauffant P] [à T]` | solide passif, à température imposée, ou chauffant (W/m³) |
-| `corps disque (x, y) rayon r "matériau"`, `corps rect (x1, y1) (x2, y2) "matériau" [angle a]`, `corps polygone (x1, y1) (x2, y2) (x3, y3) … "matériau"` | corps rigide FIXE aux bords lissés (fraction exacte de chaque maille, voir SOLID.md) : le fluide de son volume est chassé, l'écoulement le contourne ; angle en degrés (ou `rad`) ; polygone convexe. Les corps mobiles viendront |
+| `corps disque (x, y) rayon r "matériau"`, `corps rect (x1, y1) (x2, y2) "matériau" [angle a]`, `corps polygone (x1, y1) (x2, y2) (x3, y3) … "matériau"` | corps rigide aux bords lissés (fraction exacte de chaque maille, voir SOLID.md) : le fluide de son volume est chassé, l'écoulement le contourne ; angle en degrés (ou `rad`) ; polygone convexe. Fixe, ou à mouvement IMPOSÉ (il pousse le fluide), avec les options ci-dessous |
+| … `vitesse (vx, vy)` | translation à vitesse constante |
+| … `rotation ω` | rotation à vitesse constante, en °/s sans unité (ou `rad/s`, `tr/min`, `tr/s`) |
+| … `oscillation (vx, vy) période T`, … `oscillation rotation ω période T` | vitesse (ou rotation) sinusoïdale d'amplitude donnée : le corps revient pile à son point de départ à chaque période (batteur à vagues, agitateur) ; s'ajoute à la partie constante |
+| … `pivot (x, y)` | rotation autour de ce point fixe (charnière) : seules `rotation` et `oscillation rotation` s'y appliquent |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) |
 | `vitesse <zone> (vx, vy)` | impose la vitesse des faces intérieures de la zone ; la projection du pas suivant la rend admissible |
@@ -269,5 +273,5 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   sortie (PNG).
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
-- La commande `corps` pose des corps FIXES ; le mouvement imposé puis libre viendra (options `imposé`, `libre`, `pivot`… : voir
-  SOLID.md § 5 et § 7).
+- La commande `corps` pose des corps fixes ou à mouvement imposé ; les corps libres, poussés par l'écoulement, viendront (SOLID.md
+  § 7). Exemples : `experiences/piston.exp`, `experiences/vagues.exp`, `experiences/obstacles.exp`.

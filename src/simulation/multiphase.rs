@@ -65,6 +65,9 @@ pub struct MultiphaseSim {
     pub bodies: Vec<super::mp_bodies::RigidBody>,
     /// fraction de chaque maille occupée par les corps (0 sans corps), comptée dans la fermeture Σ m/ρ + α_corps = 1
     pub body_frac: Vec<f64>,
+    /// vitesse normale du corps aux faces u et v bordées par une maille couverte (corps en mouvement imposé ; vides sinon)
+    pub body_vel_u: Vec<f64>,
+    pub body_vel_v: Vec<f64>,
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
     pub k_cell: Vec<f64>,
@@ -316,6 +319,8 @@ impl MultiphaseSim {
             solid: vec![-1; n],
             bodies: vec![],
             body_frac: vec![0.0; n],
+            body_vel_u: vec![],
+            body_vel_v: vec![],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
             k_cell: vec![0.0; n],

@@ -5,8 +5,9 @@ qui coule, un projectile, un piston, une palette qui fait des vagues, un clapet 
 cellules spéciales du TODO), un agitateur qui tourne. Ce ne sont pas des poudres : la phase granulaire (GRANULAIRE.md) ne rend ni
 leur forme ni leur inertie propre.
 
-Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé) et 1 (corps
-FIXES : l'eau les contourne sans y entrer) sont faites (§ 8, `mp_bodies.rs`). Les corps mobiles viennent ensuite (§ 7).
+Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé), 1 (corps
+FIXES : l'eau les contourne sans y entrer) et 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues) sont faites (§ 8,
+`mp_bodies.rs`). Les corps libres, poussés par l'écoulement, viennent ensuite (§ 7).
 
 **En bref — recommandation**
 
@@ -253,7 +254,24 @@ conduction et la diffusion passent par les mêmes ouvertures. Comme une maille c
 φ, conductance et capacité y diminuent ensemble, et les schémas explicites gardent le pas du fluide pur (sans cela, la conduction
 s'emballait sur la trace d'une maille couverte).
 
-Pour les corps MOBILES, il reste à choisir comment la vitesse du corps est obtenue : rigidification de la quantité de mouvement
+**Ce que l'étape 2 a ajouté : déplacer le fluide balayé.** Pour un corps qui avance, l'ouverture 1 − α a un défaut : la face par
+laquelle le fluide d'une maille presque couverte doit sortir se ferme à mesure que la maille se couvre. Le dernier fluide passait
+donc par une fente de plus en plus étroite, et la pression nécessaire tendait vers l'infini : Δp ≈ ρ V dx / (A dt), déjà 6 kPa
+dans l'air pour une fente A = 1e-5, un piston à 5 cm/s, des mailles de 1 cm et un pas de 10 ms (estimation).
+- **Ouvertures exactes, essayées et écartées.** On a d'abord essayé la part exacte de chaque face hors du corps (segment découpé par
+  le corps). Mais une petite maille dont une face reste grande ouverte voit passer plus de fluide qu'elle n'en contient : erreurs de
+  fermeture jusqu'à 6 % autour d'un disque fixe. On garde donc 1 − α.
+- **Déplacement direct du fluide balayé.** Le fluide qu'un corps balaie dans une maille passe aussitôt (masses et énergies, comme en
+  redistribution des « petites mailles » des méthodes à mailles coupées) à la maille voisine du côté opposé au corps (−∇α). Une maille
+  qu'il découvre prend le sien à cette voisine. La projection n'a plus qu'à évacuer, par des faces bien ouvertes, l'excédent ou le
+  manque de cette voisine : au plus le volume balayé en un pas.
+- **Travail du corps.** Le déplacement ne porte pas de travail : on ajoute p·Δα à l'énergie de la maille voisine, réparti entre ses
+  groupes comme le travail de pression. Sans cela, le gaz qu'un piston comprime ne chauffait que de 5 % au lieu de 15 %.
+- **Entraînement.** Sur une face bordée par une maille couverte, le fluide est entraîné à la vitesse du corps :
+  vitesse débitante A (u* − dt/ρ ∇p) + A (1 − A) V_corps (non-glissement étalé sur une maille).
+- **Pas de temps.** La vitesse de surface des corps entre dans le CFL.
+
+Pour les corps LIBRES, il reste à choisir comment la vitesse du corps est obtenue : rigidification de la quantité de mouvement
 (domaine fictif) ou inconnue de la projection (monolithique). Ce sera l'étape 3.
 
 ### 6.3 Contacts
@@ -293,8 +311,8 @@ Pour les corps MOBILES, il reste à choisir comment la vitesse du corps est obte
 |---|---|---|
 | 0 (faite) | préparer (§ 8) : géométrie exacte, fractions, contraintes, fermeture, état, rendu ; aucun résultat changé | Σ α dx² = aire (1e-12) quels que soient la position et l'angle ; empreintes physiques des 18 scénarios identiques au bit près |
 | 1 (faite) | corps fixes : poser un corps chasse le fluide (trace dans les mailles couvertes) ; ouvertures des faces dans la projection, le transport, la percolation, la conduction et la diffusion ; commande `corps`, outil de la fenêtre d'expérience | fermeture à 1e-9 après la pose ; eau au repos autour de deux corps : 1.8e-7 m/s, pression à 3 mPa près ; canal autour d'un disque : débit identique entrée / disque / sortie, passages à 0.284 m/s (0.273 attendus), rien n'entre dans le corps ; barrage contre un muret et un disque : masse d'eau à 4e-16, aucun pas refait |
-| 2 | mouvement imposé | piston dans un tube de gaz fermé : p V^γ = cte en compression lente ; disque tiré à vitesse constante : traînée comparée à Tritton (1959) ; aucune pointe de pression quand le corps traverse les mailles |
-| 3 | mouvement libre + masque de DDL | flotteur : tirant d'eau = (ρ_c/ρ_eau) H, oscillation verticale amortie ; disque qui sédimente dans un canal (cas de Glowinski et al. 2001, repris par Wan & Turek 2006) ; corps léger (liège) stable ; clapet sur pivot |
+| 2 (faite) | mouvement imposé : vitesse et rotation constantes, oscillation sinusoïdale, pivot ; fluide balayé déplacé, travail p·dV, entraînement | piston dans un tube d'air fermé : γ = 1.4014 par la pression et 1.3990 par la température (attendu : 1.40), masse de gaz à 2e-7 ; disque tiré dans l'eau : la pression d'une sonde saute de 1.5 Pa au plus quand il traverse les mailles, masse d'eau à 2e-16 ; palette sur pivot : eau brassée à 0.11 m/s près des bouts (ω r = 0.11) ; lois intégrées exactement (une oscillation revient pile à son départ) |
+| 3 | mouvement libre + masque de DDL ; force du fluide sur le corps | flotteur : tirant d'eau = (ρ_c/ρ_eau) H, oscillation verticale amortie ; disque qui sédimente dans un canal (cas de Glowinski et al. 2001, repris par Wan & Turek 2006) ; corps léger (liège) stable ; clapet sur pivot ; traînée d'un disque tiré comparée à Tritton (1959) |
 | 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
@@ -342,6 +360,17 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   température (étape 5). Les grains ne le voient pas encore : leur sédimentation ignore les corps.
 - Tests (`mp_bodies.rs`) : fermeture après la pose, eau au repos, canal autour d'un disque, barrage contre deux corps ; commande et
   outil ; empreintes physiques des 18 scénarios toujours identiques au bit près.
+
+**Étape 2 (mouvement imposé, faite le 2026-11-24).**
+- Loi `Motion::Imposed` : vitesse et rotation constantes plus une oscillation sinusoïdale de période donnée, éventuellement autour
+  d'un pivot. `move_imposed` l'intègre exactement : l'oscillation revient pile à son point de départ, quel que soit le pas.
+- À chaque pas, après le transport, les corps avancent (`move_bodies`), le fluide balayé est déplacé avec le travail du corps
+  (`push_fluid`, § 6.2), et la vitesse du corps aux faces bordées par une maille couverte sert à l'entraînement dans la projection.
+  Le retour arrière du filet de sécurité remet les corps à leur place.
+- Commande `corps … vitesse (vx, vy) | rotation ω | oscillation (vx, vy) période T | oscillation rotation ω période T | pivot (x, y)`
+  (EXPERIENCES.md). Exemples : `experiences/piston.exp` (adiabatique), `experiences/vagues.exp` (batteur à vagues). État complet en
+  version 13.
+- Pas encore : la force du fluide sur le corps (étape 3), les corps libres, la chaleur, les grains, le GPU.
 
 ## 9. Choix (validés le 2026-11-24)
 
