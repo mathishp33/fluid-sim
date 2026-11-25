@@ -431,8 +431,34 @@ simuler 5 ms
     assert!(matches!(s.bodies[2].motion, Motion::Imposed { omega, .. } if (omega - std::f64::consts::PI).abs() < 1e-12));
     assert_eq!(s.bodies[2].pivot, Some([0.15, 0.2]));
     assert!(s.has_moving_bodies());
+    // corps libres : axes bloqués, masse volumique propre, vitesse de départ ramenée aux mouvements permis, pivot ; mesures
+    let f = proto(
+        "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm\n\
+         corps disque (0.2, 0.2) rayon 2 cm \"acier\" libre bloqué x et rotation masse volumique 0.6 g/cm³ vitesse (0.3, 0.1)\n\
+         corps rect (0.1, 0.19) (0.2, 0.21) \"verre\" libre pivot (0.1, 0.2) rotation 90\n\
+         mesurer toutes les 1 ms : corps 1 y comme \"hauteur\", corps 2 rotation, corps 1 fy\n\
+         simuler 3 ms\n",
+    );
+    let (s, _, _) = initial_state(&f, Path::new(".")).unwrap();
+    let (a, b) = (&s.bodies[0], &s.bodies[1]);
+    assert!(a.is_free() && !a.dof.x && a.dof.y && !a.dof.rot && a.rho == Some(600.0), "{a:?}");
+    assert!(a.vel == [0.0, 0.1] && a.omega == 0.0, "vitesse de départ {:?} {}", a.vel, a.omega);
+    // pivot : rotation de 90 °/s autour de (0.1, 0.2), le centre (0.15, 0.2) part vers le haut à ω r
+    assert!(b.is_free() && b.pivot == Some([0.1, 0.2]) && (b.omega - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    assert!(b.vel[0].abs() < 1e-15 && (b.vel[1] - 0.05 * std::f64::consts::FRAC_PI_2).abs() < 1e-12, "{:?}", b.vel);
+    let mut r = Runner::new(f, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert!(r.columns.iter().any(|c| c == "hauteur (m)") && r.columns.iter().any(|c| c == "corps 2 rotation (°/s)"), "{:?}", r.columns);
+    assert!(r.log.iter().any(|l| l.contains("corps libre « acier »") && l.contains("bloqué en x, rotation") && l.contains("600 kg/m³")), "{}", r.log.join("\n"));
+    let last = r.rows.last().unwrap();
+    let yc = r.columns.iter().position(|c| c == "hauteur (m)").unwrap();
+    assert!(last[yc] < 0.2 + 0.1 * 0.004 && last[yc] > 0.2, "le disque monte à 0.1 m/s : y = {}", last[yc]);
     for (bad, what) in [
-        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" libre", "pas encore"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" libre oscillation (0.1, 0) période 1 s", "oscillation"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" bloqué x", "libre"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" fixe libre", "pas les deux"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" libre bloqué", "axe"),
+        ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" libre masse volumique 0", "positive"),
         ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" oscillation (0.1, 0)", "période"),
         ("corps disque (0.1, 0.1) rayon 2 cm \"acier\" période 1 s", "oscillation"),
         ("corps rect (0, 0) (0.1, 0.02) \"acier\" pivot (0, 0) vitesse (1, 0)", "pivot"),

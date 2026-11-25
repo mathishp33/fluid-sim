@@ -98,6 +98,9 @@ d'expérience.
 | … `rotation ω` | rotation à vitesse constante, en °/s sans unité (ou `rad/s`, `tr/min`, `tr/s`) |
 | … `oscillation (vx, vy) période T`, … `oscillation rotation ω période T` | vitesse (ou rotation) sinusoïdale d'amplitude donnée : le corps revient pile à son point de départ à chaque période (batteur à vagues, agitateur) ; s'ajoute à la partie constante |
 | … `pivot (x, y)` | rotation autour de ce point fixe (charnière) : seules `rotation` et `oscillation rotation` s'y appliquent |
+| … `libre` | corps LIBRE, poussé par l'écoulement (pesanteur, pression, frottement) ; `vitesse` et `rotation` donnent alors sa vitesse de départ ; avec `pivot (x, y)`, il tourne librement autour de la charnière (clapet) |
+| … `bloqué x \| y \| rotation` | axes bloqués d'un corps libre, un ou plusieurs (`bloqué x et rotation` : il ne fait que monter et descendre) |
+| … `masse volumique ρ` | masse volumique propre du corps, en kg/m³ sans unité (ou `g/cm³`), à la place de celle du matériau : bouchon de liège, bloc de bois, corps de la densité de l'eau |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) |
 | `vitesse <zone> (vx, vy)` | impose la vitesse des faces intérieures de la zone ; la projection du pas suivant la rend admissible |
@@ -177,6 +180,8 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
   - `moyenne | max | min | somme <grandeur> dans <zone>` : la somme est une intégrale (× dx², par mètre de profondeur) ;
     les grandeurs du fluide ignorent les mailles solides, T les compte ;
   - `masse "fluide" [dans <zone>]` : en kg par mètre de profondeur ;
+  - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple` : position (m), angle (°), vitesse (m/s, °/s) du n-ième corps posé,
+    ou force du fluide sur lui (N/m ; couple autour de son centre de masse, N) à la dernière projection ;
   - `stats` : dt, itérations de pression, pas refaits, masse de chaque fluide, énergies cinétique et interne, T et p extrêmes,
     vitesse maximale, chaleur injectée, et, s'il y a de la chimie, chaleur de réaction, puissance chimique et énergie rayonnée.
 - **Libellés** : `comme "nom"` donne le titre de la colonne.
@@ -273,5 +278,7 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   sortie (PNG).
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
-- La commande `corps` pose des corps fixes ou à mouvement imposé ; les corps libres, poussés par l'écoulement, viendront (SOLID.md
-  § 7). Exemples : `experiences/piston.exp`, `experiences/vagues.exp`, `experiences/obstacles.exp`.
+- La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
+  `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`. Les corps ne se
+  touchent pas encore entre eux : un corps libre s'arrête net contre un bord du domaine ou un solide (les contacts sont l'étape 4 de
+  SOLID.md), et la traînée d'un corps en mouvement est encore trop forte (SOLID.md § 8).

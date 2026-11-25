@@ -240,6 +240,65 @@ pub enum Measure {
     Probe { q: Quantity, reduce: Reduce, zone: Zone, label: Option<String> },
     /// masse d'un fluide pur dans une zone (kg par mètre de profondeur)
     Mass { fluid: String, zone: Zone, label: Option<String> },
+    /// position, vitesse ou force du fluide sur un corps rigide (indice à partir de 0, dans l'ordre de pose)
+    Body { index: usize, q: BodyQty, label: Option<String> },
+}
+
+/// Grandeur mesurée sur un corps rigide.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BodyQty {
+    X,
+    Y,
+    Angle,
+    Vx,
+    Vy,
+    Rotation,
+    Fx,
+    Fy,
+    Torque,
+}
+
+impl BodyQty {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BodyQty::X => "x",
+            BodyQty::Y => "y",
+            BodyQty::Angle => "angle",
+            BodyQty::Vx => "vx",
+            BodyQty::Vy => "vy",
+            BodyQty::Rotation => "rotation",
+            BodyQty::Fx => "fx",
+            BodyQty::Fy => "fy",
+            BodyQty::Torque => "couple",
+        }
+    }
+    fn unit(&self) -> &'static str {
+        match self {
+            BodyQty::X | BodyQty::Y => "m",
+            BodyQty::Angle => "°",
+            BodyQty::Vx | BodyQty::Vy => "m/s",
+            BodyQty::Rotation => "°/s",
+            BodyQty::Fx | BodyQty::Fy => "N/m",
+            BodyQty::Torque => "N",
+        }
+    }
+    /// valeur sur le corps k (NaN s'il n'existe pas) ; forces : celles du fluide à la dernière projection (couple autour du centre de
+    /// masse, par mètre de profondeur)
+    fn value(&self, sim: &MultiphaseSim, k: usize) -> f64 {
+        let Some(b) = sim.bodies.get(k) else { return f64::NAN };
+        let f = sim.body_force.get(k).copied().unwrap_or([f64::NAN; 3]);
+        match self {
+            BodyQty::X => b.pos[0],
+            BodyQty::Y => b.pos[1],
+            BodyQty::Angle => b.angle.to_degrees(),
+            BodyQty::Vx => b.vel[0],
+            BodyQty::Vy => b.vel[1],
+            BodyQty::Rotation => b.omega.to_degrees(),
+            BodyQty::Fx => f[0],
+            BodyQty::Fy => f[1],
+            BodyQty::Torque => f[2],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -290,11 +349,17 @@ pub struct BodyMotion {
     pub osc_omega: f64,
     pub period: f64,
     pub pivot: Option<[f64; 2]>,
+    /// corps libre, poussé par l'écoulement : `v` et `omega` sont alors sa vitesse de départ
+    pub free: bool,
+    /// axes bloqués d'un corps libre (x, y, rotation)
+    pub locked: [bool; 3],
+    /// masse volumique propre du corps (kg/m³), à la place de celle du matériau
+    pub rho: Option<f64>,
 }
 
 impl BodyMotion {
     pub fn is_fixed(&self) -> bool {
-        self.v == [0.0, 0.0] && self.omega == 0.0 && self.osc_v == [0.0, 0.0] && self.osc_omega == 0.0
+        !self.free && self.v == [0.0, 0.0] && self.omega == 0.0 && self.osc_v == [0.0, 0.0] && self.osc_omega == 0.0
     }
 }
 
@@ -324,9 +389,9 @@ impl BodySpec {
         }
     }
 
-    /// corps rigide de matériau `material`, tourné de `angle` (rad) autour de son centre de masse, fixe ou à mouvement imposé
+    /// corps rigide de matériau `material`, tourné de `angle` (rad) autour de son centre de masse : fixe, à mouvement imposé ou libre
     pub fn body(&self, material: usize, angle: f64, temp: f64, motion: &BodyMotion) -> Result<super::mp_bodies::RigidBody, String> {
-        use super::mp_bodies::{Motion, RigidBody, Shape};
+        use super::mp_bodies::{Dof, Motion, RigidBody, Shape};
         let (shape, pos) = match self {
             BodySpec::Disc { c, r } => (Shape::Disc { r: *r }, *c),
             BodySpec::Rect { a, b } => {
@@ -340,7 +405,15 @@ impl BodySpec {
         };
         let mut b = RigidBody::new(shape, material, pos, temp);
         b.angle = angle;
-        if motion.is_fixed() {
+        b.rho = motion.rho;
+        if motion.free {
+            b.motion = Motion::Free;
+            b.dof = Dof { x: !motion.locked[0], y: !motion.locked[1], rot: !motion.locked[2] };
+            b.pivot = motion.pivot;
+            // vitesse de départ (ramenée aux mouvements permis par `add_body`)
+            b.vel = motion.v;
+            b.omega = motion.omega;
+        } else if motion.is_fixed() {
             b.motion = Motion::Fixed;
         } else {
             let m = motion;
@@ -783,6 +856,7 @@ pub fn initial_state(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Op
 enum ProbeKind {
     Q(QtyR, Reduce),
     Mass(usize),
+    Body(usize, BodyQty),
 }
 
 #[derive(Clone, Copy)]
@@ -825,6 +899,7 @@ impl Probe {
         let a2 = sim.dx * sim.dx;
         match self.kind {
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
+            ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Q(q, red) => {
                 let vals = self.cells.iter().filter(|&&c| !(self.fluid_only && sim.is_solid(c))).map(|&c| qty_value(sim, q, c));
                 match red {
@@ -1082,6 +1157,11 @@ impl Runner {
                     let name = label.unwrap_or_else(|| format!("masse {fluid} {}", zone.label()));
                     self.columns.push(format!("{name} (kg/m)"));
                     self.probes.push(Probe { kind: ProbeKind::Mass(k), cells, fluid_only: true });
+                }
+                Measure::Body { index, q, label } => {
+                    let name = label.unwrap_or_else(|| format!("corps {} {}", index + 1, q.name()));
+                    self.columns.push(format!("{name} ({})", q.unit()));
+                    self.probes.push(Probe { kind: ProbeKind::Body(index, q), cells: vec![], fluid_only: false });
                 }
             }
         }
@@ -1462,7 +1542,26 @@ fn describe(a: &Action) -> String {
                 BodySpec::Polygon(p) => format!("polygone de {} sommets", p.len()),
             };
             let a = if *angle != 0.0 { format!(", tourné de {}°", fmt_num(angle.to_degrees())) } else { String::new() };
-            if motion.is_fixed() {
+            let a = match motion.rho {
+                Some(r) => format!("{a}, masse volumique {} kg/m³", fmt_num(r)),
+                None => a,
+            };
+            if motion.free {
+                let m = motion;
+                let mut parts = vec![];
+                let axes: Vec<&str> = ["x", "y", "rotation"].iter().zip(m.locked).filter(|(_, l)| *l).map(|(n, _)| *n).collect();
+                if !axes.is_empty() {
+                    parts.push(format!("bloqué en {}", axes.join(", ")));
+                }
+                if let Some(q) = m.pivot {
+                    parts.push(format!("pivot {}", fmt_point(q)));
+                }
+                if m.v != [0.0, 0.0] || m.omega != 0.0 {
+                    parts.push(format!("vitesse de départ {} m/s, {} °/s", fmt_point(m.v), fmt_num(m.omega.to_degrees())));
+                }
+                let p = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
+                format!("corps libre « {material} » {f}{a}{p}")
+            } else if motion.is_fixed() {
                 format!("corps fixe « {material} » {f}{a}")
             } else {
                 let m = motion;

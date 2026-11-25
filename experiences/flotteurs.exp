@@ -1,0 +1,14 @@
+# Flotteurs : un bloc de bois (600 kg/m³) et un bouchon de liège (240 kg/m³) posés sur l'eau s'enfoncent jusqu'à leur tirant d'eau
+# d'Archimède (0.6 et 0.24 fois leur volume sous l'eau), en oscillant de moins en moins (les vagues qu'ils font emportent l'énergie).
+#   fluid-sim experience experiences/flotteurs.exp
+
+départ scénario "Cuve vide" grille 80 x 40 maille 1 cm
+remplir rect (0, 0) (0.8, 0.2) avec "eau" à 20 °C
+
+# bloc de 12 × 4 cm posé avec 1 cm dans l'eau (il en prendra 2.4) ; bouchon de 3 cm de rayon posé à mi-rayon
+corps rect (0.15, 0.19) (0.27, 0.23) "verre" libre masse volumique 600 kg/m3
+corps disque (0.6, 0.215) rayon 3 cm "verre" libre masse volumique 240 kg/m3
+
+mesurer toutes les 20 ms : corps 1 y comme "centre du bloc de bois", corps 2 y comme "centre du bouchon", corps 1 angle, corps 1 fy comme "poussée sur le bloc"
+
+simuler 4 s

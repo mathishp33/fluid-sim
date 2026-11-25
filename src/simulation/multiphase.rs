@@ -65,9 +65,22 @@ pub struct MultiphaseSim {
     pub bodies: Vec<super::mp_bodies::RigidBody>,
     /// fraction de chaque maille occupée par les corps (0 sans corps), comptée dans la fermeture Σ m/ρ + α_corps = 1
     pub body_frac: Vec<f64>,
-    /// vitesse normale du corps aux faces u et v bordées par une maille couverte (corps en mouvement imposé ; vides sinon)
+    /// vitesse normale du corps aux faces u et v bordées par une maille couverte (corps en mouvement ; vides sinon)
     pub body_vel_u: Vec<f64>,
     pub body_vel_v: Vec<f64>,
+    /// corps qui couvre le plus chaque maille (−1 : aucun ; recalculé depuis la position des corps)
+    #[serde(skip)]
+    pub(crate) body_owner: Vec<i32>,
+    /// force du fluide sur chaque corps à la dernière projection : (Fx, Fy) en N/m et couple autour du centre de masse en N
+    #[serde(skip)]
+    pub body_force: Vec<[f64; 3]>,
+    /// part du frottement (contraintes visqueuses) dans `body_force`
+    #[serde(skip)]
+    pub body_force_visc: Vec<[f64; 3]>,
+    /// volume (fraction de maille) que les corps libres ont déplacé dans chaque maille pendant ce pas (`push_fluid`) ; vide sans
+    /// corps libre
+    #[serde(skip)]
+    pub(crate) push_src: Vec<f64>,
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
     pub k_cell: Vec<f64>,
@@ -321,6 +334,10 @@ impl MultiphaseSim {
             body_frac: vec![0.0; n],
             body_vel_u: vec![],
             body_vel_v: vec![],
+            body_owner: vec![],
+            body_force: vec![],
+            body_force_visc: vec![],
+            push_src: vec![],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
             k_cell: vec![0.0; n],

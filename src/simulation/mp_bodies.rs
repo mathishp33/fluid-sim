@@ -1,7 +1,12 @@
 //! Corps rigides — solides mobiles (conception et choix : SOLID.md).
 //!
-//! ÉTAPES 0 ET 1 (SOLID.md § 7–8) : corps rigides FIXES, posés par la commande `corps` des protocoles ou l'outil « Corps » de la
-//! fenêtre d'expérience. Sans corps, le calcul est inchangé au bit près (empreintes physiques des scénarios identiques).
+//! ÉTAPES 0 À 3 (SOLID.md § 6–8) : corps rigides FIXES, à mouvement IMPOSÉ ou LIBRES (poussés par l'écoulement), posés par la
+//! commande `corps` des protocoles ou l'outil « Corps » de la fenêtre d'expérience. Sans corps, le calcul est inchangé au bit près
+//! (empreintes physiques des scénarios identiques).
+//!
+//! * Corps libres : pression et vitesse résolues ensemble dans la projection (`body_couplings`, `BodyLowRank` : masse ajoutée
+//!   implicite) ; frottement sur la vitesse du mélange fluide + corps (`mixture_velocity`) ; force du fluide dans `body_force`.
+//!   La traînée d'un corps EN MOUVEMENT est encore deux fois trop forte (SOLID.md § 8).
 //!
 //! * La fraction de chaque maille occupée par les corps (`MultiphaseSim::body_frac`) entre dans la fermeture : Σ m/ρ + α_corps = 1
 //!   (`cell_volume`, `cell_closure_g`).
@@ -196,11 +201,56 @@ pub struct RigidBody {
     pub motion: Motion,
     /// une température par corps (étape 5)
     pub temp: f64,
+    /// masse volumique propre du corps (kg/m³), à la place de celle de son matériau (bouchon, flotteur, corps de densité donnée)
+    pub rho: Option<f64>,
 }
 
 impl RigidBody {
     pub fn new(shape: Shape, material: usize, pos: [f64; 2], temp: f64) -> RigidBody {
-        RigidBody { shape, material, pos, angle: 0.0, vel: [0.0, 0.0], omega: 0.0, dof: Dof::FREE, pivot: None, motion: Motion::Free, temp }
+        RigidBody { shape, material, pos, angle: 0.0, vel: [0.0, 0.0], omega: 0.0, dof: Dof::FREE, pivot: None, motion: Motion::Free, temp, rho: None }
+    }
+
+    /// masse volumique du corps : la sienne, sinon celle de son matériau `material_rho`
+    pub fn density(&self, material_rho: f64) -> f64 {
+        self.rho.unwrap_or(material_rho)
+    }
+
+    /// corps libre, poussé par l'écoulement ?
+    pub fn is_free(&self) -> bool {
+        matches!(self.motion, Motion::Free)
+    }
+
+    /// corps qui bouge (mouvement imposé ou libre) ?
+    pub fn is_moving(&self) -> bool {
+        !matches!(self.motion, Motion::Fixed)
+    }
+
+    /// Mouvements permis d'un corps libre, en coordonnées (Vx, Vy, ω) autour du centre de masse : colonnes d'une base (axes non
+    /// bloqués ; sur un pivot q, la seule rotation autour de q : (−(G − q)y, (G − q)x, 1)).
+    pub fn motion_basis(&self) -> Vec<[f64; 3]> {
+        match self.pivot {
+            Some(q) => {
+                if self.dof.rot {
+                    let r = sub(self.pos, q);
+                    vec![[-r[1], r[0], 1.0]]
+                } else {
+                    vec![]
+                }
+            }
+            None => {
+                let mut b = vec![];
+                if self.dof.x {
+                    b.push([1.0, 0.0, 0.0]);
+                }
+                if self.dof.y {
+                    b.push([0.0, 1.0, 0.0]);
+                }
+                if self.dof.rot {
+                    b.push([0.0, 0.0, 1.0]);
+                }
+                b
+            }
+        }
     }
 
     /// Sommets dans le repère du domaine.
@@ -344,6 +394,181 @@ fn clip_to_box(poly: &[[f64; 2]], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f6
     cur
 }
 
+/// Morceaux du bord d'un polygone convexe (sens trigonométrique) dans chaque maille : (maille, p, q), les côtés étant découpés par
+/// les lignes de la grille. La normale sortante de p → q, multipliée par sa longueur, est (q_y − p_y, −(q_x − p_x)). Un morceau posé
+/// sur une ligne de la grille compte pour la maille du côté extérieur (celle que le corps couvre s'il avance). Hors du domaine : rien.
+pub(crate) fn boundary_pieces(poly: &[[f64; 2]], nx: usize, ny: usize, dx: f64) -> Vec<(usize, [f64; 2], [f64; 2])> {
+    let mut out = vec![];
+    let n = poly.len();
+    let mut ts: Vec<f64> = Vec::with_capacity(16);
+    for e in 0..n {
+        let (a, b) = (poly[e], poly[(e + 1) % n]);
+        let d = sub(b, a);
+        ts.clear();
+        ts.push(0.0);
+        ts.push(1.0);
+        for axis in 0..2 {
+            if d[axis] == 0.0 {
+                continue;
+            }
+            let (lo, hi) = (a[axis].min(b[axis]), a[axis].max(b[axis]));
+            let mut k = (lo / dx).floor() + 1.0;
+            while k * dx < hi {
+                let t = (k * dx - a[axis]) / d[axis];
+                if t > 0.0 && t < 1.0 {
+                    ts.push(t);
+                }
+                k += 1.0;
+            }
+        }
+        ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        // normale sortante unitaire, pour choisir la maille d'un morceau posé sur une ligne de la grille
+        let len = d[0].hypot(d[1]);
+        if len <= 0.0 {
+            continue;
+        }
+        let nrm = [d[1] / len, -d[0] / len];
+        for w in ts.windows(2) {
+            if w[1] - w[0] <= 1e-15 {
+                continue;
+            }
+            let p = [a[0] + w[0] * d[0], a[1] + w[0] * d[1]];
+            let q = [a[0] + w[1] * d[0], a[1] + w[1] * d[1]];
+            let m = [0.5 * (p[0] + q[0]) + 1e-9 * dx * nrm[0], 0.5 * (p[1] + q[1]) + 1e-9 * dx * nrm[1]];
+            let (fi, fj) = ((m[0] / dx).floor(), (m[1] / dx).floor());
+            if fi < 0.0 || fj < 0.0 || fi >= nx as f64 || fj >= ny as f64 {
+                continue;
+            }
+            out.push((fj as usize * nx + fi as usize, p, q));
+        }
+    }
+    out
+}
+
+/// Inverse d'une matrice symétrique définie positive k × k (k ≤ 3), par élimination de Gauss.
+fn inverse_small(a: &[[f64; 3]; 3], k: usize) -> [[f64; 3]; 3] {
+    let mut m = *a;
+    let mut inv = [[0.0; 3]; 3];
+    for i in 0..k {
+        inv[i][i] = 1.0;
+    }
+    for col in 0..k {
+        // pivot partiel
+        let mut piv = col;
+        for r in col + 1..k {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        m.swap(col, piv);
+        inv.swap(col, piv);
+        let d = m[col][col];
+        if d.abs() < 1e-300 {
+            return [[0.0; 3]; 3];
+        }
+        for c in 0..k {
+            m[col][c] /= d;
+            inv[col][c] /= d;
+        }
+        for r in 0..k {
+            if r != col {
+                let f = m[r][col];
+                for c in 0..k {
+                    m[r][c] -= f * m[col][c];
+                    inv[r][c] -= f * inv[col][c];
+                }
+            }
+        }
+    }
+    inv
+}
+
+/// Couplage d'un corps avec la projection (SOLID.md § 6.2, étape 3), recalculé à chaque projection depuis la position des corps.
+/// Coordonnées généralisées (Vx, Vy, ω) autour du centre de masse.
+#[derive(Clone, Debug)]
+pub(crate) struct BodyCoupling {
+    pub body: usize,
+    pub free: bool,
+    /// mailles qui reçoivent le volume que le corps balaie (`push_target`) et sensibilité de ce volume à (X, Y, θ) (m, m, m²) : la
+    /// force de pression est −Σ p_m J_m + `hydro`, et le pas suivant déplacera dt J_m·V de fluide dans la maille m
+    pub cells: Vec<(usize, [f64; 3])>,
+    /// part hydrostatique de la pression entre le centre de ces mailles et le bord du corps : −Σ ρ_m ∫ g·(x − x_m) n dS
+    pub hydro: [f64; 3],
+    /// frottement (quantité de mouvement que le corps échange avec le fluide qu'il entraîne) : F_v = fu − D·V
+    pub fu: [f64; 3],
+    pub d: [[f64; 3]; 3],
+    /// corps libre : V^{n+1} = v0 − dt W Σ_m J_m p_m (W = B (Bᵀ (M + dt D) B)⁻¹ Bᵀ, mouvements permis B)
+    pub w: [[f64; 3]; 3],
+    pub v0: [f64; 3],
+}
+
+impl BodyCoupling {
+    /// Σ_m J_m p_m
+    pub fn jtp(&self, p: &[f64]) -> [f64; 3] {
+        let mut s = [0.0; 3];
+        for (m, j) in &self.cells {
+            for a in 0..3 {
+                s[a] += j[a] * p[*m];
+            }
+        }
+        s
+    }
+
+    /// vitesse généralisée de fin de projection d'un corps libre à la pression p
+    pub fn velocity(&self, p: &[f64], dt: f64) -> [f64; 3] {
+        let s = self.jtp(p);
+        let mut v = self.v0;
+        for a in 0..3 {
+            for b in 0..3 {
+                v[a] -= dt * self.w[a][b] * s[b];
+            }
+        }
+        v
+    }
+
+    /// force (Fx, Fy, couple autour du centre de masse) du fluide sur le corps à la pression p, le corps allant à la vitesse v
+    pub fn force(&self, p: &[f64], v: [f64; 3]) -> [f64; 3] {
+        let s = self.jtp(p);
+        let mut f = [0.0; 3];
+        for a in 0..3 {
+            f[a] = -s[a] + self.hydro[a] + self.fu[a];
+            for b in 0..3 {
+                f[a] -= self.d[a][b] * v[b];
+            }
+        }
+        f
+    }
+}
+
+/// Terme de rang faible que les corps libres ajoutent à la matrice de la projection : (dt/dx²) J W Jᵀ (symétrique, positif).
+pub(crate) struct BodyLowRank {
+    /// pour chaque corps : mailles actives et J_m, matrice (dt/dx²) W
+    pub blocks: Vec<(Vec<(usize, [f64; 3])>, [[f64; 3]; 3])>,
+}
+
+impl BodyLowRank {
+    /// y += (dt/dx²) J W Jᵀ x
+    pub fn apply_add(&self, x: &[f64], y: &mut [f64]) {
+        for (cells, s) in &self.blocks {
+            let mut t = [0.0; 3];
+            for (m, j) in cells {
+                for a in 0..3 {
+                    t[a] += j[a] * x[*m];
+                }
+            }
+            let mut u = [0.0; 3];
+            for a in 0..3 {
+                for b in 0..3 {
+                    u[a] += s[a][b] * t[b];
+                }
+            }
+            for (m, j) in cells {
+                y[*m] += j[0] * u[0] + j[1] * u[1] + j[2] * u[2];
+            }
+        }
+    }
+}
+
 /// Fraction de chaque maille (nx × ny, pas dx) occupée par les corps ; la somme de corps qui se chevauchent est plafonnée à 1.
 pub fn body_fractions(bodies: &[RigidBody], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
     body_fractions_owned(bodies, nx, ny, dx).0
@@ -410,25 +635,27 @@ impl super::multiphase::MultiphaseSim {
             self.body_vel_v.clear();
             return;
         }
-        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
-        let (frac, owner) = body_fractions_owned(&self.bodies, nx, ny, dx);
+        let (nx, ny) = (self.nx, self.ny);
+        let (frac, owner) = body_fractions_owned(&self.bodies, nx, ny, self.dx);
         self.body_frac = frac;
-        if !self.has_moving_bodies() {
+        self.body_owner = owner;
+        self.update_body_face_velocities();
+    }
+
+    /// Vitesse normale du corps aux faces bordées par une maille couverte (corps en mouvement ; vides sinon), depuis les fractions et
+    /// propriétaires courants.
+    pub(crate) fn update_body_face_velocities(&mut self) {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        if !self.has_moving_bodies() || self.body_owner.len() != nx * ny {
             self.body_vel_u.clear();
             self.body_vel_v.clear();
             return;
         }
-        let pick = |a: Option<usize>, b: Option<usize>| -> Option<usize> {
-            let fa = a.map_or(0.0, |c| self.body_frac[c]);
-            let fb = b.map_or(0.0, |c| self.body_frac[c]);
-            let c = if fa >= fb { a } else { b }?;
-            (self.body_frac[c] > 0.0 && owner[c] >= 0).then(|| owner[c] as usize)
-        };
         let mut vu = vec![0.0; (nx + 1) * ny];
         for j in 0..ny {
             for i in 0..=nx {
                 let (a, b) = ((i > 0).then(|| j * nx + i - 1), (i < nx).then(|| j * nx + i));
-                if let Some(k) = pick(a, b) {
+                if let Some(k) = self.face_owner(a, b) {
                     vu[j * (nx + 1) + i] = self.bodies[k].velocity_at([i as f64 * dx, (j as f64 + 0.5) * dx])[0];
                 }
             }
@@ -437,13 +664,86 @@ impl super::multiphase::MultiphaseSim {
         for j in 0..=ny {
             for i in 0..nx {
                 let (a, b) = ((j > 0).then(|| (j - 1) * nx + i), (j < ny).then(|| j * nx + i));
-                if let Some(k) = pick(a, b) {
+                if let Some(k) = self.face_owner(a, b) {
                     vv[j * nx + i] = self.bodies[k].velocity_at([(i as f64 + 0.5) * dx, j as f64 * dx])[1];
                 }
             }
         }
         self.body_vel_u = vu;
         self.body_vel_v = vv;
+    }
+
+    /// Vitesse du MÉLANGE fluide + corps aux faces : u + (1 − A) V_corps (u : vitesse débitante du fluide, A : ouverture de la face,
+    /// V_corps : vitesse normale du corps qui la porte). C'est le champ à une vitesse du domaine fictif, rigide dans les corps.
+    pub(crate) fn mixture_velocity(&self) -> (Vec<f64>, Vec<f64>) {
+        let (nx, ny) = (self.nx, self.ny);
+        let mut wu = self.u.clone();
+        let mut wv = self.v.clone();
+        if self.body_vel_u.len() == wu.len() && self.body_vel_v.len() == wv.len() {
+            for j in 0..ny {
+                for i in 0..=nx {
+                    let f = j * (nx + 1) + i;
+                    let vb = self.body_vel_u[f];
+                    if vb != 0.0 {
+                        wu[f] += (1.0 - self.u_open(i, j)) * vb;
+                    }
+                }
+            }
+            for j in 0..=ny {
+                for i in 0..nx {
+                    let f = j * nx + i;
+                    let vb = self.body_vel_v[f];
+                    if vb != 0.0 {
+                        wv[f] += (1.0 - self.v_open(i, j)) * vb;
+                    }
+                }
+            }
+        }
+        (wu, wv)
+    }
+
+    /// Force visqueuse par unité de volume (∇·τ, N/m³) à la face u (i, j), 1 ≤ i < nx, ou v (i, j), 1 ≤ j < ny, pour les vitesses de
+    /// face (wu, wv) et la viscosité `mu` par maille : mêmes formules que `add_forces` (tenseur symétrique complet, glissement libre
+    /// contre les parois et les solides).
+    fn viscous_div(&self, wu: &[f64], wv: &[f64], mu: &[f64], u_face: bool, i: usize, j: usize) -> f64 {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
+        let vi = |i: usize, j: usize| wv[j * nx + i];
+        let txx = |i: usize, j: usize| 2.0 * mu[j * nx + i] * (ui(i + 1, j) - ui(i, j)) / dx;
+        let tyy = |i: usize, j: usize| 2.0 * mu[j * nx + i] * (vi(i, j + 1) - vi(i, j)) / dx;
+        let txy = |i: usize, j: usize| -> f64 {
+            if i == 0 || j == 0 || i >= nx || j >= ny {
+                return 0.0;
+            }
+            let cs = [j.wrapping_sub(1) * nx + i - 1, (j - 1) * nx + i, j * nx + i - 1, j * nx + i];
+            if cs.iter().any(|&c| self.is_solid(c)) {
+                return 0.0;
+            }
+            let m = cs.iter().map(|&c| mu[c]).sum::<f64>() / 4.0;
+            m * ((ui(i, j) - ui(i, j - 1)) / dx + (vi(i, j) - vi(i - 1, j)) / dx)
+        };
+        if u_face {
+            (txx(i, j) - txx(i - 1, j)) / dx + (txy(i, j + 1) - txy(i, j)) / dx
+        } else {
+            (tyy(i, j) - tyy(i, j - 1)) / dx + (txy(i + 1, j) - txy(i, j)) / dx
+        }
+    }
+
+    /// corps qui porte la face entre les mailles a et b (None : bord du domaine) : celui qui couvre le plus la plus couverte des deux
+    fn face_owner(&self, a: Option<usize>, b: Option<usize>) -> Option<usize> {
+        let fa = a.map_or(0.0, |c| self.body_frac[c]);
+        let fb = b.map_or(0.0, |c| self.body_frac[c]);
+        let c = if fa >= fb { a } else { b }?;
+        let o = *self.body_owner.get(c)?;
+        (self.body_frac[c] > 0.0 && o >= 0).then(|| o as usize)
+    }
+
+    /// Maille entièrement couverte par un corps (il n'y reste que la trace FLUID_TRACE de fluide, toutes ses faces sont fermées) : sa
+    /// pression n'est pas résolue. Elle ne tiendrait qu'à la compressibilité de la trace — une erreur de volume de 1e-12 la faisait
+    /// bondir ou tomber au plancher, et la cavité comblée de gaz partait dans le sillage d'un corps libre.
+    #[inline]
+    pub(crate) fn body_trace(&self, c: usize) -> bool {
+        !self.bodies.is_empty() && self.body_frac[c] >= 1.0 - FLUID_TRACE
     }
 
     /// Volume occupé par les corps dans la maille c, ajouté au volume des fluides dans la fermeture (0 sans corps) ; plafonné à
@@ -526,20 +826,136 @@ impl super::multiphase::MultiphaseSim {
         self.u_open(i, j).max(self.u_open(i + 1, j)).max(self.v_open(i, j)).max(self.v_open(i, j + 1))
     }
 
-    /// un corps au moins a-t-il un mouvement imposé ?
+    /// un corps au moins bouge-t-il (mouvement imposé ou libre) ?
     pub fn has_moving_bodies(&self) -> bool {
-        self.bodies.iter().any(|b| b.is_imposed())
+        self.bodies.iter().any(|b| b.is_moving())
     }
 
-    /// Avance les corps à mouvement imposé de t0 à t1 (intégrale exacte de leur loi), recalcule fractions et faces, puis déplace le
-    /// fluide qu'ils ont balayé (`push_fluid`).
+    /// un corps au moins est-il libre (poussé par l'écoulement) ?
+    pub fn has_free_bodies(&self) -> bool {
+        self.bodies.iter().any(|b| b.is_free())
+    }
+
+    /// Avance les corps de t0 à t1 : mouvement imposé par l'intégrale exacte de leur loi, corps libres à la vitesse que la projection
+    /// précédente leur a donnée (rotation exacte autour d'un pivot). Recalcule fractions et faces, puis déplace le fluide qu'ils ont
+    /// balayé (`push_fluid`). Un corps libre ne sort pas du domaine et n'entre pas dans un solide : il s'arrête contre (les vrais
+    /// contacts, avec rebond et frottement, sont l'étape 4).
     pub(crate) fn move_bodies(&mut self, t0: f64, t1: f64) {
         let old = self.body_frac.clone();
-        for b in &mut self.bodies {
-            b.move_imposed(t0, t1);
+        let (lx, ly) = (self.nx as f64 * self.dx, self.ny as f64 * self.dx);
+        for k in 0..self.bodies.len() {
+            if self.bodies[k].is_free() {
+                let before = self.bodies[k].clone();
+                self.bodies[k].advance(t1 - t0);
+                if let Some(q) = self.bodies[k].pivot {
+                    // centre qui tourne autour du pivot : sa vitesse suit
+                    let (r, w) = (sub(self.bodies[k].pos, q), self.bodies[k].omega);
+                    self.bodies[k].vel = [-w * r[1], w * r[0]];
+                }
+                if self.body_blocked(k, lx, ly) {
+                    self.bodies[k] = before;
+                    self.bodies[k].vel = [0.0, 0.0];
+                    self.bodies[k].omega = 0.0;
+                }
+            } else {
+                self.bodies[k].move_imposed(t0, t1);
+            }
         }
         self.update_body_fractions();
         self.push_fluid(&old);
+    }
+
+    /// Ouverture de chaque face u et v (1 sans corps).
+    pub(crate) fn face_openings(&self) -> (Vec<f64>, Vec<f64>) {
+        let (nx, ny) = (self.nx, self.ny);
+        let mut ou = vec![1.0; (nx + 1) * ny];
+        let mut ov = vec![1.0; nx * (ny + 1)];
+        for j in 0..ny {
+            for i in 0..=nx {
+                ou[j * (nx + 1) + i] = self.u_open(i, j);
+            }
+        }
+        for j in 0..=ny {
+            for i in 0..nx {
+                ov[j * nx + i] = self.v_open(i, j);
+            }
+        }
+        (ou, ov)
+    }
+
+    /// Après le déplacement des corps : vitesses prédites (us, vs) des faces dont l'ouverture a changé. La part d'une face que le corps
+    /// découvre se remplit de fluide qui va à la vitesse du corps (il occupait la place à l'instant d'avant : non-glissement des
+    /// mailles « fraîches » des méthodes de frontières immergées) ; une face qui se ferme garde la vitesse du fluide dans sa part encore
+    /// ouverte. Sans cela, le fluide qui comble la place derrière un corps qui avance partait au repos : un disque tiré dans l'huile
+    /// avait deux fois la traînée du même disque fixe dans un courant (frottement ×3.7, pression ×1.9 à Re = 20).
+    pub(crate) fn carry_face_openings(&self, before: &(Vec<f64>, Vec<f64>), vel_before: &(Vec<f64>, Vec<f64>), us: &mut [f64], vs: &mut [f64]) {
+        let after = self.face_openings();
+        let fix = |a0: f64, a1: f64, v0: f64, v1: f64, x: &mut f64| {
+            if a1 < a0 {
+                *x *= if a0 > 0.0 { a1 / a0 } else { 0.0 };
+            } else if a1 > a0 {
+                let vb = if v0 != 0.0 { v0 } else { v1 };
+                *x += (a1 - a0) * vb;
+            }
+        };
+        let get = |v: &Vec<f64>, f: usize| v.get(f).copied().unwrap_or(0.0);
+        for f in 0..us.len() {
+            if before.0[f] != after.0[f] {
+                fix(before.0[f], after.0[f], get(&vel_before.0, f), self.u_body_vel(f), &mut us[f]);
+            }
+        }
+        for f in 0..vs.len() {
+            if before.1[f] != after.1[f] {
+                fix(before.1[f], after.1[f], get(&vel_before.1, f), self.v_body_vel(f), &mut vs[f]);
+            }
+        }
+    }
+
+    /// le corps k sort-il du domaine ou entre-t-il dans une maille solide ?
+    fn body_blocked(&self, k: usize, lx: f64, ly: f64) -> bool {
+        let poly = self.bodies[k].world_vertices();
+        let eps = 1e-9 * self.dx;
+        if poly.iter().any(|p| p[0] < eps || p[1] < eps || p[0] > lx - eps || p[1] > ly - eps) {
+            return true;
+        }
+        if !self.solid.iter().any(|&s| s >= 0) {
+            return false;
+        }
+        let f = body_fractions(std::slice::from_ref(&self.bodies[k]), self.nx, self.ny, self.dx);
+        f.iter().enumerate().any(|(c, &a)| a > 0.0 && self.is_solid(c))
+    }
+
+    /// Maille où va le fluide que les corps balaient dans la maille c (ou d'où vient celui qu'ils y découvrent) : la voisine du côté
+    /// opposé aux corps (direction −∇α_corps), ni solide ni entièrement couverte. None s'il n'y en a pas.
+    pub(crate) fn push_target(&self, c: usize) -> Option<usize> {
+        let (nx, ny) = (self.nx, self.ny);
+        let cap = 1.0 - FLUID_TRACE;
+        let al = |s: &Self, i: isize, j: isize, own: f64| -> f64 {
+            if i < 0 || j < 0 || i >= nx as isize || j >= ny as isize { own } else { s.body_frac[j as usize * nx + i as usize] }
+        };
+        let (i, j) = ((c % nx) as isize, (c / nx) as isize);
+        let own = self.body_frac[c];
+        // direction qui s'éloigne du corps
+        let g = [-(al(self, i + 1, j, own) - al(self, i - 1, j, own)), -(al(self, i, j + 1, own) - al(self, i, j - 1, own))];
+        if g[0].abs() + g[1].abs() < 1e-12 {
+            return None;
+        }
+        let mut best: Option<(usize, f64, isize, isize)> = None;
+        for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            let (ii, jj) = (i + di, j + dj);
+            if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
+                continue;
+            }
+            let n = jj as usize * nx + ii as usize;
+            if self.is_solid(n) || self.body_frac[n] >= cap {
+                continue;
+            }
+            let score = g[0] * di as f64 + g[1] * dj as f64;
+            if score > 0.0 && best.map_or(true, |(_, s, _, _)| score > s) {
+                best = Some((n, score, di, dj));
+            }
+        }
+        best.map(|(n, _, _, _)| n)
     }
 
     /// Le fluide que les corps viennent de balayer dans une maille passe à la maille voisine du côté opposé au corps (direction
@@ -550,9 +966,13 @@ impl super::multiphase::MultiphaseSim {
     fn push_fluid(&mut self, old: &[f64]) {
         let (nx, ny) = (self.nx, self.ny);
         let cap = 1.0 - FLUID_TRACE;
-        let al = |s: &Self, i: isize, j: isize, own: f64| -> f64 {
-            if i < 0 || j < 0 || i >= nx as isize || j >= ny as isize { own } else { s.body_frac[j as usize * nx + i as usize] }
-        };
+        // corps libres : volume déplacé dans chaque maille, que la projection précédente a anticipé (`push_src`, voir solve_pressure)
+        let track = self.has_free_bodies();
+        if track {
+            self.push_src = vec![0.0; nx * ny];
+        } else if !self.push_src.is_empty() {
+            self.push_src.clear();
+        }
         for c in 0..nx * ny {
             if self.is_solid(c) {
                 continue;
@@ -562,36 +982,31 @@ impl super::multiphase::MultiphaseSim {
             if d.abs() < 1e-12 {
                 continue;
             }
-            let (i, j) = ((c % nx) as isize, (c / nx) as isize);
-            let own = self.body_frac[c];
-            // direction qui s'éloigne du corps
-            let g = [-(al(self, i + 1, j, own) - al(self, i - 1, j, own)), -(al(self, i, j + 1, own) - al(self, i, j - 1, own))];
-            if g[0].abs() + g[1].abs() < 1e-12 {
+            let Some(n) = self.push_target(c) else {
+                if track {
+                    self.push_src[c] += d;
+                }
                 continue;
-            }
-            let mut best: Option<(usize, f64)> = None;
-            for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
-                let (ii, jj) = (i + di, j + dj);
-                if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
-                    continue;
-                }
-                let n = jj as usize * nx + ii as usize;
-                if self.is_solid(n) || self.body_frac[n] >= cap {
-                    continue;
-                }
-                let score = g[0] * di as f64 + g[1] * dj as f64;
-                if score > 0.0 && best.map_or(true, |(_, s)| score > s) {
-                    best = Some((n, score));
-                }
-            }
-            let Some((n, _)) = best else { continue };
+            };
             if d > 0.0 {
                 // pousser la part balayée du fluide de c vers n
                 self.transfer_fluid(c, n, (d / (1.0 - a0)).min(1.0));
+                if track {
+                    self.push_src[n] += d;
+                }
             } else {
                 // reprendre à n de quoi remplir la place libérée (au plus la moitié de son fluide ; la projection fait le reste)
                 let phi_n = 1.0 - self.body_frac[n].min(cap);
-                self.transfer_fluid(n, c, ((-d) / phi_n).min(0.5));
+                let q = ((-d) / phi_n).min(0.5);
+                self.transfer_fluid(n, c, q);
+                // maille qui sort du corps : sa pression (non résolue tant qu'elle était couverte, `body_trace`) est celle de n
+                if old[c] >= cap {
+                    self.p[c] = self.p[n];
+                }
+                if track {
+                    self.push_src[n] -= q * phi_n;
+                    self.push_src[c] += q * phi_n + d;
+                }
             }
             // travail du corps sur le fluide, p·ΔV : le déplacement n'en porte pas (la projection répartit ensuite l'excédent ou le
             // manque de n sans travail net), sans lui le gaz qu'un piston comprime ne chauffait pas comme une adiabatique
@@ -654,6 +1069,179 @@ impl super::multiphase::MultiphaseSim {
         self.bodies.iter().map(|b| b.vel[0].hypot(b.vel[1]) + b.omega.abs() * b.shape.radius()).fold(0.0, f64::max)
     }
 
+    /// Couplage de chaque corps avec la projection de ce pas (SOLID.md § 6.2, étape 3) ; `us`, `vs` : vitesses prédites, avant la
+    /// pression.
+    /// * Pression : chaque morceau du bord du corps compte pour la maille qui recevra le fluide qu'il balaie (`push_target`, comme
+    ///   `push_fluid` au pas suivant) : force −Σ_m p_m J_m, plus l'écart hydrostatique ρ_m g·(x − x_m) entre le centre de cette maille
+    ///   et le bord, intégré exactement le long du bord. La poussée d'Archimède est ainsi exacte quelle que soit la position du corps
+    ///   dans ses mailles. Pour un corps libre, la projection résout pression et vitesse ENSEMBLE (le volume que le corps balaiera au
+    ///   pas suivant entre dans le bilan des mailles) : l'inertie du fluide qu'il pousse, sa « masse ajoutée », est implicite, sans
+    ///   quoi un corps plus léger que l'eau serait instable (Causin, Gerbeau & Nobile 2005).
+    /// * Frottement : contraintes visqueuses, sur la vitesse du mélange fluide + corps, intégrées sur la part du corps des faces qu'il
+    ///   porte ; leur dépendance en V est implicite. (Un premier essai faisait payer au corps la quantité de mouvement que la
+    ///   projection donne au fluide qu'il entraîne : c'était compter deux fois l'inertie de ce fluide, déjà dans la masse ajoutée de la
+    ///   pression — masse ajoutée d'un disque lâché dans l'eau 1.4 à 1.9 fois trop forte.)
+    pub(crate) fn body_couplings(&self, dt: f64) -> Vec<BodyCoupling> {
+        use std::collections::BTreeMap;
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let g = self.gravity;
+        let mixture = if self.viscous { Some(self.mixture_velocity()) } else { None };
+        let mut out = Vec::with_capacity(self.bodies.len());
+        for (k, b) in self.bodies.iter().enumerate() {
+            let gc = b.pos;
+            // 1. pression : sensibilités du bord, routées vers les mailles qui reçoivent le fluide balayé
+            let poly = b.world_vertices();
+            let mut acc: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
+            let mut hydro = [0.0; 3];
+            for (c, p, q) in boundary_pieces(&poly, nx, ny, dx) {
+                if self.is_solid(c) {
+                    continue;
+                }
+                let m = self.push_target(c).unwrap_or(c);
+                let nl = [q[1] - p[1], -(q[0] - p[0])];
+                let mid = [0.5 * (p[0] + q[0]), 0.5 * (p[1] + q[1])];
+                let e = acc.entry(m).or_insert([0.0; 3]);
+                e[0] += nl[0];
+                e[1] += nl[1];
+                e[2] += cross(sub(mid, gc), nl);
+                // p(x) ≈ p_m + ρ_m g·(x − x_m) le long du morceau : force exacte (linéaire), couple par Simpson (quadratique)
+                let xm = [((m % nx) as f64 + 0.5) * dx, ((m / nx) as f64 + 0.5) * dx];
+                let f = |x: [f64; 2]| g[0] * (x[0] - xm[0]) + g[1] * (x[1] - xm[1]);
+                let rho = self.rho_mix[m];
+                let fm = f(mid);
+                hydro[0] -= rho * fm * nl[0];
+                hydro[1] -= rho * fm * nl[1];
+                hydro[2] -= rho * (f(p) * cross(sub(p, gc), nl) + 4.0 * fm * cross(sub(mid, gc), nl) + f(q) * cross(sub(q, gc), nl)) / 6.0;
+            }
+            let cells: Vec<(usize, [f64; 3])> = acc.into_iter().collect();
+            // 2. frottement : contraintes visqueuses sur la part du corps (1 − A) des faces qu'il porte, F = Σ (1 − A) dx² ∇·τ e_f
+            // (forme volumique de ∮ τ·n dS : un mouvement rigide ne déforme pas, τ est nul à l'intérieur), τ calculé sur la vitesse
+            // du mélange ; sa dépendance linéaire en V, F = F(Vⁿ) − D (V − Vⁿ), est implicite (stable même dans un fluide très visqueux)
+            let (mut fu, mut d) = ([0.0f64; 3], [[0.0f64; 3]; 3]);
+            if let Some((wu, wv)) = &mixture {
+                let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for p in &poly {
+                    x0 = x0.min(p[0]);
+                    y0 = y0.min(p[1]);
+                    x1 = x1.max(p[0]);
+                    y1 = y1.max(p[1]);
+                }
+                let ci = |x: f64, n: usize| ((x / dx).floor().max(0.0) as usize).min(n - 1);
+                let (i0, i1, j0, j1) = (ci(x0, nx).saturating_sub(1), (ci(x1, nx) + 1).min(nx - 1), ci(y0, ny).saturating_sub(1), (ci(y1, ny) + 1).min(ny - 1));
+                // faces du corps : (face u ?, i, j, part du corps 1 − A, direction généralisée e_f)
+                let mut faces: Vec<(bool, usize, usize, f64, [f64; 3])> = vec![];
+                for j in j0..=j1 {
+                    for i in i0.max(1)..=(i1 + 1).min(nx - 1) {
+                        let (a, c) = (j * nx + i - 1, j * nx + i);
+                        let s = 1.0 - self.u_open(i, j);
+                        if s > 0.0 && !self.is_solid(a) && !self.is_solid(c) && self.face_owner(Some(a), Some(c)) == Some(k) {
+                            faces.push((true, i, j, s, [1.0, 0.0, -((j as f64 + 0.5) * dx - gc[1])]));
+                        }
+                    }
+                }
+                for j in j0.max(1)..=(j1 + 1).min(ny - 1) {
+                    for i in i0..=i1 {
+                        let (a, c) = ((j - 1) * nx + i, j * nx + i);
+                        let s = 1.0 - self.v_open(i, j);
+                        if s > 0.0 && !self.is_solid(a) && !self.is_solid(c) && self.face_owner(Some(a), Some(c)) == Some(k) {
+                            faces.push((false, i, j, s, [0.0, 1.0, (i as f64 + 0.5) * dx - gc[0]]));
+                        }
+                    }
+                }
+                let mu = &self.mu_cell;
+                let force = |wu: &[f64], wv: &[f64]| -> [f64; 3] {
+                    let mut f = [0.0; 3];
+                    for &(uf, i, j, s, e) in &faces {
+                        let t = s * dx * dx * self.viscous_div(wu, wv, mu, uf, i, j);
+                        for r in 0..3 {
+                            f[r] += t * e[r];
+                        }
+                    }
+                    f
+                };
+                let f0 = force(wu, wv);
+                // réponse à une vitesse unité du corps (la part (1 − A) e_f de chaque face du corps)
+                let (mut zu, mut zv) = (vec![0.0; wu.len()], vec![0.0; wv.len()]);
+                let mut l = [[0.0f64; 3]; 3];
+                for kk in 0..3 {
+                    for &(uf, i, j, s, e) in &faces {
+                        if uf {
+                            zu[j * (nx + 1) + i] = s * e[kk];
+                        } else {
+                            zv[j * nx + i] = s * e[kk];
+                        }
+                    }
+                    let col = force(&zu, &zv);
+                    for r in 0..3 {
+                        l[r][kk] = col[r];
+                    }
+                }
+                let vn = [b.vel[0], b.vel[1], b.omega];
+                for r in 0..3 {
+                    for s in 0..3 {
+                        d[r][s] = -0.5 * (l[r][s] + l[s][r]);
+                    }
+                }
+                for r in 0..3 {
+                    fu[r] = f0[r] + (0..3).map(|s| d[r][s] * vn[s]).sum::<f64>();
+                }
+            }
+            // 3. corps libre : mobilité dans ses mouvements permis
+            let (mut w, mut v0) = ([[0.0f64; 3]; 3], [b.vel[0], b.vel[1], b.omega]);
+            if b.is_free() {
+                let rho_b = b.density(self.reg.solids[b.material].rho);
+                let (mb, ib) = (rho_b * b.shape.area(), rho_b * b.shape.polar_moment());
+                let mass = [mb, mb, ib];
+                let basis = b.motion_basis();
+                let nb = basis.len();
+                v0 = [0.0; 3];
+                if nb > 0 {
+                    // K = M + dt D ; Bᵀ K B (nb × nb)
+                    let mut kk = d;
+                    for r in 0..3 {
+                        for s in 0..3 {
+                            kk[r][s] *= dt;
+                        }
+                        kk[r][r] += mass[r];
+                    }
+                    let mut bkb = [[0.0f64; 3]; 3];
+                    for a in 0..nb {
+                        for c in 0..nb {
+                            let mut s = 0.0;
+                            for r in 0..3 {
+                                for t in 0..3 {
+                                    s += basis[a][r] * kk[r][t] * basis[c][t];
+                                }
+                            }
+                            bkb[a][c] = s;
+                        }
+                    }
+                    let inv = inverse_small(&bkb, nb);
+                    for r in 0..3 {
+                        for s in 0..3 {
+                            let mut x = 0.0;
+                            for a in 0..nb {
+                                for c in 0..nb {
+                                    x += basis[a][r] * inv[a][c] * basis[c][s];
+                                }
+                            }
+                            w[r][s] = x;
+                        }
+                    }
+                    // M Vⁿ + dt (M g + fu + hydro)
+                    let vn = [b.vel[0], b.vel[1], b.omega];
+                    let gf = [mb * g[0], mb * g[1], 0.0];
+                    let rhs: [f64; 3] = std::array::from_fn(|r| mass[r] * vn[r] + dt * (gf[r] + fu[r] + hydro[r]));
+                    for r in 0..3 {
+                        v0[r] = (0..3).map(|s| w[r][s] * rhs[s]).sum();
+                    }
+                }
+            }
+            out.push(BodyCoupling { body: k, free: b.is_free(), cells, hydro, fu, d, w, v0 });
+        }
+        out
+    }
+
     /// Pose un corps (étape 1 : corps fixes). Sa fraction de maille est calculée et le fluide qu'il recouvre est chassé : dans chaque
     /// maille, masses et énergies sont ramenées à la place restante 1 − α_corps (composition et température gardées ; une trace
     /// FLUID_TRACE reste dans les mailles entièrement couvertes). Le fluide chassé disparaît, comme quand on peint un solide.
@@ -670,12 +1258,34 @@ impl super::multiphase::MultiphaseSim {
         if !ok || !b.pos.iter().chain([b.angle].iter()).all(|x| x.is_finite()) {
             return Err("corps de forme ou de position invalide".into());
         }
+        if let Some(r) = b.rho {
+            if !(r > 0.0 && r.is_finite()) {
+                return Err(format!("masse volumique {r} kg/m³ : il faut un nombre positif"));
+            }
+        }
         let mut b = b;
         if b.is_imposed() {
             // vitesses de la loi à l'instant de la pose (faces du premier pas)
             let (v, w) = b.rates(self.time);
             b.vel = v;
             b.omega = w;
+        }
+        if b.is_free() {
+            // vitesse de départ ramenée aux mouvements permis (axes bloqués à zéro ; sur un pivot, rotation autour du pivot)
+            match b.pivot {
+                Some(q) => {
+                    let w = if b.dof.rot { b.omega } else { 0.0 };
+                    let r = sub(b.pos, q);
+                    b.vel = [-w * r[1], w * r[0]];
+                    b.omega = w;
+                }
+                None => {
+                    b.vel = [if b.dof.x { b.vel[0] } else { 0.0 }, if b.dof.y { b.vel[1] } else { 0.0 }];
+                    if !b.dof.rot {
+                        b.omega = 0.0;
+                    }
+                }
+            }
         }
         let old = self.body_frac.clone();
         self.bodies.push(b);
@@ -1174,5 +1784,497 @@ mod tests {
         c.vel = [1.0, -2.0];
         c.advance(0.5);
         assert_eq!(c.pos, [0.5, -1.0]);
+    }
+
+    /// hauteur d'eau d'une colonne de mailles (m), d'après sa masse
+    fn water_level(s: &crate::simulation::multiphase::MultiphaseSim, eau: usize, i: usize) -> f64 {
+        (0..s.ny).map(|j| s.alpha[eau][s.idx(i, j)] * (1.0 - s.body_frac[s.idx(i, j)])).sum::<f64>() * s.dx
+    }
+
+    #[test]
+    fn a_body_as_dense_as_the_water_stays_where_it_is() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 30 x 40 maille 1 cm\n\
+             remplir rect (0, 0) (0.3, 0.3) avec \"eau\" à 20 °C\n",
+        );
+        let rho_w = s.rho_mix[s.idx(15, 15)];
+        let mut b = RigidBody::new(Shape::Disc { r: 0.04 }, 0, [0.153, 0.147], 293.15);
+        b.rho = Some(rho_w);
+        s.add_body(b).unwrap();
+        run_to(&mut s, 1.0);
+        let b = &s.bodies[0];
+        let (dx, dy) = (b.pos[0] - 0.153, b.pos[1] - 0.147);
+        let f = s.body_force[0];
+        eprintln!(
+            "corps neutre : déplacé de ({dx:.2e}, {dy:.2e}) m, vitesse ({:.2e}, {:.2e}) m/s, ω {:.2e} rad/s ; force du fluide ({:.4}, {:.4}) N/m pour un poids de {:.4} N/m ; {} pas, {} refaits",
+            b.vel[0], b.vel[1], b.omega, f[0], f[1], rho_w * PI * 0.0016 * 9.81, s.step_count, s.rollbacks
+        );
+        assert!(dx.hypot(dy) < 1e-4, "le corps a bougé de ({dx}, {dy}) m");
+        assert!(b.vel[0].hypot(b.vel[1]) < 1e-4, "vitesse {:?}", b.vel);
+    }
+
+    #[test]
+    fn a_steel_disc_falls_freely_in_air() {
+        let mut s = scene("départ scénario \"cuve vide\" grille 40 x 50 maille 1 cm\n");
+        let air = s.ambient_phase;
+        let rho_a = s.rho_mix[s.idx(20, 25)];
+        let b = RigidBody::new(Shape::Disc { r: 0.02 }, 0, [0.2, 0.4], 293.15);
+        s.add_body(b).unwrap();
+        let _ = air;
+        let mut dt_max = 0.0f64;
+        while s.time < 0.2 && !s.diverged {
+            dt_max = dt_max.max(s.step());
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let t = s.time;
+        let rho_s = s.reg.solids[0].rho;
+        // chute dans le vide, moins la poussée d'Archimède et la masse ajoutée de l'air (ρ_a π r² : coefficient 1 pour un cylindre)
+        let gp = 9.81 * (rho_s - rho_a) / (rho_s + rho_a);
+        let (y, v) = (s.bodies[0].pos[1], s.bodies[0].vel[1]);
+        let (y_th, v_th) = (0.4 - 0.5 * gp * t * t, -gp * t);
+        // la position avance avec la vitesse du début de chaque pas (celle de la projection précédente) : retard d'au plus g t dt
+        let lag = gp * t * dt_max;
+        eprintln!(
+            "chute dans l'air : t {t:.4} s, y {y:.5} m (attendu {y_th:.5}, retard permis {lag:.5}), vy {v:.4} m/s (attendu {v_th:.4}) ; x {:.2e}, ω {:.2e} ; {} pas",
+            s.bodies[0].pos[0] - 0.2,
+            s.bodies[0].omega,
+            s.step_count
+        );
+        assert!(y >= y_th - 1e-4 && y - y_th <= lag, "chute : y = {y} m pour {y_th} m (retard permis {lag} m)");
+        assert!((v / v_th - 1.0).abs() < 0.005, "vitesse {v} au lieu de {v_th}");
+        assert!((s.bodies[0].pos[0] - 0.2).abs() < 1e-5 && s.bodies[0].omega.abs() < 1e-3, "le disque dérive ou tourne");
+    }
+
+    #[test]
+    fn a_wooden_block_floats_at_the_archimedes_draft() {
+        for (rho_b, h, name) in [(600.0, 0.04, "bois"), (240.0, 0.06, "liège")] {
+            let mut s = scene(
+                "départ scénario \"cuve vide\" grille 60 x 30 maille 1 cm\n\
+                 remplir rect (0, 0) (0.6, 0.15) avec \"eau\" à 20 °C\n",
+            );
+            let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+            let (rho_w, rho_a) = (s.rho_mix[s.idx(5, 3)], s.rho_mix[s.idx(5, 25)]);
+            // tirant d'eau d'équilibre : (ρ_c − ρ_a) / (ρ_e − ρ_a) h ; posé avec 0.5 cm de moins
+            let d_eq = (rho_b - rho_a) / (rho_w - rho_a) * h;
+            let mut b = RigidBody::new(Shape::Rect { w: 0.1, h }, 0, [0.3, 0.15 - (d_eq - 0.005) + 0.5 * h], 293.15);
+            b.rho = Some(rho_b);
+            s.add_body(b).unwrap();
+            let m0 = s.total_mass(eau);
+            let mut ys = vec![];
+            while s.time < 4.0 && !s.diverged {
+                s.step();
+                ys.push((s.time, s.bodies[0].pos[1]));
+            }
+            assert!(!s.diverged && s.state_is_sane(), "{name} : état invalide à t = {}", s.time);
+            let b = &s.bodies[0];
+            // tirant d'eau moyen sur la dernière seconde (la cuve est fermée : les vagues du flotteur y reviennent, il oscille encore un
+            // peu autour de son équilibre)
+            let level = 0.5 * (water_level(&s, eau, 3) + water_level(&s, eau, 56));
+            let late: Vec<f64> = ys.iter().filter(|(t, _)| *t > 3.0).map(|(_, y)| *y).collect();
+            let y_mean = late.iter().sum::<f64>() / late.len() as f64;
+            let draft = level - (y_mean - 0.5 * h);
+            let swing = late.iter().cloned().fold(f64::MIN, f64::max) - late.iter().cloned().fold(f64::MAX, f64::min);
+            let first: Vec<f64> = ys.iter().filter(|(t, _)| *t < 1.0).map(|(_, y)| *y).collect();
+            let swing0 = first.iter().cloned().fold(f64::MIN, f64::max) - first.iter().cloned().fold(f64::MAX, f64::min);
+            eprintln!(
+                "flotteur {name} (ρ {rho_b}) : tirant d'eau moyen {:.3} cm (attendu {:.3}), angle {:.2e} rad ; amplitude {:.2} mm la 1re seconde, {:.2} mm la 4e ; masse d'eau à {:.1e} ; {} pas, {} refaits",
+                draft * 100.0,
+                d_eq * 100.0,
+                b.angle,
+                swing0 * 1e3,
+                swing * 1e3,
+                (s.total_mass(eau) / m0 - 1.0).abs(),
+                s.step_count,
+                s.rollbacks
+            );
+            assert!((draft - d_eq).abs() < 0.1 * s.dx, "{name} : tirant d'eau {draft} m au lieu de {d_eq} m");
+            assert!(swing < 0.7 * swing0, "{name} : l'oscillation ne décroît pas ({swing} m la 4e seconde, {swing0} m la 1re)");
+            assert!(b.angle.abs() < 0.05, "{name} : le flotteur se renverse ({} rad)", b.angle);
+        }
+    }
+
+    /// Écoulement uniforme d'huile autour d'un disque fixe de `cells` mailles de diamètre, au nombre de Reynolds `re` : C_D moyen sur
+    /// la fin du calcul (25 d/U) et nombre de pas.
+    fn fixed_disc_drag(re: f64, cells: usize) -> (f64, usize) {
+        let d = 0.01;
+        let dx = d / cells as f64;
+        let (nx, ny) = (30 * cells, 15 * cells);
+        let probe = scene(&format!("départ scénario \"cuve vide\" grille 4 x 4 maille {dx} m\nremplir partout avec \"huile\" à 20 °C\n"));
+        let (rho, mu) = (probe.rho_mix[5], probe.mu_cell[5]);
+        let u = re * mu / (rho * d);
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille {nx} x {ny} maille {dx} m\n\
+             gravité (0, 0)\n\
+             remplir partout avec \"huile\" à 20 °C\n\
+             bord haut mur\n\
+             bord bas mur\n\
+             bord gauche entrée ({u}, 0) m/s à 20 °C \"huile\"\n\
+             bord droite ouvert\n\
+             corps disque ({}, {}) rayon {} \"acier\"\n",
+            8.0 * d,
+            7.5 * d,
+            0.5 * d
+        ));
+        s.surface_tension = false;
+        let t_end = 25.0 * d / u;
+        let (mut sum, mut sv, mut n) = (0.0, 0.0, 0usize);
+        while s.time < t_end && !s.diverged {
+            s.step();
+            if s.time > 0.8 * t_end {
+                sum += s.body_force[0][0];
+                sv += s.body_force_visc[0][0];
+                n += 1;
+            }
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let q = 0.5 * rho * u * u * d * n.max(1) as f64;
+        eprintln!("    (fixe : frottement C_Df = {:.3}, pression C_Dp = {:.3})", sv / q, (sum - sv) / q);
+        (sum / q, s.step_count)
+    }
+
+    /// Le même disque TIRÉ à vitesse constante dans l'huile au repos (mouvement imposé) : C_D moyen sur la fin du trajet (25 d).
+    fn towed_disc_drag(re: f64, cells: usize, dt_max: f64) -> (f64, usize) {
+        let d = 0.01;
+        let dx = d / cells as f64;
+        let (nx, ny) = (45 * cells, 15 * cells);
+        let probe = scene(&format!("départ scénario \"cuve vide\" grille 4 x 4 maille {dx} m\nremplir partout avec \"huile\" à 20 °C\n"));
+        let (rho, mu) = (probe.rho_mix[5], probe.mu_cell[5]);
+        let u = re * mu / (rho * d);
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille {nx} x {ny} maille {dx} m\n\
+             gravité (0, 0)\n\
+             remplir partout avec \"huile\" à 20 °C\n\
+             bord haut mur\n\
+             corps disque ({}, {}) rayon {} \"acier\" vitesse ({u}, 0) m/s\n",
+            5.0 * d,
+            7.5 * d,
+            0.5 * d
+        ));
+        s.surface_tension = false;
+        s.dt_max = s.dt_max.min(dt_max);
+        let t_end = 25.0 * d / u;
+        let (mut sum, mut sv, mut n) = (0.0, 0.0, 0usize);
+        while s.time < t_end && !s.diverged {
+            s.step();
+            if s.time > 0.8 * t_end {
+                sum -= s.body_force[0][0];
+                sv -= s.body_force_visc[0][0];
+                n += 1;
+            }
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let q = 0.5 * rho * u * u * d * n.max(1) as f64;
+        eprintln!("    (tiré : frottement C_Df = {:.3}, pression C_Dp = {:.3})", sv / q, (sum - sv) / q);
+        (sum / q, s.step_count)
+    }
+
+    /// Convergence en maillage de la traînée d'un disque tiré (Re = 20, domaine de 30 × 10 diamètres, trajet de 15 diamètres).
+    /// Diagnostic : `cargo test --release towed_drag_resolution -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn towed_drag_resolution_diag() {
+        let list: Vec<usize> = std::env::var("MP_CELLS").ok().map_or(vec![10, 20], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+        for cells in list {
+            let d = 0.01;
+            let dx = d / cells as f64;
+            let probe = scene(&format!("départ scénario \"cuve vide\" grille 4 x 4 maille {dx} m\nremplir partout avec \"huile\" à 20 °C\n"));
+            let (rho, mu) = (probe.rho_mix[5], probe.mu_cell[5]);
+            let u = 20.0 * mu / (rho * d);
+            let mut s = scene(&format!(
+                "départ scénario \"cuve vide\" grille {} x {} maille {dx} m\n\
+                 gravité (0, 0)\n\
+                 remplir partout avec \"huile\" à 20 °C\n\
+                 bord haut mur\n\
+                 corps disque ({}, {}) rayon {} \"acier\" vitesse ({u}, 0) m/s\n",
+                30 * cells,
+                10 * cells,
+                5.0 * d,
+                5.0 * d,
+                0.5 * d
+            ));
+            s.surface_tension = false;
+            let t_end = 15.0 * d / u;
+            let (mut sum, mut sv, mut n) = (0.0, 0.0, 0usize);
+            while s.time < t_end && !s.diverged {
+                s.step();
+                if s.time > 0.75 * t_end {
+                    sum -= s.body_force[0][0];
+                    sv -= s.body_force_visc[0][0];
+                    n += 1;
+                }
+            }
+            let q = 0.5 * rho * u * u * d * n.max(1) as f64;
+            eprintln!("disque tiré à Re = 20, {cells} mailles par diamètre : C_D = {:.3} (frottement {:.3}, pression {:.3}) ; {} pas", sum / q, sv / q, (sum - sv) / q, s.step_count);
+        }
+    }
+
+    /// Traînée d'un disque fixe dans un écoulement uniforme, comparée aux calculs de Dennis & Chang (1970, écoulement stationnaire
+    /// non confiné) : C_D = 2.05 à Re = 20, 1.522 à Re = 40. Diagnostic (quelques minutes) :
+    /// `cargo test --release drag_of_a_fixed_disc -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn drag_of_a_fixed_disc_diag() {
+        for (re, cd_ref) in [(20.0, 2.05), (40.0, 1.522)] {
+            let (cd, steps) = fixed_disc_drag(re, 10);
+            eprintln!("disque fixe, Re = {re}, 10 mailles par diamètre : C_D = {cd:.3} (Dennis & Chang : {cd_ref}, écart {:+.1} %) ; {steps} pas", 100.0 * (cd / cd_ref - 1.0));
+            let (cd, steps) = towed_disc_drag(re, 10, 1.0);
+            eprintln!("disque tiré, Re = {re}, 10 mailles par diamètre : C_D = {cd:.3} (Dennis & Chang : {cd_ref}, écart {:+.1} %) ; {steps} pas", 100.0 * (cd / cd_ref - 1.0));
+        }
+    }
+
+    /// Disque qui sédimente dans l'huile (masse volumique choisie pour Re ≈ 20 à la vitesse limite) : vitesse limite comparée à
+    /// l'équilibre poids − poussée = traînée avec le C_D de Dennis & Chang. Diagnostic : `cargo test --release settling_disc --
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn settling_disc_diag() {
+        let (d, cells, cd) = (0.01, 10usize, 2.05);
+        let dx = d / cells as f64;
+        let probe = scene(&format!("départ scénario \"cuve vide\" grille 4 x 4 maille {dx} m\nremplir partout avec \"huile\" à 20 °C\n"));
+        let (rho, mu) = (probe.rho_mix[5], probe.mu_cell[5]);
+        let u = 20.0 * mu / (rho * d);
+        // (ρ_c − ρ) g π d²/4 = ½ ρ U² d C_D
+        let rho_b = rho + 0.5 * rho * u * u * d * cd / (9.81 * PI * d * d / 4.0);
+        let (nx, ny) = (15 * cells, 40 * cells);
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille {nx} x {ny} maille {dx} m\n\
+             remplir partout avec \"huile\" à 20 °C\n\
+             bord haut mur\n\
+             corps disque ({}, {}) rayon {} \"acier\" libre masse volumique {rho_b} kg/m3\n",
+            7.5 * d,
+            34.0 * d,
+            0.5 * d
+        ));
+        s.surface_tension = false;
+        let mut last = vec![];
+        let clock = std::time::Instant::now();
+        while s.time < 30.0 * d / u && !s.diverged && s.bodies[0].pos[1] > 6.0 * d {
+            s.step();
+            last.push((s.time, s.bodies[0].vel[1]));
+            if s.step_count % 100 == 0 {
+                eprintln!(
+                    "  t {:.3} s, y {:.4} m, vy {:.4} m/s ({} pas, {:.1} s, {} refaits)",
+                    s.time,
+                    s.bodies[0].pos[1],
+                    s.bodies[0].vel[1],
+                    s.step_count,
+                    clock.elapsed().as_secs_f64(),
+                    s.rollbacks
+                );
+            }
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let t1 = s.time;
+        let tail: Vec<f64> = last.iter().filter(|(t, _)| *t > 0.8 * t1).map(|(_, v)| -*v).collect();
+        let v = tail.iter().sum::<f64>() / tail.len().max(1) as f64;
+        let b = &s.bodies[0];
+        eprintln!(
+            "disque qui sédimente (ρ {rho_b:.1} dans l'huile à {rho:.1}, Re visé 20) : vitesse limite {v:.4} m/s (attendue {u:.4}, écart {:+.1} %, Re {:.1}) ; dérive x {:.2e} m, ω {:.2e} ; t {t1:.2} s, {} pas",
+            100.0 * (v / u - 1.0),
+            rho * v * d / mu,
+            b.pos[0] - 7.5 * d,
+            b.omega,
+            s.step_count
+        );
+    }
+
+    #[test]
+    fn a_floating_flap_on_its_hinge_rises_to_the_vertical() {
+        // plaque de 12 × 2 cm, deux fois plus légère que l'eau, sur une charnière au fond à son extrémité, partie à 45° : la poussée la
+        // redresse à la verticale, où elle s'arrête (l'eau amortit le mouvement)
+        let (q, l, a0) = ([0.15f64, 0.05f64], 0.12f64, 45f64.to_radians());
+        let c = [q[0] + 0.5 * l * a0.cos(), q[1] + 0.5 * l * a0.sin()];
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille 40 x 32 maille 1 cm\n\
+             remplir rect (0, 0) (0.4, 0.25) avec \"eau\" à 20 °C\n\
+             corps rect ({}, {}) ({}, {}) \"acier\" angle 45 libre pivot ({}, {}) masse volumique 500 kg/m3\n",
+            c[0] - 0.5 * l,
+            c[1] - 0.01,
+            c[0] + 0.5 * l,
+            c[1] + 0.01,
+            q[0],
+            q[1]
+        ));
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        let mut angles = vec![];
+        while s.time < 3.0 && !s.diverged {
+            s.step();
+            angles.push((s.time, s.bodies[0].angle.to_degrees()));
+        }
+        assert!(!s.diverged && s.state_is_sane(), "état invalide à t = {}", s.time);
+        let b = &s.bodies[0];
+        let dist = (b.pos[0] - q[0]).hypot(b.pos[1] - q[1]);
+        // il dépasse la verticale puis oscille autour, de moins en moins
+        let window = |t0: f64, t1: f64| -> (f64, f64) {
+            let a: Vec<f64> = angles.iter().filter(|(t, _)| *t >= t0 && *t < t1).map(|(_, a)| *a).collect();
+            (a.iter().sum::<f64>() / a.len() as f64, a.iter().cloned().fold(f64::MIN, f64::max) - a.iter().cloned().fold(f64::MAX, f64::min))
+        };
+        let (_, swing1) = window(0.5, 1.5);
+        let (mean3, swing3) = window(2.0, 3.0);
+        let peak = angles.iter().map(|(_, a)| *a).fold(f64::MIN, f64::max);
+        eprintln!(
+            "clapet flottant : angle moyen {mean3:.2}° la 3e seconde (amplitude {swing3:.2}°, {swing1:.2}° de 0.5 à 1.5 s ; au plus {peak:.2}°), distance au pivot {dist:.6} m ; masse d'eau à {:.1e} ; {} pas, {} refaits",
+            (s.total_mass(eau) / m0 - 1.0).abs(),
+            s.step_count,
+            s.rollbacks
+        );
+        assert!((dist - 0.5 * l).abs() < 1e-9, "le centre s'éloigne de la charnière : {dist}");
+        assert!(peak > 90.0, "le clapet ne se redresse pas ({peak}°)");
+        assert!((mean3 - 90.0).abs() < 3.0, "le clapet n'oscille pas autour de la verticale : {mean3}°");
+        assert!(swing3 < 0.7 * swing1, "l'oscillation du clapet ne décroît pas : {swing3}° la 3e seconde, {swing1}° avant");
+    }
+
+    /// Accélération au départ d'un disque lâché dans l'eau au repos : g (ρ_c − ρ_e) / (ρ_c + C_a ρ_e), masse ajoutée d'un cylindre
+    /// C_a = 1. Diagnostic : `cargo test --release added_mass -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn added_mass_of_a_disc_diag() {
+        for (cells, rho_b, dtm) in [(10usize, 2000.0, 1.0), (10, 2000.0, 1e-3), (10, 2000.0, 2.5e-4), (10, 500.0, 2.5e-4), (20, 2000.0, 2.5e-4)] {
+            let dx = 0.02 / cells as f64;
+            let n = 15 * cells;
+            let mut s = scene(&format!(
+                "départ scénario \"cuve vide\" grille {n} x {n} maille {dx} m\n\
+                 remplir partout avec \"eau\" à 20 °C\n\
+                 bord haut mur\n"
+            ));
+            // (aucune interface : pas de borne capillaire)
+            s.surface_tension = false;
+            s.dt_max = s.dt_max.min(dtm);
+            let rho_w = s.rho_mix[5];
+            let mut b = RigidBody::new(Shape::Disc { r: 0.01 }, 0, [0.5 * n as f64 * dx + 0.3 * dx, 0.5 * n as f64 * dx + 0.2 * dx], 293.15);
+            b.rho = Some(rho_b);
+            s.add_body(b).unwrap();
+            let area = PI * 1e-4;
+            let mut first = (0.0, 0.0);
+            let mut line = String::new();
+            for k in 0..6 {
+                let dt = s.step();
+                let v = s.bodies[0].vel[1];
+                if k == 0 {
+                    first = (s.time, v);
+                    line += &format!("1er pas : a {:.4}, F {:.5} ; ", v / dt, s.body_force[0][1]);
+                }
+            }
+            let a = (s.bodies[0].vel[1] - first.1) / (s.time - first.0);
+            let a_th = -9.81 * (rho_b - rho_w) / (rho_b + rho_w);
+            // masse ajoutée apparente d'après la force du fluide : F = ρ_e g A − m_a a, en unités de ρ_e A
+            let fy = s.body_force[0][1];
+            let ca = (fy - rho_w * 9.81 * area) / (-a) / (rho_w * area);
+            eprintln!(
+                "disque lâché ({cells} mailles par diamètre, ρ {rho_b}, pas max {dtm}) : accélération {a:.4} m/s² (attendue {a_th:.4}) ; force {fy:.5} N/m (poussée {:.5}) → C_a {ca:.3} ; {line}dt {:.2e}, {} it. de pression",
+                rho_w * 9.81 * area,
+                s.last_dt,
+                s.last_pressure_iters
+            );
+        }
+    }
+
+    /// Disque à mouvement IMPOSÉ qui part du repos, V = v₀ sin(2πt/P) en x : la force du fluide au départ est celle de la masse
+    /// ajoutée, −ρ π r² dV/dt (C_a = 1), la traînée étant encore nulle. Diagnostic : `cargo test --release imposed_acceleration --
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn imposed_acceleration_force_diag() {
+        for (cells, period, dtm) in [(10usize, 0.5, 0.01), (10, 0.05, 1e-3), (20, 0.05, 1e-3), (10, 0.05, 2.5e-4)] {
+            let dx = 0.02 / cells as f64;
+            let n = 15 * cells;
+            let mut s = scene(&format!(
+                "départ scénario \"cuve vide\" grille {n} x {n} maille {dx} m\n\
+                 gravité (0, 0)\n\
+                 remplir partout avec \"eau\" à 20 °C\n\
+                 corps disque ({}, {}) rayon 1 cm \"acier\" oscillation (0.05, 0) m/s période {period} s\n",
+                0.5 * n as f64 * dx + 0.3 * dx,
+                0.5 * n as f64 * dx + 0.2 * dx
+            ));
+            s.surface_tension = false;
+            s.dt_max = dtm;
+            let rho_w = s.rho_mix[5];
+            let ma = rho_w * PI * 1e-4;
+            let mut line = String::new();
+            for _ in 0..8 {
+                s.step();
+                let t = s.time;
+                let a = 0.05 * 2.0 * PI / period * (2.0 * PI * t / period).cos();
+                line += &format!(" {:.2}", -s.body_force[0][0] / (ma * a));
+            }
+            eprintln!("disque accéléré ({cells} mailles par diamètre, période {period} s, pas max {dtm} s) : C_a = −F/(ρ π r² a) aux 8 premiers pas :{line} ; dt {:.2e}", s.last_dt);
+        }
+    }
+
+    #[test]
+    fn a_free_body_sinking_in_a_closed_tank_of_liquid_keeps_the_pressure_level() {
+        // cuve fermée pleine d'eau, sans gaz : son niveau de pression ne tient qu'à la compressibilité de l'eau. Le volume que le corps
+        // balaie, anticipé par la projection, n'est pas une erreur héritée ; la pression des mailles qu'il couvre n'est pas résolue ; sa
+        // surface ne parcourt pas plus de 0.15 maille par pas. Avant ces corrections : niveau qui oscillait de ±5 kPa d'un pas à
+        // l'autre, pas refaits, puis cavité au plancher de pression et divergence (disque dans l'huile).
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 60 x 100 maille 2 mm
+             remplir partout avec \"eau\" à 20 °C
+             bord haut mur
+             corps disque (0.06, 0.15) rayon 1 cm \"acier\" libre masse volumique 1100 kg/m3
+",
+        );
+        s.surface_tension = false;
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        let top = s.idx(30, 99);
+        let p0 = s.p[top];
+        let (mut swing1, mut swing2, mut pmin) = (0.0f64, 0.0f64, f64::MAX);
+        while s.time < 0.6 && !s.diverged {
+            s.step();
+            let d = (s.p[top] - p0).abs();
+            if s.time < 0.3 { swing1 = swing1.max(d) } else { swing2 = swing2.max(d) }
+            pmin = pmin.min((0..s.nx * s.ny).filter(|&c| !s.body_trace(c)).map(|c| s.p[c]).fold(f64::MAX, f64::min));
+        }
+        assert!(!s.diverged && s.state_is_sane(), "état invalide à t = {}", s.time);
+        let b = &s.bodies[0];
+        let dm = (s.total_mass(eau) / m0 - 1.0).abs();
+        eprintln!(
+            "corps qui coule dans une cuve fermée d'eau : y {:.4} m, vy {:.4} m/s ; niveau de pression à ±{swing1:.0} Pa puis ±{swing2:.0} Pa, p min {pmin:.0} Pa ; masse d'eau à {dm:.1e} ; {} pas, {} refaits",
+            b.pos[1],
+            b.vel[1],
+            s.step_count,
+            s.rollbacks
+        );
+        assert_eq!(s.rollbacks, 0, "pas refaits");
+        assert!(pmin > 0.5 * 101325.0, "dépression dans la cuve : p min {pmin} Pa");
+        assert!(swing2 < 2.0 * swing1.max(1000.0), "le niveau de pression s'emballe : ±{swing1} Pa puis ±{swing2} Pa");
+        assert!(b.vel[1] < -0.02 && b.pos[1] < 0.14, "le corps ne coule pas : y {} vy {}", b.pos[1], b.vel[1]);
+        assert!(dm < 1e-9, "masse d'eau {dm}");
+    }
+
+    #[test]
+    fn a_pendulum_on_a_pivot_swings_with_the_period_of_a_physical_pendulum() {
+        let mut s = scene("départ scénario \"cuve vide\" grille 60 x 50 maille 1 cm\n");
+        let (r, l, th0) = (0.02f64, 0.1f64, 10f64.to_radians());
+        let q = [0.3, 0.4];
+        let mut b = RigidBody::new(Shape::Disc { r }, 0, [q[0] + l * th0.sin(), q[1] - l * th0.cos()], 293.15);
+        b.pivot = Some(q);
+        s.add_body(b).unwrap();
+        // période : 2π √(I_q / (M g L)), I_q = M (r²/2 + L²), corrigée de l'amplitude (1 + θ0²/16)
+        let t0 = 2.0 * PI * ((0.5 * r * r + l * l) / (9.81 * l)).sqrt() * (1.0 + th0 * th0 / 16.0);
+        let angle = |s: &crate::simulation::multiphase::MultiphaseSim| {
+            let p = s.bodies[0].pos;
+            (p[0] - q[0]).atan2(q[1] - p[1])
+        };
+        let mut crossings = vec![];
+        let mut prev = (s.time, angle(&s));
+        while s.time < 2.2 && !s.diverged {
+            s.step();
+            let a = angle(&s);
+            if prev.1 > 0.0 && a <= 0.0 {
+                crossings.push(prev.0 + (s.time - prev.0) * prev.1 / (prev.1 - a));
+            }
+            prev = (s.time, a);
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let b = &s.bodies[0];
+        let dist = (b.pos[0] - q[0]).hypot(b.pos[1] - q[1]);
+        assert!(crossings.len() >= 3, "{crossings:?}");
+        let period = (crossings[crossings.len() - 1] - crossings[0]) / (crossings.len() - 1) as f64;
+        eprintln!("pendule dans l'air : période {period:.4} s (attendue {t0:.4}), distance au pivot {dist:.6} m, {} passages, {} pas", crossings.len(), s.step_count);
+        assert!((dist - l).abs() < 1e-9, "le centre s'éloigne du pivot : {dist}");
+        assert!((period / t0 - 1.0).abs() < 0.01, "période {period} s au lieu de {t0} s");
     }
 }

@@ -13,6 +13,7 @@
 //! itérations suivantes rétablissant le volume (blocs de Gauss–Seidel p / σ'), et une première fois avant le frottement, sur la vitesse
 //! prédite (`presolve_contact_stress`).
 
+use super::mp_bodies::{BodyCoupling, BodyLowRank};
 use super::mp_par::{for_ranges, for_rows, map_ranges, MIN_HEAVY, MIN_LIGHT};
 use super::multiphase::{Bc, MultiphaseSim, SyncPtr};
 use super::phases::MAX_PHASES;
@@ -272,7 +273,7 @@ impl MultiphaseSim {
         for_rows(ny, nx, MIN_LIGHT, |j| {
             for i in 0..nx {
                 let c = j * nx + i;
-                if self.is_solid(c) || self.pinned(c) {
+                if self.is_solid(c) || self.pinned(c) || self.body_trace(c) {
                     continue; // ligne identité (δp = 0)
                 }
                 let mut d = kappa[c] / dt;
@@ -334,18 +335,20 @@ impl MultiphaseSim {
         s
     }
 
-    /// Résout A x = b (PCG + IC(0)). Retourne le nombre d'itérations.
-    fn pcg(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
+    /// Résout (A + L) x = b, L : terme de rang faible des corps libres (`BodyLowRank`, absent sans eux). Retourne le nombre
+    /// d'itérations.
+    fn pcg(&self, st: &Stencil, b: &[f64], x: &mut [f64], extra: Option<&BodyLowRank>) -> usize {
         if self.multigrid {
-            self.pcg_mg(st, b, x, None)
+            self.pcg_mg(st, b, x, None, extra)
         } else {
-            self.pcg_ic0(st, b, x)
+            self.pcg_ic0(st, b, x, extra)
         }
     }
 
     /// Gradient conjugué préconditionné par multigrille (vecteurs et opérateur parallèles). `mask` : lignes actives (les autres sont
-    /// des lignes identité) ; défaut : cellules ni solides ni épinglées.
-    fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64], mask: Option<&[bool]>) -> usize {
+    /// des lignes identité) ; défaut : cellules ni solides ni épinglées. `extra` : terme des corps libres ajouté à l'opérateur (le
+    /// préconditionneur l'ignore : de rang 3 par corps, il coûte au plus quelques itérations).
+    fn pcg_mg(&self, st: &Stencil, b: &[f64], x: &mut [f64], mask: Option<&[bool]>, extra: Option<&BodyLowRank>) -> usize {
         use super::mp_mg::{Level, Multigrid};
         use super::mp_par::{collect, dot, for_ranges, MIN_LIGHT};
         use super::multiphase::SyncPtr;
@@ -359,6 +362,9 @@ impl MultiphaseSim {
         let mut r = vec![0.0; n];
         let mut ax = vec![0.0; n];
         mg.levels[0].apply(x, &mut ax);
+        if let Some(l) = extra {
+            l.apply_add(x, &mut ax);
+        }
         super::mp_par::fill(&mut r, MIN_LIGHT, |c| b[c] - ax[c]);
         let bn = dot(b, b).sqrt().max(1e-300);
         let mut z = vec![0.0; n];
@@ -371,6 +377,9 @@ impl MultiphaseSim {
                 break;
             }
             mg.levels[0].apply(&pdir, &mut ax);
+            if let Some(l) = extra {
+                l.apply_add(&pdir, &mut ax);
+            }
             let pap = dot(&pdir, &ax);
             if pap.abs() < 1e-300 {
                 break;
@@ -409,7 +418,7 @@ impl MultiphaseSim {
     }
 
     /// Gradient conjugué préconditionné par Cholesky incomplet IC(0) (historique, séquentiel).
-    fn pcg_ic0(&self, st: &Stencil, b: &[f64], x: &mut [f64]) -> usize {
+    fn pcg_ic0(&self, st: &Stencil, b: &[f64], x: &mut [f64], extra: Option<&BodyLowRank>) -> usize {
         let nx = self.nx;
         let n = b.len();
         let mut l = vec![1.0; n];
@@ -464,6 +473,9 @@ impl MultiphaseSim {
                     s -= st.an[c - nx] * x[c - nx];
                 }
                 out[c] = s;
+            }
+            if let Some(l) = extra {
+                l.apply_add(x, out);
             }
         };
         let mut r = vec![0.0; n];
@@ -617,7 +629,7 @@ impl MultiphaseSim {
             }
         }
         let mut x = vec![0.0; n];
-        let it = if self.multigrid { self.pcg_mg(&st, &b, &mut x, Some(skel)) } else { self.pcg_ic0(&st, &b, &mut x) };
+        let it = if self.multigrid { self.pcg_mg(&st, &b, &mut x, Some(skel), None) } else { self.pcg_ic0(&st, &b, &mut x, None) };
         (x, it)
     }
 
@@ -687,6 +699,30 @@ impl MultiphaseSim {
         let mut sig: Vec<f64> = (0..n).map(|c| if skel[c] { self.sigma[c].max(0.0) } else { 0.0 }).collect();
         let mut skel_pending = skel.iter().any(|&s| s);
         let total = |pk: &[f64], sig: &[f64]| -> Vec<f64> { pk.iter().zip(sig).map(|(a, b)| a + b).collect() };
+        // corps rigides (mp_bodies.rs) : force du fluide sur chacun ; corps libres résolus avec la pression (terme de rang faible
+        // (dt/dx²) J W Jᵀ dans la matrice, volume qu'ils balaieront au pas suivant dans le second membre)
+        if self.has_bodies() && self.body_owner.len() != n {
+            self.update_body_fractions();
+        }
+        let couplings: Vec<BodyCoupling> = if self.has_bodies() { self.body_couplings(dt) } else { vec![] };
+        let psrc: Vec<f64> = if self.push_src.len() == n { self.push_src.clone() } else { vec![] };
+        let dx2 = self.dx * self.dx;
+        let act: Vec<bool> = (0..n).map(|m| !self.is_solid(m) && !self.pinned(m) && !self.body_trace(m)).collect();
+        let lowrank = if couplings.iter().any(|c| c.free) {
+            Some(BodyLowRank {
+                blocks: couplings
+                    .iter()
+                    .filter(|c| c.free)
+                    .map(|c| {
+                        let cells: Vec<(usize, [f64; 3])> = c.cells.iter().filter(|(m, _)| act[*m]).cloned().collect();
+                        let s: [[f64; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|q| dt / dx2 * c.w[r][q]));
+                        (cells, s)
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
         for _newton in 0..4 {
             newton += 1;
             let mut vol = vec![1.0; n];
@@ -702,7 +738,7 @@ impl MultiphaseSim {
                             continue;
                         }
                         // SAFETY (écritures) : la cellule c n'est écrite que par sa tranche
-                        if this.pinned(c) {
+                        if this.pinned(c) || this.body_trace(c) {
                             unsafe { *kp.at(c) = 1.0 };
                             continue; // cellule épinglée : δp = 0
                         }
@@ -719,6 +755,18 @@ impl MultiphaseSim {
                 });
             }
             let st = self.build_stencil(&kappa, dt, darcy.as_ref());
+            // corps libres : le fluide qu'ils entraînent va à la vitesse que leur donne la pression p_k (pas celle du pas précédent : la
+            // couche entraînée en retard sur un corps qui accélère agissait comme une inertie de plus)
+            if lowrank.is_some() {
+                let pt = total(&pk, &sig);
+                for c in couplings.iter().filter(|c| c.free) {
+                    let v = c.velocity(&pt, dt);
+                    let b = &mut self.bodies[c.body];
+                    b.vel = [v[0], v[1]];
+                    b.omega = v[2];
+                }
+                self.update_body_face_velocities();
+            }
             let (ut, vt) = self.face_velocities(us, vs, &total(&pk, &sig), dt);
             let qt = darcy.as_ref().map(|df| self.darcy_flux(df, &pk));
             let mut b = vec![0.0; n];
@@ -726,7 +774,7 @@ impl MultiphaseSim {
             for_rows(ny, nx, MIN_HEAVY, |j| {
                 for i in 0..nx {
                     let c = j * nx + i;
-                    if self.is_solid(c) || self.pinned(c) {
+                    if self.is_solid(c) || self.pinned(c) || self.body_trace(c) {
                         continue;
                     }
                     let mut d_new = self.divergence_of(&ut, &vt, i, j);
@@ -741,14 +789,31 @@ impl MultiphaseSim {
                     // précédent) : corriger err0 lui-même recorrigeait cette part déjà en route — e_{n+2} = e_{n+1} − e_n, oscillateur
                     // neutre de période 6 pas (barrage : ε jusqu'à 45 % dans l'eau pure, pression de 1.9 kPa à 93 bar, vapeur à
                     // l'impact). Sur f = err0 − dt·∇·u^n : f_{n+1} = f_n − corr, sans oscillation.
-                    let f = err0[c] - dt * d_old;
-                    let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
+                    // corps libres : le volume qu'ils viennent de déplacer dans la maille était anticipé par la projection précédente (ses
+                    // flux lui ont fait place) ; ce n'est pas une erreur héritée — sans cela, au-delà de CLOSURE_SMALL, sa correction partielle
+                    // se reportait sur la compression : niveau de pression d'une cuve fermée d'huile qui oscillait de ±5 kPa puis s'effondrait
+                    let e0 = err0[c] + psrc.get(c).copied().unwrap_or(0.0);
+                    let f = e0 - dt * d_old;
+let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum(), relax, small);
                     // SAFETY : la cellule c n'est écrite que par sa ligne
-                    unsafe { *bp.at(c) = (vol[c] - 1.0 - (err0[c] - corr)) / dt - (d_new - d_old) }
+                    unsafe { *bp.at(c) = (vol[c] - 1.0 - (e0 - corr)) / dt - (d_new - d_old) }
                 }
             });
+            // corps libres : le volume que chacun balaiera au pas suivant, à la vitesse de la pression p_k (la correction δp y entre par
+            // le terme de rang faible)
+            if lowrank.is_some() {
+                let pt = total(&pk, &sig);
+                for c in couplings.iter().filter(|c| c.free) {
+                    let vk = c.velocity(&pt, dt);
+                    for (m, j) in &c.cells {
+                        if act[*m] {
+                            b[*m] += (j[0] * vk[0] + j[1] * vk[1] + j[2] * vk[2]) / dx2;
+                        }
+                    }
+                }
+            }
             let mut dp = vec![0.0; n];
-            total_it += self.pcg(&st, &b, &mut dp);
+            total_it += self.pcg(&st, &b, &mut dp, lowrank.as_ref());
             let dmax = {
                 let (pkp, clp) = (SyncPtr(pk.as_mut_ptr()), SyncPtr(clamped.as_mut_ptr()));
                 let (tkv, kap, dpr, fl, ps) = (&tkv, &kappa, &dp, &floor, &p_start);
@@ -757,7 +822,7 @@ impl MultiphaseSim {
                     let mut tc = [0.0f64; MAX_PHASES];
                     let mut dmax = 0.0f64;
                     for c in lo..hi {
-                        if !this.is_solid(c) && !this.pinned(c) {
+                        if !this.is_solid(c) && !this.pinned(c) && !this.body_trace(c) {
                             // très grands écarts (> 50 % de p) dans une cellule contenant du gaz : mise à jour polytropique (voir
                             // `gas_newton_update`)
                             // SAFETY (tout le bloc) : la cellule c n'est lue et écrite que par sa tranche
@@ -810,6 +875,28 @@ impl MultiphaseSim {
         }
         self.last_newton_iters = newton;
         self.pressure_clamped = clamped;
+        // corps : vitesse des corps libres pour le pas suivant (le fluide qu'ils entraînent la prend aussi), force du fluide sur chacun
+        if !couplings.is_empty() {
+            let pt = total(&pk, &sig);
+            let mut forces = vec![[0.0; 3]; self.bodies.len()];
+            let mut visc = vec![[0.0; 3]; self.bodies.len()];
+            for c in &couplings {
+                let b = &self.bodies[c.body];
+                let v = if c.free { c.velocity(&pt, dt) } else { [b.vel[0], b.vel[1], b.omega] };
+                forces[c.body] = c.force(&pt, v);
+                visc[c.body] = std::array::from_fn(|r| c.fu[r] - (0..3).map(|q| c.d[r][q] * v[q]).sum::<f64>());
+                if c.free {
+                    let b = &mut self.bodies[c.body];
+                    b.vel = [v[0], v[1]];
+                    b.omega = v[2];
+                }
+            }
+            self.body_force = forces;
+            self.body_force_visc = visc;
+            if lowrank.is_some() {
+                self.update_body_face_velocities();
+            }
+        }
         let (uf, vf) = self.face_velocities(us, vs, &total(&pk, &sig), dt);
         self.u = uf;
         self.v = vf;

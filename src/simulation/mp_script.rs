@@ -5,7 +5,7 @@
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
 };
 use super::mp_view::T_IGNITION;
 
@@ -63,6 +63,8 @@ enum Dim {
     Angle,
     /// vitesse angulaire : DEGRÉS PAR SECONDE sans unité (°/s, rad/s, tr/min, tr/s écrits)
     AngSpeed,
+    /// masse volumique : kg/m³ sans unité
+    Density,
     Plain,
 }
 
@@ -77,6 +79,7 @@ fn dim_name(d: Dim) -> &'static str {
         Dim::Power => "une puissance volumique (W/m³)",
         Dim::Angle => "un angle (°, rad)",
         Dim::AngSpeed => "une vitesse de rotation (°/s, rad/s, tr/min)",
+        Dim::Density => "une masse volumique (kg/m³, g/cm³)",
         Dim::Plain => "un nombre sans unité",
     }
 }
@@ -117,6 +120,8 @@ fn unit_of(w: &str) -> Option<(Dim, f64, f64)> {
         "rad/s" => (Dim::AngSpeed, 1.0, 0.0),
         "tr/min" => (Dim::AngSpeed, 2.0 * std::f64::consts::PI / 60.0, 0.0),
         "tr/s" => (Dim::AngSpeed, 2.0 * std::f64::consts::PI, 0.0),
+        "kg/m3" | "g/l" => (Dim::Density, 1.0, 0.0),
+        "g/cm3" | "kg/l" | "kg/dm3" => (Dim::Density, 1e3, 0.0),
         _ => return None,
     })
 }
@@ -457,7 +462,7 @@ impl<'a> P<'a> {
         })
     }
     fn measure(&mut self) -> R<Measure> {
-        let w = self.word("une mesure (stats, T en (x, y), moyenne T dans <zone>, masse \"fluide\")")?;
+        let w = self.word("une mesure (stats, T en (x, y), moyenne T dans <zone>, masse \"fluide\", corps 1 y)")?;
         let reduce = match w.as_str() {
             "moyenne" => Some(Reduce::Mean),
             "max" | "maximum" => Some(Reduce::Max),
@@ -471,6 +476,23 @@ impl<'a> P<'a> {
                 let fluid = self.string("le fluide")?;
                 let zone = if self.eat_w("dans") { self.zone()? } else { Zone::Partout };
                 Measure::Mass { fluid, zone, label: None }
+            }
+            ("corps", _) => {
+                let n = self.count("le numéro du corps (1 pour le premier posé)")?;
+                let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple)")?;
+                let q = match w.as_str() {
+                    "x" => BodyQty::X,
+                    "y" => BodyQty::Y,
+                    "angle" => BodyQty::Angle,
+                    "vx" => BodyQty::Vx,
+                    "vy" => BodyQty::Vy,
+                    "rotation" => BodyQty::Rotation,
+                    "fx" => BodyQty::Fx,
+                    "fy" => BodyQty::Fy,
+                    "couple" => BodyQty::Torque,
+                    o => return self.err(format!("grandeur « {o} » d'un corps : x, y, angle, vx, vy, rotation, fx, fy, couple")),
+                };
+                Measure::Body { index: n - 1, q, label: None }
             }
             (_, Some(reduce)) => {
                 let q = self.quantity_name()?;
@@ -492,7 +514,7 @@ impl<'a> P<'a> {
         if self.eat_w("comme") {
             let l = self.string("le nom de la colonne")?;
             match &mut m {
-                Measure::Probe { label, .. } | Measure::Mass { label, .. } => *label = Some(l),
+                Measure::Probe { label, .. } | Measure::Mass { label, .. } | Measure::Body { label, .. } => *label = Some(l),
                 Measure::Stats => return self.err("« comme » ne s'applique pas à « stats »"),
             }
         }
@@ -678,6 +700,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let mut angle = 0.0;
             let mut motion = BodyMotion::default();
             let mut osc = false;
+            let mut fixed_kw = false;
             // vitesse angulaire : degrés par seconde sans unité
             let ang_speed = |p: &mut P| -> R<f64> {
                 let v = p.number("la vitesse de rotation")?;
@@ -685,13 +708,43 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Ok(if unit { v } else { v.to_radians() })
             };
             while !p.done() {
-                match p.word("une option (angle, fixe, vitesse, rotation, oscillation, période, pivot)")?.as_str() {
+                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique)")?.as_str() {
                     "angle" => {
                         let v = p.number("l'angle")?;
                         let (v, unit) = p.opt_unit(Dim::Angle, v)?;
                         angle = if unit { v } else { v.to_radians() };
                     }
-                    "fixe" => {}
+                    "fixe" => fixed_kw = true,
+                    "libre" => motion.free = true,
+                    "bloque" => {
+                        let mut any = false;
+                        loop {
+                            // (« rotation » suivi d'un nombre est l'option de vitesse de rotation, pas un axe bloqué)
+                            let rotation_value = matches!(p.t.get(p.i + 1), Some(Tok::N(_)));
+                            match p.peek_w() {
+                                Some("x") => motion.locked[0] = true,
+                                Some("y") => motion.locked[1] = true,
+                                Some("rotation") if !rotation_value => motion.locked[2] = true,
+                                Some("et") if any => {}
+                                _ => break,
+                            }
+                            p.i += 1;
+                            any = true;
+                        }
+                        if !any {
+                            return p.err(format!("il faut l'axe bloqué après « bloqué » : x, y ou rotation{}", p.here()));
+                        }
+                    }
+                    "masse" => {
+                        if !p.eat_w("volumique") {
+                            return p.err(format!("il faut « masse volumique <ρ> »{}", p.here()));
+                        }
+                        let r = p.quantity(Dim::Density, "la masse volumique")?;
+                        if !(r > 0.0) {
+                            return p.err("la masse volumique doit être positive");
+                        }
+                        motion.rho = Some(r);
+                    }
                     "vitesse" => motion.v = p.vector(Dim::Speed, "la vitesse du corps")?,
                     "rotation" => motion.omega = ang_speed(p)?,
                     "oscillation" => {
@@ -709,14 +762,25 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         }
                     }
                     "pivot" => motion.pivot = Some(p.point()?),
-                    "libre" | "bloque" => return p.err("mouvement libre (poussé par l'écoulement) : pas encore (solides mobiles, étape 3)"),
                     o => {
                         return p.err(format!(
-                            "option « {o} » inconnue après « corps » : angle <a>, fixe, vitesse (vx, vy), rotation <ω>, oscillation (vx, vy) | \
-                             oscillation rotation <ω> avec période <T>, pivot (x, y)"
+                            "option « {o} » inconnue après « corps » : angle <a>, fixe, libre, bloqué x | y | rotation, vitesse (vx, vy), \
+                             rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>"
                         ))
                     }
                 }
+            }
+            if motion.free && fixed_kw {
+                return p.err("un corps est « fixe » ou « libre », pas les deux");
+            }
+            if motion.free && osc {
+                return p.err("un corps libre suit l'écoulement : pas d'oscillation imposée (« vitesse » et « rotation » donnent sa vitesse de départ)");
+            }
+            if motion.locked.iter().any(|&l| l) && !motion.free {
+                return p.err("« bloqué » ne s'applique qu'à un corps « libre »");
+            }
+            if fixed_kw && !motion.is_fixed() {
+                return p.err("un corps « fixe » n'a ni vitesse, ni rotation, ni oscillation");
             }
             if osc && !(motion.period > 0.0) {
                 return p.err("une oscillation demande sa « période <T> »");

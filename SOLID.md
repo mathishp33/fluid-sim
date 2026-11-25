@@ -6,8 +6,9 @@ cellules spéciales du TODO), un agitateur qui tourne. Ce ne sont pas des poudre
 leur forme ni leur inertie propre.
 
 Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé), 1 (corps
-FIXES : l'eau les contourne sans y entrer) et 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues) sont faites (§ 8,
-`mp_bodies.rs`). Les corps libres, poussés par l'écoulement, viennent ensuite (§ 7).
+FIXES : l'eau les contourne sans y entrer), 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues) et 3 (corps LIBRES : flotteur,
+clapet, pendule, corps qui coule) sont faites (§ 8, `mp_bodies.rs`). Reste à corriger à l'étape 3 : la traînée d'un corps EN
+MOUVEMENT est deux fois trop forte (§ 8). Viennent ensuite les contacts (§ 7).
 
 **En bref — recommandation**
 
@@ -271,8 +272,24 @@ dans l'air pour une fente A = 1e-5, un piston à 5 cm/s, des mailles de 1 cm et 
   vitesse débitante A (u* − dt/ρ ∇p) + A (1 − A) V_corps (non-glissement étalé sur une maille).
 - **Pas de temps.** La vitesse de surface des corps entre dans le CFL.
 
-Pour les corps LIBRES, il reste à choisir comment la vitesse du corps est obtenue : rigidification de la quantité de mouvement
-(domaine fictif) ou inconnue de la projection (monolithique). Ce sera l'étape 3.
+**Ce que l'étape 3 a ajouté : les corps libres, en couplage MONOLITHIQUE.** La rigidification après coup (domaine fictif) ne
+convenait plus : la projection ne voit pas l'intérieur des corps (ouvertures 1 − α). La vitesse d'un corps libre est donc une inconnue
+de la projection, comme chez Batty et al. (2007) et Gibou & Min (2012).
+- **Volume balayé anticipé.** Le volume que le corps balaiera au pas suivant, dt J·V, entre dans le bilan des mailles. J est la
+  sensibilité du volume de chaque maille au mouvement du corps, routée vers la maille qui recevra le fluide déplacé (comme
+  `push_fluid`).
+- **Force de pression.** −Σ p_m J_m (travail virtuel, symétrique du bilan), plus l'écart hydrostatique ρ_m g·(x − x_m) entre le
+  centre de la maille m et le bord, intégré exactement le long du bord : la poussée d'Archimède est exacte où que soit le corps dans
+  ses mailles.
+- **Système résolu.** Matrice A + (dt/dx²) J W Jᵀ (W : mobilité du corps dans ses mouvements permis), symétrique définie positive,
+  de rang 3 par corps en plus ; le gradient conjugué la résout avec quelques itérations de plus. La masse ajoutée est implicite : un
+  corps quatre fois plus léger que l'eau (liège) est stable, alors que le couplage explicite, essayé en comparaison, diverge.
+- **Frottement.** Les contraintes visqueuses sont calculées sur la vitesse du MÉLANGE fluide + corps des faces, u + (1 − A) V_corps
+  (l'intérieur d'un corps qui bouge n'est pas un fluide au repos), et intégrées sur la part du corps des faces qu'il porte ; leur
+  dépendance linéaire en V est implicite. Un premier essai faisait payer au corps la quantité de mouvement que la projection donne au
+  fluide qu'il entraîne : c'était compter deux fois l'inertie de ce fluide, déjà dans la masse ajoutée (C_a mesuré 1.4 à 1.9).
+- **Conditions de pas.** La surface d'un corps libre parcourt au plus 0.15 maille par pas. Près d'un corps qui bouge, la viscosité
+  reste explicite : la viscosité implicite ne voit pas sa vitesse, et un disque dans l'huile faisait exploser les pas plus longs.
 
 ### 6.3 Contacts
 
@@ -312,12 +329,12 @@ Pour les corps LIBRES, il reste à choisir comment la vitesse du corps est obten
 | 0 (faite) | préparer (§ 8) : géométrie exacte, fractions, contraintes, fermeture, état, rendu ; aucun résultat changé | Σ α dx² = aire (1e-12) quels que soient la position et l'angle ; empreintes physiques des 18 scénarios identiques au bit près |
 | 1 (faite) | corps fixes : poser un corps chasse le fluide (trace dans les mailles couvertes) ; ouvertures des faces dans la projection, le transport, la percolation, la conduction et la diffusion ; commande `corps`, outil de la fenêtre d'expérience | fermeture à 1e-9 après la pose ; eau au repos autour de deux corps : 1.8e-7 m/s, pression à 3 mPa près ; canal autour d'un disque : débit identique entrée / disque / sortie, passages à 0.284 m/s (0.273 attendus), rien n'entre dans le corps ; barrage contre un muret et un disque : masse d'eau à 4e-16, aucun pas refait |
 | 2 (faite) | mouvement imposé : vitesse et rotation constantes, oscillation sinusoïdale, pivot ; fluide balayé déplacé, travail p·dV, entraînement | piston dans un tube d'air fermé : γ = 1.4014 par la pression et 1.3990 par la température (attendu : 1.40), masse de gaz à 2e-7 ; disque tiré dans l'eau : la pression d'une sonde saute de 1.5 Pa au plus quand il traverse les mailles, masse d'eau à 2e-16 ; palette sur pivot : eau brassée à 0.11 m/s près des bouts (ω r = 0.11) ; lois intégrées exactement (une oscillation revient pile à son départ) |
-| 3 | mouvement libre + masque de DDL ; force du fluide sur le corps | flotteur : tirant d'eau = (ρ_c/ρ_eau) H, oscillation verticale amortie ; disque qui sédimente dans un canal (cas de Glowinski et al. 2001, repris par Wan & Turek 2006) ; corps léger (liège) stable ; clapet sur pivot ; traînée d'un disque tiré comparée à Tritton (1959) |
+| 3 (faite, traînée à reprendre) | mouvement libre + masque de DDL et pivot ; couplage monolithique pression–corps ; force du fluide sur tout corps (mesurable) | corps de la densité de l'eau immobile (2 µm en 1 s, force du fluide = poids à 6 chiffres) ; chute dans l'air : vitesse à 0.1 % ; masse ajoutée d'un disque lâché ou accéléré dans l'eau : C_a = 0.94 à 1.04 (1 attendu) ; flotteurs : tirant d'eau à 0.7 mm près (bois 0.6, liège 0.24), oscillation qui s'amortit ; pendule dans l'air : période à 0.03 % ; clapet flottant redressé à la verticale ; traînée d'un disque FIXE à Re 20 / 40 : −11 % / −9 % de Dennis & Chang (1970). MAIS la traînée d'un disque tiré ou qui sédimente est deux fois trop forte, et ne converge pas en maillage |
 | 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
 
-## 8. Ce qui est fait : étape 0 (préparer l'architecture sans changer un résultat) et étape 1 (corps fixes)
+## 8. Ce qui est fait : étapes 0 (préparer l'architecture sans changer un résultat), 1 (corps fixes), 2 (mouvement imposé) et 3 (corps libres)
 
 1. **`mp_bodies.rs`**, testé à part (6 tests) :
    - corps rigide `RigidBody` (forme, matériau, position, angle, vitesses, axes libres `Dof`, pivot, mode `Motion` : libre, fixe,
@@ -370,7 +387,38 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
 - Commande `corps … vitesse (vx, vy) | rotation ω | oscillation (vx, vy) période T | oscillation rotation ω période T | pivot (x, y)`
   (EXPERIENCES.md). Exemples : `experiences/piston.exp` (adiabatique), `experiences/vagues.exp` (batteur à vagues). État complet en
   version 13.
-- Pas encore : la force du fluide sur le corps (étape 3), les corps libres, la chaleur, les grains, le GPU.
+- Depuis l'étape 3, la force du fluide sur un corps imposé est calculée et mesurable. Les faces qu'un corps ouvre se remplissent de
+  fluide à sa vitesse, et le frottement suit la vitesse du mélange. Effets : disque tiré, saut de pression d'un pas 3.2 Pa au lieu de
+  1.5 ; palette 0.126 m/s au lieu de 0.114 ; piston identique au bit près.
+
+**Étape 3 (corps libres, faite le 2026-11-25 — traînée des corps en mouvement à reprendre).**
+- Corps `Motion::Free` : axes bloqués un par un (`Dof`), pivot, masse volumique propre (`rho`, état complet en version 14).
+  `move_bodies` les avance à la vitesse de la projection précédente. Un corps libre s'arrête net contre un bord du domaine ou un
+  solide : il n'y a pas encore de contacts.
+- Projection (`mp_pressure.rs`, `BodyCoupling`, `BodyLowRank`) : voir § 6.2. La force du fluide sur chaque corps est dans
+  `body_force` (le frottement à part dans `body_force_visc`). Mesures : `corps n x | y | angle | vx | vy | rotation | fx | fy | couple`.
+- Commande `corps … libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse …] [masse volumique ρ]` (EXPERIENCES.md). Exemples :
+  `experiences/flotteurs.exp` (bois et liège), `experiences/clapet.exp`.
+- Deux défauts trouvés en route, sur une cuve FERMÉE pleine d'huile où coule un disque (son niveau de pression ne tient qu'à la
+  compressibilité) :
+  - le volume que le corps vient de déplacer, anticipé par la projection précédente, était pris pour une erreur de fermeture
+    héritée et seulement en partie corrigé au-delà de 10 % : le niveau oscillait de ±5 kPa ;
+  - la pression des mailles ENTIÈREMENT couvertes, qui ne tient qu'à la trace de fluide, bondissait au moindre écart de volume et
+    tombait au plancher ; la cavité, comblée de gaz, partait dans le sillage et le calcul divergeait.
+  Corrigés : `push_src`, et `body_trace` (pression non résolue, reprise de la voisine quand le corps découvre la maille). Il reste
+  un niveau qui oscille de quelques kPa dans une cuve fermée pleine de liquide, sans effet sur les forces.
+- Validations : § 7. Diagnostics (`--ignored`) : `added_mass_of_a_disc_diag`, `imposed_acceleration_force_diag`,
+  `drag_of_a_fixed_disc_diag`, `towed_drag_resolution_diag`, `settling_disc_diag`.
+- **À reprendre : la traînée d'un corps EN MOUVEMENT.** Même disque, même nombre de Reynolds (20, 10 mailles par diamètre) :
+  - fixe dans un courant : C_D = 1.83 (frottement 0.57, pression 1.25 ; Dennis & Chang : 2.05) ;
+  - tiré dans le fluide au repos : C_D = 4.3 (frottement 1.9, pression 2.4).
+  L'écart CROÎT quand on raffine (C_D ≈ 6.7 à 20 mailles) et quand le pas diminue (≈ 5.1 à un pas quatre fois plus petit) : c'est un
+  défaut numérique du bord mobile, pas de la physique. Conséquence : un disque qui sédimente dans l'huile tombe à environ 0.065 m/s
+  au lieu de 0.142 (stable, sans dérive). Essais
+  sans effet : remplir de fluide à la vitesse du corps les faces qu'il découvre (4.5 → 4.3) ; déposer le fluide balayé hors du corps
+  (pire, 5.7). La statique, la masse ajoutée et les corps lents ne sont pas touchés.
+- Pas encore : contacts (étape 4), chaleur des corps (étape 5), grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre,
+  la masse ajoutée apparente monte jusqu'à 1.4 (la correction de fermeture était prévue pour l'ancien pas).
 
 ## 9. Choix (validés le 2026-11-24)
 
@@ -393,6 +441,8 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   23(3), 377–384 — [PDF](https://faculty.cc.gatech.edu/~turk/my_papers/rigid_fluid.pdf).
 - P. Causin, J.-F. Gerbeau, F. Nobile (2005), Added-mass effect in the design of partitioned algorithms for fluid–structure
   problems, Comput. Methods Appl. Mech. Engrg. 194, 4506–4527.
+- S. C. R. Dennis, G.-Z. Chang (1970), Numerical solutions for steady flow past a circular cylinder at Reynolds numbers up to 100,
+  J. Fluid Mech. 42, 471–489 (C_D = 1.522 à Re = 40, ≈ 2.05 à Re = 20).
 - E. A. Fadlun, R. Verzicco, P. Orlandi, J. Mohd-Yusof (2000), Combined immersed-boundary finite-difference methods for
   three-dimensional complex flow simulations, J. Comput. Phys. 161, 35–60.
 - Flow Science, A fixed mesh method for general moving objects in fluid flow (note technique TN73, modèle GMO de FLOW-3D) —

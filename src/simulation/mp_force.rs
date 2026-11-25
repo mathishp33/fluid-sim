@@ -147,7 +147,13 @@ impl MultiphaseSim {
         // implicite (`apply_implicit_viscosity`)
         if self.viscous {
             let mue: Vec<f64> = (0..nx * ny).map(|c| self.mu_cell[c].min(self.explicit_mu_cap(c, dt))).collect();
-            let (u, v) = (&self.u, &self.v);
+            // corps en mouvement (mp_bodies.rs) : contraintes calculées sur la vitesse du MÉLANGE fluide + corps de chaque face,
+            // u + (1 − A) V_corps — l'intérieur d'un corps qui bouge n'est pas un fluide au repos qui freinerait la couche entraînée
+            let mixture = if self.has_moving_bodies() { Some(self.mixture_velocity()) } else { None };
+            let (u, v) = match &mixture {
+                Some((a, b)) => (a, b),
+                None => (&self.u, &self.v),
+            };
             let ui = |i: usize, j: usize| u[j * (nx + 1) + i];
             let vi = |i: usize, j: usize| v[j * nx + i];
             // τxx, τyy aux centres

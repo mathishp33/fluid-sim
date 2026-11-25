@@ -1,0 +1,13 @@
+# Clapet flottant : une plaque de 12 × 2 cm deux fois plus légère que l'eau, sur une charnière au fond à son extrémité, part à 45° ;
+# la poussée d'Archimède la redresse à la verticale, où l'eau l'arrête.
+#   fluid-sim experience experiences/clapet.exp
+
+départ scénario "Cuve vide" grille 40 x 32 maille 1 cm
+remplir rect (0, 0) (0.4, 0.25) avec "eau" à 20 °C
+
+# plaque tournée de 45° autour de son centre (0.1924, 0.0924) : son extrémité basse est sur la charnière (0.15, 0.05)
+corps rect (0.1324, 0.0824) (0.2524, 0.1024) "acier" angle 45 libre pivot (0.15, 0.05) masse volumique 500 kg/m3
+
+mesurer toutes les 20 ms : corps 1 angle comme "angle du clapet", corps 1 rotation
+
+simuler 3 s

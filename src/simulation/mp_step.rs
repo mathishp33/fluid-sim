@@ -16,6 +16,8 @@ use super::multiphase::MultiphaseSim;
 /// croissance maximale du pas de temps d'un pas au suivant (voir `choose_dt`). ×1.25 était trop serré : après un pas refait (dt/4),
 /// le pas ne remontait pas assez vite et les retours arrière s'enchaînaient (braséro : dt jusqu'à 1.5e-6 s)
 pub(crate) const DT_GROWTH: f64 = 2.0;
+/// déplacement maximal de la surface d'un corps libre par pas, en mailles (voir `choose_dt`)
+pub(crate) const FREE_BODY_CFL: f64 = 0.15;
 
 pub(crate) static PROBE_CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -91,6 +93,13 @@ impl MultiphaseSim {
             dt = dt.min((self.heat_tau * 20.0 / gap).max(1e-6));
         }
         dt = dt.min(self.cfl * dx / umax.max(1e-9));
+        // corps libres : leur surface ne parcourt pas plus de 0.15 maille par pas — au-delà, l'écart entre le volume que la projection
+        // anticipe (linéarisé) et celui que le corps balaie vraiment faisait osciller une cuve fermée de liquide (±26 kPa à 0.33 maille
+        // par pas)
+        if self.has_free_bodies() {
+            let vmax = self.bodies.iter().filter(|b| b.is_free()).map(|b| b.vel[0].hypot(b.vel[1]) + b.omega.abs() * b.shape.radius()).fold(0.0, f64::max);
+            dt = dt.min(FREE_BODY_CFL * dx / vmax.max(1e-9));
+        }
         // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas ; percolation : |q| dt ≤ 0.4 du fluide amont
         let w = if self.has_granular() { self.max_settling_speed() } else { 0.0 }.max(self.max_darcy_speed());
         if w > 0.0 {
@@ -120,6 +129,30 @@ impl MultiphaseSim {
             // (viscosité implicite : la part au-delà de la borne explicite est résolue par `apply_implicit_viscosity`, pas de borne)
             if self.mu_cell[c] > 0.0 && !(self.viscous && self.implicit_viscosity) {
                 dt = dt.min(0.2 * self.rho_mix[c] * dx * dx / self.mu_cell[c]);
+            }
+        }
+        // corps en mouvement (mp_bodies.rs) : la viscosité implicite ne voit pas leur vitesse ; autour d'eux le pas reste sous la borne
+        // explicite, la viscosité y est entièrement explicite, calculée sur la vitesse du mélange fluide + corps (sans cela, un disque
+        // qui sédimente dans l'huile faisait exploser les pas plus longs que la borne : vitesses de 6000 m/s, pas refaits sans fin)
+        if self.viscous && self.implicit_viscosity && self.has_moving_bodies() {
+            let (nx, ny) = (self.nx, self.ny);
+            for c in 0..n {
+                if self.is_solid(c) || self.mu_cell[c] <= 0.0 {
+                    continue;
+                }
+                let (i, j) = (c % nx, c / nx);
+                let near = |ii: isize, jj: isize| ii >= 0 && jj >= 0 && (ii as usize) < nx && (jj as usize) < ny && self.body_frac[jj as usize * nx + ii as usize] > 0.0;
+                let (ii, jj) = (i as isize, j as isize);
+                if !(near(ii, jj) || near(ii - 1, jj) || near(ii + 1, jj) || near(ii, jj - 1) || near(ii, jj + 1)) {
+                    continue;
+                }
+                let mut rn = self.rho_mix[c];
+                for (ok, q) in [(i > 0, c.wrapping_sub(1)), (i + 1 < nx, c + 1), (j > 0, c.wrapping_sub(nx)), (j + 1 < ny, c + nx)] {
+                    if ok && !self.is_solid(q) {
+                        rn = rn.min(self.rho_mix[q]);
+                    }
+                }
+                dt = dt.min(0.99 * super::mp_friction::VISC_EXPLICIT * rn * dx * dx / self.mu_cell[c]);
             }
         }
         // tension de surface : seulement des liquides effectivement présents (un liquide absent n'impose pas de pas capillaire)
@@ -342,7 +375,17 @@ impl MultiphaseSim {
         // corps à mouvement imposé (mp_bodies.rs) : ils avancent pendant que le fluide est transporté (les flux de ce pas ont été
         // calculés par la projection précédente pour faire place au volume qu'ils balaient)
         if self.has_moving_bodies() {
+            let open_before = self.face_openings();
+            let vel_before = (self.body_vel_u.clone(), self.body_vel_v.clone());
             self.move_bodies(self.time, self.time + dt);
+            // faces que les corps ouvrent ou ferment : vitesse du fluide qui les remplit (voir `carry_face_openings`) — sur la vitesse
+            // prédite et sur la vitesse courante, dont la vitesse du mélange (frottement des corps) doit suivre la nouvelle position (la
+            // divergence de la vitesse qui a transporté les masses, `un`, `vn`, est gardée à part)
+            self.carry_face_openings(&open_before, &vel_before, &mut us, &mut vs);
+            let (mut uc, mut vc) = (std::mem::take(&mut self.u), std::mem::take(&mut self.v));
+            self.carry_face_openings(&open_before, &vel_before, &mut uc, &mut vc);
+            self.u = uc;
+            self.v = vc;
         }
         // percolation : le fluide traverse les lits tassés et les grilles avec les flux de Darcy de la dernière projection
         self.percolate(dt);
