@@ -708,7 +708,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Ok(if unit { v } else { v.to_radians() })
             };
             while !p.done() {
-                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique)")?.as_str() {
+                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement)")?.as_str() {
                     "angle" => {
                         let v = p.number("l'angle")?;
                         let (v, unit) = p.opt_unit(Dim::Angle, v)?;
@@ -745,6 +745,20 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         }
                         motion.rho = Some(r);
                     }
+                    "rebond" => {
+                        let e = p.quantity(Dim::Plain, "le coefficient de restitution")?;
+                        if !(0.0..=1.0).contains(&e) {
+                            return p.err("le coefficient de restitution est entre 0 (choc mou) et 1 (rebond parfait)");
+                        }
+                        motion.restitution = Some(e);
+                    }
+                    "frottement" => {
+                        let m = p.quantity(Dim::Plain, "le coefficient de frottement")?;
+                        if !(m >= 0.0) {
+                            return p.err("le coefficient de frottement doit être positif ou nul");
+                        }
+                        motion.friction = Some(m);
+                    }
                     "vitesse" => motion.v = p.vector(Dim::Speed, "la vitesse du corps")?,
                     "rotation" => motion.omega = ang_speed(p)?,
                     "oscillation" => {
@@ -765,7 +779,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                     o => {
                         return p.err(format!(
                             "option « {o} » inconnue après « corps » : angle <a>, fixe, libre, bloqué x | y | rotation, vitesse (vx, vy), \
-                             rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>"
+                             rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>, \
+                             rebond <e>, frottement <μ>"
                         ))
                     }
                 }

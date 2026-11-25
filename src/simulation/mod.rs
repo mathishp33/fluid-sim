@@ -34,6 +34,7 @@ pub mod lowmach_regression_tests;
 pub mod mp_view;
 pub mod mp_state;
 pub mod mp_bodies;
+pub mod mp_contacts;
 pub mod mp_experiment;
 pub mod mp_script;
 pub mod mp_fields;

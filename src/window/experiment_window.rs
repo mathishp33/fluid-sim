@@ -106,6 +106,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
         (corps rigide aux bords lissés ; angle en degrés) — fixe, ou mouvement imposé :
         vitesse (vx, vy) · rotation 90 (°/s, rad/s, tr/min) · oscillation (vx, vy) période 1 s · oscillation rotation 30 période 2 s · pivot (x, y)
         — ou libre, poussé par l'écoulement : libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse (vx, vy)] [masse volumique 600 kg/m³]
+          [rebond 0.5] [frottement 0.3]   (contacts contre les bords, les solides et les autres corps)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"]

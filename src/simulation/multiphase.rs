@@ -81,6 +81,9 @@ pub struct MultiphaseSim {
     /// corps libre
     #[serde(skip)]
     pub(crate) push_src: Vec<f64>,
+    /// ressorts des contacts en cours des corps libres (mp_contacts.rs)
+    #[serde(skip)]
+    pub(crate) contact_springs: Vec<super::mp_contacts::ContactSpring>,
     pub rho_mix: Vec<f64>,
     pub mu_cell: Vec<f64>,
     pub k_cell: Vec<f64>,
@@ -338,6 +341,7 @@ impl MultiphaseSim {
             body_force: vec![],
             body_force_visc: vec![],
             push_src: vec![],
+            contact_springs: vec![],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
             k_cell: vec![0.0; n],

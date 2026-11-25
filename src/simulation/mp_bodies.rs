@@ -204,11 +204,33 @@ pub struct RigidBody {
     pub temp: f64,
     /// masse volumique propre du corps (kg/m³), à la place de celle de son matériau (bouchon, flotteur, corps de densité donnée)
     pub rho: Option<f64>,
+    /// contacts (mp_contacts.rs) : coefficient de restitution normal et coefficient de frottement de Coulomb
+    pub restitution: f64,
+    pub friction: f64,
 }
+
+/// coefficient de restitution d'un corps, sauf mention
+pub const DEFAULT_RESTITUTION: f64 = 0.5;
+/// coefficient de frottement d'un corps contre une paroi ou un autre corps, sauf mention
+pub const DEFAULT_FRICTION: f64 = 0.3;
 
 impl RigidBody {
     pub fn new(shape: Shape, material: usize, pos: [f64; 2], temp: f64) -> RigidBody {
-        RigidBody { shape, material, pos, angle: 0.0, vel: [0.0, 0.0], omega: 0.0, dof: Dof::FREE, pivot: None, motion: Motion::Free, temp, rho: None }
+        RigidBody {
+            shape,
+            material,
+            pos,
+            angle: 0.0,
+            vel: [0.0, 0.0],
+            omega: 0.0,
+            dof: Dof::FREE,
+            pivot: None,
+            motion: Motion::Free,
+            temp,
+            rho: None,
+            restitution: DEFAULT_RESTITUTION,
+            friction: DEFAULT_FRICTION,
+        }
     }
 
     /// masse volumique du corps : la sienne, sinon celle de son matériau `material_rho`
@@ -397,7 +419,8 @@ fn clip_to_box(poly: &[[f64; 2]], x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f6
 
 /// Morceaux du bord d'un polygone convexe (sens trigonométrique) dans chaque maille : (maille, p, q), les côtés étant découpés par
 /// les lignes de la grille. La normale sortante de p → q, multipliée par sa longueur, est (q_y − p_y, −(q_x − p_x)). Un morceau posé
-/// sur une ligne de la grille compte pour la maille du côté extérieur (celle que le corps couvre s'il avance). Hors du domaine : rien.
+/// sur une ligne de la grille compte pour la maille du côté extérieur (celle que le corps couvre s'il avance). Hors du domaine : la
+/// maille du domaine la plus proche.
 pub(crate) fn boundary_pieces(poly: &[[f64; 2]], nx: usize, ny: usize, dx: f64) -> Vec<(usize, [f64; 2], [f64; 2])> {
     let mut out = vec![];
     let n = poly.len();
@@ -436,10 +459,10 @@ pub(crate) fn boundary_pieces(poly: &[[f64; 2]], nx: usize, ny: usize, dx: f64) 
             let p = [a[0] + w[0] * d[0], a[1] + w[0] * d[1]];
             let q = [a[0] + w[1] * d[0], a[1] + w[1] * d[1]];
             let m = [0.5 * (p[0] + q[0]) + 1e-9 * dx * nrm[0], 0.5 * (p[1] + q[1]) + 1e-9 * dx * nrm[1]];
-            let (fi, fj) = ((m[0] / dx).floor(), (m[1] / dx).floor());
-            if fi < 0.0 || fj < 0.0 || fi >= nx as f64 || fj >= ny as f64 {
-                continue;
-            }
+            // (hors du domaine, corps en contact avec un bord : maille du domaine la plus proche — la pression du fluide voisin agit
+            // sur tout le bord, sans quoi la part manquante, à 1 atm, plaquait le corps contre la paroi)
+            let fi = (m[0] / dx).floor().clamp(0.0, nx as f64 - 1.0);
+            let fj = (m[1] / dx).floor().clamp(0.0, ny as f64 - 1.0);
             out.push((fj as usize * nx + fi as usize, p, q));
         }
     }
@@ -715,8 +738,10 @@ impl super::multiphase::MultiphaseSim {
         }
         let mut eu = vec![0.0; (nx + 1) * ny];
         let mut ev = vec![0.0; nx * (ny + 1)];
+        // (faces intérieures seulement : le fluide collé ne traverse pas le bord du domaine — sans cela, un disque qui rebondit sur le
+        // fond faisait passer de l'eau à travers la paroi)
         for j in 0..ny {
-            for i in 0..=nx {
+            for i in 1..nx {
                 let f = j * (nx + 1) + i;
                 let vb = self.body_vel_u[f];
                 if vb != 0.0 {
@@ -724,7 +749,7 @@ impl super::multiphase::MultiphaseSim {
                 }
             }
         }
-        for j in 0..=ny {
+        for j in 1..ny {
             for i in 0..nx {
                 let f = j * nx + i;
                 let vb = self.body_vel_v[f];
@@ -912,6 +937,7 @@ impl super::multiphase::MultiphaseSim {
                     let (r, w) = (sub(self.bodies[k].pos, q), self.bodies[k].omega);
                     self.bodies[k].vel = [-w * r[1], w * r[0]];
                 }
+                // (les contacts, mp_contacts.rs, repoussent le corps ; sécurité si un pas l'enfonce quand même de plus d'une demi-maille)
                 if self.body_blocked(k, lx, ly) {
                     self.bodies[k] = before;
                     self.bodies[k].vel = [0.0, 0.0];
@@ -923,20 +949,23 @@ impl super::multiphase::MultiphaseSim {
         }
         self.update_body_fractions();
         self.push_fluid(&old);
+        if self.has_free_bodies() {
+            self.update_contact_springs(t1 - t0);
+        }
     }
 
-    /// le corps k sort-il du domaine ou entre-t-il dans une maille solide ?
+    /// le corps k s'enfonce-t-il de plus d'une demi-maille hors du domaine ou dans une maille solide ?
     fn body_blocked(&self, k: usize, lx: f64, ly: f64) -> bool {
         let poly = self.bodies[k].world_vertices();
-        let eps = 1e-9 * self.dx;
-        if poly.iter().any(|p| p[0] < eps || p[1] < eps || p[0] > lx - eps || p[1] > ly - eps) {
+        let h = 0.5 * self.dx;
+        if poly.iter().any(|p| p[0] < -h || p[1] < -h || p[0] > lx + h || p[1] > ly + h) {
             return true;
         }
         if !self.solid.iter().any(|&s| s >= 0) {
             return false;
         }
         let f = body_fractions(std::slice::from_ref(&self.bodies[k]), self.nx, self.ny, self.dx);
-        f.iter().enumerate().any(|(c, &a)| a > 0.0 && self.is_solid(c))
+        f.iter().enumerate().any(|(c, &a)| a > 0.25 && self.is_solid(c))
     }
 
     /// Maille où va le fluide que les corps balaient dans la maille c (ou d'où vient celui qu'ils y découvrent) : la voisine du côté
@@ -1100,6 +1129,8 @@ impl super::multiphase::MultiphaseSim {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let g = self.gravity;
         let mixture = if self.viscous { Some(self.mixture_velocity()) } else { None };
+        // contacts des corps libres (mp_contacts.rs) : forces explicites, avec la pesanteur
+        let (contact, contact_damp) = self.contact_forces(dt);
         let mut out = Vec::with_capacity(self.bodies.len());
         for (k, b) in self.bodies.iter().enumerate() {
             let gc = b.pos;
@@ -1108,9 +1139,21 @@ impl super::multiphase::MultiphaseSim {
             let mut acc: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
             let mut hydro = [0.0; 3];
             for (c, p, q) in boundary_pieces(&poly, nx, ny, dx) {
-                if self.is_solid(c) {
-                    continue;
-                }
+                // (morceau dans une maille solide, corps en contact : maille fluide voisine — même raison que hors du domaine)
+                let c = if self.is_solid(c) {
+                    let (i, j) = ((c % nx) as isize, (c / nx) as isize);
+                    let near = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)].iter().find_map(|&(di, dj)| {
+                        let (ii, jj) = (i + di, j + dj);
+                        (ii >= 0 && jj >= 0 && (ii as usize) < nx && (jj as usize) < ny && !self.is_solid(jj as usize * nx + ii as usize))
+                            .then(|| jj as usize * nx + ii as usize)
+                    });
+                    match near {
+                        Some(n) => n,
+                        None => continue,
+                    }
+                } else {
+                    c
+                };
                 let m = self.push_target(c).unwrap_or(c);
                 let nl = [q[1] - p[1], -(q[0] - p[0])];
                 let mid = [0.5 * (p[0] + q[0]), 0.5 * (p[1] + q[1])];
@@ -1211,7 +1254,13 @@ impl super::multiphase::MultiphaseSim {
                 v0 = [0.0; 3];
                 if nb > 0 {
                     // K = M + dt D ; Bᵀ K B (nb × nb)
+                    // (amortissement des contacts implicite, avec le frottement du fluide)
                     let mut kk = d;
+                    for r in 0..3 {
+                        for q in 0..3 {
+                            kk[r][q] += contact_damp[k][r][q];
+                        }
+                    }
                     for r in 0..3 {
                         for s in 0..3 {
                             kk[r][s] *= dt;
@@ -1245,7 +1294,8 @@ impl super::multiphase::MultiphaseSim {
                     // M Vⁿ + dt (M g + fu + hydro)
                     let vn = [b.vel[0], b.vel[1], b.omega];
                     let gf = [mb * g[0], mb * g[1], 0.0];
-                    let rhs: [f64; 3] = std::array::from_fn(|r| mass[r] * vn[r] + dt * (gf[r] + fu[r] + hydro[r]));
+                    let fc = contact[k];
+                    let rhs: [f64; 3] = std::array::from_fn(|r| mass[r] * vn[r] + dt * (gf[r] + fu[r] + hydro[r] + fc[r]));
                     for r in 0..3 {
                         v0[r] = (0..3).map(|s| w[r][s] * rhs[s]).sum();
                     }
@@ -1350,6 +1400,7 @@ impl super::multiphase::MultiphaseSim {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+    use crate::simulation::mp_contacts::{CONTACT_PENETRATION, CONTACT_SKIN};
 
     #[test]
     fn shapes_have_their_exact_area_and_inertia() {
@@ -2331,6 +2382,180 @@ mod tests {
         assert!(swing2 < 2.0 * swing1.max(1000.0), "le niveau de pression s'emballe : ±{swing1} Pa puis ±{swing2} Pa");
         assert!(b.vel[1] < -0.02 && b.pos[1] < 0.14, "le corps ne coule pas : y {} vy {}", b.pos[1], b.vel[1]);
         assert!(dm < 1e-9, "masse d'eau {dm}");
+    }
+
+    #[test]
+    fn a_steel_disc_comes_to_rest_on_the_bottom_of_a_tank() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 40 x 40 maille 2 mm\n\
+             remplir rect (0, 0) (0.08, 0.06) avec \"eau\" à 20 °C\n\
+             corps disque (0.04, 0.025) rayon 1 cm \"acier\" libre\n",
+        );
+        let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let m0 = s.total_mass(eau);
+        let (mut vmax_late, mut ymin) = (0.0f64, f64::MAX);
+        while s.time < 1.0 && !s.diverged {
+            s.step();
+            let b = &s.bodies[0];
+            ymin = ymin.min(b.pos[1]);
+            if s.time > 0.7 {
+                // (vitesse verticale : posé sur un fond plat, sans résistance au roulement, le disque peut rouler lentement)
+                vmax_late = vmax_late.max(b.vel[1].abs());
+            }
+        }
+        assert!(!s.diverged && s.state_is_sane(), "état invalide à t = {}", s.time);
+        let b = &s.bodies[0];
+        let dm = (s.total_mass(eau) / m0 - 1.0).abs();
+        let vap = s.reg.phases.iter().position(|p| p.name == "vapeur").map_or(0.0, |k| s.total_mass(k));
+        eprintln!("    (vapeur formée : {vap:.3e} kg/m, eau au départ {m0:.3e} kg/m)");
+        eprintln!(
+            "disque posé au fond : y {:.5} m (rayon 0.01), au plus bas {ymin:.5}, x {:.5}, vitesse verticale ≤ {vmax_late:.2e} m/s après 0.7 s, ω {:.2e} ; masse d'eau à {dm:.1e} ; {} pas, {} refaits",
+            b.pos[1],
+            b.pos[0],
+            b.omega,
+            s.step_count,
+            s.rollbacks
+        );
+        // posé dans la peau de contact : à CONTACT_SKIN maille du fond, moins sa pénétration (au plus CONTACT_PENETRATION maille)
+        let y_rest = 0.01 + (CONTACT_SKIN - CONTACT_PENETRATION) * s.dx;
+        assert!((b.pos[1] - y_rest).abs() < 0.1 * s.dx, "le disque ne repose pas sur le fond : y = {} (attendu {y_rest})", b.pos[1]);
+        assert!(0.01 + CONTACT_SKIN * s.dx - ymin < 0.25 * s.dx, "le disque s'enfonce de {} m dans la peau", 0.01 + CONTACT_SKIN * s.dx - ymin);
+        assert!(vmax_late < 1e-3, "le disque tremble encore : {vmax_late} m/s");
+        assert!(dm < 1e-6, "masse d'eau {dm}");
+    }
+
+    #[test]
+    fn a_steel_disc_bounces_in_air_with_its_restitution() {
+        let (h0, e) = (0.2, 0.8);
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille 40 x 60 maille 5 mm\n\
+             corps disque (0.1, {h0}) rayon 1 cm \"acier\" libre rebond {e}\n"
+        ));
+        let mut bounced = false;
+        let mut apex = 0.0f64;
+        let mut prev = 0.0f64;
+        while s.time < 0.75 && !s.diverged {
+            s.step();
+            let (y, vy) = (s.bodies[0].pos[1], s.bodies[0].vel[1]);
+            if prev < 0.0 && vy > 0.0 {
+                bounced = true;
+            }
+            if bounced {
+                apex = apex.max(y);
+            }
+            prev = vy;
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        // chute de h = h0 − r − peau, rebond à e² h au-dessus du contact (la traînée de l'air, faible, en retire un peu)
+        let floor = 0.01 + CONTACT_SKIN * s.dx;
+        let h = h0 - floor;
+        let rise = apex - floor;
+        eprintln!("rebond dans l'air : remonté à {:.4} m au-dessus du sol (attendu e² h = {:.4}), restitution effective {:.3} ; {} pas", rise, e * e * h, (rise / h).sqrt(), s.step_count);
+        assert!(bounced, "pas de rebond");
+        assert!(((rise / h).sqrt() / e - 1.0).abs() < 0.1, "restitution {} au lieu de {e}", (rise / h).sqrt());
+    }
+
+    #[test]
+    fn a_small_block_dropped_on_a_big_one_stays_on_top() {
+        // deux blocs d'acier dans l'air : le grand (8 × 2 cm) posé au sol (à l'équilibre dans la peau de contact), le petit
+        // (3 × 2 cm) lâché 8.5 mm au-dessus de lui
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 40 x 30 maille 5 mm
+             corps rect (0.06, 0.0015) (0.14, 0.0215) \"acier\" libre
+             corps rect (0.085, 0.03) (0.115, 0.05) \"acier\" libre
+",
+        );
+        let mut vmax_late = 0.0f64;
+        while s.time < 1.0 && !s.diverged {
+            s.step();
+            if s.time > 0.7 {
+                vmax_late = s.bodies.iter().map(|b| b.vel[0].hypot(b.vel[1])).fold(vmax_late, f64::max);
+            }
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let (a, b) = (&s.bodies[0], &s.bodies[1]);
+        eprintln!(
+            "deux blocs empilés : en bas y {:.5} (0.01), en haut y {:.5} (0.03), x {:.5} et {:.5}, angles {:.2}° et {:.2}° ; vitesse ≤ {vmax_late:.2e} m/s après 0.7 s ; {} pas, {} refaits",
+            a.pos[1],
+            b.pos[1],
+            a.pos[0],
+            b.pos[0],
+            a.angle.to_degrees(),
+            b.angle.to_degrees(),
+            s.step_count,
+            s.rollbacks
+        );
+        // chaque bloc repose dans la peau de contact de ce qui le porte
+        let gap = (CONTACT_SKIN - CONTACT_PENETRATION) * s.dx;
+        assert!((a.pos[1] - 0.01 - gap).abs() < 0.2 * s.dx && (b.pos[1] - 0.03 - 2.0 * gap).abs() < 0.3 * s.dx, "empilement : {} et {}", a.pos[1], b.pos[1]);
+        assert!((b.pos[0] - 0.1).abs() < 0.2 * s.dx, "le petit bloc glisse : x = {}", b.pos[0]);
+        assert!(a.angle.abs() < 0.02 && b.angle.abs() < 0.02, "les blocs basculent");
+        assert!(vmax_late < 5e-3, "les blocs bougent encore : {vmax_late} m/s");
+    }
+
+    #[test]
+    fn two_discs_collide_head_on_with_their_restitution() {
+        // sans pesanteur, dans l'air : un disque d'acier lancé à 0.5 m/s sur un autre au repos, e = 0.8. Masses égales : après le
+        // choc v1 = v (1 − e)/2, v2 = v (1 + e)/2, quantité de mouvement conservée
+        let (v, e) = (0.5, 0.8);
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille 60 x 30 maille 5 mm gravité 0
+             corps disque (0.06, 0.075) rayon 1 cm \"acier\" libre vitesse ({v}, 0) rebond {e}
+             corps disque (0.12, 0.075) rayon 1 cm \"acier\" libre rebond {e}
+"
+        ));
+        let m = s.body_mass(0);
+        while s.time < 0.2 && !s.diverged {
+            s.step();
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let (a, b) = (&s.bodies[0], &s.bodies[1]);
+        let (p0, p1) = (m * v, m * (a.vel[0] + b.vel[0]));
+        let e_eff = (b.vel[0] - a.vel[0]) / v;
+        eprintln!(
+            "deux disques : après le choc v1 = {:.4} m/s, v2 = {:.4} m/s (attendus {:.4} et {:.4}) ; quantité de mouvement ×{:.4} ; restitution {e_eff:.3} ; vy {:.1e} {:.1e} ; {} pas, {} refaits",
+            a.vel[0],
+            b.vel[0],
+            v * (1.0 - e) / 2.0,
+            v * (1.0 + e) / 2.0,
+            p1 / p0,
+            a.vel[1],
+            b.vel[1],
+            s.step_count,
+            s.rollbacks
+        );
+        assert!(b.vel[0] > a.vel[0], "pas de choc");
+        // la traînée de l'air freine un peu les deux disques
+        assert!((p1 / p0 - 1.0).abs() < 0.03, "quantité de mouvement ×{}", p1 / p0);
+        assert!((e_eff / e - 1.0).abs() < 0.1, "restitution {e_eff} au lieu de {e}");
+        assert!(a.vel[1].abs() < 0.01 && b.vel[1].abs() < 0.01, "choc frontal dévié");
+    }
+
+    #[test]
+    fn a_block_dropped_on_a_solid_shelf_rests_on_it() {
+        let mut s = scene(
+            "départ scénario \"cuve vide\" grille 40 x 40 maille 5 mm\n\
+             solide rect (0, 0) (0.2, 0.05) \"acier\"\n\
+             corps rect (0.06, 0.08) (0.14, 0.1) \"verre\" libre angle 5\n",
+        );
+        while s.time < 1.0 && !s.diverged {
+            s.step();
+        }
+        assert!(!s.diverged && s.state_is_sane());
+        let b = &s.bodies[0];
+        eprintln!(
+            "bloc posé sur une étagère solide : centre y {:.5} (0.06 à plat), angle {:.2}°, vitesse ({:.1e}, {:.1e}) ; {} pas, {} refaits",
+            b.pos[1],
+            b.angle.to_degrees(),
+            b.vel[0],
+            b.vel[1],
+            s.step_count,
+            s.rollbacks
+        );
+        let y_rest = 0.06 + (CONTACT_SKIN - CONTACT_PENETRATION) * s.dx;
+        assert!((b.pos[1] - y_rest).abs() < 0.2 * s.dx, "le bloc ne repose pas sur l'étagère : y = {} (attendu {y_rest})", b.pos[1]);
+        assert!(b.angle.to_degrees().abs() < 1.0, "le bloc ne se met pas à plat : {}°", b.angle.to_degrees());
+        assert!(b.vel[1].abs() < 5e-3, "le bloc bouge encore : {:?}", b.vel);
     }
 
     #[test]

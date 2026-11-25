@@ -76,8 +76,9 @@ struct Snapshot {
     mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
     dt_phase: f64, pressure_clamped: Vec<bool>,
-    /// corps rigides (vide sans corps ; leurs fractions et faces se recalculent depuis leur position)
+    /// corps rigides (vide sans corps ; leurs fractions et faces se recalculent depuis leur position) et ressorts de leurs contacts
     bodies: Vec<super::mp_bodies::RigidBody>,
+    contact_springs: Vec<super::mp_contacts::ContactSpring>,
 }
 
 impl MultiphaseSim {
@@ -99,6 +100,8 @@ impl MultiphaseSim {
         if self.has_free_bodies() {
             let vmax = self.bodies.iter().filter(|b| b.is_free()).map(|b| b.vel[0].hypot(b.vel[1]) + b.omega.abs() * b.shape.radius()).fold(0.0, f64::max);
             dt = dt.min(FREE_BODY_CFL * dx / vmax.max(1e-9));
+            // contacts (mp_contacts.rs) : pénétration bornée près d'un obstacle
+            dt = dt.min(self.contact_dt_bound());
         }
         // grains : la dérive explicite ne traverse pas plus d'une demi-maille par pas ; percolation : |q| dt ≤ 0.4 du fluide amont
         let w = if self.has_granular() { self.max_settling_speed() } else { 0.0 }.max(self.max_darcy_speed());
@@ -221,6 +224,7 @@ impl MultiphaseSim {
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
             dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
             bodies: self.bodies.clone(),
+            contact_springs: self.contact_springs.clone(),
         }
     }
 
@@ -240,6 +244,7 @@ impl MultiphaseSim {
         if self.has_bodies() || !s.bodies.is_empty() {
             // fractions et faces : fonction exacte de la position des corps
             self.bodies.clone_from(&s.bodies);
+            self.contact_springs.clone_from(&s.contact_springs);
             self.update_body_fractions();
         }
     }

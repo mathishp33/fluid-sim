@@ -1,0 +1,16 @@
+# Rebonds : deux disques d'acier lâchés de la même hauteur, l'un dans l'air, l'autre dans l'eau, de part et d'autre d'un muret.
+# Dans l'air, il remonte à e² de sa hauteur de chute à chaque rebond (coefficient de restitution 0.8 : 10 cm après 16 cm de chute,
+# puis 6.6 cm…) ; dans l'eau, freiné par le liquide, il arrive moins vite (1.1 m/s au lieu de 1.8), ne remonte que de 3 cm et se
+# pose en moins d'une seconde. Posés, les disques restent à ~0.3 maille du fond (peau de contact, SOLID.md § 6.3).
+#   fluid-sim experience experiences/rebonds.exp
+
+départ scénario "Cuve vide" grille 80 x 50 maille 5 mm
+solide rect (0.2, 0) (0.21, 0.25) "acier"
+remplir rect (0.21, 0) (0.4, 0.2) avec "eau" à 20 °C
+
+corps disque (0.1, 0.17) rayon 1 cm "acier" libre rebond 0.8
+corps disque (0.3, 0.17) rayon 1 cm "acier" libre rebond 0.8
+
+mesurer toutes les 10 ms : corps 1 y comme "disque dans l'air", corps 2 y comme "disque dans l'eau", corps 1 vy, corps 2 vy
+
+simuler 1.5 s

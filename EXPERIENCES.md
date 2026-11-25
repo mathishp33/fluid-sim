@@ -101,6 +101,7 @@ d'expérience.
 | … `libre` | corps LIBRE, poussé par l'écoulement (pesanteur, pression, frottement) ; `vitesse` et `rotation` donnent alors sa vitesse de départ ; avec `pivot (x, y)`, il tourne librement autour de la charnière (clapet) |
 | … `bloqué x \| y \| rotation` | axes bloqués d'un corps libre, un ou plusieurs (`bloqué x et rotation` : il ne fait que monter et descendre) |
 | … `masse volumique ρ` | masse volumique propre du corps, en kg/m³ sans unité (ou `g/cm³`), à la place de celle du matériau : bouchon de liège, bloc de bois, corps de la densité de l'eau |
+| … `rebond e`, … `frottement μ` | contacts d'un corps libre contre les bords du domaine, les solides et les autres corps : coefficient de restitution e entre 0 (choc mou) et 1 (rebond parfait), 0.5 par défaut ; coefficient de frottement de Coulomb μ, 0.3 par défaut ; entre deux corps, la moyenne de leurs deux valeurs |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) |
 | `vitesse <zone> (vx, vy)` | impose la vitesse des faces intérieures de la zone ; la projection du pas suivant la rend admissible |
@@ -279,7 +280,7 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
-  `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`. Les corps ne se
-  touchent pas encore entre eux : un corps libre s'arrête net contre un bord du domaine ou un solide (les contacts sont l'étape 4 de
-  SOLID.md), et la traînée d'un corps en mouvement n'est qu'approchée à 10 mailles par diamètre (+20 à +55 %,
-  SOLID.md § 8).
+  `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`,
+  `experiences/rebonds.exp`. Les corps libres rebondissent et frottent contre les bords du domaine, les solides et les autres corps
+  (SOLID.md § 6.3) ; un corps posé reste à environ 0.3 maille de ce qui le porte (peau de contact). La traînée d'un corps en
+  mouvement n'est qu'approchée à 10 mailles par diamètre (+20 à +55 %, SOLID.md § 8).

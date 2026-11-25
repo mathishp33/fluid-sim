@@ -6,9 +6,10 @@ cellules spéciales du TODO), un agitateur qui tourne. Ce ne sont pas des poudre
 leur forme ni leur inertie propre.
 
 Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé), 1 (corps
-FIXES : l'eau les contourne sans y entrer), 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues) et 3 (corps LIBRES : flotteur,
-clapet, pendule, corps qui coule) sont faites (§ 8, `mp_bodies.rs`). La traînée d'un corps EN MOUVEMENT converge en maillage, mais
-reste approchée à 10 mailles par diamètre (§ 8). Viennent ensuite les contacts (§ 7).
+FIXES : l'eau les contourne sans y entrer), 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues), 3 (corps LIBRES : flotteur,
+clapet, pendule, corps qui coule) et 4 (CONTACTS : rebonds, frottement, empilements) sont faites (§ 8, `mp_bodies.rs`,
+`mp_contacts.rs`). La traînée d'un corps EN MOUVEMENT converge en maillage, mais reste approchée à 10 mailles par diamètre (§ 8).
+Viennent ensuite la chaleur des corps et le GPU (étape 5, § 7).
 
 **En bref — recommandation**
 
@@ -302,12 +303,30 @@ de la projection, comme chez Batty et al. (2007) et Gibou & Min (2012).
 
 ### 6.3 Contacts
 
-- Une force de ressort-amortisseur s'applique, comme dans la méthode des éléments discrets, quand le corps pénètre une paroi, un
-  solide fixe (maille carrée) ou un autre corps : F_n = k δ − c v_n, plus un frottement de Coulomb tangent.
-- Formes convexes (disque, rectangle, polygone convexe) : test des axes séparateurs.
-- La raideur est liée au pas : si besoin, le mouvement des corps est intégré en sous-pas dans un pas fluide.
-- Plus tard, si les contacts se compliquent (empilements, liaisons entre corps) : Rapier (`rapier2d`, en Rust) pour les corps, le
-  fluide restant ici.
+Fait à l'étape 4 (`mp_contacts.rs`, § 8).
+- Contact SOUPLE, comme dans la méthode des éléments discrets : force normale F_n = k (δ − δ0) − c v_n, jamais attractive, et
+  frottement de Coulomb régularisé |F_t| ≤ μ F_n, contre les bords du domaine, les solides fixes (sommets du corps dans une maille
+  solide ou près d'elle, coins SAILLANTS des mailles solides dans le corps ou près de lui) et les autres corps (axes séparateurs
+  pour les polygones convexes, distance exacte entre deux disques).
+- **Peau de contact** : la répulsion commence dès que l'écart passe sous 0.4 maille, δ = 0.4 maille − écart. Un corps posé repose
+  donc à environ 0.3 maille de ce qui le porte, et le film de fluide entre deux surfaces garde au moins cette épaisseur. Les
+  méthodes à domaine fictif font de même (zone de répulsion d'une maille environ, Glowinski et al. 1999). Sans peau, le film sous un
+  bloc posé à plat ne faisait que quelques microns, et la température y devenait négative (§ 8).
+- **Un ressort par contact** (corps, obstacle), réglé au début du contact sur la vitesse d'approche : k = m ω², avec
+  ω = max(√(g/δ_max), v_n/δ_max) et δ_max = 0.1 maille ; m est la masse effective au point de contact, rotation comprise (et celle
+  des deux corps s'ils sont libres). La pénétration reste de l'ordre de δ_max, au repos sous la pesanteur comme à l'impact. Le
+  ressort est gardé tant que le contact dure : il est raidi si l'approche s'accélère (un bloc posé qu'un autre vient frapper) et
+  détendu vers √(g/δ_max) une fois le corps posé. Aucun changement ne rend d'énergie au corps : la force est continue quand on
+  raidit, l'énergie du ressort ne croît pas quand on détend (décalage δ0). Le ressort part de zéro là où le contact est vu.
+- **Pas de temps** : au moins 8 pas par période de contact, à l'approche (pénétration bornée avant que le contact ne commence)
+  comme pendant le contact (`contact_dt_bound`). Pas de sous-pas : le corps reste résolu avec la pression.
+- **Amortisseur** implicite, à l'approche seulement, réglé pour donner le coefficient de restitution e du corps au schéma réel
+  (`damping_for_restitution`, dans l'ordre du calcul) ; le fluide amortit en plus.
+- Le ressort et le frottement sont explicites ; ils entrent dans l'équation des corps libres avec la pesanteur, résolue avec la
+  pression (§ 6.2). L'amortisseur s'ajoute à l'inertie du corps. Pour deux corps libres, la vitesse de l'autre est celle du pas
+  précédent.
+- Plus tard, si les contacts se compliquent (liaisons entre corps, grands empilements) : Rapier (`rapier2d`, en Rust) pour les
+  corps, le fluide restant ici.
 
 ### 6.4 Chaleur
 
@@ -339,11 +358,11 @@ de la projection, comme chez Batty et al. (2007) et Gibou & Min (2012).
 | 1 (faite) | corps fixes : poser un corps chasse le fluide (trace dans les mailles couvertes) ; ouvertures des faces dans la projection, le transport, la percolation, la conduction et la diffusion ; commande `corps`, outil de la fenêtre d'expérience | fermeture à 1e-9 après la pose ; eau au repos autour de deux corps : 1.8e-7 m/s, pression à 3 mPa près ; canal autour d'un disque : débit identique entrée / disque / sortie, passages à 0.284 m/s (0.273 attendus), rien n'entre dans le corps ; barrage contre un muret et un disque : masse d'eau à 4e-16, aucun pas refait |
 | 2 (faite) | mouvement imposé : vitesse et rotation constantes, oscillation sinusoïdale, pivot ; fluide balayé déplacé, travail p·dV, entraînement | piston dans un tube d'air fermé : γ = 1.4014 par la pression et 1.3990 par la température (attendu : 1.40), masse de gaz à 2e-7 ; disque tiré dans l'eau : la pression d'une sonde saute de 1.5 Pa au plus quand il traverse les mailles, masse d'eau à 2e-16 ; palette sur pivot : eau brassée à 0.11 m/s près des bouts (ω r = 0.11) ; lois intégrées exactement (une oscillation revient pile à son départ) |
 | 3 (faite) | mouvement libre + masque de DDL et pivot ; couplage monolithique pression–corps ; force du fluide sur tout corps (mesurable) | corps de la densité de l'eau immobile (2 µm en 1 s, force du fluide = poids à 6 chiffres) ; chute dans l'air : vitesse à 0.1 % ; masse ajoutée d'un disque lâché ou accéléré dans l'eau : C_a = 0.94 à 1.04 (1 attendu) ; flotteurs : tirant d'eau à 0.7 mm près (bois 0.6, liège 0.24), oscillation qui s'amortit ; pendule dans l'air : période à 0.03 % ; clapet flottant redressé à la verticale ; traînée d'un disque FIXE à Re 20 / 40 : −11 % / −9 % de Dennis & Chang (1970) ; disque TIRÉ à Re 20 : C_D 2.68 à 10 mailles par diamètre, 1.61 à 20 (Dennis & Chang : 2.05), pression à 20 mailles 1.26 (≈ 1.24) ; disque qui sédimente dans l'huile : vitesse limite à −23 % |
-| 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
+| 4 (faite) | contacts contre les bords, les solides fixes et les autres corps ; ressort par contact, peau de contact ; restitution et frottement par corps | rebond d'un disque d'acier dans l'air : e = 0.803 (0.8 visé) ; choc frontal de deux disques : restitution 0.777 (0.8), quantité de mouvement à 0.1 % ; disque posé au fond d'une cuve d'eau : 2.6e-6 m/s ; bloc lâché penché sur une étagère solide : à plat (0.00°), immobile ; petit bloc lâché sur un grand : empilement immobile (1e-5 m/s) et à plat ; aucun pas refait. Pas fait : rebond dans un liquide selon le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
 
-## 8. Ce qui est fait : étapes 0 (préparer l'architecture sans changer un résultat), 1 (corps fixes), 2 (mouvement imposé) et 3 (corps libres)
+## 8. Ce qui est fait : étapes 0 (préparer l'architecture sans changer un résultat), 1 (corps fixes), 2 (mouvement imposé), 3 (corps libres) et 4 (contacts)
 
 1. **`mp_bodies.rs`**, testé à part (6 tests) :
    - corps rigide `RigidBody` (forme, matériau, position, angle, vitesses, axes libres `Dof`, pivot, mode `Motion` : libre, fixe,
@@ -403,8 +422,8 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
 
 **Étape 3 (corps libres, faite le 2026-11-25).**
 - Corps `Motion::Free` : axes bloqués un par un (`Dof`), pivot, masse volumique propre (`rho`, état complet en version 14).
-  `move_bodies` les avance à la vitesse de la projection précédente. Un corps libre s'arrête net contre un bord du domaine ou un
-  solide : il n'y a pas encore de contacts.
+  `move_bodies` les avance à la vitesse de la projection précédente. Un corps libre s'arrêtait net contre un bord du domaine ou un
+  solide ; depuis l'étape 4, les contacts le repoussent, et l'arrêt net ne sert plus que de sécurité (au-delà d'une demi-maille).
 - Projection (`mp_pressure.rs`, `BodyCoupling`, `BodyLowRank`) : voir § 6.2. La force du fluide sur chaque corps est dans
   `body_force` (le frottement à part dans `body_force_visc`). Mesures : `corps n x | y | angle | vx | vy | rotation | fx | fy | couple`.
 - Commande `corps … libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse …] [masse volumique ρ]` (EXPERIENCES.md). Exemples :
@@ -432,14 +451,46 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   à une seule voisine, alors que le fluide collé quitte la maille par deux faces sur un bord oblique). Répartir le volume balayé
   entre les voisines, au prorata du débit collé qui sort par chaque face, améliorait la traînée (2.36) mais cassait un flotteur à la
   ligne d'eau (mailles mêlées d'eau et d'air) : écarté. Diagnostic : `co_moving_disc_diag` (disque qui suit le courant).
-- Pas encore : contacts (étape 4), chaleur des corps (étape 5), grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre,
-  la masse ajoutée apparente monte jusqu'à 1.4 (la correction de fermeture était prévue pour l'ancien pas).
+- Pas encore : chaleur des corps (étape 5), grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre, la masse ajoutée
+  apparente monte jusqu'à 1.4 (la correction de fermeture était prévue pour l'ancien pas).
+
+**Étape 4 (contacts, faite le 2026-11-25).**
+- `mp_contacts.rs` (§ 6.3) : détection (`contacts`) contre les bords, les solides fixes et les autres corps ; un ressort par contact
+  (`ContactSpring`, gardé dans l'instantané du pas pour le retour arrière) ; forces (`contact_forces`) ; borne du pas
+  (`contact_dt_bound`). Dans `body_couplings`, le ressort et le frottement s'ajoutent à la pesanteur, l'amortisseur à l'inertie.
+- Commande `corps … libre rebond e frottement μ` (0.5 et 0.3 par défaut ; entre deux corps, la moyenne des deux), EXPERIENCES.md.
+  État complet en version 15. Exemple : `experiences/rebonds.exp` (disques qui rebondissent dans l'air et dans l'eau).
+- Défauts trouvés en route :
+  - une raideur qui suivait le pas ne rendait pas à la détente l'énergie de la compression (rebond à 0.29 pour e = 0.8) → ressort
+    figé pendant le contact ;
+  - un amortisseur explicite renvoyait le corps plus vite qu'il n'arrivait au-delà de ζ ≈ 0.5 (arrivé à 1.9 m/s, reparti à
+    11 m/s) → amortisseur implicite ;
+  - le premier calibrage de l'amortisseur faisait entrer le corps d'un pas entier dans l'obstacle avant toute force : à 8 pas par
+    période, l'énergie de cette seule entrée renvoyait le corps à e ≈ 0.85, l'amortisseur partait en butée, et le rebond dépendait
+    de l'instant d'entrée (de 0.01 à 0.82 pour 0.8) → calibrage dans l'ordre du calcul, ressort qui part de zéro là où le contact
+    est vu ;
+  - sous un bloc posé à plat sur des mailles solides, seize ressorts en parallèle (tous les coins de mailles le long de la surface)
+    → coins saillants seulement ; sans la rotation dans la masse effective, un contact en coin oscillait deux à trois fois trop vite
+    et le ressort explicite s'emballait ;
+  - de l'eau fuyait à travers les bords du domaine par le débit collé au corps sur les faces de bord → faces intérieures seulement ;
+  - deux blocs empilés : le contact entre les blocs prenait la raideur du contact bloc-sol (une raideur par corps au lieu d'une par
+    contact) ; le signe de l'amortisseur sur le second corps d'une paire était inversé (le bloc du dessus relancé quand celui du
+    dessous s'enfonçait) ; détendre un ressort en gardant sa force rendait de l'énergie (+20 % par détente au fond d'un rebond) ;
+  - le film de fluide sous un bloc posé à plat ne faisait que quelques microns ; à chaque frémissement du bloc, son volume variait
+    de plusieurs fois le sien en un pas, et la détente y rendait la température négative (pas refaits sans fin, bloc relancé jusqu'à
+    0.8 m/s, deux blocs empilés non calculés en 25 minutes) → peau de contact. Les blocs empilés se calculent maintenant en 199 pas
+    (5 s).
+- Validations : § 7.
+- Limites : formes convexes seulement ; un corps posé reste à ~0.3 maille de ce qui le porte (peau) ; la vitesse de l'autre corps
+  d'une paire libre est celle du pas précédent (choc de deux disques à 0.777 pour 0.8) ; le film de fluide entre deux surfaces
+  n'est pas résolu (pas de lubrification : le rebond dans un liquide ne faiblit que par la traînée, comparaison avec Gondret et al.
+  à faire).
 
 ## 9. Choix (validés le 2026-11-24)
 
 - Corps rigides seulement, en 2D, formes convexes (disque, rectangle, polygone).
 - Couplage par domaine fictif (phase rigide dans le mélange), avec repli monolithique si les corps légers posent problème.
-- Ordre : corps fixes, puis mouvement imposé, puis mouvement libre, puis contacts ; une température par corps au début.
+- Ordre : corps fixes, puis mouvement imposé, puis mouvement libre, puis contacts (faits) ; une température par corps au début.
 - Pas de corps de forme quelconque au début : plus tard, par décomposition en polygones convexes.
 
 ## Références

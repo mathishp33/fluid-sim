@@ -355,6 +355,9 @@ pub struct BodyMotion {
     pub locked: [bool; 3],
     /// masse volumique propre du corps (kg/m³), à la place de celle du matériau
     pub rho: Option<f64>,
+    /// contacts : coefficient de restitution et de frottement (sinon ceux par défaut)
+    pub restitution: Option<f64>,
+    pub friction: Option<f64>,
 }
 
 impl BodyMotion {
@@ -406,6 +409,12 @@ impl BodySpec {
         let mut b = RigidBody::new(shape, material, pos, temp);
         b.angle = angle;
         b.rho = motion.rho;
+        if let Some(e) = motion.restitution {
+            b.restitution = e;
+        }
+        if let Some(m) = motion.friction {
+            b.friction = m;
+        }
         if motion.free {
             b.motion = Motion::Free;
             b.dof = Dof { x: !motion.locked[0], y: !motion.locked[1], rot: !motion.locked[2] };
