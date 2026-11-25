@@ -6,7 +6,8 @@
 //!
 //! * Corps libres : pression et vitesse résolues ensemble dans la projection (`body_couplings`, `BodyLowRank` : masse ajoutée
 //!   implicite) ; frottement sur la vitesse du mélange fluide + corps (`mixture_velocity`) ; force du fluide dans `body_force`.
-//!   La traînée d'un corps EN MOUVEMENT est encore deux fois trop forte (SOLID.md § 8).
+//!   Fluide collé aux corps en mouvement porté par le déplacement géométrique, transport relatif (`body_attached_flux`) ; traînée
+//!   d'un corps en mouvement approchée à 10 mailles par diamètre (SOLID.md § 8).
 //!
 //! * La fraction de chaque maille occupée par les corps (`MultiphaseSim::body_frac`) entre dans la fermeture : Σ m/ρ + α_corps = 1
 //!   (`cell_volume`, `cell_closure_g`).
@@ -702,6 +703,65 @@ impl super::multiphase::MultiphaseSim {
         (wu, wv)
     }
 
+    /// Débit du fluide COLLÉ aux corps en mouvement, A V_corps aux faces qu'ils portent (None sans corps en mouvement). Le volume
+    /// qu'un corps balaie est déplacé par `push_fluid` ; le transport des masses et les bilans de volume (divergence de la projection,
+    /// travail de pression) ne voient que le débit RELATIF u − A V_corps. Sans cela, le fluide qui avance avec le corps sortait deux
+    /// fois de la maille qu'il quitte : la projection le freinait devant le corps (fluide qui borde à 0.8 V un disque qui suit le
+    /// courant ; traînée d'un disque tiré deux fois trop forte).
+    pub(crate) fn body_attached_flux(&self) -> Option<(Vec<f64>, Vec<f64>)> {
+        let (nx, ny) = (self.nx, self.ny);
+        if !self.has_moving_bodies() || self.body_vel_u.len() != (nx + 1) * ny || self.body_vel_v.len() != nx * (ny + 1) {
+            return None;
+        }
+        let mut eu = vec![0.0; (nx + 1) * ny];
+        let mut ev = vec![0.0; nx * (ny + 1)];
+        for j in 0..ny {
+            for i in 0..=nx {
+                let f = j * (nx + 1) + i;
+                let vb = self.body_vel_u[f];
+                if vb != 0.0 {
+                    eu[f] = self.u_open(i, j) * vb;
+                }
+            }
+        }
+        for j in 0..=ny {
+            for i in 0..nx {
+                let f = j * nx + i;
+                let vb = self.body_vel_v[f];
+                if vb != 0.0 {
+                    ev[f] = self.v_open(i, j) * vb;
+                }
+            }
+        }
+        Some((eu, ev))
+    }
+
+    /// Inverse de `mixture_velocity` avec la position COURANTE des corps : débit u = w − (1 − A) V_corps aux faces qu'un corps porte.
+    pub(crate) fn mixture_to_flux(&self, wu: &mut [f64], wv: &mut [f64]) {
+        let (nx, ny) = (self.nx, self.ny);
+        if self.body_vel_u.len() != wu.len() || self.body_vel_v.len() != wv.len() {
+            return;
+        }
+        for j in 0..ny {
+            for i in 0..=nx {
+                let f = j * (nx + 1) + i;
+                let vb = self.body_vel_u[f];
+                if vb != 0.0 {
+                    wu[f] -= (1.0 - self.u_open(i, j)) * vb;
+                }
+            }
+        }
+        for j in 0..=ny {
+            for i in 0..nx {
+                let f = j * nx + i;
+                let vb = self.body_vel_v[f];
+                if vb != 0.0 {
+                    wv[f] -= (1.0 - self.v_open(i, j)) * vb;
+                }
+            }
+        }
+    }
+
     /// Force visqueuse par unité de volume (∇·τ, N/m³) à la face u (i, j), 1 ≤ i < nx, ou v (i, j), 1 ≤ j < ny, pour les vitesses de
     /// face (wu, wv) et la viscosité `mu` par maille : mêmes formules que `add_forces` (tenseur symétrique complet, glissement libre
     /// contre les parois et les solides).
@@ -865,52 +925,6 @@ impl super::multiphase::MultiphaseSim {
         self.push_fluid(&old);
     }
 
-    /// Ouverture de chaque face u et v (1 sans corps).
-    pub(crate) fn face_openings(&self) -> (Vec<f64>, Vec<f64>) {
-        let (nx, ny) = (self.nx, self.ny);
-        let mut ou = vec![1.0; (nx + 1) * ny];
-        let mut ov = vec![1.0; nx * (ny + 1)];
-        for j in 0..ny {
-            for i in 0..=nx {
-                ou[j * (nx + 1) + i] = self.u_open(i, j);
-            }
-        }
-        for j in 0..=ny {
-            for i in 0..nx {
-                ov[j * nx + i] = self.v_open(i, j);
-            }
-        }
-        (ou, ov)
-    }
-
-    /// Après le déplacement des corps : vitesses prédites (us, vs) des faces dont l'ouverture a changé. La part d'une face que le corps
-    /// découvre se remplit de fluide qui va à la vitesse du corps (il occupait la place à l'instant d'avant : non-glissement des
-    /// mailles « fraîches » des méthodes de frontières immergées) ; une face qui se ferme garde la vitesse du fluide dans sa part encore
-    /// ouverte. Sans cela, le fluide qui comble la place derrière un corps qui avance partait au repos : un disque tiré dans l'huile
-    /// avait deux fois la traînée du même disque fixe dans un courant (frottement ×3.7, pression ×1.9 à Re = 20).
-    pub(crate) fn carry_face_openings(&self, before: &(Vec<f64>, Vec<f64>), vel_before: &(Vec<f64>, Vec<f64>), us: &mut [f64], vs: &mut [f64]) {
-        let after = self.face_openings();
-        let fix = |a0: f64, a1: f64, v0: f64, v1: f64, x: &mut f64| {
-            if a1 < a0 {
-                *x *= if a0 > 0.0 { a1 / a0 } else { 0.0 };
-            } else if a1 > a0 {
-                let vb = if v0 != 0.0 { v0 } else { v1 };
-                *x += (a1 - a0) * vb;
-            }
-        };
-        let get = |v: &Vec<f64>, f: usize| v.get(f).copied().unwrap_or(0.0);
-        for f in 0..us.len() {
-            if before.0[f] != after.0[f] {
-                fix(before.0[f], after.0[f], get(&vel_before.0, f), self.u_body_vel(f), &mut us[f]);
-            }
-        }
-        for f in 0..vs.len() {
-            if before.1[f] != after.1[f] {
-                fix(before.1[f], after.1[f], get(&vel_before.1, f), self.v_body_vel(f), &mut vs[f]);
-            }
-        }
-    }
-
     /// le corps k sort-il du domaine ou entre-t-il dans une maille solide ?
     fn body_blocked(&self, k: usize, lx: f64, ly: f64) -> bool {
         let poly = self.bodies[k].world_vertices();
@@ -940,7 +954,7 @@ impl super::multiphase::MultiphaseSim {
         if g[0].abs() + g[1].abs() < 1e-12 {
             return None;
         }
-        let mut best: Option<(usize, f64, isize, isize)> = None;
+        let mut best: Option<(usize, f64)> = None;
         for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
             let (ii, jj) = (i + di, j + dj);
             if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
@@ -951,11 +965,11 @@ impl super::multiphase::MultiphaseSim {
                 continue;
             }
             let score = g[0] * di as f64 + g[1] * dj as f64;
-            if score > 0.0 && best.map_or(true, |(_, s, _, _)| score > s) {
-                best = Some((n, score, di, dj));
+            if score > 0.0 && best.map_or(true, |(_, s)| score > s) {
+                best = Some((n, score));
             }
         }
-        best.map(|(n, _, _, _)| n)
+        best.map(|(n, _)| n)
     }
 
     /// Le fluide que les corps viennent de balayer dans une maille passe à la maille voisine du côté opposé au corps (direction
@@ -1966,6 +1980,81 @@ mod tests {
         let q = 0.5 * rho * u * u * d * n.max(1) as f64;
         eprintln!("    (tiré : frottement C_Df = {:.3}, pression C_Dp = {:.3})", sv / q, (sum - sv) / q);
         (sum / q, s.step_count)
+    }
+
+    /// Disque qui avance À LA VITESSE du courant (mouvement imposé dans un écoulement uniforme) : le fluide est au repos par rapport à
+    /// lui, la force doit être nulle — toute force est un défaut du bord mobile. Diagnostic : `cargo test --release co_moving --
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn co_moving_disc_diag() {
+        for (fluid, u) in [("huile", 0.142), ("eau", 0.142)] {
+            let (d, cells) = (0.01, 10usize);
+            let dx = d / cells as f64;
+            let mut s = scene(&format!(
+                "départ scénario \"cuve vide\" grille {} x {} maille {dx} m\n\
+                 gravité (0, 0)\n\
+                 remplir partout avec \"{fluid}\" à 20 °C\n\
+                 bord haut mur\n\
+                 bord bas mur\n\
+                 bord gauche entrée ({u}, 0) m/s à 20 °C \"{fluid}\"\n\
+                 bord droite ouvert\n\
+                 vitesse partout ({u}, 0) m/s\n\
+                 corps disque ({}, {}) rayon {} \"acier\" vitesse ({u}, 0) m/s\n",
+                30 * cells,
+                10 * cells,
+                5.0 * d,
+                5.0 * d,
+                0.5 * d
+            ));
+            s.surface_tension = false;
+            let rho = s.rho_mix[5];
+            let q = 0.5 * rho * u * u * d;
+            let mut line = String::new();
+            let (mut sum, mut sv, mut n) = (0.0, 0.0, 0usize);
+            while s.time < 10.0 * d / u && !s.diverged {
+                s.step();
+                if s.step_count % 40 == 0 {
+                    line += &format!(" {:.3}/{:.3}", s.body_force[0][0] / q, s.body_force_visc[0][0] / q);
+                }
+                if s.time > 3.0 * d / u {
+                    sum += s.body_force[0][0];
+                    sv += s.body_force_visc[0][0];
+                    n += 1;
+                }
+            }
+            let m = n.max(1) as f64;
+            // vitesse du mélange (u + (1 − A) V) / V aux faces u, par classe d'ouverture
+            let (wu, _) = s.mixture_velocity();
+            let mut classes: [(f64, f64, f64, usize); 4] = [(0.0, f64::MAX, f64::MIN, 0); 4];
+            for j in 0..s.ny {
+                for i in 1..s.nx {
+                    let f = j * (s.nx + 1) + i;
+                    let (a, c) = (s.body_frac[j * s.nx + i - 1], s.body_frac[j * s.nx + i]);
+                    if a.max(c) <= 0.0 && !(i > 1 && s.body_frac[j * s.nx + i - 2] > 0.0) && !(i + 1 < s.nx && s.body_frac[j * s.nx + i + 1] > 0.0) {
+                        continue;
+                    }
+                    let open = s.u_open(i, j);
+                    let k = if a.max(c) <= 0.0 { 3 } else if open <= 0.0 { if a.min(c) >= 1.0 - FLUID_TRACE { 0 } else { 1 } } else { 2 };
+                    let r = wu[f] / u;
+                    let e = &mut classes[k];
+                    e.0 += r;
+                    e.1 = e.1.min(r);
+                    e.2 = e.2.max(r);
+                    e.3 += 1;
+                }
+            }
+            let names = ["intérieur", "fermées au bord", "partiellement ouvertes", "voisines hors du corps"];
+            let stats: Vec<String> = classes.iter().zip(names).map(|(c, nm)| format!("{nm} {:.3} [{:.3} … {:.3}] ({})", c.0 / c.3.max(1) as f64, c.1, c.2, c.3)).collect();
+            eprintln!("    w/V aux faces u : {}", stats.join(" ; "));
+            eprintln!(
+                "disque qui suit le courant ({fluid}, {u} m/s) : force moyenne en unités de ½ρU²d : {:.3} (frottement {:.3}, pression {:.3}) ; au fil des pas (total/frottement) :{line} ; {} pas",
+                sum / m / q,
+                sv / m / q,
+                (sum - sv) / m / q,
+                s.step_count
+            );
+        }
     }
 
     /// Convergence en maillage de la traînée d'un disque tiré (Re = 20, domaine de 30 × 10 diamètres, trajet de 15 diamètres).

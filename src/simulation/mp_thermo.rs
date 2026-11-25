@@ -882,6 +882,8 @@ impl MultiphaseSim {
     pub(crate) fn pressure_work(&mut self, dt: f64) {
         let (nx, ny) = (self.nx, self.ny);
         let ng = self.groups.len();
+        // corps en mouvement : débit du fluide qui leur est collé (voir `body_attached_flux`)
+        let attached = self.body_attached_flux();
         let ep = SyncPtr(self.e.as_mut_ptr());
         let tp = SyncPtr(self.temp.as_mut_ptr());
         let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
@@ -899,7 +901,9 @@ impl MultiphaseSim {
                 // où p·∇·u n'a plus de sens physique (et divise par une capacité calorifique qui tend vers 0)
                 // (+ divergence du flux de percolation : le fluide des pores se détend ou se comprime aussi)
                 let dq = if this.percolation { this.divergence_of(&this.q_u, &this.q_v, i, j) } else { 0.0 };
-                let d = (dt * (this.divergence_of(&this.u, &this.v, i, j) + dq)).clamp(-0.5, 0.5) / dt;
+                // (corps en mouvement : débit relatif, le volume qu'ils balaient porte son travail dans `push_fluid`)
+                let da = attached.as_ref().map_or(0.0, |(eu, ev)| this.divergence_of(eu, ev, i, j));
+                let d = (dt * (this.divergence_of(&this.u, &this.v, i, j) - da + dq)).clamp(-0.5, 0.5) / dt;
                 // au plus −50 % / +100 % de T par pas, et pas de refroidissement sous T_PW_MIN : une cellule presque vide (liquide
                 // arraché, poche de gaz raréfiée par un écoulement violent) a une capacité calorifique quasi nulle et p·∇·u y donnerait des
                 // températures absurdes (< 50 K → pas refusé à tout dt). L'énergie ainsi écrêtée est négligeable (capacité ~0).

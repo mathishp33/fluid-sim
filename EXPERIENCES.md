@@ -281,4 +281,5 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
   `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`. Les corps ne se
   touchent pas encore entre eux : un corps libre s'arrête net contre un bord du domaine ou un solide (les contacts sont l'étape 4 de
-  SOLID.md), et la traînée d'un corps en mouvement est encore trop forte (SOLID.md § 8).
+  SOLID.md), et la traînée d'un corps en mouvement n'est qu'approchée à 10 mailles par diamètre (+20 à +55 %,
+  SOLID.md § 8).

@@ -346,6 +346,14 @@ impl MultiphaseSim {
         self.probe("début");
         lap(&mut prof, P_OTHER);
         let (un, vn) = (self.u.clone(), self.v.clone());
+        // corps en mouvement (mp_bodies.rs) : la quantité de mouvement transportée est celle du MÉLANGE fluide + corps des faces,
+        // w = u + (1 − A) V_corps, régulière (rigide dans les corps, la vitesse du fluide autour) ; le débit u, nul dans les corps et
+        // réduit à A V au bord, ne se transporte pas comme une vitesse : un disque qui avance avec le courant laissait le fluide qui le
+        // borde à 0.8 V (frottement et pression parasites). Le débit se déduit ensuite de w avec la position des corps après leur pas.
+        let mixture = if self.has_moving_bodies() { Some(self.mixture_velocity()) } else { None };
+        // débit du fluide collé aux corps en mouvement (position du début du pas) : le transport des masses ne voit que le débit relatif
+        // (voir `body_attached_flux`)
+        let attached = self.body_attached_flux();
         // 2. prédiction de vitesse
         let (mut us, mut vs);
         if self.conservative_momentum {
@@ -354,38 +362,53 @@ impl MultiphaseSim {
             let mut fy = vec![0.0; self.v.len()];
             self.add_forces(dt, &mut fx, &mut fy);
             lap(&mut prof, P_FORCES);
-            self.advect_mass_energy_with(dt);
+            self.advect_mass_energy_rel(dt, attached.as_ref());
             lap(&mut prof, P_ADVECT_MASS);
-            let (mut ua, mut va) = self.advect_momentum();
+            let (mut ua, mut va) = match &mixture {
+                Some((wu, wv)) => {
+                    let (fu, fv) = (std::mem::replace(&mut self.u, wu.clone()), std::mem::replace(&mut self.v, wv.clone()));
+                    let r = self.advect_momentum();
+                    self.u = fu;
+                    self.v = fv;
+                    r
+                }
+                None => self.advect_momentum(),
+            };
             for (a, f) in ua.iter_mut().zip(&fx) { *a += *f; }
             for (a, f) in va.iter_mut().zip(&fy) { *a += *f; }
             us = ua;
             vs = va;
             lap(&mut prof, P_ADVECT_MOM);
         } else {
-            let (mut a, mut b) = self.advect_velocity(dt);
+            let (mut a, mut b) = match &mixture {
+                Some((wu, wv)) => {
+                    let (fu, fv) = (std::mem::replace(&mut self.u, wu.clone()), std::mem::replace(&mut self.v, wv.clone()));
+                    let r = self.advect_velocity(dt);
+                    self.u = fu;
+                    self.v = fv;
+                    r
+                }
+                None => self.advect_velocity(dt),
+            };
             lap(&mut prof, P_ADVECT_MOM);
             self.add_forces(dt, &mut a, &mut b);
             lap(&mut prof, P_FORCES);
-            self.advect_mass_energy_with(dt);
+            self.advect_mass_energy_rel(dt, attached.as_ref());
             lap(&mut prof, P_ADVECT_MASS);
             us = a;
             vs = b;
         }
-        // corps à mouvement imposé (mp_bodies.rs) : ils avancent pendant que le fluide est transporté (les flux de ce pas ont été
-        // calculés par la projection précédente pour faire place au volume qu'ils balaient)
-        if self.has_moving_bodies() {
-            let open_before = self.face_openings();
-            let vel_before = (self.body_vel_u.clone(), self.body_vel_v.clone());
+        // corps à mouvement imposé ou libres (mp_bodies.rs) : ils avancent pendant que le fluide est transporté (les flux de ce pas ont
+        // été calculés par la projection précédente pour faire place au volume qu'ils balaient)
+        if let Some((wu, wv)) = mixture {
             self.move_bodies(self.time, self.time + dt);
-            // faces que les corps ouvrent ou ferment : vitesse du fluide qui les remplit (voir `carry_face_openings`) — sur la vitesse
-            // prédite et sur la vitesse courante, dont la vitesse du mélange (frottement des corps) doit suivre la nouvelle position (la
-            // divergence de la vitesse qui a transporté les masses, `un`, `vn`, est gardée à part)
-            self.carry_face_openings(&open_before, &vel_before, &mut us, &mut vs);
-            let (mut uc, mut vc) = (std::mem::take(&mut self.u), std::mem::take(&mut self.v));
-            self.carry_face_openings(&open_before, &vel_before, &mut uc, &mut vc);
-            self.u = uc;
-            self.v = vc;
+            // débits déduits des vitesses du mélange avec la nouvelle position des corps : prédits (us, vs) et courants (dont la vitesse
+            // du mélange sert au frottement des corps ; la divergence de la vitesse qui a transporté les masses, `un`, `vn`, est à part)
+            self.mixture_to_flux(&mut us, &mut vs);
+            let (mut cu, mut cv) = (wu, wv);
+            self.mixture_to_flux(&mut cu, &mut cv);
+            self.u = cu;
+            self.v = cv;
         }
         // percolation : le fluide traverse les lits tassés et les grilles avec les flux de Darcy de la dernière projection
         self.percolate(dt);
@@ -450,7 +473,12 @@ impl MultiphaseSim {
             self.apply_implicit_viscosity(dt, &mut us, &mut vs);
             lap(&mut prof, P_FORCES);
         }
-        let (ua, va) = match &self.adv_vel { Some((a, b)) => (a.clone(), b.clone()), None => (un.clone(), vn.clone()) };
+        let (mut ua, mut va) = match &self.adv_vel { Some((a, b)) => (a.clone(), b.clone()), None => (un.clone(), vn.clone()) };
+        // (divergence de la vitesse qui a transporté les masses : débit relatif aux corps en mouvement)
+        if let Some((eu, ev)) = &attached {
+            ua.iter_mut().zip(eu).for_each(|(x, e)| *x -= *e);
+            va.iter_mut().zip(ev).for_each(|(x, e)| *x -= *e);
+        }
         self.last_pressure_iters = self.solve_pressure(dt, &us, &vs, &ua, &va, &err0);
         self.probe("pression");
         lap(&mut prof, P_PRESSURE);
@@ -507,6 +535,29 @@ impl MultiphaseSim {
     }
 
     /// advection masse / énergie avec la vitesse imposée par le correcteur (sinon la vitesse courante u^n)
+    /// `advect_mass_energy_with` avec le débit RELATIF aux corps en mouvement (`attached` : débit du fluide qui leur est collé)
+    fn advect_mass_energy_rel(&mut self, dt: f64, attached: Option<&(Vec<f64>, Vec<f64>)>) {
+        let Some((eu, ev)) = attached else {
+            self.advect_mass_energy_with(dt);
+            return;
+        };
+        let sub = |a: &mut Vec<f64>, e: &Vec<f64>, k: f64| a.iter_mut().zip(e).for_each(|(x, y)| *x -= k * *y);
+        let (u0, v0) = (self.u.clone(), self.v.clone());
+        sub(&mut self.u, eu, 1.0);
+        sub(&mut self.v, ev, 1.0);
+        if let Some((a, b)) = &mut self.adv_vel {
+            sub(a, eu, 1.0);
+            sub(b, ev, 1.0);
+        }
+        self.advect_mass_energy_with(dt);
+        self.u = u0;
+        self.v = v0;
+        if let Some((a, b)) = &mut self.adv_vel {
+            sub(a, eu, -1.0);
+            sub(b, ev, -1.0);
+        }
+    }
+
     fn advect_mass_energy_with(&mut self, dt: f64) {
         if let Some((ua, va)) = self.adv_vel.take() {
             let un = std::mem::replace(&mut self.u, ua);

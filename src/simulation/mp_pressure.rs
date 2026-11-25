@@ -706,6 +706,9 @@ impl MultiphaseSim {
         }
         let couplings: Vec<BodyCoupling> = if self.has_bodies() { self.body_couplings(dt) } else { vec![] };
         let psrc: Vec<f64> = if self.push_src.len() == n { self.push_src.clone() } else { vec![] };
+        // débit du fluide collé aux corps en mouvement, position après leur pas : la divergence qui compte pour le pas suivant est celle
+        // du débit relatif (voir `body_attached_flux`)
+        let attached = self.body_attached_flux();
         let dx2 = self.dx * self.dx;
         let act: Vec<bool> = (0..n).map(|m| !self.is_solid(m) && !self.pinned(m) && !self.body_trace(m)).collect();
         let lowrank = if couplings.iter().any(|c| c.free) {
@@ -778,6 +781,9 @@ impl MultiphaseSim {
                         continue;
                     }
                     let mut d_new = self.divergence_of(&ut, &vt, i, j);
+                    if let Some((eu, ev)) = &attached {
+                        d_new -= self.divergence_of(eu, ev, i, j);
+                    }
                     let mut d_old = self.divergence_of(un, vn, i, j);
                     if let Some((qu, qv)) = &qt {
                         d_new += self.divergence_of(qu, qv, i, j);

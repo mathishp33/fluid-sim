@@ -7,8 +7,8 @@ leur forme ni leur inertie propre.
 
 Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé), 1 (corps
 FIXES : l'eau les contourne sans y entrer), 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues) et 3 (corps LIBRES : flotteur,
-clapet, pendule, corps qui coule) sont faites (§ 8, `mp_bodies.rs`). Reste à corriger à l'étape 3 : la traînée d'un corps EN
-MOUVEMENT est deux fois trop forte (§ 8). Viennent ensuite les contacts (§ 7).
+clapet, pendule, corps qui coule) sont faites (§ 8, `mp_bodies.rs`). La traînée d'un corps EN MOUVEMENT converge en maillage, mais
+reste approchée à 10 mailles par diamètre (§ 8). Viennent ensuite les contacts (§ 7).
 
 **En bref — recommandation**
 
@@ -290,6 +290,15 @@ de la projection, comme chez Batty et al. (2007) et Gibou & Min (2012).
   fluide qu'il entraîne : c'était compter deux fois l'inertie de ce fluide, déjà dans la masse ajoutée (C_a mesuré 1.4 à 1.9).
 - **Conditions de pas.** La surface d'un corps libre parcourt au plus 0.15 maille par pas. Près d'un corps qui bouge, la viscosité
   reste explicite : la viscosité implicite ne voit pas sa vitesse, et un disque dans l'huile faisait exploser les pas plus longs.
+- **Fluide collé au corps (tout corps en mouvement, imposé ou libre).** Aux faces qu'un corps en mouvement porte, le débit A V_corps
+  du fluide qui avance avec lui est porté par le déplacement géométrique (`push_fluid`). Le transport des masses et les bilans de
+  volume (divergence de la projection, travail de pression) ne voient que le débit relatif u − A V_corps (`body_attached_flux`).
+  Avant, ce fluide sortait deux fois de la maille qu'il quitte, une fois transporté et une fois déplacé, et la projection le freinait
+  devant le corps. Révélateur : un disque qui avance à la vitesse du courant, où toute force est un défaut, avait le fluide qui le
+  borde à 0.8 V et une traînée de 2.4 ½ρU²d.
+- **Quantité de mouvement du mélange.** Le transport de la quantité de mouvement porte la vitesse du mélange w = u + (1 − A) V_corps,
+  régulière (rigide dans les corps) ; le débit s'en déduit ensuite avec la position des corps après leur pas (`mixture_to_flux`). Le
+  débit, nul dans le corps et réduit à A V au bord, ne se transporte pas comme une vitesse.
 
 ### 6.3 Contacts
 
@@ -329,7 +338,7 @@ de la projection, comme chez Batty et al. (2007) et Gibou & Min (2012).
 | 0 (faite) | préparer (§ 8) : géométrie exacte, fractions, contraintes, fermeture, état, rendu ; aucun résultat changé | Σ α dx² = aire (1e-12) quels que soient la position et l'angle ; empreintes physiques des 18 scénarios identiques au bit près |
 | 1 (faite) | corps fixes : poser un corps chasse le fluide (trace dans les mailles couvertes) ; ouvertures des faces dans la projection, le transport, la percolation, la conduction et la diffusion ; commande `corps`, outil de la fenêtre d'expérience | fermeture à 1e-9 après la pose ; eau au repos autour de deux corps : 1.8e-7 m/s, pression à 3 mPa près ; canal autour d'un disque : débit identique entrée / disque / sortie, passages à 0.284 m/s (0.273 attendus), rien n'entre dans le corps ; barrage contre un muret et un disque : masse d'eau à 4e-16, aucun pas refait |
 | 2 (faite) | mouvement imposé : vitesse et rotation constantes, oscillation sinusoïdale, pivot ; fluide balayé déplacé, travail p·dV, entraînement | piston dans un tube d'air fermé : γ = 1.4014 par la pression et 1.3990 par la température (attendu : 1.40), masse de gaz à 2e-7 ; disque tiré dans l'eau : la pression d'une sonde saute de 1.5 Pa au plus quand il traverse les mailles, masse d'eau à 2e-16 ; palette sur pivot : eau brassée à 0.11 m/s près des bouts (ω r = 0.11) ; lois intégrées exactement (une oscillation revient pile à son départ) |
-| 3 (faite, traînée à reprendre) | mouvement libre + masque de DDL et pivot ; couplage monolithique pression–corps ; force du fluide sur tout corps (mesurable) | corps de la densité de l'eau immobile (2 µm en 1 s, force du fluide = poids à 6 chiffres) ; chute dans l'air : vitesse à 0.1 % ; masse ajoutée d'un disque lâché ou accéléré dans l'eau : C_a = 0.94 à 1.04 (1 attendu) ; flotteurs : tirant d'eau à 0.7 mm près (bois 0.6, liège 0.24), oscillation qui s'amortit ; pendule dans l'air : période à 0.03 % ; clapet flottant redressé à la verticale ; traînée d'un disque FIXE à Re 20 / 40 : −11 % / −9 % de Dennis & Chang (1970). MAIS la traînée d'un disque tiré ou qui sédimente est deux fois trop forte, et ne converge pas en maillage |
+| 3 (faite) | mouvement libre + masque de DDL et pivot ; couplage monolithique pression–corps ; force du fluide sur tout corps (mesurable) | corps de la densité de l'eau immobile (2 µm en 1 s, force du fluide = poids à 6 chiffres) ; chute dans l'air : vitesse à 0.1 % ; masse ajoutée d'un disque lâché ou accéléré dans l'eau : C_a = 0.94 à 1.04 (1 attendu) ; flotteurs : tirant d'eau à 0.7 mm près (bois 0.6, liège 0.24), oscillation qui s'amortit ; pendule dans l'air : période à 0.03 % ; clapet flottant redressé à la verticale ; traînée d'un disque FIXE à Re 20 / 40 : −11 % / −9 % de Dennis & Chang (1970) ; disque TIRÉ à Re 20 : C_D 2.68 à 10 mailles par diamètre, 1.61 à 20 (Dennis & Chang : 2.05), pression à 20 mailles 1.26 (≈ 1.24) ; disque qui sédimente dans l'huile : vitesse limite à −23 % |
 | 4 | contacts | disque posé sur le fond (repos sans tremblement), deux disques ; rebond dans un liquide qui faiblit avec le nombre de Stokes (Gondret et al. 2002, sphères) |
 | 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
@@ -387,11 +396,12 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
 - Commande `corps … vitesse (vx, vy) | rotation ω | oscillation (vx, vy) période T | oscillation rotation ω période T | pivot (x, y)`
   (EXPERIENCES.md). Exemples : `experiences/piston.exp` (adiabatique), `experiences/vagues.exp` (batteur à vagues). État complet en
   version 13.
-- Depuis l'étape 3, la force du fluide sur un corps imposé est calculée et mesurable. Les faces qu'un corps ouvre se remplissent de
-  fluide à sa vitesse, et le frottement suit la vitesse du mélange. Effets : disque tiré, saut de pression d'un pas 3.2 Pa au lieu de
-  1.5 ; palette 0.126 m/s au lieu de 0.114 ; piston identique au bit près.
+- Depuis l'étape 3, la force du fluide sur un corps imposé est calculée et mesurable, et le mouvement imposé profite des corrections
+  du fluide collé au corps (§ 6.2). Effets : disque tiré dans l'eau, saut de pression d'un pas 9.9 Pa au lieu de 1.5 (le routage du
+  fluide balayé vers une seule voisine fait encore du bruit, § 8) ; palette 0.119 m/s au lieu de 0.114 ; piston identique au bit
+  près.
 
-**Étape 3 (corps libres, faite le 2026-11-25 — traînée des corps en mouvement à reprendre).**
+**Étape 3 (corps libres, faite le 2026-11-25).**
 - Corps `Motion::Free` : axes bloqués un par un (`Dof`), pivot, masse volumique propre (`rho`, état complet en version 14).
   `move_bodies` les avance à la vitesse de la projection précédente. Un corps libre s'arrête net contre un bord du domaine ou un
   solide : il n'y a pas encore de contacts.
@@ -408,15 +418,20 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   Corrigés : `push_src`, et `body_trace` (pression non résolue, reprise de la voisine quand le corps découvre la maille). Il reste
   un niveau qui oscille de quelques kPa dans une cuve fermée pleine de liquide, sans effet sur les forces.
 - Validations : § 7. Diagnostics (`--ignored`) : `added_mass_of_a_disc_diag`, `imposed_acceleration_force_diag`,
-  `drag_of_a_fixed_disc_diag`, `towed_drag_resolution_diag`, `settling_disc_diag`.
-- **À reprendre : la traînée d'un corps EN MOUVEMENT.** Même disque, même nombre de Reynolds (20, 10 mailles par diamètre) :
-  - fixe dans un courant : C_D = 1.83 (frottement 0.57, pression 1.25 ; Dennis & Chang : 2.05) ;
-  - tiré dans le fluide au repos : C_D = 4.3 (frottement 1.9, pression 2.4).
-  L'écart CROÎT quand on raffine (C_D ≈ 6.7 à 20 mailles) et quand le pas diminue (≈ 5.1 à un pas quatre fois plus petit) : c'est un
-  défaut numérique du bord mobile, pas de la physique. Conséquence : un disque qui sédimente dans l'huile tombe à environ 0.065 m/s
-  au lieu de 0.142 (stable, sans dérive). Essais
-  sans effet : remplir de fluide à la vitesse du corps les faces qu'il découvre (4.5 → 4.3) ; déposer le fluide balayé hors du corps
-  (pire, 5.7). La statique, la masse ajoutée et les corps lents ne sont pas touchés.
+  `drag_of_a_fixed_disc_diag`, `towed_drag_resolution_diag`, `co_moving_disc_diag`, `settling_disc_diag`.
+- **Traînée d'un corps EN MOUVEMENT (corrigée le 2026-11-25).** Dans la première version, même disque, Re = 20, 10 mailles par
+  diamètre : fixe dans un courant C_D = 1.83 (frottement 0.57, pression 1.25 ; Dennis & Chang : 2.05), mais tiré dans le fluide au
+  repos C_D = 4.3, et l'écart croissait quand on raffinait (6.7 à 20 mailles) et quand le pas diminuait. Cause : le fluide collé au
+  corps comptait deux fois (§ 6.2). Après correction :
+  - disque tiré à Re = 20 : C_D = 2.68 à 10 mailles par diamètre (frottement 0.80, pression 1.88), 1.61 à 20 mailles (frottement
+    0.35, pression 1.26) — l'écart décroît maintenant avec la maille, la pression rejoint Dennis & Chang (≈ 1.24) ;
+  - disque tiré, domaine de 45 × 15 diamètres : C_D = 2.47 à Re = 20 et 2.36 à Re = 40 (fixe : 1.83 et 1.38) ;
+  - disque qui sédimente dans l'huile (Re visé 20) : 0.109 m/s pour 0.142 (−23 %, Re 15), au lieu de 0.065.
+  Restent : le frottement, trop faible à 20 mailles (non-glissement étalé sur une maille), et un bruit de pression sur les corps en
+  mouvement dans l'eau (force d'un disque qui suit le courant qui varie de plusieurs ½ρU²d d'un pas à l'autre : le fluide balayé va
+  à une seule voisine, alors que le fluide collé quitte la maille par deux faces sur un bord oblique). Répartir le volume balayé
+  entre les voisines, au prorata du débit collé qui sort par chaque face, améliorait la traînée (2.36) mais cassait un flotteur à la
+  ligne d'eau (mailles mêlées d'eau et d'air) : écarté. Diagnostic : `co_moving_disc_diag` (disque qui suit le courant).
 - Pas encore : contacts (étape 4), chaleur des corps (étape 5), grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre,
   la masse ajoutée apparente monte jusqu'à 1.4 (la correction de fermeture était prévue pour l'ancien pas).
 
