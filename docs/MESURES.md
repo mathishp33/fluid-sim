@@ -13,6 +13,8 @@ Légende de la colonne « Écart » : **exact** = au chiffre imprimé ou à l'ar
 | Grandeur | Simulé | Référence | Écart | Conditions |
 |---|---|---|---|---|
 | Courants parasites d'une cuve d'eau au repos | 5e-11 m/s | 0 | — | hydrostatique ; pression au fond exacte |
+| Poussée de l'eau sur un bloc de mailles solides immergé (6 × 4 cm) | 23.5017 N/m vers le haut, 0 de côté | Archimède ρ g A : 23.5017 N/m | exact | mesure `force y sur <zone>` |
+| Poussée de 10 cm d'eau sur un muret de mailles solides | 48.921 N/m | ½ (ρ_eau − ρ_air) g H² : 48.903 N/m | +0.04 % | mesure `force x sur <zone>` |
 | Air au repos dans une cuve aux côtés ouverts | 7.6e-8 m/s après 5 s | 0 | — | 60 × 40, maille 1 cm ; avant la colonne compressible du bord : 4 mm/s, croissant sans fin |
 | Montée de pression d'une eau confinée chauffée | Δp = β/κ ΔT | β/κ ΔT (dilatation / compressibilité) | 0.25 % | boîte fermée pleine d'eau |
 | Pulsation du ballottement d'une surface libre | ω² | g k tanh(k h) | +1 % | mode fondamental |

@@ -186,6 +186,10 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
   - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple | température` : position (m), angle (°), vitesse (m/s, °/s) du
     n-ième corps posé, force du fluide sur lui (N/m ; couple autour de son centre de masse, N) à la dernière projection, ou sa
     température (K) ;
+  - `force x | y sur <zone>` : force du fluide sur les mailles SOLIDES de la zone (N par mètre de profondeur), celles qui y sont au
+    moment du relevé : la pression de chaque maille fluide voisine, ramenée par l'hydrostatique au centre de la face commune. Les
+    parois glissent : pas de frottement. Une face contre le bord du domaine ne reçoit rien (un solide posé sur le fond y est plaqué
+    par la pression d'au-dessus) ;
   - `stats` : dt, itérations de pression, pas refaits, masse de chaque fluide, énergies cinétique et interne, T et p extrêmes,
     vitesse maximale, chaleur injectée, et, s'il y a de la chimie, chaleur de réaction, puissance chimique et énergie rayonnée.
 - **Libellés** : `comme "nom"` donne le titre de la colonne.

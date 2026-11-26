@@ -617,3 +617,42 @@ simuler jusqu'à ce que T en (0.06, 0.015) > 320 K au plus 5 s
     // le GPU vérifie après chaque série de pas (au plus 8) : même moment à quelques pas près
     assert!((t_gpu - t_cpu).abs() < 0.05 * t_cpu, "arrêt : CPU {t_cpu} / GPU {t_gpu}");
 }
+
+#[test]
+fn the_fluid_force_on_solid_cells_is_archimedes_and_the_hydrostatic_thrust() {
+    // bloc de mailles solides entouré d'eau au repos : poussée d'Archimède ρ g A vers le haut, rien de côté ; muret qui retient
+    // 10 cm d'eau : poussée horizontale ½ (ρ_eau − ρ_air) g H² (la pression de l'air agit des deux côtés)
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+remplir rect (0, 0) (0.2, 0.18) avec \"eau\" à 20 °C
+solide rect (0.07, 0.06) (0.13, 0.1) \"acier\"
+mesurer toutes les 10 ms : force x sur rect (0.07, 0.06) (0.13, 0.1), force y sur rect (0.07, 0.06) (0.13, 0.1) comme \"poussée\"
+simuler 50 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert_eq!(r.columns[3], "poussée (N/m)");
+    let row = r.rows.last().unwrap();
+    let eau = r.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+    let rho = r.sim.reg.phases[eau].rho(101325.0, 293.15);
+    let expect = rho * 9.81 * 0.06 * 0.04;
+    eprintln!("bloc immergé : force ({:.4}, {:.4}) N/m, Archimède {expect:.4}", row[2], row[3]);
+    assert!(row[2].abs() < 1e-3 * expect, "force de côté {}", row[2]);
+    assert!((row[3] / expect - 1.0).abs() < 2e-3, "poussée {} pour {expect}", row[3]);
+
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+solide rect (0.1, 0) (0.12, 0.15) \"acier\"
+remplir rect (0, 0) (0.1, 0.1) avec \"eau\" à 20 °C
+mesurer toutes les 10 ms : force x sur rect (0.1, 0) (0.12, 0.15)
+simuler 20 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let fx = r.rows.last().unwrap()[2];
+    let air = r.sim.reg.phases.iter().position(|p| p.name == "air").unwrap();
+    let expect = 0.5 * (rho - r.sim.reg.phases[air].rho(101325.0, 293.15)) * 9.81 * 0.1 * 0.1;
+    eprintln!("muret : force x {fx:.4} N/m, ½ Δρ g H² = {expect:.4}");
+    assert!((fx / expect - 1.0).abs() < 1e-2, "poussée sur le muret {fx} pour {expect}");
+    // erreur : zone hors du domaine
+    let e = Runner::new(proto("départ scénario \"cuve vide\" grille 10 x 10\nmesurer toutes les 1 ms : force y sur rect (2, 2) (3, 3)\nsimuler 1 ms\n"), Path::new("."), None, Some(false)).err().unwrap();
+    assert!(e.contains("hors du domaine"), "{e}");
+}

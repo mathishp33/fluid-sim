@@ -242,6 +242,8 @@ pub enum Measure {
     Mass { fluid: String, zone: Zone, label: Option<String> },
     /// position, vitesse ou force du fluide sur un corps rigide (indice à partir de 0, dans l'ordre de pose)
     Body { index: usize, q: BodyQty, label: Option<String> },
+    /// force du fluide (composante x : 0, y : 1) sur les mailles solides de la zone, par mètre de profondeur
+    SolidForce { axis: usize, zone: Zone, label: Option<String> },
 }
 
 /// Grandeur mesurée sur un corps rigide.
@@ -903,6 +905,8 @@ enum ProbeKind {
     Q(QtyR, Reduce),
     Mass(usize),
     Body(usize, BodyQty),
+    /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
+    SolidForce(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +947,38 @@ impl Cond {
     }
 }
 
+/// Force du fluide sur un ensemble de mailles solides (N par mètre de profondeur) : la pression de chaque maille fluide voisine, ramenée
+/// au centre de la face commune par l'hydrostatique (p + ρ g · (x_face − x_maille)), sur la longueur de la face, poussant vers le
+/// solide. Les parois glissent librement : pas de frottement. Les faces entre deux mailles solides et contre le bord du domaine ne
+/// reçoivent rien (un solide collé au bord est plaqué contre lui par la pression du fluide de l'autre côté).
+pub(crate) fn solid_force(sim: &MultiphaseSim, cells: &[usize]) -> [f64; 2] {
+    let (nx, ny, dx) = (sim.nx, sim.ny, sim.dx);
+    let (gx, gy) = (sim.gravity[0], sim.gravity[1]);
+    let mut f = [0.0f64; 2];
+    for &c in cells {
+        if !sim.is_solid(c) {
+            continue;
+        }
+        let (i, j) = ((c % nx) as isize, (c / nx) as isize);
+        // (di, dj) : position de la maille fluide voisine ; la force sur le solide va d'elle vers lui
+        for (di, dj) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+            let (ii, jj) = (i + di, j + dj);
+            if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
+                continue;
+            }
+            let n = jj as usize * nx + ii as usize;
+            if sim.is_solid(n) {
+                continue;
+            }
+            // centre de la face moins centre de la maille fluide : −(di, dj) dx / 2
+            let p = sim.p[n] + sim.rho_mix[n] * (gx * (-(di as f64)) + gy * (-(dj as f64))) * 0.5 * dx;
+            f[0] -= p * dx * di as f64;
+            f[1] -= p * dx * dj as f64;
+        }
+    }
+    f
+}
+
 fn qty_value(sim: &MultiphaseSim, q: QtyR, c: usize) -> f64 {
     let (i, j) = (c % sim.nx, c / sim.nx);
     match q {
@@ -965,6 +1001,7 @@ impl Probe {
         let a2 = sim.dx * sim.dx;
         match self.kind {
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
+            ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Q(q, red) => {
                 let vals = self.cells.iter().filter(|&&c| !(self.fluid_only && sim.is_solid(c))).map(|&c| qty_value(sim, q, c));
@@ -1240,6 +1277,15 @@ impl Runner {
             Measure::Body { index, q, label } => {
                 let name = label.clone().unwrap_or_else(|| format!("corps {} {}", index + 1, q.name()));
                 (Probe { kind: ProbeKind::Body(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
+            }
+            Measure::SolidForce { axis, zone, label } => {
+                // toutes les mailles de la zone : les solides sont retenus au relevé (posés avant ou pendant l'expérience)
+                let cells: Vec<usize> = zone.cells(nx, ny, dx).into_iter().map(|(i, j)| self.sim.idx(i, j)).collect();
+                if cells.is_empty() {
+                    return Err(format!("la zone « {} » est hors du domaine", zone.label()));
+                }
+                let name = label.clone().unwrap_or_else(|| format!("force {} sur {}", ["x", "y"][*axis], zone.label()));
+                (Probe { kind: ProbeKind::SolidForce(*axis), cells, fluid_only: false }, name, "N/m".to_string())
             }
         }))
     }

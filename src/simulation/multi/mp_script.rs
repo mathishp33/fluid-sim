@@ -359,7 +359,7 @@ impl<'a> P<'a> {
     /// seuil d'une condition, dans l'unité où le relevé est mesuré (K, Pa, m/s, m ; angles en degrés, rotations en °/s)
     fn threshold(&mut self, m: &Measure) -> R<f64> {
         let dim = match m {
-            Measure::Probe { reduce: Reduce::Sum, .. } | Measure::Mass { .. } | Measure::Stats => Dim::Plain,
+            Measure::Probe { reduce: Reduce::Sum, .. } | Measure::Mass { .. } | Measure::SolidForce { .. } | Measure::Stats => Dim::Plain,
             Measure::Probe { q, .. } => match q {
                 Quantity::T => Dim::Temp,
                 Quantity::P => Dim::Pressure,
@@ -504,7 +504,7 @@ impl<'a> P<'a> {
         })
     }
     fn measure(&mut self) -> R<Measure> {
-        let w = self.word("une mesure (stats, T en (x, y), moyenne T dans <zone>, masse \"fluide\", corps 1 y)")?;
+        let w = self.word("une mesure (stats, T en (x, y), moyenne T dans <zone>, masse \"fluide\", corps 1 y, force x sur <zone>)")?;
         let reduce = match w.as_str() {
             "moyenne" => Some(Reduce::Mean),
             "max" | "maximum" => Some(Reduce::Max),
@@ -518,6 +518,17 @@ impl<'a> P<'a> {
                 let fluid = self.string("le fluide")?;
                 let zone = if self.eat_w("dans") { self.zone()? } else { Zone::Partout };
                 Measure::Mass { fluid, zone, label: None }
+            }
+            ("force", _) => {
+                let axis = match self.word("la composante de la force (x ou y)")?.as_str() {
+                    "x" => 0,
+                    "y" => 1,
+                    o => return self.err(format!("composante « {o} » de la force : x ou y")),
+                };
+                if !self.eat_w("sur") {
+                    return self.err(format!("il faut « force x | y sur <zone> »{}", self.here()));
+                }
+                Measure::SolidForce { axis, zone: self.zone()?, label: None }
             }
             ("corps", _) => {
                 let n = self.count("le numéro du corps (1 pour le premier posé)")?;
@@ -557,7 +568,7 @@ impl<'a> P<'a> {
         if self.eat_w("comme") {
             let l = self.string("le nom de la colonne")?;
             match &mut m {
-                Measure::Probe { label, .. } | Measure::Mass { label, .. } | Measure::Body { label, .. } => *label = Some(l),
+                Measure::Probe { label, .. } | Measure::Mass { label, .. } | Measure::Body { label, .. } | Measure::SolidForce { label, .. } => *label = Some(l),
                 Measure::Stats => return self.err("« comme » ne s'applique pas à « stats »"),
             }
         }

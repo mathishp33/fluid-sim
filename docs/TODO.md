@@ -25,9 +25,6 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
   pression–corps, fluide balayé, contacts et chaleur des corps (fin de l'étape 5) ; accord CPU / GPU.
 - [M] Convection naturelle autour d'un corps sous-résolue à 10 mailles par diamètre (h ≈ 250 W/(m²·K) pour ≈ 1400 selon
   Churchill–Chu) : mesurer à 20 mailles, revoir les ouvertures prudentes des faces pour le fluide chauffé au contact.
-- [M+1] Solides immobiles qui subissent des forces (sans bouger) : la force du fluide sur les mailles solides n'est pas calculée.
-  Un corps fixe (`corps … fixe`) la mesure déjà (`corps n fx | fy | couple`) ; à faire pour les solides peints, ou proposer le
-  corps fixe à leur place.
 - [M] Rebond dans un liquide selon le nombre de Stokes (Gondret et al. 2002) : à mesurer ; le film entre deux surfaces n'est pas
   résolu (pas de lubrification).
 - [M] Bruit de pression des corps en mouvement dans l'eau (fluide balayé routé vers une seule voisine) ; niveau de pression d'une
@@ -209,6 +206,8 @@ détail dans les documents de conception et l'historique git.
 - Étape 5, chaleur : une température par corps, échangée avec le fluide qui le borde (option `à T`, mesure `corps n température`).
 - Outil « Corps » de la fenêtre d'expérience : corps fixes ou libres, masse volumique propre, rebond, frottement, température.
 - Protocoles : `simuler jusqu'à ce que <relevé> < <seuil> [au plus d]` (condition d'arrêt sur une mesure, CPU et GPU).
+- Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
+  fixe la mesurait déjà).
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

@@ -124,6 +124,7 @@ TEMPS, MESURES, SORTIES
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
+     force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
 
 Résultats : résultats/<nom du protocole>/ à côté du protocole (mesures.csv, journal.txt, états .mps, copie du protocole).
@@ -1304,7 +1305,9 @@ impl ExperimentWindow {
         }
         for (m, _) in &p.measures {
             match m {
-                Measure::Probe { zone, .. } | Measure::Mass { zone, .. } => self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230)),
+                Measure::Probe { zone, .. } | Measure::Mass { zone, .. } | Measure::SolidForce { zone, .. } => {
+                    self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230))
+                }
                 Measure::Stats | Measure::Body { .. } => {}
             }
         }
