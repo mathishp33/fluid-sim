@@ -181,7 +181,10 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
 - **Une seule période par protocole.** Plusieurs lignes `mesurer` ajoutent des colonnes.
 - **Grandeurs** : `T`, `p`, `vx`, `vy`, `vitesse`, `rho`, `fraction "fluide pur"`, `chaleur` (puissance chimique, W/m³).
 - **Relevés** :
-  - `<grandeur> en (x, y)` : valeur dans la maille du point ;
+  - `<grandeur> en (x, y)` : valeur au point, interpolée entre les quatre centres de mailles voisins (bilinéaire ; les composantes
+    de vitesse, entre les faces où elles sont calculées). Au centre d'une maille, c'est sa valeur ; à moins d'une demi-maille d'un
+    bord, celle de la rangée la plus proche (pas d'extrapolation). Les grandeurs du fluide écartent les mailles solides voisines, et
+    un point dans une maille solide n'a pas de valeur (NaN) ; T compte les solides ;
   - `moyenne | max | min | somme <grandeur> dans <zone>` : la somme est une intégrale (× dx², par mètre de profondeur) ;
     les grandeurs du fluide ignorent les mailles solides, T les compte ;
   - `masse "fluide" [dans <zone>]` : en kg par mètre de profondeur ;
@@ -285,7 +288,7 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 
 - Pas de boucles, hormis le balayage. Une condition d'arrêt (`simuler jusqu'à ce que …`) relie ses comparaisons par « et » ou par
   « ou », pas les deux à la fois : il n'y a pas de parenthèses.
-- Une sonde lit la valeur de sa maille, sans interpolation. Il n'y a pas de flux à travers une ligne.
+- Il n'y a pas de flux à travers une ligne.
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,

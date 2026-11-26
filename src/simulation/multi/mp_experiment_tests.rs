@@ -595,6 +595,48 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn a_point_probe_interpolates_between_the_neighbouring_cells() {
+    // champs linéaires : l'interpolation bilinéaire les rend exactement, entre les centres des mailles pour T, entre les faces pour
+    // les vitesses ; au centre d'une maille, sa valeur ; à moins d'une demi-maille du bord, la rangée de mailles la plus proche
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+champ T formule \"300 + 1000*x + 2000*y\"
+champ vx formule \"0.1 + 2*y\"
+champ vy formule \"0.05 + 3*x\"
+mesurer toutes les 1 ms : T en (0.033, 0.047), T en (0.035, 0.045), T en (0.002, 0.047), vx en (0.033, 0.047), vy en (0.033, 0.047), vitesse en (0.033, 0.047)
+simuler 1 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let row = &r.rows[0];
+    assert_eq!(row[0], 0.0, "{:?}", r.columns);
+    let want = [427.0, 425.0, 399.0, 0.194, 0.149, 0.194f64.hypot(0.149)];
+    for (k, w) in want.iter().enumerate() {
+        assert!((row[2 + k] - w).abs() < 1e-9 * w.max(1.0), "{} : {} au lieu de {w}", r.columns[2 + k], row[2 + k]);
+    }
+
+    // maille solide voisine : écartée pour p (poids des autres renormalisés), comptée pour T ; point dans le solide : pas de pression
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+remplir rect (0, 0) (0.1, 0.05) avec \"eau\"
+solide rect (0.04, 0) (0.06, 0.03) \"acier\" à 350 K
+mesurer toutes les 1 ms : p en (0.038, 0.012), p en (0.045, 0.015), T en (0.038, 0.012)
+simuler 1 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let row = r.rows.last().unwrap();
+    let s = &r.sim;
+    assert!(s.is_solid(s.idx(4, 1)) && !s.is_solid(s.idx(3, 1)), "solide mal placé");
+    // (0.038, 0.012) : colonnes 3 (0.7) et 4 (0.3, solide), rangées 0 (0.3) et 1 (0.7)
+    let at = |f: &[f64], i: usize, j: usize| f[s.idx(i, j)];
+    let p = 0.3 * at(&s.p, 3, 0) + 0.7 * at(&s.p, 3, 1);
+    assert!((row[2] - p).abs() < 1e-9 * p.abs(), "p : {} au lieu de {p}", row[2]);
+    assert!(row[3].is_nan(), "p dans le solide : {}", row[3]);
+    let t = 0.7 * (0.3 * at(&s.temp, 3, 0) + 0.7 * at(&s.temp, 3, 1)) + 0.3 * (0.3 * at(&s.temp, 4, 0) + 0.7 * at(&s.temp, 4, 1));
+    assert!((row[4] - t).abs() < 1e-9 * t, "T : {} au lieu de {t}", row[4]);
+    assert!(at(&s.temp, 4, 1) > at(&s.temp, 3, 1) + 10.0, "le solide est plus chaud que l'eau : {} / {}", at(&s.temp, 4, 1), at(&s.temp, 3, 1));
+}
+
+#[test]
 fn a_condition_can_combine_comparisons_with_and_or() {
     use super::mp_experiment::{BodyQty, Clause, Cmp};
     // lecture : comparaisons reliées par « et » ou par « ou » (sans mélange), durée maximale à la fin

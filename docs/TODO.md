@@ -12,7 +12,7 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 - [M] Améliorer la fenêtre d'expérience : mouvement imposé, pivot et axes bloqués dans l'outil « Corps » (qui pose des corps fixes
   ou libres, avec masse volumique, rebond, frottement et température ; le reste passe par la commande `corps`) ; gestes à la souris
   enregistrés en actions datées pendant une expérience ; flux à travers une ligne (les flux de masse des faces ne sont gardés que
-  toutes phases confondues) ; sondes interpolées.
+  toutes phases confondues).
 
 ### Bords du domaine
 - [M+1] Plus de types de bords : sortie à vitesse imposée, périodiques, sortie convective. Existent : [M] bord ouvert à pression
@@ -206,6 +206,8 @@ détail dans les documents de conception et l'historique git.
 - Outil « Corps » de la fenêtre d'expérience : corps fixes ou libres, masse volumique propre, rebond, frottement, température.
 - Protocoles : `simuler jusqu'à ce que <relevé> < <seuil> [et | ou …] [au plus d]` (condition d'arrêt sur une ou plusieurs
   mesures reliées par « et » ou par « ou », CPU et GPU).
+- Protocoles : sondes interpolées (`T en (x, y)` interpole entre les centres des mailles voisines, les vitesses entre les faces ; au
+  centre d'une maille, sa valeur).
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d

@@ -224,7 +224,7 @@ impl Quantity {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Reduce {
-    /// valeur dans la maille d'un point
+    /// valeur en un point, interpolée entre les mailles voisines (`point_value`)
     At,
     Mean,
     Max,
@@ -915,6 +915,8 @@ pub fn initial_state(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Op
 
 enum ProbeKind {
     Q(QtyR, Reduce),
+    /// valeur interpolée en un point ; `cells` : la maille qui le contient
+    Point(QtyR, [f64; 2]),
     Mass(usize),
     Body(usize, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
@@ -1054,6 +1056,52 @@ fn qty_value(sim: &MultiphaseSim, q: QtyR, c: usize) -> f64 {
     }
 }
 
+/// Valeur d'une grandeur au point p (m), interpolée (bilinéaire) entre les quatre points voisins de la grille où elle est calculée :
+/// centres des mailles, milieux des faces pour les composantes de vitesse (grille décalée). Au centre d'une maille, sa valeur ; à moins
+/// d'une demi-maille d'un bord, la rangée la plus proche (pas d'extrapolation). Les grandeurs du fluide écartent les mailles solides
+/// voisines (poids des autres renormalisés) et n'ont pas de valeur (NaN) dans une maille solide (`cell` : la maille du point).
+fn point_value(sim: &MultiphaseSim, q: QtyR, p: [f64; 2], cell: usize, fluid_only: bool) -> f64 {
+    if fluid_only && sim.is_solid(cell) {
+        return f64::NAN;
+    }
+    let (nx, ny) = (sim.nx, sim.ny);
+    let (x, y) = (p[0] / sim.dx, p[1] / sim.dx);
+    // grandeur aux points (i + ox, j + oy) mailles, i < ni, j < nj ; `val` : None pour un point écarté
+    let interp = |ox: f64, oy: f64, ni: usize, nj: usize, val: &dyn Fn(usize, usize) -> Option<f64>| -> f64 {
+        let (i0, i1, fx) = lerp_index(x - ox, ni);
+        let (j0, j1, fy) = lerp_index(y - oy, nj);
+        let (mut s, mut w) = (0.0, 0.0);
+        for (i, j, wk) in [(i0, j0, (1.0 - fx) * (1.0 - fy)), (i1, j0, fx * (1.0 - fy)), (i0, j1, (1.0 - fx) * fy), (i1, j1, fx * fy)] {
+            if wk > 0.0 {
+                if let Some(v) = val(i, j) {
+                    s += wk * v;
+                    w += wk;
+                }
+            }
+        }
+        if w > 0.0 { s / w } else { f64::NAN }
+    };
+    let u = || interp(0.0, 0.5, nx + 1, ny, &|i, j| Some(sim.u[sim.uidx(i, j)]));
+    let v = || interp(0.5, 0.0, nx, ny + 1, &|i, j| Some(sim.v[sim.vidx(i, j)]));
+    match q {
+        QtyR::Vx => u(),
+        QtyR::Vy => v(),
+        QtyR::Speed => u().hypot(v()),
+        _ => interp(0.5, 0.5, nx, ny, &|i, j| {
+            let c = sim.idx(i, j);
+            if fluid_only && sim.is_solid(c) { None } else { Some(qty_value(sim, q, c)) }
+        }),
+    }
+}
+
+/// points voisins d'une position s (en points de la grille, bornée à [0, n − 1]) et poids du second
+fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
+    let s = s.clamp(0.0, (n - 1) as f64);
+    let i0 = (s.floor() as usize).min(n - 1);
+    let i1 = (i0 + 1).min(n - 1);
+    (i0, i1, s - i0 as f64)
+}
+
 impl Probe {
     fn value(&self, sim: &MultiphaseSim) -> f64 {
         let a2 = sim.dx * sim.dx;
@@ -1061,6 +1109,7 @@ impl Probe {
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
+            ProbeKind::Point(q, p) => point_value(sim, q, p, self.cells[0], self.fluid_only),
             ProbeKind::Q(q, red) => {
                 let vals = self.cells.iter().filter(|&&c| !(self.fluid_only && sim.is_solid(c))).map(|&c| qty_value(sim, q, c));
                 match red {
@@ -1327,7 +1376,11 @@ impl Runner {
                     Reduce::Sum => "somme ",
                 };
                 let name = label.clone().unwrap_or_else(|| format!("{red}{} {}", q.name(), zone.label()));
-                (Probe { kind: ProbeKind::Q(qr, *reduce), cells, fluid_only: q.fluid_only() }, name, q.unit(*reduce).to_string())
+                let kind = match (reduce, zone) {
+                    (Reduce::At, Zone::Point(p)) => ProbeKind::Point(qr, *p),
+                    _ => ProbeKind::Q(qr, *reduce),
+                };
+                (Probe { kind, cells, fluid_only: q.fluid_only() }, name, q.unit(*reduce).to_string())
             }
             Measure::Mass { fluid, zone, label } => {
                 let k = find_phase(&self.sim, fluid)?;
