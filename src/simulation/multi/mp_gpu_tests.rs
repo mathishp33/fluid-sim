@@ -88,6 +88,14 @@ fn take_gpu_slot() {
     });
 }
 
+/// Rend le jeton GPU du fil (s'il en a un) : à n'appeler que sans solveur GPU vivant dans ce fil.
+fn release_gpu_slot() {
+    GPU_SLOT.with(|slot| drop(slot.borrow_mut().take()));
+}
+
+/// pas d'adaptateur GPU (vu par un test précédent) : les comparaisons s'arrêtent avant leur calcul CPU
+static GPU_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn gpu_or_skip(sim: &MultiphaseSim) -> Option<MultiphaseGpu> {
     take_gpu_slot();
     match MultiphaseGpu::try_new(sim) {
@@ -97,6 +105,7 @@ pub(crate) fn gpu_or_skip(sim: &MultiphaseSim) -> Option<MultiphaseGpu> {
                 panic!("GPU : {e}");
             }
             eprintln!("test GPU ignoré : {e}");
+            GPU_MISSING.store(true, std::sync::atomic::Ordering::Relaxed);
             None
         }
     }
@@ -257,15 +266,21 @@ fn gpu_compiles_and_runs_dam_break() {
 
 /// construit deux fois la même scène, avance le CPU et le GPU jusqu'à t_end, imprime les grandeurs ; renvoie (cpu, gpu, gpu solver)
 pub(crate) fn compare(name: &str, mk: &dyn Fn() -> MultiphaseSim, t_end: f64) -> Option<(MultiphaseSim, MultiphaseSim, MultiphaseGpu)> {
+    if GPU_MISSING.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // la référence CPU d'abord, SANS jeton GPU (rendu s'il a été pris par un accord pas à pas plus haut, dont le solveur n'existe plus) :
+    // pendant ce calcul, souvent le plus long du test, les autres tests GPU se servent du périphérique
+    release_gpu_slot();
     let mut cpu = mk();
+    let t0 = std::time::Instant::now();
+    cpu.run(t_end);
+    let tc = t0.elapsed().as_secs_f64();
     let mut gs = mk();
     let mut g = gpu_or_skip(&gs)?;
     let t0 = std::time::Instant::now();
     run_gpu(&mut g, &mut gs, t_end, 50000);
     let tg = t0.elapsed().as_secs_f64();
-    let t0 = std::time::Instant::now();
-    cpu.run(t_end);
-    let tc = t0.elapsed().as_secs_f64();
     let (a, b) = (metrics(&cpu), metrics(&gs));
     eprintln!("== {name}\n CPU {tc:.2}s {a:?}\n GPU {tg:.2}s {b:?}\n GPU dernier pas {:?}", g.last);
     assert!(!gs.diverged && gs.state_is_sane(), "{name} : GPU divergé ou état invalide");
