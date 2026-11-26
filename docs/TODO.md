@@ -9,8 +9,6 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 ## 1. Prioritaire
 
 ### Organisation et interface
-- [M] Fenêtre d'expérience : enregistrer en actions datées les gestes faits à la souris pendant une expérience (« à t = 1.2 s,
-  chauffer … ») ; aujourd'hui, la fenêtre ne peint qu'en mode « Conditions initiales ».
 
 ### Bords du domaine
 - [M+1] Plus de types de bords : périodiques, sortie convective. Existent : [M] bord ouvert à pression imposée (hydrostatique de
@@ -220,6 +218,8 @@ détail dans les documents de conception et l'historique git.
   gardé ; CPU et GPU), à ouvrir et fermer par des actions répétées.
 - Cellules spéciales : `pompe <zone> (vx, vy)` (ou `compresseur`), débit volumique fixé à travers la zone (vitesse imposée sur ses
   faces) ; en aval fermé, le gaz se comprime (CPU et GPU).
+- Protocoles et fenêtre : action datée `à t : <action>` ; un geste fait pendant une expérience (en cours ou en pause) est fait tout
+  de suite et inscrit ainsi, rejoué à l'heure pile.
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d

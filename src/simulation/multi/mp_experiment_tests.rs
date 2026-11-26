@@ -697,6 +697,35 @@ simuler 0.4 s
 }
 
 #[test]
+fn a_dated_action_happens_once_on_time() {
+    let p = proto("départ scénario \"cuve vide\"\nà 0.05 s : marque \"x\"\nà 20 ms : remplir rect (0, 0) (0.1, 0.02) avec \"eau\"\n");
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(
+        matches!(acts[0], Action::Periodic { period, start: Some(s), end: Some(e), action } if period.is_infinite() && *s == 0.05 && *e == 0.05 && matches!(**action, Action::Mark(_))),
+        "{:?}",
+        acts[0]
+    );
+    assert!(matches!(acts[1], Action::Periodic { start: Some(s), action, .. } if (*s - 0.02).abs() < 1e-15 && matches!(**action, Action::Fill { .. })));
+    for (bad, what) in [("à 1 s marque \"x\"", "« : »"), ("à 1 s : simuler 1 s", "une seule action"), ("à : marque \"x\"", "instant")] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // à l'heure pile, une seule fois ; un instant déjà passé quand la ligne est atteinte : tout de suite, noté
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+à 0.05 s : marque \"top\"
+simuler 0.1 s
+à 0.05 s : marque \"tard\"
+simuler 0.05 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    assert!(log.contains("[t = 0.050000 s] ligne 2 : repère « top »") && log.matches("repère « top »").count() == 1, "{log}");
+    assert!(log.contains("[t = 0.100000 s] ligne 4 : à 0.05 s — instant déjà passé") && log.contains("[t = 0.100000 s] ligne 4 : repère « tard »"), "{log}");
+    assert!(log.contains("ligne 2 : à 0.05 s — faite"), "{log}");
+}
+
+#[test]
 fn periodic_actions_repeat_on_time_alongside_the_protocol() {
     // lecture : période, début et fin facultatifs, puis l'action après « : »
     let p = proto(

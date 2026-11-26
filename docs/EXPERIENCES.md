@@ -173,6 +173,7 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 | `simuler jusqu'à t` | avance jusqu'au temps simulé t |
 | `simuler jusqu'à ce que <relevé> < \| <= \| > \| >= <seuil> [et \| ou …] [au plus d]` | avance jusqu'à ce que le relevé franchisse le seuil (≤ et ≥ s'écrivent aussi) : le relevé s'écrit comme une mesure (`T en (x, y)`, `max T dans <zone>`, `masse "eau" dans <zone>`, `corps 1 y`…), le seuil dans son unité (`400 K`, `20 °C`, `2 bar`, `30` pour un angle en degrés). Plusieurs comparaisons se relient par `et` (toutes vraies) ou par `ou` (l'une d'elles), sans mélanger les deux (pas de parenthèses) : `simuler jusqu'à ce que max T dans partout > 400 K ou corps 1 y < 5 cm`. Vérifié après chaque pas (sur le GPU, après chaque série de pas, puis pas à pas près du seuil) ; le journal note l'instant et les valeurs. `au plus d` borne la durée (sinon, aucune limite) |
 | `toutes les T [à partir de t0] [jusqu'à t1] : <action>` (ou `chaque T …`) | action RÉPÉTÉE en parallèle du déroulement : toute action d'une ligne (remplir, chauffer … pendant d, accélérer, bord …, solide, effacer, corps, marque, sauver état…), faite à t0 (sinon à l'instant où la ligne est atteinte), puis toutes les T, jusqu'à t1 (sinon jusqu'à la fin), chaque fois à l'heure pile (le pas s'arrête sur ses échéances). Une vanne : `toutes les 0.2 s : bord bas sortie (0, -0.05)` et `toutes les 0.2 s à partir de 0.1 s : bord bas mur`. Le journal note les trois premières fois, puis le nombre de fois à la fin. Pas de répétition d'une répétition, ni de `simuler`, `mesurer` ou `pause` |
+| `à t : <action>` | action DATÉE : faite une fois, à l'instant t pile, en parallèle du déroulement (comme une répétition qui ne se répète pas) ; c'est ainsi que la fenêtre inscrit les gestes faits pendant une expérience. Un instant déjà passé quand la ligne est atteinte : faite tout de suite, et notée au journal |
 | `pause` | met l'expérience en pause dans la fenêtre (ignorée en ligne de commande) |
 | `marque "texte"` | repère dans le journal |
 | `sauver état "nom"` | écrit `nom.mps` dans le dossier des résultats |
@@ -247,6 +248,9 @@ chauffer rect (0.1, 0) (0.2, 0.01) à $T pendant 3 s
   - À son relâchement, l'aperçu est reconstruit depuis le texte : ce que l'on voit est ce que la ligne de commande rejouera (testé
     au bit près).
   - « Annuler le dernier geste » retire la ligne.
+  - **Pendant une expérience** (en cours ou en pause), un geste dans l'onglet « Conditions initiales » est fait tout de suite sur la
+    simulation, et inscrit comme action datée `à t s : <ligne>`, avant le premier `simuler` : le protocole rejoue le geste à l'heure
+    pile (testé). Un trait de pinceau compte à son relâchement.
 - **« Charger un champ de valeurs »** : grandeur, formule ou fichier CSV / PNG, sens des rangées, niveaux de l'image, dans le
   dernier rectangle tracé ou partout. Le bouton ajoute la ligne `champ …` correspondante.
 - **Exécution** :
@@ -311,8 +315,6 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   par « ou », pas les deux à la fois : il n'y a pas de parenthèses.
 - Une ligne de débit est horizontale ou verticale (elle suit les faces des mailles) ; un débit à travers une ligne oblique se
   mesure en ligne brisée, par plusieurs mesures.
-- Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
-  Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
   `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`,
   `experiences/rebonds.exp`, `experiences/bille_chaude.exp`. Les corps libres rebondissent et frottent contre les bords du domaine,

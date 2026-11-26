@@ -1818,6 +1818,29 @@ impl Runner {
         self.finish_edits(edited, heat);
     }
 
+    /// Fait une action tout de suite, pendant l'expérience (geste de la fenêtre) ; le journal la note « geste ».
+    pub fn apply_now(&mut self, a: &Action) -> Result<(), String> {
+        if !matches!(self.state, RunState::Running | RunState::Paused(_)) {
+            return Err("l'expérience est terminée".into());
+        }
+        self.sync_host();
+        let n0 = self.log.len();
+        let r = self.do_action(a, 0);
+        for l in &mut self.log[n0..] {
+            *l = l.replacen("ligne 0 : ", "geste : ", 1);
+        }
+        match r {
+            Ok((e, h)) => {
+                self.finish_edits(e, h);
+                Ok(())
+            }
+            Err(()) => Err(match &self.state {
+                RunState::Failed(m) => m.clone(),
+                _ => "action refusée".into(),
+            }),
+        }
+    }
+
     /// après des actions : cibles de chauffage recalculées, état renvoyé au GPU s'il a changé
     fn finish_edits(&mut self, edited: bool, heat: bool) {
         if heat {
@@ -1877,15 +1900,27 @@ impl Runner {
                     self.state = RunState::Paused(format!("pause du protocole (ligne {line})"));
                 }
                 Action::Periodic { period, start, end, action } => {
+                    // (période infinie : action datée « à t : … », faite une fois)
+                    let once = period.is_infinite();
                     let mut next = start.unwrap_or(now);
-                    // (début passé : la phase est gardée, première fois à l'échéance suivante)
+                    let mut last = end.unwrap_or(f64::INFINITY);
                     if next < now {
-                        next += ((now - next) / period).ceil() * period;
+                        if once {
+                            self.note(format!("ligne {line} : à {} s — instant déjà passé quand la ligne est atteinte : faite maintenant", fmt_num(next)));
+                            (next, last) = (now, now);
+                        } else {
+                            // (début passé : la phase est gardée, première fois à l'échéance suivante)
+                            next += ((now - next) / period).ceil() * period;
+                        }
                     }
-                    let from = start.map_or(String::new(), |s| format!(" à partir de {} s", fmt_num(s)));
-                    let until = end.map_or(String::new(), |e| format!(" jusqu'à {} s", fmt_num(e)));
-                    self.note(format!("ligne {line} : toutes les {} s{from}{until} : {}", fmt_num(*period), describe(action)));
-                    self.periodic.push(Periodic { action: (**action).clone(), period: *period, next, end: end.unwrap_or(f64::INFINITY), line, count: 0 });
+                    if once {
+                        self.note(format!("ligne {line} : à {} s : {}", fmt_num(next), describe(action)));
+                    } else {
+                        let from = start.map_or(String::new(), |s| format!(" à partir de {} s", fmt_num(s)));
+                        let until = end.map_or(String::new(), |e| format!(" jusqu'à {} s", fmt_num(e)));
+                        self.note(format!("ligne {line} : toutes les {} s{from}{until} : {}", fmt_num(*period), describe(action)));
+                    }
+                    self.periodic.push(Periodic { action: (**action).clone(), period: *period, next, end: last, line, count: 0 });
                     let eps = 1e-12 * (1.0 + now.abs());
                     let (e, h) = self.fire_due(now, eps)?;
                     edited |= e;
@@ -2260,7 +2295,11 @@ impl Runner {
     fn finish(&mut self) {
         for k in 0..self.periodic.len() {
             let p = &self.periodic[k];
-            let msg = format!("ligne {} : toutes les {} s — {} fois", p.line, fmt_num(p.period), p.count);
+            let msg = if p.period.is_infinite() {
+                format!("ligne {} : à {} s — {}", p.line, fmt_num(p.end), if p.count > 0 { "faite" } else { "instant pas atteint" })
+            } else {
+                format!("ligne {} : toutes les {} s — {} fois", p.line, fmt_num(p.period), p.count)
+            };
             self.note(msg);
         }
         if self.proto.period.is_some() {
@@ -2392,6 +2431,7 @@ fn describe(a: &Action) -> String {
                 format!("corps « {material} » {f}{a}, mouvement imposé : {}", parts.join(", "))
             }
         }
+        Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),
         Action::Ignite { zone, temp } => format!("allumer {} à {} K", zone.label(), fmt_num(*temp)),

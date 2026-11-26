@@ -168,6 +168,7 @@ TEMPS, MESURES, SORTIES
   images toutes les 50 ms [phases | température | vitesse | …]   (série d'images PNG dans images-<affichage>/)
   simuler jusqu'à ce que max T dans partout < 400 K [ou corps 1 y < 5 cm] [au plus 10 s]   (relevé comme une mesure ; < <= > >= ; et | ou)
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
+  à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
@@ -1058,6 +1059,29 @@ impl ExperimentWindow {
         self.status = if self.errors.is_empty() { format!("Ligne {n} ajoutée : {line}") } else { format!("Ligne {n} ajoutée, mais : {}", self.errors[0]) };
     }
 
+    /// Geste pendant une expérience : fait tout de suite sur la simulation en cours, et inscrit au protocole (avant le premier
+    /// « simuler ») comme action datée « à t s : … », que le protocole rejoue à l'heure pile.
+    fn record_gesture(&mut self, line: String) {
+        let a = match Self::line_action(&line) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = format!("Geste refusé : {e}");
+                return;
+            }
+        };
+        let Some(r) = self.runner.as_mut() else { return };
+        let t = r.sim.time;
+        if let Err(e) = r.apply_now(&a) {
+            self.status = format!("Geste refusé : {e}");
+            return;
+        }
+        let dated = format!("à {} s : {line}", fmt_num(t));
+        let (text, n) = insert_initial_line(&self.text, &dated);
+        self.text = text;
+        self.last_insert = Some((n, dated.clone()));
+        self.status = format!("Geste fait à t = {} s, inscrit ligne {n} : {dated}", fmt_num(t));
+    }
+
     fn undo_last(&mut self) {
         let Some((n, line)) = self.last_insert.take() else { return };
         let mut lines: Vec<&str> = self.text.lines().collect();
@@ -1321,7 +1345,9 @@ impl ExperimentWindow {
                 self.status = format!("Coordonnées copiées : {t}");
             }
         }
-        let editable = self.tab == Tab::Initial && self.runner.is_none() && self.preview.is_some();
+        // pendant une expérience (en cours ou en pause), un geste est fait tout de suite et inscrit au protocole comme action datée
+        let live = self.tab == Tab::Initial && self.running();
+        let editable = live || (self.tab == Tab::Initial && self.runner.is_none() && self.preview.is_some());
         if !editable {
             self.stroke.clear();
             self.drag_start = None;
@@ -1349,8 +1375,10 @@ impl ExperimentWindow {
                             let r = self.radius as f64 * self.preview.as_ref().map_or(0.01, |s| s.dx);
                             let line = self.tool_line(&Zone::Trait { pts: seg, r });
                             let base = self.base_dir();
-                            if let (Ok(a), Some(sim)) = (Self::line_action(&line), self.preview.as_mut()) {
-                                let _ = apply_action(sim, &a, &base);
+                            if !live {
+                                if let (Ok(a), Some(sim)) = (Self::line_action(&line), self.preview.as_mut()) {
+                                    let _ = apply_action(sim, &a, &base);
+                                }
                             }
                         }
                     }
@@ -1373,7 +1401,11 @@ impl ExperimentWindow {
                         let pts = std::mem::take(&mut self.stroke);
                         let zone = if pts.len() == 1 || body { Zone::Disque { c: pts[0], r } } else { Zone::Trait { pts, r } };
                         let line = self.tool_line(&zone);
-                        self.commit_line(line);
+                        if live {
+                            self.record_gesture(line);
+                        } else {
+                            self.commit_line(line);
+                        }
                     }
                 }
                 Shape::Rect => {
@@ -1384,7 +1416,11 @@ impl ExperimentWindow {
                         let zone = Zone::Rect { a: [i0 as f64 * dx, j0 as f64 * dx], b: [(i1 + 1) as f64 * dx, (j1 + 1) as f64 * dx] };
                         self.last_rect = Some(zone.clone());
                         let line = self.tool_line(&zone);
-                        self.commit_line(line);
+                        if live {
+                            self.record_gesture(line);
+                        } else {
+                            self.commit_line(line);
+                        }
                     }
                 }
             }
@@ -1697,6 +1733,54 @@ mod tests {
             w.display = d;
             frame(&ctx, &mut w, vec![]);
         }
+    }
+
+    #[test]
+    fn a_gesture_during_an_experiment_is_done_at_once_and_recorded_as_a_dated_line() {
+        let ctx = egui::Context::default();
+        let mut w = window("départ scénario \"cuve vide\" grille 30 x 20 maille 1 cm\nsimuler 20 ms\npause\nsimuler 20 ms\n");
+        frame(&ctx, &mut w, vec![]);
+        w.start_run();
+        assert!(w.running(), "{}", w.status);
+        for _ in 0..400 {
+            frame(&ctx, &mut w, vec![]);
+            if matches!(w.runner.as_ref().unwrap().state, RunState::Paused(_)) {
+                break;
+            }
+        }
+        let t = w.runner.as_ref().unwrap().sim.time;
+        assert!(matches!(w.runner.as_ref().unwrap().state, RunState::Paused(_)) && (t - 0.02).abs() < 1e-9, "t = {t}");
+        // pendant la pause : de l'eau au rectangle, faite tout de suite et inscrite « à t s : … »
+        w.tab = Tab::Initial;
+        w.tool = CiTool::Fill;
+        w.fluid = "eau".into();
+        w.shape = Shape::Rect;
+        let path = [at(&w, 2, 2), at(&w, 6, 4)];
+        drag(&ctx, &mut w, &path);
+        {
+            let r = w.runner.as_ref().unwrap();
+            let eau = r.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+            let c = r.sim.idx(4, 3);
+            assert!(r.sim.alpha[eau][c] > 0.99, "le geste n'a pas rempli la maille : α = {} — {}", r.sim.alpha[eau][c], w.status);
+            assert!(r.log.iter().any(|l| l.contains("geste : remplir rect")), "{}", r.log.join("\n"));
+        }
+        let dated = format!("à {} s : remplir rect (0.02, 0.02) (0.07, 0.05) avec \"eau\" à", fmt_num(t));
+        assert!(w.text.contains(&dated), "{dated}\n{}", w.text);
+        // reprise jusqu'au bout ; le protocole inscrit rejoue le geste à l'heure pile
+        w.toggle_pause();
+        for _ in 0..400 {
+            frame(&ctx, &mut w, vec![]);
+            if w.runner.as_ref().unwrap().state == RunState::Finished {
+                break;
+            }
+        }
+        assert_eq!(w.runner.as_ref().unwrap().state, RunState::Finished, "{}", w.status);
+        let mut replay = Runner::new(parse_all(&w.text).unwrap().remove(0), std::path::Path::new("."), None, Some(false)).unwrap();
+        while matches!(replay.state, RunState::Running) {
+            replay.advance(std::time::Duration::from_secs(5));
+        }
+        let log = replay.log.join("\n");
+        assert!(log.contains(&format!("[t = {:.6} s] ligne 2 : remplir rect (0.02, 0.02) (0.07, 0.05)", t)), "{log}");
     }
 
     #[test]

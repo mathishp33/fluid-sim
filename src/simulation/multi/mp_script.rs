@@ -622,6 +622,27 @@ impl<'a> P<'a> {
     }
 }
 
+/// « : <action> » d'une action datée ou répétée : le reste de la ligne, lu comme une commande d'une seule action
+fn timed_action(p: &mut P, ln: usize) -> R<Action> {
+    if !p.eat(&Tok::Colon) {
+        return p.err(format!("il faut « : » puis l'action{}", p.here()));
+    }
+    if p.done() {
+        return p.err("il manque l'action après « : »");
+    }
+    let mut inner = Protocol::default();
+    let mut q = P { t: &p.t[p.i..], i: 0, ln };
+    parse_line(&mut q, &mut inner)?;
+    p.i = p.t.len();
+    let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
+    match inner.steps.pop() {
+        Some((Step::Do(a), _)) if only && inner.steps.is_empty() && !matches!(a, Action::Periodic { .. } | Action::Pause) => Ok(a),
+        _ => p.err(
+            "une action datée ou répétée porte sur une seule action (remplir, chauffer, bord, corps…), pas sur simuler, mesurer, pause ni une autre action datée",
+        ),
+    }
+}
+
 fn push(proto: &mut Protocol, a: Action, ln: usize) {
     proto.steps.push((Step::Do(a), ln));
 }
@@ -697,23 +718,14 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                     break;
                 }
             }
-            if !p.eat(&Tok::Colon) {
-                return p.err(format!("il faut « : » puis l'action répétée{}", p.here()));
-            }
-            if p.done() {
-                return p.err("il manque l'action répétée après « : »");
-            }
-            // l'action : le reste de la ligne, lu comme une commande
-            let mut inner = Protocol::default();
-            let mut q = P { t: &p.t[p.i..], i: 0, ln };
-            parse_line(&mut q, &mut inner)?;
-            p.i = p.t.len();
-            let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
-            let action = match inner.steps.pop() {
-                Some((Step::Do(a), _)) if only && inner.steps.is_empty() && !matches!(a, Action::Periodic { .. } | Action::Pause) => a,
-                _ => return p.err("une répétition porte sur une seule action (remplir, chauffer, bord, corps…), pas sur simuler, mesurer, pause ni une autre répétition"),
-            };
+            let action = timed_action(p, ln)?;
             push(proto, Action::Periodic { period, start, end, action: Box::new(action) }, ln);
+        }
+        "a" => {
+            // à <t> : <action> — faite une fois, à l'instant t pile, en parallèle du déroulement (geste enregistré par la fenêtre…)
+            let t = p.quantity(Dim::Time, "l'instant de l'action")?;
+            let action = timed_action(p, ln)?;
+            push(proto, Action::Periodic { period: f64::INFINITY, start: Some(t), end: Some(t), action: Box::new(action) }, ln);
         }
         "calcul" => {
             let w = p.word("« cpu » ou « gpu »")?;
