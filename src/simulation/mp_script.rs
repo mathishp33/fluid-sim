@@ -479,7 +479,7 @@ impl<'a> P<'a> {
             }
             ("corps", _) => {
                 let n = self.count("le numéro du corps (1 pour le premier posé)")?;
-                let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple)")?;
+                let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple, température)")?;
                 let q = match w.as_str() {
                     "x" => BodyQty::X,
                     "y" => BodyQty::Y,
@@ -490,7 +490,8 @@ impl<'a> P<'a> {
                     "fx" => BodyQty::Fx,
                     "fy" => BodyQty::Fy,
                     "couple" => BodyQty::Torque,
-                    o => return self.err(format!("grandeur « {o} » d'un corps : x, y, angle, vx, vy, rotation, fx, fy, couple")),
+                    "t" | "temperature" => BodyQty::Temp,
+                    o => return self.err(format!("grandeur « {o} » d'un corps : x, y, angle, vx, vy, rotation, fx, fy, couple, température")),
                 };
                 Measure::Body { index: n - 1, q, label: None }
             }
@@ -701,6 +702,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let mut motion = BodyMotion::default();
             let mut osc = false;
             let mut fixed_kw = false;
+            let mut temp = None;
             // vitesse angulaire : degrés par seconde sans unité
             let ang_speed = |p: &mut P| -> R<f64> {
                 let v = p.number("la vitesse de rotation")?;
@@ -708,7 +710,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Ok(if unit { v } else { v.to_radians() })
             };
             while !p.done() {
-                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement)")?.as_str() {
+                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement, à T)")?.as_str() {
+                    "a" => temp = Some(p.quantity(Dim::Temp, "la température du corps")?),
                     "angle" => {
                         let v = p.number("l'angle")?;
                         let (v, unit) = p.opt_unit(Dim::Angle, v)?;
@@ -780,7 +783,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         return p.err(format!(
                             "option « {o} » inconnue après « corps » : angle <a>, fixe, libre, bloqué x | y | rotation, vitesse (vx, vy), \
                              rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>, \
-                             rebond <e>, frottement <μ>"
+                             rebond <e>, frottement <μ>, à <T>"
                         ))
                     }
                 }
@@ -806,7 +809,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             if motion.pivot.is_some() && (motion.v != [0.0, 0.0] || motion.osc_v != [0.0, 0.0]) {
                 return p.err("sur un pivot, seul le mouvement de rotation compte (rotation, oscillation rotation)");
             }
-            push(proto, Action::Body { shape, material, angle, motion }, ln);
+            push(proto, Action::Body { shape, material, angle, motion, temp }, ln);
         }
         "chauffer" | "refroidir" => {
             let zone = p.zone()?;

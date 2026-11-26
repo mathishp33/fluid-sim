@@ -7,9 +7,10 @@ leur forme ni leur inertie propre.
 
 Document de conception (2026-11-24). Les choix du § 9 sont validés. Les étapes 0 (préparation, aucun résultat changé), 1 (corps
 FIXES : l'eau les contourne sans y entrer), 2 (mouvement IMPOSÉ : piston, palette, batteur à vagues), 3 (corps LIBRES : flotteur,
-clapet, pendule, corps qui coule) et 4 (CONTACTS : rebonds, frottement, empilements) sont faites (§ 8, `mp_bodies.rs`,
-`mp_contacts.rs`). La traînée d'un corps EN MOUVEMENT converge en maillage, mais reste approchée à 10 mailles par diamètre (§ 8).
-Viennent ensuite la chaleur des corps et le GPU (étape 5, § 7).
+clapet, pendule, corps qui coule) et 4 (CONTACTS : rebonds, frottement, empilements) sont faites, ainsi que la CHALEUR des corps
+(étape 5 : une température par corps, échangée avec le fluide) (§ 8, `mp_bodies.rs`, `mp_contacts.rs`, `mp_body_heat.rs`). La
+traînée d'un corps EN MOUVEMENT converge en maillage, mais reste approchée à 10 mailles par diamètre (§ 8). Reste le GPU (étape 5,
+§ 7).
 
 **En bref — recommandation**
 
@@ -333,6 +334,11 @@ Fait à l'étape 4 (`mp_contacts.rs`, § 8).
 - Au début, une température par corps (capacité M cp). Elle échange avec le fluide des mailles qu'il couvre, par une conductance
   proportionnelle à la longueur de paroi dans la maille (k du fluide sur une demi-maille). C'est valable pour un corps métallique,
   dont le nombre de Biot est faible.
+- Fait à l'étape 5 (`mp_body_heat.rs`, § 8) : à travers le morceau de bord de longueur L dans la maille c, conductance L k_h / dx,
+  k_h moyenne harmonique des conductivités du corps et du fluide (une demi-maille de chaque côté : la même qu'entre une maille
+  solide et sa voisine fluide), partagée entre les groupes de fluide de la maille au prorata de leur volume. Résolu implicitement,
+  corps et mailles ensemble, en forme close : la trace de fluide d'une maille presque couverte prend la température du corps sans
+  sous-pas, et l'énergie que cède le corps est exactement celle que reçoit le fluide.
 - Plus tard : un champ de température attaché au corps (une grille dans son repère) et la conduction interne.
 
 ### 6.5 Avec le reste
@@ -359,7 +365,7 @@ Fait à l'étape 4 (`mp_contacts.rs`, § 8).
 | 2 (faite) | mouvement imposé : vitesse et rotation constantes, oscillation sinusoïdale, pivot ; fluide balayé déplacé, travail p·dV, entraînement | piston dans un tube d'air fermé : γ = 1.4014 par la pression et 1.3990 par la température (attendu : 1.40), masse de gaz à 2e-7 ; disque tiré dans l'eau : la pression d'une sonde saute de 1.5 Pa au plus quand il traverse les mailles, masse d'eau à 2e-16 ; palette sur pivot : eau brassée à 0.11 m/s près des bouts (ω r = 0.11) ; lois intégrées exactement (une oscillation revient pile à son départ) |
 | 3 (faite) | mouvement libre + masque de DDL et pivot ; couplage monolithique pression–corps ; force du fluide sur tout corps (mesurable) | corps de la densité de l'eau immobile (2 µm en 1 s, force du fluide = poids à 6 chiffres) ; chute dans l'air : vitesse à 0.1 % ; masse ajoutée d'un disque lâché ou accéléré dans l'eau : C_a = 0.94 à 1.04 (1 attendu) ; flotteurs : tirant d'eau à 0.7 mm près (bois 0.6, liège 0.24), oscillation qui s'amortit ; pendule dans l'air : période à 0.03 % ; clapet flottant redressé à la verticale ; traînée d'un disque FIXE à Re 20 / 40 : −11 % / −9 % de Dennis & Chang (1970) ; disque TIRÉ à Re 20 : C_D 2.68 à 10 mailles par diamètre, 1.61 à 20 (Dennis & Chang : 2.05), pression à 20 mailles 1.26 (≈ 1.24) ; disque qui sédimente dans l'huile : vitesse limite à −23 % |
 | 4 (faite) | contacts contre les bords, les solides fixes et les autres corps ; ressort par contact, peau de contact ; restitution et frottement par corps | rebond d'un disque d'acier dans l'air : e = 0.803 (0.8 visé) ; choc frontal de deux disques : restitution 0.777 (0.8), quantité de mouvement à 0.1 % ; disque posé au fond d'une cuve d'eau : 2.6e-6 m/s ; bloc lâché penché sur une étagère solide : à plat (0.00°), immobile ; petit bloc lâché sur un grand : empilement immobile (1e-5 m/s) et à plat ; aucun pas refait. Pas fait : rebond dans un liquide selon le nombre de Stokes (Gondret et al. 2002, sphères) |
-| 5 | chaleur, GPU, protocole | bille chaude dans l'eau : refroidissement quasi exponentiel ; accord CPU / GPU |
+| 5 (chaleur faite) | chaleur des corps (une température par corps), GPU, protocole | corps chaud aligné sur la grille et même carré en mailles solides d'acier, dans l'eau sans pesanteur : refroidissements identiques à 0.4 % près pendant 10 s, énergie conservée à 3e-4 de la chaleur échangée ; disque d'acier à 80 °C dans l'eau sous la pesanteur : l'eau chauffée monte, énergie à 3e-5. GPU, accord CPU / GPU : à faire |
 | plus tard | fonte d'un bloc de glace, combustion d'une bûche, liaisons, butées, ressorts, formes non convexes | |
 
 ## 8. Ce qui est fait : étapes 0 (préparer l'architecture sans changer un résultat), 1 (corps fixes), 2 (mouvement imposé), 3 (corps libres) et 4 (contacts)
@@ -451,8 +457,8 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   à une seule voisine, alors que le fluide collé quitte la maille par deux faces sur un bord oblique). Répartir le volume balayé
   entre les voisines, au prorata du débit collé qui sort par chaque face, améliorait la traînée (2.36) mais cassait un flotteur à la
   ligne d'eau (mailles mêlées d'eau et d'air) : écarté. Diagnostic : `co_moving_disc_diag` (disque qui suit le courant).
-- Pas encore : chaleur des corps (étape 5), grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre, la masse ajoutée
-  apparente monte jusqu'à 1.4 (la correction de fermeture était prévue pour l'ancien pas).
+- Pas encore : grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre, la masse ajoutée apparente monte jusqu'à 1.4 (la
+  correction de fermeture était prévue pour l'ancien pas).
 
 **Étape 4 (contacts, faite le 2026-11-25).**
 - `mp_contacts.rs` (§ 6.3) : détection (`contacts`) contre les bords, les solides fixes et les autres corps ; un ressort par contact
@@ -485,6 +491,26 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   d'une paire libre est celle du pas précédent (choc de deux disques à 0.777 pour 0.8) ; le film de fluide entre deux surfaces
   n'est pas résolu (pas de lubrification : le rebond dans un liquide ne faiblit que par la traînée, comparaison avec Gondret et al.
   à faire).
+
+**Étape 5, chaleur des corps (faite le 2026-11-26).**
+- `mp_body_heat.rs` (§ 6.4) : `exchange_body_heat`, après la conduction du pas, pour tous les corps (fixes, imposés, libres). La
+  température du corps (`RigidBody::temp`, déjà dans l'état complet) colore son rendu.
+- Commande `corps … à T` (température de départ, sinon celle du fluide ambiant) et mesure `corps n température` (EXPERIENCES.md).
+  Exemple : `experiences/bille_chaude.exp` (disque d'acier chaud qui coule dans l'eau froide).
+- Validations (§ 7, `mp_body_heat.rs`) :
+  - un corps carré d'acier de 1 cm aligné sur la grille, et le même carré en mailles solides d'acier, à 80 °C dans l'eau à 20 °C
+    sans pesanteur (conduction seule) : refroidissements identiques à 0.38 % près pendant 10 s (60 → 36.8 K au-dessus de l'eau ; le
+    bloc a sa conduction interne, Biot ≈ 0.07), énergie totale conservée à 2.7e-4 de la chaleur échangée ;
+  - disque d'acier fixe à 80 °C dans l'eau sous la pesanteur : il refroidit sans jamais se réchauffer (72.5 °C après 8 s), l'eau
+    chauffée monte (la chaleur reçue est centrée 3 mm au-dessus du disque), énergie à 2.6e-5.
+- Bilans : la « cuve vide » est OUVERTE en haut ; de l'eau qui l'emplit jusqu'au bord en sort en se dilatant, avec son énergie
+  (comptée depuis 0 K) : les essais laissent une couche d'air en haut.
+- Effet sur le piston de l'étape 2 : γ = 1.394 par la pression et 1.392 par la température (1.401 et 1.399 avant) ; le piston
+  d'acier, à 20 °C, prend un peu de la chaleur de compression.
+- Limite : la convection naturelle autour d'un corps est sous-résolue à 10 mailles par diamètre. Le disque à 80 °C échange
+  h ≈ 250 W/(m²·K) de 4 à 8 s, quand la corrélation de Churchill–Chu donne ≈ 1400 en régime établi : la couche limite thermique
+  (≈ 0.5 mm) est plus fine que la maille (2 mm), et les ouvertures prudentes des faces freinent l'eau chauffée au contact du corps.
+  La conduction, elle, est exacte (même échange qu'une paroi solide).
 
 ## 9. Choix (validés le 2026-11-24)
 

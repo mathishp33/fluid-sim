@@ -1,0 +1,14 @@
+# Bille chaude : un disque d'acier à 90 °C lâché dans l'eau à 15 °C coule, se pose au fond en moins d'une demi-seconde et cède sa
+# chaleur à l'eau (81 °C après 5 s). Le disque n'a qu'une température (métal : nombre de Biot faible), SOLID.md § 6.4. L'eau chauffée
+# à son contact ne monte que lentement : à 2 mm par maille, la convection naturelle autour d'un corps est sous-résolue (SOLID.md § 8).
+#   fluid-sim experience experiences/bille_chaude.exp
+
+départ scénario "Cuve vide" grille 40 x 50 maille 2 mm
+remplir rect (0, 0) (0.08, 0.08) avec "eau" à 15 °C
+
+corps disque (0.04, 0.06) rayon 8 mm "acier" libre à 90 °C
+
+# (les mailles que couvre le disque, posé au fond, s'arrêtent à 1.7 cm : au-dessus de 2 cm, rien que de l'eau)
+mesurer toutes les 50 ms : corps 1 température comme "disque", corps 1 y comme "hauteur du disque", T en (0.04, 0.03) comme "eau 1.3 cm au-dessus du disque posé", max T dans rect (0, 0.02) (0.08, 0.08) comme "eau la plus chaude au-dessus de 2 cm"
+
+simuler 5 s

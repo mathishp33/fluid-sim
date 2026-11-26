@@ -101,6 +101,7 @@ d'expérience.
 | … `libre` | corps LIBRE, poussé par l'écoulement (pesanteur, pression, frottement) ; `vitesse` et `rotation` donnent alors sa vitesse de départ ; avec `pivot (x, y)`, il tourne librement autour de la charnière (clapet) |
 | … `bloqué x \| y \| rotation` | axes bloqués d'un corps libre, un ou plusieurs (`bloqué x et rotation` : il ne fait que monter et descendre) |
 | … `masse volumique ρ` | masse volumique propre du corps, en kg/m³ sans unité (ou `g/cm³`), à la place de celle du matériau : bouchon de liège, bloc de bois, corps de la densité de l'eau |
+| … `à T` | température du corps au départ (sinon celle du fluide ambiant) : il échange ensuite sa chaleur avec le fluide qui le borde (une température par corps, SOLID.md § 6.4) |
 | … `rebond e`, … `frottement μ` | contacts d'un corps libre contre les bords du domaine, les solides et les autres corps : coefficient de restitution e entre 0 (choc mou) et 1 (rebond parfait), 0.5 par défaut ; coefficient de frottement de Coulomb μ, 0.3 par défaut ; entre deux corps, la moyenne de leurs deux valeurs |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) |
@@ -181,8 +182,9 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
   - `moyenne | max | min | somme <grandeur> dans <zone>` : la somme est une intégrale (× dx², par mètre de profondeur) ;
     les grandeurs du fluide ignorent les mailles solides, T les compte ;
   - `masse "fluide" [dans <zone>]` : en kg par mètre de profondeur ;
-  - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple` : position (m), angle (°), vitesse (m/s, °/s) du n-ième corps posé,
-    ou force du fluide sur lui (N/m ; couple autour de son centre de masse, N) à la dernière projection ;
+  - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple | température` : position (m), angle (°), vitesse (m/s, °/s) du
+    n-ième corps posé, force du fluide sur lui (N/m ; couple autour de son centre de masse, N) à la dernière projection, ou sa
+    température (K) ;
   - `stats` : dt, itérations de pression, pas refaits, masse de chaque fluide, énergies cinétique et interne, T et p extrêmes,
     vitesse maximale, chaleur injectée, et, s'il y a de la chimie, chaleur de réaction, puissance chimique et énergie rayonnée.
 - **Libellés** : `comme "nom"` donne le titre de la colonne.
@@ -281,6 +283,8 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
   `experiences/vagues.exp`, `experiences/obstacles.exp`, `experiences/flotteurs.exp`, `experiences/clapet.exp`,
-  `experiences/rebonds.exp`. Les corps libres rebondissent et frottent contre les bords du domaine, les solides et les autres corps
-  (SOLID.md § 6.3) ; un corps posé reste à environ 0.3 maille de ce qui le porte (peau de contact). La traînée d'un corps en
+  `experiences/rebonds.exp`, `experiences/bille_chaude.exp`. Les corps libres rebondissent et frottent contre les bords du domaine,
+  les solides et les autres corps (SOLID.md § 6.3) ; un corps posé reste à environ 0.3 maille de ce qui le porte (peau de contact).
+  Chaque corps a une température, qui échange avec le fluide qui le borde (SOLID.md § 6.4) ; la convection naturelle autour d'un
+  corps reste sous-résolue à 10 mailles par diamètre (échange 3 à 6 fois trop faible). La traînée d'un corps en
   mouvement n'est qu'approchée à 10 mailles par diamètre (+20 à +55 %, SOLID.md § 8).

@@ -256,6 +256,7 @@ pub enum BodyQty {
     Fx,
     Fy,
     Torque,
+    Temp,
 }
 
 impl BodyQty {
@@ -270,6 +271,7 @@ impl BodyQty {
             BodyQty::Fx => "fx",
             BodyQty::Fy => "fy",
             BodyQty::Torque => "couple",
+            BodyQty::Temp => "température",
         }
     }
     fn unit(&self) -> &'static str {
@@ -280,6 +282,7 @@ impl BodyQty {
             BodyQty::Rotation => "°/s",
             BodyQty::Fx | BodyQty::Fy => "N/m",
             BodyQty::Torque => "N",
+            BodyQty::Temp => "K",
         }
     }
     /// valeur sur le corps k (NaN s'il n'existe pas) ; forces : celles du fluide à la dernière projection (couple autour du centre de
@@ -297,6 +300,7 @@ impl BodyQty {
             BodyQty::Fx => f[0],
             BodyQty::Fy => f[1],
             BodyQty::Torque => f[2],
+            BodyQty::Temp => b.temp,
         }
     }
 }
@@ -437,7 +441,8 @@ impl BodySpec {
 pub enum Action {
     Fill { zone: Zone, fluid: String, temp: Option<f64> },
     /// corps rigide, fixe ou à mouvement imposé (solides mobiles : voir SOLID.md)
-    Body { shape: BodySpec, material: String, angle: f64, motion: BodyMotion },
+    /// `temp` : température du corps au départ (sinon celle du fluide ambiant)
+    Body { shape: BodySpec, material: String, angle: f64, motion: BodyMotion, temp: Option<f64> },
     SetTemp { zone: Zone, temp: f64 },
     Solid { zone: Zone, material: String, thermal: ThermalSpec, temp: Option<f64> },
     Clear { zone: Zone },
@@ -757,9 +762,9 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             apply_tool_with(sim, MpTool::ClearCell, &cs, &tool_opts(t_amb, MpThermal::Passive));
             Ok(cs.len())
         }
-        Action::Body { shape, material, angle, motion } => {
+        Action::Body { shape, material, angle, motion, temp } => {
             let s = find_solid(sim, material)?;
-            let b = shape.body(s, *angle, t_amb, motion)?;
+            let b = shape.body(s, *angle, temp.unwrap_or(t_amb), motion)?;
             sim.add_body(b)?;
             Ok(sim.body_frac.iter().filter(|&&a| a > 0.0).count())
         }
@@ -1544,7 +1549,7 @@ fn describe(a: &Action) -> String {
         Action::SetTemp { zone, temp } => format!("température {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Solid { zone, material, .. } => format!("solide « {material} » {}", zone.label()),
         Action::Clear { zone } => format!("effacer {}", zone.label()),
-        Action::Body { shape, material, angle, motion } => {
+        Action::Body { shape, material, angle, motion, temp } => {
             let f = match shape {
                 BodySpec::Disc { c, r } => format!("disque {} rayon {}", fmt_point(*c), fmt_num(*r)),
                 BodySpec::Rect { a, b } => format!("rect {} {}", fmt_point(*a), fmt_point(*b)),
@@ -1553,6 +1558,10 @@ fn describe(a: &Action) -> String {
             let a = if *angle != 0.0 { format!(", tourné de {}°", fmt_num(angle.to_degrees())) } else { String::new() };
             let a = match motion.rho {
                 Some(r) => format!("{a}, masse volumique {} kg/m³", fmt_num(r)),
+                None => a,
+            };
+            let a = match temp {
+                Some(t) => format!("{a}, à {} K", fmt_num(*t)),
                 None => a,
             };
             if motion.free {

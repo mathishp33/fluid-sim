@@ -455,6 +455,9 @@ impl MultiphaseSim {
             self.react_step_sel(dt, ChemSel::NonFlame, false);
             lap(&mut prof, P_CHEM);
         }
+        // corps rigides : chaleur échangée avec le fluide qui les borde (mp_body_heat.rs)
+        self.exchange_body_heat(dt);
+        lap(&mut prof, P_CONDUCT);
         self.probe("conduction + diffusion + chimie");
         self.radiate(dt);
         self.probe("rayonnement");

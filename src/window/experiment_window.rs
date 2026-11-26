@@ -107,6 +107,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
         vitesse (vx, vy) · rotation 90 (°/s, rad/s, tr/min) · oscillation (vx, vy) période 1 s · oscillation rotation 30 période 2 s · pivot (x, y)
         — ou libre, poussé par l'écoulement : libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse (vx, vy)] [masse volumique 600 kg/m³]
           [rebond 0.5] [frottement 0.3]   (contacts contre les bords, les solides et les autres corps)
+        — tout corps : à 80 °C   (température de départ ; il échange ensuite sa chaleur avec le fluide)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"]
@@ -121,7 +122,7 @@ TEMPS, MESURES, SORTIES
   simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\"
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
-     corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple   (position, vitesse, force du fluide sur le 1er corps posé)
+     corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
 
 Résultats : résultats/<nom du protocole>/ à côté du protocole (mesures.csv, journal.txt, états .mps, copie du protocole).
