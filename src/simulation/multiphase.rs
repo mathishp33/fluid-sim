@@ -822,16 +822,29 @@ impl MultiphaseSim {
         self.ambient_alpha().iter().enumerate().map(|(k, a)| a * self.reg.phases[k].rho(p, self.t_ambient)).sum()
     }
 
+    /// dρ/dp du fluide ambiant à la pression p (à la température ambiante) : sa compressibilité, pour l'hydrostatique des bords ouverts
+    pub(crate) fn ambient_compressibility(&self, p: f64) -> f64 {
+        let d = 1e-3 * p.abs().max(1.0);
+        (self.ambient_density(p + d) - self.ambient_density(p - d)) / (2.0 * d)
+    }
+
     /// Pression imposée à une face de bord ouvert de centre (x, y) : celle du bord, `po`, plus le poids de la colonne de fluide AMBIANT
-    /// (masse volumique `rho_a`) depuis le coin le plus haut du domaine selon la gravité — le bord du haut reste à `po`, les bords
-    /// latéraux suivent l'hydrostatique de l'air extérieur. À pression constante, un bord latéral ouvert poussait sous la gravité un
-    /// courant parasite (ρ g H ≈ 5 Pa sur 40 cm d'air : l'air sortait en bas et rentrait en haut).
-    pub(crate) fn open_face_pressure(&self, po: f64, rho_a: f64, x: f64, y: f64) -> f64 {
+    /// depuis le coin le plus haut du domaine selon la gravité — le bord du haut reste à `po`, les bords latéraux suivent l'hydrostatique
+    /// de l'air extérieur. À pression constante, un bord latéral ouvert poussait sous la gravité un courant parasite (ρ g H ≈ 5 Pa sur
+    /// 40 cm d'air : l'air sortait en bas et rentrait en haut). La colonne est COMPRESSIBLE, dp/dΦ = ρ(p) (Φ : potentiel de pesanteur
+    /// depuis le haut), prise au second ordre : p = po + ρ_a Φ (1 + ½ ρ' Φ), ρ_a et ρ' = dρ/dp à `po` (`rho_a`, `drho`) — l'air
+    /// intérieur au repos suit l'hydrostatique de ρ(p) (`finalize_init`) ; à masse volumique constante, l'écart au pied d'une colonne
+    /// de 40 cm (1e-4 Pa) soufflait un vent qui croissait sans fin (4 mm/s après 5 s, côtés ouverts). Plus ⅛ ρ_a ρ' (g dx)² sous le
+    /// haut : la demi-maille du haut de l'intérieur prend la masse volumique de sa maille, ce qui décale toute la colonne d'autant
+    /// (1.7e-8 Pa dans l'air à 1 cm : 7 µm/s après 5 s sans ce terme).
+    pub(crate) fn open_face_pressure(&self, po: f64, rho_a: f64, drho: f64, x: f64, y: f64) -> f64 {
         let (lx, ly) = (self.nx as f64 * self.dx, self.ny as f64 * self.dx);
         let (gx, gy) = (self.gravity[0], self.gravity[1]);
         let xr = if gx < 0.0 { lx } else { 0.0 };
         let yr = if gy < 0.0 { ly } else { 0.0 };
-        po + rho_a * (gx * (x - xr) + gy * (y - yr))
+        let phi = gx * (x - xr) + gy * (y - yr);
+        let half = if phi > 0.0 { 0.125 * rho_a * drho * (gx * gx + gy * gy) * self.dx * self.dx } else { 0.0 };
+        po + rho_a * phi * (1.0 + 0.5 * drho * phi) + half
     }
 
     pub fn liquid_phases(&self) -> Vec<usize> {

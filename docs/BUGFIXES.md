@@ -15,7 +15,8 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
 - **Vapeur « verrouillée » sur son liquide** au-delà de 50 % de la masse de son groupe : seuil arbitraire.
 - **Poches de gaz très détendues** (quelques centaines de Pa) refroidies jusqu'au plancher de 60 K ; la conduction des voisines
   devrait les réchauffer plus vite.
-- **Bords ouverts qui créent du vent parasite** (sorties) : il faudrait plus de types de bords.
+- **Peu de types de bords** : ouvert à pression imposée (hydrostatique), entrée à vitesse imposée, paroi ; ni sortie à vitesse
+  imposée, ni bords périodiques, ni sortie convective.
 - **Cuve vide ouverte en haut** (pas un défaut, un piège) : de l'eau qui l'emplit jusqu'au bord en sort en se dilatant, avec son
   énergie comptée depuis 0 K ; les bilans d'énergie le voient (laisser une couche d'air en haut).
 
@@ -59,6 +60,13 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
 - **Suite de tests longue** (~65 min sur la machine de développement) : essais GPU un par un, mémoire juste (8 Go pour les essais).
 
 ## 2. Défauts corrigés
+
+### Bords ouverts (2026-11-26)
+- **Vent parasite des bords ouverts** (multiphasique) : de l'air au repos dans une cuve aux côtés ouverts se mettait en mouvement,
+  de plus en plus vite (4 mm/s après 5 s, sans fin). Le bord suivait l'hydrostatique d'une colonne d'air à masse volumique
+  constante, l'air intérieur celle de ρ(p), compressible : 1e-4 Pa d'écart au pied d'une colonne de 40 cm, qui ne s'annule jamais →
+  colonne compressible au second ordre, p = po + ρ_a Φ (1 + ½ ρ' Φ), plus le décalage de la demi-maille du haut de l'intérieur
+  (⅛ ρ_a ρ' (g dx)²), sur le CPU et le GPU : 7.6e-8 m/s après 5 s, au niveau des arrondis.
 
 ### Solides mobiles (2026-11-24 → 26)
 - **Raideur de contact qui suivait le pas** → le ressort ne rendait pas à la détente l'énergie de la compression (rebond à 0.29 pour

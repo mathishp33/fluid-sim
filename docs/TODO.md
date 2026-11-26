@@ -18,9 +18,9 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
   interpolées.
 
 ### Bords du domaine
-- [M+1] Les sorties (bords ouverts) créent du vent parasite : il faut plus de types de bords — sortie à vitesse imposée,
-  périodiques, sortie convective. Existent : [M] bord ouvert à pression imposée (hydrostatique de l'ambiant) et entrées de bord ;
-  [1] entrée et sortie.
+- [M+1] Plus de types de bords : sortie à vitesse imposée, périodiques, sortie convective. Existent : [M] bord ouvert à pression
+  imposée (hydrostatique de l'ambiant, colonne compressible : le vent parasite des côtés ouverts est corrigé, 7.6e-8 m/s après 5 s au
+  lieu de 4 mm/s) et entrées de bord ; [1] entrée et sortie.
 
 ### Solides mobiles (voir SOLID.md ; étapes 0 à 4 et chaleur faites)
 - [M] GPU : les scènes avec des corps se calculent sur le CPU. Porter fractions et ouvertures des faces, couplage monolithique

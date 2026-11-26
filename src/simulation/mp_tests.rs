@@ -490,13 +490,15 @@ fn open_tank(nx: usize, ny: usize, h: f64) -> (MultiphaseSim, usize, usize) {
 fn open_sides_keep_still_air_and_water_at_rest_under_gravity() {
     // cuve de 40 cm, eau sur 10 cm, ouverte à gauche, à droite et en haut, sous la gravité : rien ne bouge — la pression d'un bord
     // ouvert suit l'hydrostatique de l'air extérieur (`open_face_pressure`). À pression constante sur tout le bord, l'air sortait en bas
-    // des côtés et rentrait par le haut (ρ g H ≈ 5 Pa sur 40 cm) ; un bord du bas ouvert reste, lui, sous le poids de la colonne d'air
+    // des côtés et rentrait par le haut (ρ g H ≈ 5 Pa sur 40 cm) ; à masse volumique constante (colonne incompressible), un vent
+    // parasite croissait sans fin (1 mm/s par seconde) ; un bord du bas ouvert reste, lui, sous le poids de la colonne d'air
     let (mut s, _air, _) = tank(20, 40, 0.01, 0.0);
     s.bc = [Bc::Open { p: P_ATM }, Bc::Open { p: P_ATM }, Bc::Wall, Bc::Open { p: P_ATM }];
     s.finalize_init(|_, _| 293.15);
-    run_for(&mut s, 0.5);
+    run_for(&mut s, 3.0);
     let u_air = s.max_speed();
-    assert!(u_air < 1e-3, "air ouvert sur les côtés : |u| max {u_air} m/s");
+    eprintln!("air au repos, côtés ouverts : |u| max {u_air:.2e} m/s après {:.1} s", s.time);
+    assert!(u_air < 1e-6, "air ouvert sur les côtés : |u| max {u_air} m/s");
     // l'eau d'une cuve aux côtés ouverts s'écoule (bord à la pression de l'air extérieur, bien plus faible que celle de l'eau)
     let (mut s, _air, eau) = tank(20, 40, 0.01, 0.1);
     s.bc = [Bc::Wall, Bc::Open { p: P_ATM }, Bc::Wall, Bc::Open { p: P_ATM }];

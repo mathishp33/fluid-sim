@@ -53,7 +53,7 @@ const D_FR_UNCONV: usize = 65;
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
 const SLOT_BYTES: u64 = 256;
-const PARAMS_WORDS: usize = 68;
+const PARAMS_WORDS: usize = 72;
 /// groupes de travail des copies d'instantané du prédicteur-correcteur (boucle à pas SNAP_STRIDE = 1024 × 64 dans k_pc_save / k_pc_restore)
 const PC_GROUPS: u32 = 1024;
 
@@ -1363,12 +1363,15 @@ impl MultiphaseGpu {
         w[61] = f(sim.flame_speed_floor);
         w[62] = self.thermo_k(sim) as u32;
         w[63] = self.ntd as u32;
-        // bords ouverts : masse volumique de l'ambiant (pression hydrostatique le long du bord, miroir de open_face_pressure)
+        // bords ouverts : masse volumique de l'ambiant et sa compressibilité dρ/dp (pression hydrostatique le long du bord, miroir de
+        // open_face_pressure)
         for s in 0..4 {
-            w[64 + s] = f(match sim.bc[s] {
-                Bc::Open { p } => sim.ambient_density(p),
-                Bc::Wall => 0.0,
-            });
+            let (rho, drho) = match sim.bc[s] {
+                Bc::Open { p } => (sim.ambient_density(p), sim.ambient_compressibility(p)),
+                Bc::Wall => (0.0, 0.0),
+            };
+            w[64 + s] = f(rho);
+            w[68 + s] = f(drho);
         }
         w
     }

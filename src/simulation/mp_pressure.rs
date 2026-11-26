@@ -159,6 +159,10 @@ impl MultiphaseSim {
             Bc::Open { p } => self.ambient_density(p),
             Bc::Wall => 0.0,
         });
+        let drho_open: [f64; 4] = std::array::from_fn(|s| match self.bc[s] {
+            Bc::Open { p } => self.ambient_compressibility(p),
+            Bc::Wall => 0.0,
+        });
         let (lx, ly) = (nx as f64 * dx, ny as f64 * dx);
         let up = SyncPtr(un.as_mut_ptr());
         for_rows(ny, nx + 1, MIN_LIGHT, |j| {
@@ -175,14 +179,14 @@ impl MultiphaseSim {
                     }
                     (None, Some(b)) => match (self.bc[0], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[0], 0.0, (j as f64 + 0.5) * dx);
+                            let pb = self.open_face_pressure(po, rho_open[0], drho_open[0], 0.0, (j as f64 + 0.5) * dx);
                             bf(ou(i, j), us[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[1], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[1], lx, (j as f64 + 0.5) * dx);
+                            let pb = self.open_face_pressure(po, rho_open[1], drho_open[1], lx, (j as f64 + 0.5) * dx);
                             bf(ou(i, j), us[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
@@ -208,14 +212,14 @@ impl MultiphaseSim {
                     }
                     (None, Some(b)) => match (self.bc[2], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[2], (i as f64 + 0.5) * dx, 0.0);
+                            let pb = self.open_face_pressure(po, rho_open[2], drho_open[2], (i as f64 + 0.5) * dx, 0.0);
                             bf(ov(i, j), vs[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[3], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[3], (i as f64 + 0.5) * dx, ly);
+                            let pb = self.open_face_pressure(po, rho_open[3], drho_open[3], (i as f64 + 0.5) * dx, ly);
                             bf(ov(i, j), vs[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,

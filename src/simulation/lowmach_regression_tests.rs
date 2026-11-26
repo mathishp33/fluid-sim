@@ -834,3 +834,21 @@ fn four_orientations_are_equivalent() {
         assert!(dt_max < 1.0 && dtr_max < 1e-2 && dv_max / vmax < 5e-3, "orientation {dir} : ΔT {dt_max}, Δtracer {dtr_max}, Δv {}", dv_max / vmax);
     }
 }
+// ---- Air au repos sous la pesanteur, Outlet à gauche, à droite et en haut : aucun courant parasite (le multiphasique en avait un,
+// voir `open_sides_keep_still_air_and_water_at_rest_under_gravity`)
+#[test]
+fn still_air_stays_still_with_open_sides_under_gravity() {
+    let mat = FluidMaterial::air();
+    let mut f = cpu_sim(30, 40, 0.01, mat, 9.81);
+    f.low_mach = true;
+    f.left_boundary = bnd(BoundaryType::Outlet, 0.0, 0.0, 0.0, mat.t_ref);
+    f.right_boundary = bnd(BoundaryType::Outlet, 0.0, 0.0, 0.0, mat.t_ref);
+    f.top_boundary = bnd(BoundaryType::Outlet, 0.0, 0.0, 0.0, mat.t_ref);
+    for _ in 0..750 {
+        f.step(0.004, 200);
+    }
+    assert!(finite(&f));
+    let umax = f.velocity_x.iter().chain(&f.velocity_y).fold(0.0f32, |a, &b| a.max(b.abs()));
+    println!("air au repos, Outlet sur trois côtés : |u| max {umax:.3e} m/s après 3 s");
+    assert!(umax < 1e-6, "courant parasite : {umax} m/s");
+}

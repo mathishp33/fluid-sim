@@ -23,6 +23,7 @@ struct Params {
     closure_relax: f32, cfl_reject: f32, closure_small_scale: f32, phase_exch: f32,   // fermeture héritée (r, échelle) ; Courant de refus ; λ (≥ 1e37 : ∞)
     cfl_flame: f32, flame_u_floor: f32, thermo_k: u32, ntd: u32,   // borne de pas des flammes ; sous-pas du bloc thermique (correcteur) ; groupes de téléporteurs
     rho_l: f32, rho_r: f32, rho_b: f32, rho_t: f32,   // masse volumique de l'ambiant aux bords ouverts (pression hydrostatique le long du bord)
+    drho_l: f32, drho_r: f32, drho_b: f32, drho_t: f32,   // sa compressibilité dρ/dp (colonne d'ambiant compressible)
 };
 // drapeaux (Params.flags)
 const F_ST: u32 = 1u;        // tension de surface

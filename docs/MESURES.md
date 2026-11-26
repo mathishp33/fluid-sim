@@ -13,6 +13,7 @@ Légende de la colonne « Écart » : **exact** = au chiffre imprimé ou à l'ar
 | Grandeur | Simulé | Référence | Écart | Conditions |
 |---|---|---|---|---|
 | Courants parasites d'une cuve d'eau au repos | 5e-11 m/s | 0 | — | hydrostatique ; pression au fond exacte |
+| Air au repos dans une cuve aux côtés ouverts | 7.6e-8 m/s après 5 s | 0 | — | 60 × 40, maille 1 cm ; avant la colonne compressible du bord : 4 mm/s, croissant sans fin |
 | Montée de pression d'une eau confinée chauffée | Δp = β/κ ΔT | β/κ ΔT (dilatation / compressibilité) | 0.25 % | boîte fermée pleine d'eau |
 | Pulsation du ballottement d'une surface libre | ω² | g k tanh(k h) | +1 % | mode fondamental |
 | Saut de pression d'une goutte (Laplace) | Δp | σ / R | 0.1 % | goutte au repos |
