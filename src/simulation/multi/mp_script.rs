@@ -1054,8 +1054,45 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             push(proto, Action::DtMax(d), ln);
         }
         "sauver" | "enregistrer" => {
+            if p.eat_w("image") {
+                // sauver image "nom" [phases | température | pression | vitesse | masse volumique | vapeur | divergence | flamme | chaleur]
+                let name = p.string("le nom de l'image")?;
+                if name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.') {
+                    return p.err(format!("nom d'image « {name} » : un simple nom de fichier, sans dossier"));
+                }
+                use super::mp_view::MpDisplay as D;
+                let display = match p.peek_w() {
+                    None => D::Phases,
+                    Some(w) => {
+                        let d = match w {
+                            "phases" => D::Phases,
+                            "temperature" | "t" => D::Temperature,
+                            "pression" | "p" => D::Pressure,
+                            "vitesse" => D::Velocity,
+                            "densite" | "rho" | "masse" => D::Density,
+                            "vapeur" => D::Vapor,
+                            "divergence" => D::Divergence,
+                            "flamme" => D::Flame,
+                            "chaleur" => D::HeatRelease,
+                            o => {
+                                return p.err(format!(
+                                    "affichage « {o} » inconnu : phases, température, pression, vitesse, masse volumique, vapeur, divergence, flamme, chaleur"
+                                ))
+                            }
+                        };
+                        p.i += 1;
+                        if d == D::Density {
+                            p.eat_w("volumique");
+                        }
+                        d
+                    }
+                };
+                p.end()?;
+                push(proto, Action::SaveImage { name, display }, ln);
+                return Ok(());
+            }
             if !p.eat_w("etat") {
-                return p.err("il faut « sauver état \"nom\" »");
+                return p.err("il faut « sauver état \"nom\" » ou « sauver image \"nom\" [affichage] »");
             }
             let name = p.string("le nom de l'état")?;
             if name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.') {

@@ -169,6 +169,7 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 | `pause` | met l'expérience en pause dans la fenêtre (ignorée en ligne de commande) |
 | `marque "texte"` | repère dans le journal |
 | `sauver état "nom"` | écrit `nom.mps` dans le dossier des résultats |
+| `sauver image "nom" [affichage]` | écrit `nom.png` dans le dossier des résultats : le rendu de la fenêtre, agrandi d'un facteur entier (au plus 16) jusqu'à ~800 pixels de côté ; affichage `phases` (par défaut), `température` (échelle ΔT 100 K), `pression`, `vitesse`, `masse volumique`, `vapeur`, `divergence`, `flamme` ou `chaleur` |
 
 ### Mesures
 
@@ -282,8 +283,8 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 ## 7. Limites et suites
 
 - Pas de boucles, hormis le balayage ; une seule condition à la fois (`simuler jusqu'à ce que …`), sans « et » ni « ou ».
-- Une sonde lit la valeur de sa maille, sans interpolation. Il n'y a pas de flux à travers une ligne, ni d'images des champs en
-  sortie (PNG).
+- Une sonde lit la valeur de sa maille, sans interpolation. Il n'y a pas de flux à travers une ligne. Les images (`sauver image`) se
+  prennent à des instants écrits, pas à intervalles réguliers.
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,

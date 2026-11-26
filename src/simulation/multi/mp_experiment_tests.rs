@@ -656,3 +656,46 @@ simuler 20 ms
     let e = Runner::new(proto("départ scénario \"cuve vide\" grille 10 x 10\nmesurer toutes les 1 ms : force y sur rect (2, 2) (3, 3)\nsimuler 1 ms\n"), Path::new("."), None, Some(false)).err().unwrap();
     assert!(e.contains("hors du domaine"), "{e}");
 }
+
+#[test]
+fn a_protocol_saves_png_images_of_its_fields() {
+    use super::mp_view::MpDisplay;
+    let p = proto("départ scénario \"cuve vide\"\nsauver image \"a\"\nsauver image \"b\" masse volumique\nsauver image \"c\" température\n");
+    let disp: Vec<MpDisplay> = p
+        .steps
+        .iter()
+        .filter_map(|(s, _)| match s {
+            Step::Do(Action::SaveImage { display, .. }) => Some(*display),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(disp, [MpDisplay::Phases, MpDisplay::Density, MpDisplay::Temperature]);
+    for (bad, what) in [("sauver image \"x\" couleur", "affichage"), ("sauver image \"../x\"", "sans dossier"), ("sauver image", "nom de l'image")] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // barrage : image des phases au départ, de la vitesse après 0.1 s ; 40 × 30 mailles agrandies 16 fois (au plus)
+    let dir = tmp_dir("images");
+    let text = "départ scénario \"Rupture de barrage\" grille 40 x 30 maille 1 cm
+sauver image \"départ\"
+simuler 0.1 s
+sauver image \"vitesse\" vitesse
+";
+    let mut r = Runner::new(proto(text), Path::new("."), Some(dir.clone()), Some(false)).unwrap();
+    run_to_end(&mut r);
+    for (name, expect_motion) in [("départ", false), ("vitesse", true)] {
+        let path = dir.join(format!("{name}.png"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{} : {e}\n{}", path.display(), r.log.join("\n")));
+        let dec = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut rd = dec.read_info().unwrap();
+        let mut buf = vec![0u8; rd.output_buffer_size()];
+        let info = rd.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (640, 480), "{name}");
+        // pixels de couleurs différentes : l'image n'est pas uniforme
+        let first = &buf[0..4];
+        let distinct = buf[..info.buffer_size()].chunks(4).any(|px| px != first);
+        assert!(distinct || !expect_motion, "{name} : image uniforme");
+    }
+    assert!(r.log.iter().any(|l| l.contains("image vitesse (640 × 480)")), "{}", r.log.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

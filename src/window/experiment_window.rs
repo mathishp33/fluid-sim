@@ -119,7 +119,7 @@ ACTIONS À DURÉE
   chauffer <zone> à 600 K [pendant 2 s]          accélérer <zone> de (5, 0) m/s² [pendant 0.5 s]
 
 TEMPS, MESURES, SORTIES
-  simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\"
+  simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\" · sauver image \"nom\" [température | vitesse | …]
   simuler jusqu'à ce que max T dans partout < 400 K [au plus 10 s]   (relevé comme une mesure ; < <= > >=)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
@@ -628,6 +628,7 @@ impl ExperimentWindow {
                     ("vitesse", "vitesse rect (0, 0) (0.1, 0.05) (1, 0) m/s"),
                     ("bord", "bord haut ouvert"),
                     ("sauver état", "sauver état \"etat\""),
+                    ("sauver image", "sauver image \"image\" température"),
                     ("marque", "marque \"repère\""),
                     ("pause", "pause"),
                     ("balayage", "balayage T0 = 300 K, 350 K, 400 K"),

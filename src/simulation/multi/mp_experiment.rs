@@ -462,6 +462,8 @@ pub enum Action {
     Gravity([f64; 2]),
     DtMax(f64),
     SaveState(String),
+    /// image PNG du champ `display` dans le dossier des résultats (`nom.png`)
+    SaveImage { name: String, display: super::mp_view::MpDisplay },
     Mark(String),
     /// met l'expérience en pause (fenêtre) ; ignorée en ligne de commande
     Pause,
@@ -470,7 +472,7 @@ pub enum Action {
 impl Action {
     /// action qui modifie l'état sur-le-champ (et qu'on peut donc rejouer pour construire les conditions initiales)
     pub fn is_instant_edit(&self) -> bool {
-        !matches!(self, Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::Mark(_) | Action::Pause)
+        !matches!(self, Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause)
     }
     /// zone de l'action (pour l'afficher sur l'image)
     pub fn zone(&self) -> Option<&Zone> {
@@ -875,7 +877,7 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             sim.dt_max = *d;
             Ok(0)
         }
-        Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::Mark(_) | Action::Pause => Ok(0),
+        Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause => Ok(0),
     }
 }
 
@@ -1415,6 +1417,7 @@ impl Runner {
                 }
                 Action::Mark(t) => self.note(format!("ligne {line} : repère « {t} »")),
                 Action::SaveState(name) => self.save_state(name, line),
+                Action::SaveImage { name, display } => self.save_image(name, *display, line),
                 Action::Heat { zone, temp, duration } => {
                     let cells = idx_cells(&self.sim, zone);
                     self.note(format!("ligne {line} : chauffer {} à {} K{} — {} mailles", zone.label(), fmt_num(*temp), dur(*duration), cells.len()));
@@ -1491,6 +1494,41 @@ impl Runner {
         match state_to_bytes(&self.sim, self.library.as_ref(), self.scenario, None).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
             Ok(()) => self.note(format!("ligne {line} : état enregistré : {}", path.display())),
             Err(e) => self.fail(format!("ligne {line} : sauver état : {e}")),
+        }
+    }
+
+    /// Image PNG d'un champ (rendu de la fenêtre : `mp_view::render_rgba`, échelle ΔT 100 K, pression automatique), agrandie d'un
+    /// facteur entier (au plus 16) jusqu'à ~800 pixels de côté.
+    fn save_image(&mut self, name: &str, display: super::mp_view::MpDisplay, line: usize) {
+        let Some(dir) = self.out_dir.clone() else {
+            self.note(format!("ligne {line} : sauver image « {name} » — pas de dossier de résultats, rien d'écrit"));
+            return;
+        };
+        self.sync_host();
+        let (nx, ny) = (self.sim.nx, self.sim.ny);
+        let mut rgba = vec![];
+        super::mp_view::render_rgba(&self.sim, super::mp_view::RenderOpts::new(display, 100.0, 0.0), &mut rgba);
+        let k = (800 / nx.max(ny)).clamp(1, 16);
+        let (w, h) = (nx * k, ny * k);
+        let mut big = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let (s, d) = (((y / k) * nx + x / k) * 4, (y * w + x) * 4);
+                big[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+            }
+        }
+        let path = dir.join(format!("{name}.png"));
+        let write = || -> Result<(), String> {
+            let f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+            wr.write_image_data(&big).map_err(|e| e.to_string())
+        };
+        match write() {
+            Ok(()) => self.note(format!("ligne {line} : image {} ({w} × {h}) : {}", display.name().to_lowercase(), path.display())),
+            Err(e) => self.fail(format!("ligne {line} : sauver image : {e}")),
         }
     }
 
