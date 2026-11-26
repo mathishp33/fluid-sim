@@ -484,6 +484,9 @@ pub enum Action {
     Sink { zone: Zone, rate: f64 },
     Emitter { zone: Zone, fluid: String, v: [f64; 2], temp: Option<f64> },
     Grille { zone: Zone, hole: f64, open: f64 },
+    /// vanne à guillotine sur la zone : la part `open` (0 fermée à 1 ouverte) de ses rangées le long de son plus grand côté, depuis la
+    /// gauche ou le bas, est ouverte ; le reste est fermé (faces fermées, fluide gardé)
+    Valve { zone: Zone, open: f64 },
     Boundary { side: usize, spec: BoundarySpec },
     Field { qty: FieldQty, source: FieldSource, zone: Zone, temp: Option<f64> },
     Gravity([f64; 2]),
@@ -522,6 +525,7 @@ impl Action {
             | Action::Sink { zone, .. }
             | Action::Emitter { zone, .. }
             | Action::Grille { zone, .. }
+            | Action::Valve { zone, .. }
             | Action::Field { zone, .. } => Some(zone),
             Action::Periodic { action, .. } => action.zone(),
             _ => None,
@@ -892,6 +896,31 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             effect(sim, zone, MpEffect::Emitter { vx: v[0], vy: v[1], phase, temp: temp.unwrap_or(t_amb) })
         }
         Action::Grille { zone, hole, open } => effect(sim, zone, MpEffect::Grille { hole: *hole, open: *open }),
+        Action::Valve { zone, open } => {
+            // le long du plus grand côté de la zone, les rangées d'indice < part ouverte × nombre de rangées sont ouvertes (mailles
+            // ordinaires), les autres fermées ; une autre cellule spéciale de la zone est laissée telle quelle
+            let cs = cells(sim, zone);
+            if cs.is_empty() {
+                return Err(format!("la zone « {} » est hors du domaine", zone.label()));
+            }
+            let (i0, i1) = (cs.iter().map(|c| c.0).min().unwrap(), cs.iter().map(|c| c.0).max().unwrap());
+            let (j0, j1) = (cs.iter().map(|c| c.1).min().unwrap(), cs.iter().map(|c| c.1).max().unwrap());
+            let along_x = i1 - i0 >= j1 - j0;
+            let rows = if along_x { i1 - i0 + 1 } else { j1 - j0 + 1 };
+            let n_open = (open.clamp(0.0, 1.0) * rows as f64 + 0.5).floor() as usize;
+            let mut closed = 0;
+            for &(i, j) in &cs {
+                let c = sim.idx(i, j);
+                if sim.is_solid(c) || !matches!(sim.special[c], None | Some(MpEffect::Valve)) {
+                    continue;
+                }
+                let shut = (if along_x { i - i0 } else { j - j0 }) >= n_open;
+                sim.special[c] = if shut { Some(MpEffect::Valve) } else { None };
+                closed += shut as usize;
+            }
+            sim.refresh();
+            Ok(closed)
+        }
         Action::Boundary { side, spec } => {
             let k = *side;
             match spec {
@@ -1882,7 +1911,8 @@ impl Runner {
                 other => match apply_action(&mut self.sim, other, &self.base.clone()) {
                     Ok(n) => {
                         let what = describe(other);
-                        let cells = if other.zone().is_some() { format!(" — {n} mailles") } else { String::new() };
+                        let shut = if matches!(other, Action::Valve { .. }) { " fermées" } else { "" };
+                        let cells = if other.zone().is_some() { format!(" — {n} mailles{shut}") } else { String::new() };
                         self.note(format!("ligne {line} : {what}{cells}"));
                         edited = true;
                     }
@@ -2351,6 +2381,11 @@ fn describe(a: &Action) -> String {
         Action::Sink { zone, rate } => format!("puits {} ({} m/s)", zone.label(), fmt_num(*rate)),
         Action::Emitter { zone, fluid, .. } => format!("émetteur de « {fluid} » {}", zone.label()),
         Action::Grille { zone, .. } => format!("grille {}", zone.label()),
+        Action::Valve { zone, open } => match *open {
+            o if o <= 0.0 => format!("vanne {} fermée", zone.label()),
+            o if o >= 1.0 => format!("vanne {} ouverte", zone.label()),
+            o => format!("vanne {} ouverte à {} %", zone.label(), fmt_num((o * 1000.0).round() / 10.0)),
+        },
         Action::Boundary { side, spec } => {
             let s = ["gauche", "droite", "bas", "haut"][*side];
             match spec {

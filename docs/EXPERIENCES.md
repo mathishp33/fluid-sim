@@ -112,6 +112,7 @@ d'expérience.
 | `puits <zone> [v]` | cellules qui aspirent le fluide (0.2 m/s par défaut) |
 | `émetteur <zone> "fluide" (vx, vy) [à T]` | buses qui créent et expulsent un fluide |
 | `grille <zone> [trous d] [ouverte f]` | grille qui arrête les grains (trous de 1 cm, 60 % ouverte par défaut) |
+| `vanne <zone> [fermée \| ouverte [f \| n %]]` | vanne à guillotine (fermée par défaut) : le long du plus grand côté de la zone, la part ouverte (fraction f de 0 à 1, ou n %) de ses rangées, depuis la gauche ou le bas, laisse passer l'écoulement ; les autres mailles ont leurs faces fermées et gardent leur fluide. À répéter pour l'ouvrir ou la fermer en cours d'expérience, par exemple `toutes les 0.2 s : vanne … ouverte` et `toutes les 0.2 s à partir de 0.1 s : vanne … fermée`. CPU et GPU |
 | `bord gauche\|droite\|bas\|haut mur` | paroi |
 | `bord … ouvert [p]` | ouvert à la pression p (1 atm par défaut) au point le plus haut du bord |
 | `bord … entrée (vx, vy) [à T] ["fluide"]` | entrée à vitesse imposée (premier liquide par défaut) |

@@ -35,10 +35,13 @@ pub enum MpEffect {
     /// grille : arrête les grains (un tas y repose, comme sur un solide) et laisse passer le fluide par percolation (trous de `hole` m,
     /// fraction ouverte `open` ; loi d'Ergun, voir mp_percolation.rs). Ses faces sont fermées à l'écoulement du mélange.
     Grille { hole: f64, open: f64 },
+    /// maille FERMÉE d'une vanne : ses faces sont fermées à l'écoulement, son fluide reste (la part ouverte d'une vanne est faite de
+    /// mailles ordinaires)
+    Valve,
 }
 
 impl MpEffect {
-    pub const KINDS: [&'static str; 5] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille"];
+    pub const KINDS: [&'static str; 6] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille", "Vanne"];
     pub fn kind_name(&self) -> &'static str {
         match self {
             MpEffect::Sink { .. } => "Puits",
@@ -46,6 +49,7 @@ impl MpEffect {
             MpEffect::Accelerator { .. } => "Accélérateur",
             MpEffect::Teleporter { .. } => "Téléporteur",
             MpEffect::Grille { .. } => "Grille",
+            MpEffect::Valve => "Vanne",
         }
     }
 }
@@ -236,6 +240,8 @@ impl MultiphaseSim {
                 }
                 // grille : faces fermées au mélange (le fluide passe par percolation, les grains ne passent pas)
                 Some(MpEffect::Grille { .. }) => fx.fix_faces(i, j, 0.0),
+                // maille fermée d'une vanne : faces fermées, fluide gardé (ni épinglée, ni vidée)
+                Some(MpEffect::Valve) => fx.fix_faces(i, j, 0.0),
                 Some(MpEffect::Teleporter { dest, speed, radius }) if self.tp_dest_ok(c, dest) => {
                     pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
                     match tp_groups.iter_mut().find(|g| g.0 == dest) {

@@ -130,11 +130,12 @@ fn unit_of(w: &str) -> Option<(Dim, f64, f64)> {
 }
 
 fn word_start(c: char) -> bool {
-    c.is_alphabetic() || matches!(c, '_' | '°' | 'µ')
+    c.is_alphabetic() || matches!(c, '_' | '°' | 'µ' | '%')
 }
 
 fn word_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '/' | '²' | '³' | '°' | 'µ' | '\'' | '’')
+    // (tout caractère qui commence un mot doit en faire partie : sinon la lecture n'avance plus)
+    c.is_alphanumeric() || matches!(c, '_' | '/' | '²' | '³' | '°' | 'µ' | '%' | '\'' | '’')
 }
 
 fn tokenize(line: &str, ln: usize) -> Result<Vec<Tok>, ScriptError> {
@@ -1133,6 +1134,28 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let temp = p.opt_temp()?;
             p.end()?;
             push(proto, Action::Emitter { zone, fluid, v, temp }, ln);
+        }
+        "vanne" => {
+            // vanne <zone> [fermée | ouverte [fraction | n %]] — vanne à guillotine, fermée par défaut
+            let zone = p.zone()?;
+            let open = if p.eat_w("fermee") || p.done() {
+                0.0
+            } else if p.eat_w("ouverte") {
+                if p.done() {
+                    1.0
+                } else {
+                    let v = p.number("l'ouverture (fraction de 0 à 1, ou pourcentage suivi de %)")?;
+                    let v = if p.eat_w("%") { v / 100.0 } else { v };
+                    if !(0.0..=1.0).contains(&v) {
+                        return p.err("l'ouverture d'une vanne est entre 0 (fermée) et 1 (ouverte), ou entre 0 et 100 %");
+                    }
+                    v
+                }
+            } else {
+                return p.err(format!("après la zone de la vanne : « fermée » ou « ouverte [fraction] »{}", p.here()));
+            };
+            p.end()?;
+            push(proto, Action::Valve { zone, open }, ln);
         }
         "grille" => {
             let zone = p.zone()?;

@@ -596,6 +596,66 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn a_valve_closes_its_cells_to_the_flow_and_opens_like_a_gate() {
+    // lecture : fermée (par défaut), ouverte, ouverte en fraction ou en pourcentage
+    let p = proto(
+        "départ scénario \"cuve vide\"
+vanne rect (0.15, 0) (0.16, 0.3) fermée
+vanne rect (0.15, 0) (0.16, 0.3) ouverte
+vanne rect (0.15, 0) (0.16, 0.3) ouverte 0.4
+vanne rect (0.15, 0) (0.16, 0.3) ouverte 40 %
+vanne rect (0.15, 0) (0.16, 0.3)
+",
+    );
+    let opens: Vec<f64> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(Action::Valve { open, .. }) = s { Some(*open) } else { None }).collect();
+    assert_eq!(opens, [0.0, 1.0, 0.4, 0.4, 0.0]);
+    for (bad, what) in [("vanne partout ouverte 1.5", "entre 0"), ("vanne partout entrouverte", "« fermée » ou « ouverte")] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+
+    // rupture de barrage (eau à gauche, 15 cm de haut), vanne en travers à x = 15 cm, sur toute la hauteur (30 mailles) : fermée,
+    // rien ne passe ; ouverte à moitié (les 15 mailles du bas), l'eau passe par le bas seulement
+    let text = |state: &str| {
+        format!(
+            "départ scénario \"Rupture de barrage\" grille 40 x 30 maille 1 cm
+vanne rect (0.15, 0) (0.16, 0.3) {state}
+mesurer toutes les 10 ms : masse \"eau\" dans rect (0.16, 0) (0.4, 0.3), débit massique \"eau\" à travers ligne (0.15, 0) (0.15, 0.15), débit massique \"eau\" à travers ligne (0.15, 0.15) (0.15, 0.3)
+simuler 0.4 s
+"
+        )
+    };
+    let run = |state: &str, gpu: bool| -> Runner {
+        let mut r = Runner::new(proto(&text(state)), Path::new("."), None, Some(gpu)).unwrap();
+        assert!(r.gpu.is_some() == gpu, "{}", r.log.join("\n"));
+        run_to_end(&mut r);
+        r
+    };
+    let closed = run("fermée", false);
+    let log = closed.log.join("\n");
+    assert!(log.contains("vanne rect (0.15, 0) (0.16, 0.3) fermée — 30 mailles fermées"), "{log}");
+    let last = closed.rows.last().unwrap();
+    assert!(last[2].abs() < 1e-9 && closed.rows.iter().all(|r| r[3] == 0.0 && r[4] == 0.0), "fermée : {} kg/m passés", last[2]);
+    let half = |r: &Runner, what: &str| -> f64 {
+        let log = r.log.join("\n");
+        assert!(log.contains("ouverte à 50 % — 15 mailles fermées"), "{what}\n{log}");
+        let passed = r.rows.last().unwrap()[2];
+        let low: f64 = r.rows.iter().map(|row| row[3]).fold(0.0, f64::max);
+        assert!(r.rows.iter().all(|row| row[4] == 0.0), "{what} : la moitié fermée laisse passer");
+        eprintln!("{what} : vanne ouverte à moitié, {passed:.4} kg/m passés (débit du bas jusqu'à {low:.3} kg/(m·s))");
+        assert!(passed > 1.0 && low > 1.0, "{what} : {passed} kg/m passés");
+        passed
+    };
+    let cpu = half(&run("ouverte 0.5", false), "CPU");
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let gpu = half(&run("ouverte 0.5", true), "GPU");
+    assert!((gpu / cpu - 1.0).abs() < 0.1, "GPU {gpu} / CPU {cpu}");
+}
+
+#[test]
 fn periodic_actions_repeat_on_time_alongside_the_protocol() {
     // lecture : période, début et fin facultatifs, puis l'action après « : »
     let p = proto(
