@@ -65,6 +65,7 @@ une heure sur la machine de développement (les essais GPU passent un par un). L
 - **MESURES.md** — la simulation face aux valeurs de référence, chiffres à l'appui ;
 - **BUGFIXES.md** — défauts connus et défauts corrigés ;
 - **TODO.md** — ce qui reste à faire, par priorité, et ce qui est fait ;
+- **PHYSICS.md** — toutes les lois physiques, mathématiques et chimiques de la simulation, et à quoi chacune sert ;
 - **MULTIPHASE.md** — le solveur multiphasique (modèles, validation, portage GPU) ;
 - **GRANULAIRE.md** — poudres et grains (transport, chute, frottement, réactions, solidification) ;
 - **SOLID.md** — solides mobiles (corps rigides : couplage, contacts, chaleur) ;

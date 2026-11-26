@@ -2,8 +2,9 @@
 
 Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux. Mis à jour le 2026-11-26. Le solveur monophasique
 n'est plus suivi depuis le 2026-11-26 : il reste tel quel, ses points [1] pour mémoire seulement.
-À lire avec : MESURES.md (la simulation face aux références), BUGFIXES.md (défauts connus et corrigés), et les documents de
-conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (solveur), EXPERIENCES.md (protocoles).
+À lire avec : PHYSICS.md (les lois de la simulation), MESURES.md (la simulation face aux références), BUGFIXES.md (défauts connus
+et corrigés), et les documents de conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (solveur),
+EXPERIENCES.md (protocoles).
 
 ---
 
