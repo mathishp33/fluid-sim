@@ -407,8 +407,8 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   fixe » de la fenêtre d'expérience (disque au clic, rectangle tiré) posent les corps.
 - La « masse du corps dans ρ » prévue au départ n'est pas utile pour un corps fixe : la part couverte ne bouge pas, seule l'inertie
   du fluide compte. Elle reviendra avec les corps libres.
-- Le corps n'échange pas encore de chaleur avec le fluide : la trace des mailles couvertes est isolée et le corps garde sa
-  température (étape 5). Les grains ne le voient pas encore : leur sédimentation ignore les corps.
+- Le corps n'échangeait pas encore de chaleur avec le fluide (fait à l'étape 5 : il échange avec le fluide qui le borde ; la trace
+  des mailles entièrement couvertes reste isolée). Les grains ne le voient pas encore : leur sédimentation ignore les corps.
 - Tests (`mp_bodies.rs`) : fermeture après la pose, eau au repos, canal autour d'un disque, barrage contre deux corps ; commande et
   outil ; empreintes physiques des 18 scénarios toujours identiques au bit près.
 
