@@ -5,7 +5,7 @@
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Cmp, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Clause, Cmp, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
 };
 use super::mp_view::T_IGNITION;
 
@@ -714,20 +714,36 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         }
         "simuler" | "avancer" => {
             let step = if (p.eat_w("jusqua") || p.eat_w("jusque")) && p.eat_w("ce") {
-                // simuler jusqu'à ce que <relevé> < | ≤ | > | ≥ <seuil> [au plus <durée>]
+                // simuler jusqu'à ce que <relevé> < | ≤ | > | ≥ <seuil> [et | ou <relevé> … <seuil>]… [au plus <durée>]
                 if !p.eat_w("que") {
                     return p.err(format!("il faut « jusqu'à ce que <relevé> < <valeur> »{}", p.here()));
                 }
-                let measure = p.measure()?;
-                if measure == Measure::Stats {
-                    return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
+                let mut clauses = vec![];
+                let mut any: Option<bool> = None;
+                loop {
+                    let measure = p.measure()?;
+                    if measure == Measure::Stats {
+                        return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
+                    }
+                    let cmp = match p.peek() {
+                        Some(Tok::Cmp(c)) => *c,
+                        _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
+                    };
+                    p.i += 1;
+                    let value = p.threshold(&measure)?;
+                    clauses.push(Clause { measure, cmp, value });
+                    let link = if p.eat_w("et") {
+                        false
+                    } else if p.eat_w("ou") {
+                        true
+                    } else {
+                        break;
+                    };
+                    if any.is_some_and(|a| a != link) {
+                        return p.err("« et » et « ou » ne se mélangent pas dans une même condition (pas de parenthèses)");
+                    }
+                    any = Some(link);
                 }
-                let cmp = match p.peek() {
-                    Some(Tok::Cmp(c)) => *c,
-                    _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
-                };
-                p.i += 1;
-                let value = p.threshold(&measure)?;
                 let limit = if p.eat_w("au") {
                     if !p.eat_w("plus") {
                         return p.err(format!("il faut « au plus <durée> »{}", p.here()));
@@ -740,7 +756,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 } else {
                     None
                 };
-                Step::UntilCond { measure, cmp, value, limit }
+                Step::UntilCond { clauses, any: any.unwrap_or(false), limit }
             } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
             } else {

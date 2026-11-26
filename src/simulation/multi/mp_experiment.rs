@@ -522,6 +522,14 @@ impl Cmp {
     }
 }
 
+/// une comparaison d'une condition d'arrêt : relevé (comme une mesure), comparaison, seuil dans l'unité du relevé
+#[derive(Clone, Debug, PartialEq)]
+pub struct Clause {
+    pub measure: Measure,
+    pub cmp: Cmp,
+    pub value: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     Do(Action),
@@ -529,9 +537,9 @@ pub enum Step {
     Simulate(f64),
     /// avance jusqu'à ce temps simulé
     Until(f64),
-    /// avance jusqu'à ce que le relevé `measure` vérifie `cmp value` (vérifié après chaque pas, ou chaque série de pas du GPU), au plus
-    /// pendant `limit` secondes si elle est donnée
-    UntilCond { measure: Measure, cmp: Cmp, value: f64, limit: Option<f64> },
+    /// avance jusqu'à ce que les comparaisons `clauses` soient toutes vraies (`any` : l'une d'elles), vérifiées après chaque pas (ou
+    /// chaque série de pas du GPU), au plus pendant `limit` secondes si elle est donnée
+    UntilCond { clauses: Vec<Clause>, any: bool, limit: Option<f64> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -959,23 +967,41 @@ fn display_slug(d: super::mp_view::MpDisplay) -> &'static str {
     }
 }
 
-/// condition d'arrêt en cours : relevé, comparaison, seuil, ligne du protocole, nom et unité du relevé
-struct Cond {
+/// une comparaison d'une condition d'arrêt en cours : relevé, comparaison, seuil, nom et unité du relevé, dernier relevé (t, valeur)
+struct CondClause {
     probe: Probe,
     cmp: Cmp,
     value: f64,
-    line: usize,
     name: String,
     unit: String,
-    /// dernier relevé (t, valeur) ; franchissement prévu avant la prochaine série de pas du GPU (il repasse alors au pas unique)
     last: Option<(f64, f64)>,
+}
+
+/// condition d'arrêt en cours : comparaisons reliées par « et » (toutes) ou « ou » (`any`) ; `near` : franchissement prévu avant la
+/// prochaine série de pas du GPU (il repasse alors au pas unique)
+struct Cond {
+    clauses: Vec<CondClause>,
+    any: bool,
+    line: usize,
     near: bool,
 }
 
 impl Cond {
-    /// « corps 1 y < 0.1 m »
+    /// « corps 1 y < 0.1 m ou max T partout > 400 K »
     fn text(&self) -> String {
-        format!("{} {} {} {}", self.name, self.cmp.symbol(), fmt_num(self.value), self.unit)
+        let parts: Vec<String> = self.clauses.iter().map(|c| format!("{} {} {} {}", c.name, c.cmp.symbol(), fmt_num(c.value), c.unit)).collect();
+        parts.join(if self.any { " ou " } else { " et " })
+    }
+    fn values(&self, sim: &MultiphaseSim) -> Vec<f64> {
+        self.clauses.iter().map(|c| c.probe.value(sim)).collect()
+    }
+    fn holds(&self, xs: &[f64]) -> bool {
+        let mut it = self.clauses.iter().zip(xs).map(|(c, &x)| c.cmp.holds(x, c.value));
+        if self.any { it.any(|b| b) } else { it.all(|b| b) }
+    }
+    /// « 0.099 m ; 412 K »
+    fn values_text(&self, xs: &[f64]) -> String {
+        self.clauses.iter().zip(xs).map(|(c, &x)| format!("{} {}", fmt_num(x), c.unit)).collect::<Vec<_>>().join(" ; ")
     }
 }
 
@@ -1357,31 +1383,38 @@ impl Runner {
                     }
                     self.pc += 1;
                 }
-                Step::UntilCond { measure, cmp, value, limit } => {
+                Step::UntilCond { clauses, any, limit } => {
                     self.start_sampling();
                     self.pc += 1;
-                    let (probe, name, unit) = match self.make_probe(&measure) {
-                        Ok(Some(p)) => p,
-                        Ok(None) => {
-                            self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
-                            break;
+                    let mut parts = vec![];
+                    for cl in &clauses {
+                        match self.make_probe(&cl.measure) {
+                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None }),
+                            Ok(None) => {
+                                self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
+                                return &self.state;
+                            }
+                            Err(e) => {
+                                self.fail(format!("ligne {line} : {e}"));
+                                return &self.state;
+                            }
                         }
-                        Err(e) => {
-                            self.fail(format!("ligne {line} : {e}"));
-                            break;
-                        }
-                    };
+                    }
                     self.sync_host();
-                    let x = probe.value(&self.sim);
-                    let c = Cond { probe, cmp, value, line, name, unit, last: Some((self.sim.time, x)), near: false };
-                    if cmp.holds(x, value) {
-                        self.note(format!("ligne {line} : {} déjà vrai ({} {})", c.text(), fmt_num(x), c.unit));
+                    let mut c = Cond { clauses: parts, any, line, near: false };
+                    let xs = c.values(&self.sim);
+                    let t = self.sim.time;
+                    for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
+                        cl.last = Some((t, x));
+                    }
+                    if c.holds(&xs) {
+                        self.note(format!("ligne {line} : {} déjà vrai ({})", c.text(), c.values_text(&xs)));
                     } else {
                         let what = match limit {
                             Some(d) => format!("au plus {} s", fmt_num(d)),
                             None => "sans limite de durée".to_string(),
                         };
-                        self.note(format!("ligne {line} : simuler jusqu'à ce que {} ({what}) — {} {} au départ", c.text(), fmt_num(x), c.unit));
+                        self.note(format!("ligne {line} : simuler jusqu'à ce que {} ({what}) — {} au départ", c.text(), c.values_text(&xs)));
                         self.target = Some(limit.map_or(f64::INFINITY, |d| self.sim.time + d));
                         self.cond = Some(c);
                     }
@@ -1633,8 +1666,8 @@ impl Runner {
             self.target = None;
             if let Some(c) = self.cond.take() {
                 self.sync_host();
-                let x = c.probe.value(&self.sim);
-                self.note(format!("ligne {} : {} non atteint au bout du temps permis ({} {})", c.line, c.text(), fmt_num(x), c.unit));
+                let xs = c.values(&self.sim);
+                self.note(format!("ligne {} : {} non atteint au bout du temps permis ({})", c.line, c.text(), c.values_text(&xs)));
             }
             return;
         }
@@ -1675,22 +1708,35 @@ impl Runner {
         if self.cond.is_some() {
             self.sync_host();
             let (t, dt) = (self.sim.time, self.sim.last_dt);
-            let c = self.cond.as_mut().unwrap();
-            let x = c.probe.value(&self.sim);
-            if c.cmp.holds(x, c.value) {
+            let xs = self.cond.as_ref().unwrap().values(&self.sim);
+            if self.cond.as_ref().unwrap().holds(&xs) {
                 let c = self.cond.take().unwrap();
-                self.note(format!("ligne {} : {} atteint ({} {})", c.line, c.text(), fmt_num(x), c.unit));
+                self.note(format!("ligne {} : {} atteint ({})", c.line, c.text(), c.values_text(&xs)));
                 self.target = None;
             } else {
-                // tendance des deux derniers relevés : franchissement prévu dans moins de deux séries de 8 pas ?
-                c.near = match c.last {
-                    Some((t0, x0)) if t > t0 && x != x0 => {
-                        let eta = (c.value - x) / ((x - x0) / (t - t0));
-                        eta >= 0.0 && eta < 16.0 * dt
+                // tendance des deux derniers relevés : franchissement prévu dans moins de deux séries de 8 pas ? « ou » : celui d'une
+                // comparaison encore fausse ; « et » : celui de toutes les comparaisons encore fausses
+                let c = self.cond.as_mut().unwrap();
+                let any = c.any;
+                let mut near = !any;
+                for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
+                    if !cl.cmp.holds(x, cl.value) {
+                        let close = match cl.last {
+                            Some((t0, x0)) if t > t0 && x != x0 => {
+                                let eta = (cl.value - x) / ((x - x0) / (t - t0));
+                                eta >= 0.0 && eta < 16.0 * dt
+                            }
+                            _ => false,
+                        };
+                        if any {
+                            near |= close;
+                        } else {
+                            near &= close;
+                        }
                     }
-                    _ => false,
-                };
-                c.last = Some((t, x));
+                    cl.last = Some((t, x));
+                }
+                c.near = near;
             }
         }
         for k in 0..self.series.len() {

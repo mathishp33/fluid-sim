@@ -165,7 +165,7 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 |---|---|
 | `simuler d` | avance de la durée d |
 | `simuler jusqu'à t` | avance jusqu'au temps simulé t |
-| `simuler jusqu'à ce que <relevé> < \| <= \| > \| >= <seuil> [au plus d]` | avance jusqu'à ce que le relevé franchisse le seuil (≤ et ≥ s'écrivent aussi) : le relevé s'écrit comme une mesure (`T en (x, y)`, `max T dans <zone>`, `masse "eau" dans <zone>`, `corps 1 y`…), le seuil dans son unité (`400 K`, `20 °C`, `2 bar`, `30` pour un angle en degrés). Vérifié après chaque pas (sur le GPU, après chaque série de pas, puis pas à pas près du seuil) ; le journal note l'instant et la valeur. `au plus d` borne la durée (sinon, aucune limite) |
+| `simuler jusqu'à ce que <relevé> < \| <= \| > \| >= <seuil> [et \| ou …] [au plus d]` | avance jusqu'à ce que le relevé franchisse le seuil (≤ et ≥ s'écrivent aussi) : le relevé s'écrit comme une mesure (`T en (x, y)`, `max T dans <zone>`, `masse "eau" dans <zone>`, `corps 1 y`…), le seuil dans son unité (`400 K`, `20 °C`, `2 bar`, `30` pour un angle en degrés). Plusieurs comparaisons se relient par `et` (toutes vraies) ou par `ou` (l'une d'elles), sans mélanger les deux (pas de parenthèses) : `simuler jusqu'à ce que max T dans partout > 400 K ou corps 1 y < 5 cm`. Vérifié après chaque pas (sur le GPU, après chaque série de pas, puis pas à pas près du seuil) ; le journal note l'instant et les valeurs. `au plus d` borne la durée (sinon, aucune limite) |
 | `pause` | met l'expérience en pause dans la fenêtre (ignorée en ligne de commande) |
 | `marque "texte"` | repère dans le journal |
 | `sauver état "nom"` | écrit `nom.mps` dans le dossier des résultats |
@@ -283,7 +283,8 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 
 ## 7. Limites et suites
 
-- Pas de boucles, hormis le balayage ; une seule condition à la fois (`simuler jusqu'à ce que …`), sans « et » ni « ou ».
+- Pas de boucles, hormis le balayage. Une condition d'arrêt (`simuler jusqu'à ce que …`) relie ses comparaisons par « et » ou par
+  « ou », pas les deux à la fois : il n'y a pas de parenthèses.
 - Une sonde lit la valeur de sa maille, sans interpolation. Il n'y a pas de flux à travers une ligne.
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.

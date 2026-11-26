@@ -518,7 +518,7 @@ fn the_command_line_runs_every_variant_of_a_protocol_file() {
 
 #[test]
 fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
-    use super::mp_experiment::{BodyQty, Cmp};
+    use super::mp_experiment::{BodyQty, Clause, Cmp};
     // lecture : relevé comme une mesure, comparaison, seuil avec son unité, durée maximale facultative
     let p = proto(
         "départ scénario \"cuve vide\"
@@ -528,19 +528,24 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
          simuler jusqu'à 2 s
 ",
     );
-    match &p.steps[0].0 {
-        Step::UntilCond { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, zone: Zone::Partout, .. }, cmp: Cmp::Lt, value, limit: Some(l) } => {
-            assert!(*value == 400.0 && *l == 5.0)
+    // une seule comparaison : la clause et le seuil
+    let one = |k: usize| match &p.steps[k].0 {
+        Step::UntilCond { clauses, any: false, limit } if clauses.len() == 1 => (clauses[0].clone(), *limit),
+        s => panic!("{s:?}"),
+    };
+    match one(0) {
+        (Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, zone: Zone::Partout, .. }, cmp: Cmp::Lt, value }, Some(l)) => {
+            assert!(value == 400.0 && l == 5.0)
         }
         s => panic!("{s:?}"),
     }
-    match &p.steps[1].0 {
-        Step::UntilCond { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value, limit: None } => {
+    match one(1) {
+        (Clause { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value }, None) => {
             assert!((value - 0.5f64.to_degrees()).abs() < 1e-9, "angle en degrés comme la mesure : {value}")
         }
         s => panic!("{s:?}"),
     }
-    assert!(matches!(&p.steps[2].0, Step::UntilCond { cmp: Cmp::Gt, value, .. } if (*value - 293.15).abs() < 1e-9));
+    assert!(matches!(one(2).0, Clause { cmp: Cmp::Gt, value, .. } if (value - 293.15).abs() < 1e-9));
     assert!(matches!(&p.steps[3].0, Step::Until(t) if *t == 2.0));
     assert_eq!(p.planned_end(0.0), 5.0);
     for (bad, what) in [
@@ -590,15 +595,80 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn a_condition_can_combine_comparisons_with_and_or() {
+    use super::mp_experiment::{BodyQty, Clause, Cmp};
+    // lecture : comparaisons reliées par « et » ou par « ou » (sans mélange), durée maximale à la fin
+    let p = proto(
+        "départ scénario \"cuve vide\"
+         simuler jusqu'à ce que max T dans partout > 400 K ou corps 1 y < 5 cm ou corps 1 angle > 1.5 rad au plus 2 s
+         simuler jusqu'à ce que corps 1 vy > -0.01 et corps 1 y < 0.05
+",
+    );
+    match &p.steps[0].0 {
+        Step::UntilCond { clauses, any: true, limit: Some(l) } if clauses.len() == 3 && *l == 2.0 => {
+            assert!(matches!(clauses[0], Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, .. }, cmp: Cmp::Gt, value } if value == 400.0));
+            assert!(matches!(clauses[1], Clause { measure: Measure::Body { index: 0, q: BodyQty::Y, .. }, cmp: Cmp::Lt, value } if (value - 0.05).abs() < 1e-12));
+            assert!(matches!(clauses[2], Clause { measure: Measure::Body { q: BodyQty::Angle, .. }, cmp: Cmp::Gt, value } if (value - 1.5f64.to_degrees()).abs() < 1e-9));
+        }
+        s => panic!("{s:?}"),
+    }
+    assert!(matches!(&p.steps[1].0, Step::UntilCond { clauses, any: false, limit: None } if clauses.len() == 2));
+    for (bad, what) in [
+        ("simuler jusqu'à ce que corps 1 y < 0.1 et corps 1 x > 0 ou corps 1 vy < 0", "ne se mélangent pas"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 et stats < 3", "stats"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 ou corps 1 x 0.2", "comparaison"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 et", ""),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+
+    // déroulement : le disque d'acier qui tombe dans l'air ; « ou » s'arrête à la première comparaison vraie, « et » attend toutes
+    let mut r = Runner::new(
+        proto(
+            "départ scénario \"cuve vide\" grille 20 x 40 maille 5 mm
+             corps disque (0.05, 0.15) rayon 1 cm \"acier\" libre
+             simuler jusqu'à ce que corps 1 y < -1 ou corps 1 y < 0.1 au plus 1 s
+             simuler jusqu'à ce que corps 1 y < 0.08 et corps 1 x > 1 au plus 20 ms
+             simuler jusqu'à ce que corps 1 y < 0.09 et corps 1 x > 0.04
+",
+        ),
+        Path::new("."),
+        None,
+        Some(false),
+    )
+    .unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    let num = |s: &str| s.trim().parse::<f64>().unwrap_or_else(|e| panic!("« {s} » : {e}"));
+    // [t = … s] ligne 3 : corps 1 y < -1 m ou corps 1 y < 0.1 m atteint (y m ; y m)
+    let hit = r.log.iter().find(|l| l.contains("corps 1 y < -1 m ou corps 1 y < 0.1 m atteint (")).unwrap_or_else(|| panic!("{log}"));
+    let t1 = num(&hit[hit.find("t = ").unwrap() + 4..hit.find(" s]").unwrap()]);
+    let t_free = (2.0 * 0.05 / 9.81f64).sqrt();
+    assert!((t1 / t_free - 1.0).abs() < 0.05, "temps de chute {t1} pour {t_free}");
+    // « et » : le disque passe sous 8 cm, mais x reste à 5 cm : la condition court jusqu'au bout des 20 ms
+    let miss = r
+        .log
+        .iter()
+        .find(|l| l.contains("corps 1 y < 0.08 m et corps 1 x > 1 m non atteint au bout du temps permis ("))
+        .unwrap_or_else(|| panic!("{log}"));
+    let vals: Vec<f64> = miss[miss.rfind('(').unwrap() + 1..miss.rfind(')').unwrap()].split(" ; ").map(|v| num(v.trim_end_matches(" m"))).collect();
+    assert!(vals.len() == 2 && vals[0] < 0.08 && (vals[1] - 0.05).abs() < 1e-3, "{miss}");
+    assert!(log.contains("corps 1 y < 0.09 m et corps 1 x > 0.04 m déjà vrai"), "{log}");
+    assert!((r.sim.time - (t1 + 0.02)).abs() < 2e-6, "t = {} (attendu {})", r.sim.time, t1 + 0.02);
+}
+
+#[test]
 fn a_condition_stops_the_gpu_run_like_the_cpu_run() {
     // eau chauffée par le fond : la condition sur la température d'une sonde arrête le calcul au même moment sur le CPU et le GPU
+    // (« et » avec une comparaison toujours vraie : le GPU repasse au pas unique à l'approche du seuil de l'autre)
     let text = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm
 remplir rect (0, 0) (0.12, 0.08) avec \"eau\" à 20 °C
 chauffer rect (0.03, 0) (0.09, 0.02) à 360 K
-simuler jusqu'à ce que T en (0.06, 0.015) > 320 K au plus 5 s
+simuler jusqu'à ce que T en (0.06, 0.015) > 320 K et max T dans partout < 1000 K au plus 5 s
 ";
     let stop = |r: &Runner| -> f64 {
-        let l = r.log.iter().find(|l| l.contains("> 320 K atteint")).unwrap_or_else(|| panic!("{}", r.log.join("\n")));
+        let l = r.log.iter().find(|l| l.contains("> 320 K et ") && l.contains("< 1000 K atteint")).unwrap_or_else(|| panic!("{}", r.log.join("\n")));
         l[l.find("t = ").unwrap() + 4..l.find(" s]").unwrap()].trim().parse().unwrap()
     };
     let mut cpu = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
