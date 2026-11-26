@@ -689,6 +689,10 @@ pub(crate) struct BodyCoupling {
     /// corps libre : V^{n+1} = v0 − dt W Σ_m J_m p_m (W = B (Bᵀ (M + dt D) B)⁻¹ Bᵀ, mouvements permis B)
     pub w: [[f64; 3]; 3],
     pub v0: [f64; 3],
+    /// corps libre : force explicite des contacts et leur amortisseur implicite (force −D_c V), force d'une loi en formule
+    pub contact: [f64; 3],
+    pub contact_damp: [[f64; 3]; 3],
+    pub applied: [f64; 3],
 }
 
 impl BodyCoupling {
@@ -1417,6 +1421,7 @@ impl super::multiphase::MultiphaseSim {
             }
             // 3. corps libre : mobilité dans ses mouvements permis
             let (mut w, mut v0) = ([[0.0f64; 3]; 3], [b.vel[0], b.vel[1], b.omega]);
+            let (mut ck, mut cdk, mut lfk) = ([0.0f64; 3], [[0.0f64; 3]; 3], [0.0f64; 3]);
             if b.is_free() {
                 let rho_b = b.density(self.reg.solids[b.material].rho);
                 let (mb, ib) = (rho_b * b.shape.area(), rho_b * b.shape.polar_moment());
@@ -1468,6 +1473,7 @@ impl super::multiphase::MultiphaseSim {
                     let gf = [mb * g[0], mb * g[1], 0.0];
                     // contacts et force imposée par une formule (ressort, moteur…), explicites
                     let lf = b.law_force(self.time);
+                    (ck, cdk, lfk) = (contact[k], contact_damp[k], lf);
                     let fc: [f64; 3] = std::array::from_fn(|r| contact[k][r] + lf[r]);
                     let rhs: [f64; 3] = std::array::from_fn(|r| mass[r] * vn[r] + dt * (gf[r] + fu[r] + hydro[r] + fc[r]));
                     for r in 0..3 {
@@ -1475,7 +1481,7 @@ impl super::multiphase::MultiphaseSim {
                     }
                 }
             }
-            out.push(BodyCoupling { body: k, free: b.is_free(), cells, hydro, fu, d, w, v0 });
+            out.push(BodyCoupling { body: k, free: b.is_free(), cells, hydro, fu, d, w, v0, contact: ck, contact_damp: cdk, applied: lfk });
         }
         out
     }

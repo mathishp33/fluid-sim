@@ -890,11 +890,15 @@ let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum()
             let pt = total(&pk, &sig);
             let mut forces = vec![[0.0; 3]; self.bodies.len()];
             let mut visc = vec![[0.0; 3]; self.bodies.len()];
+            let (mut contacts, mut applied) = (vec![[0.0; 3]; self.bodies.len()], vec![[0.0; 3]; self.bodies.len()]);
             for c in &couplings {
                 let b = &self.bodies[c.body];
                 let v = if c.free { c.velocity(&pt, dt) } else { [b.vel[0], b.vel[1], b.omega] };
                 forces[c.body] = c.force(&pt, v);
                 visc[c.body] = std::array::from_fn(|r| c.fu[r] - (0..3).map(|q| c.d[r][q] * v[q]).sum::<f64>());
+                // contacts : ressort et frottement explicites, amortisseur à la vitesse obtenue
+                contacts[c.body] = std::array::from_fn(|r| c.contact[r] - (0..3).map(|q| c.contact_damp[r][q] * v[q]).sum::<f64>());
+                applied[c.body] = c.applied;
                 if c.free {
                     let b = &mut self.bodies[c.body];
                     b.vel = [v[0], v[1]];
@@ -903,6 +907,8 @@ let corr = closure_correction(f, gas_ids.iter().map(|&k| self.alpha[k][c]).sum()
             }
             self.body_force = forces;
             self.body_force_visc = visc;
+            self.body_contact = contacts;
+            self.body_applied = applied;
             if lowrank.is_some() {
                 self.update_body_face_velocities();
             }

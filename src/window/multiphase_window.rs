@@ -75,10 +75,21 @@ enum CellKind {
     Accelerator,
     Teleporter,
     Grille,
+    Valve,
+    Pump,
 }
 
 impl CellKind {
-    const ALL: [CellKind; 6] = [CellKind::Wall, CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Teleporter, CellKind::Grille];
+    const ALL: [CellKind; 8] = [
+        CellKind::Wall,
+        CellKind::Sink,
+        CellKind::Emitter,
+        CellKind::Accelerator,
+        CellKind::Teleporter,
+        CellKind::Grille,
+        CellKind::Valve,
+        CellKind::Pump,
+    ];
     fn name(self) -> &'static str {
         match self {
             CellKind::Wall => "Solide (mur)",
@@ -87,6 +98,8 @@ impl CellKind {
             CellKind::Accelerator => "Accélérateur",
             CellKind::Teleporter => "Téléporteur",
             CellKind::Grille => "Grille (arrête les grains)",
+            CellKind::Valve => "Vanne fermée (fluide gardé)",
+            CellKind::Pump => "Pompe / compresseur",
         }
     }
 }
@@ -151,6 +164,9 @@ pub struct MultiphaseWindow {
     grille_hole_mm: f64,
     grille_open: f64,
     acc_ay: f64,
+    /// pompe : vitesse imposée sur ses faces (m/s)
+    pump_vx: f64,
+    pump_vy: f64,
     tp_dest: Option<usize>,
     tp_speed: f64,
     /// rayon (mailles) de la zone de destination des téléporteurs posés
@@ -236,6 +252,8 @@ impl MultiphaseWindow {
             grille_hole_mm: 10.0,
             grille_open: 0.6,
             acc_ay: 0.0,
+            pump_vx: 0.5,
+            pump_vy: 0.0,
             tp_dest: None,
             tp_speed: 0.5,
             tp_radius: 2,
@@ -906,6 +924,14 @@ impl MultiphaseWindow {
                 );
                 ui.weak("Le fluide absorbé par toutes les sources d'une même destination (composition, température) y réapparaît, mélangé, avec le même débit volumique.");
             }
+            CellKind::Valve => {
+                ui.weak("Maille de vanne fermée : ses faces sont fermées à l'écoulement et son fluide reste (un mur effacerait le fluide). Clic milieu pour la rouvrir ; ouverture réglable et manœuvres à l'heure dite : commande « vanne » des protocoles d'expérience.");
+            }
+            CellKind::Pump => {
+                ui.add(egui::Slider::new(&mut self.pump_vx, -5.0..=5.0).text("Vitesse X (m/s)"));
+                ui.add(egui::Slider::new(&mut self.pump_vy, -5.0..=5.0).text("Vitesse Y (m/s)"));
+                ui.weak("Impose cette vitesse sur les faces de la maille vers ses voisines fluides (X sur les faces verticales, Y sur les horizontales) : débit volumique fixé, que le fluide traverse ; en aval fermé, la pression monte (compresseur).");
+            }
         }
     }
 
@@ -1193,6 +1219,8 @@ impl MultiphaseWindow {
             CellKind::Accelerator => Some((MpTool::Effect(MpEffect::Accelerator { ax: self.acc_ax, ay: self.acc_ay }), MpThermal::Passive)),
             CellKind::Grille => Some((MpTool::Effect(MpEffect::Grille { hole: self.grille_hole_mm * 1e-3, open: self.grille_open }), MpThermal::Passive)),
             CellKind::Teleporter => self.tp_dest.map(|d| (MpTool::Effect(MpEffect::Teleporter { dest: d, speed: self.tp_speed, radius: self.tp_radius }), MpThermal::Passive)),
+            CellKind::Valve => Some((MpTool::Effect(MpEffect::Valve), MpThermal::Passive)),
+            CellKind::Pump => Some((MpTool::Effect(MpEffect::Pump { vx: self.pump_vx, vy: self.pump_vy }), MpThermal::Passive)),
         }
     }
 
@@ -1496,7 +1524,7 @@ mod tests {
 
         // chaque type de cellule posable
         w.paused = true;
-        for kind in [CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Wall] {
+        for kind in [CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Valve, CellKind::Pump, CellKind::Wall] {
             w.cell_kind = kind;
             if kind == CellKind::Wall {
                 w.thermal_mode = ThermalMode::Heater;
@@ -1504,6 +1532,8 @@ mod tests {
             click_at(&ctx, &mut w, centre, ctrl, egui::PointerButton::Primary);
             match kind {
                 CellKind::Wall => assert!(w.sim.solid.iter().any(|&s| s >= 0), "solide non posé"),
+                CellKind::Valve => assert!(w.sim.special.iter().any(|s| *s == Some(MpEffect::Valve)), "vanne non posée"),
+                CellKind::Pump => assert!(w.sim.special.iter().any(|s| *s == Some(MpEffect::Pump { vx: 0.5, vy: 0.0 })), "pompe non posée"),
                 _ => assert!(w.sim.special_count() > 0, "{} non posé", kind.name()),
             }
             if kind == CellKind::Wall {

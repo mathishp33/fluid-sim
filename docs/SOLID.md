@@ -432,7 +432,9 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   `move_bodies` les avance à la vitesse de la projection précédente. Un corps libre s'arrêtait net contre un bord du domaine ou un
   solide ; depuis l'étape 4, les contacts le repoussent, et l'arrêt net ne sert plus que de sécurité (au-delà d'une demi-maille).
 - Projection (`mp_pressure.rs`, `BodyCoupling`, `BodyLowRank`) : voir § 6.2. La force du fluide sur chaque corps est dans
-  `body_force` (le frottement à part dans `body_force_visc`). Mesures : `corps n x | y | angle | vx | vy | rotation | fx | fy | couple`.
+  `body_force` (le frottement à part dans `body_force_visc`), celle des contacts dans `body_contact` (amortisseur évalué à la vitesse
+  obtenue), celle d'une loi en formule dans `body_applied`. Mesures : `corps n x | y | angle | vx | vy | rotation | fx | fy | couple`,
+  les forces suivies au choix de `contact`, `loi` ou `total` (avec le poids : M a, au pas près).
 - Commande `corps … libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse …] [masse volumique ρ]` (EXPERIENCES.md). Exemples :
   `experiences/flotteurs.exp` (bois et liège), `experiences/clapet.exp`.
 - Deux défauts trouvés en route, sur une cuve FERMÉE pleine d'huile où coule un disque (son niveau de pression ne tient qu'à la

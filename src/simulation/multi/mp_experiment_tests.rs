@@ -801,6 +801,51 @@ simuler 1 s
 }
 
 #[test]
+fn a_teleporter_carries_what_it_draws_in_to_its_destination() {
+    use super::mp_cells::MpEffect;
+    // téléporteur au fond de l'eau, destination dans l'air en haut à droite : ses mailles visent la maille de destination, et l'eau
+    // aspirée y réapparaît
+    let text = "départ scénario \"cuve vide\" grille 24 x 24 maille 1 cm
+remplir rect (0, 0) (0.24, 0.12) avec \"eau\" à 20 °C
+téléporteur rect (0.04, 0.03) (0.06, 0.05) vers (0.185, 0.185) 0.3 m/s rayon 1 cm
+mesurer toutes les 0.1 s : masse \"eau\" dans disque (0.185, 0.185) rayon 4 cm comme \"arrivée\"
+simuler 0.3 s
+";
+    let p = proto(text);
+    let (s, _, _) = initial_state(&p, Path::new(".")).unwrap();
+    let dst = s.idx(18, 18);
+    let src: Vec<Option<MpEffect>> = s.special.iter().copied().filter(|e| matches!(e, Some(MpEffect::Teleporter { .. }))).collect();
+    assert_eq!(src.len(), 4);
+    assert!(src.iter().all(|e| *e == Some(MpEffect::Teleporter { dest: dst, speed: 0.3, radius: 1 })), "{src:?}");
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let c = r.columns.iter().position(|c| c.starts_with("arrivée")).unwrap();
+    let (first, last) = (r.rows[0][c], r.rows.last().unwrap()[c]);
+    eprintln!("téléporteur : eau autour de la destination {first:.2e} → {last:.4} kg/m");
+    assert!(first < 1e-6 && last > 1e-2, "rien n'est arrivé à destination : {first} → {last}");
+    assert!(r.log.iter().any(|l| l.contains("téléporteur") && l.contains("vers (0.185, 0.185)")), "{}", r.log.join("\n"));
+    // erreurs de lecture, puis de pose (destination hors du domaine, dans un solide, sous la zone)
+    for (bad, what) in [
+        ("téléporteur rect (0, 0) (0.02, 0.02)", "vers (x, y)"),
+        ("téléporteur rect (0, 0) (0.02, 0.02) vers (0.1, 0.1) rayon -1 cm", "positif"),
+        ("téléporteur rect (0, 0) (0.02, 0.02) vers (0.1, 0.1) vite", "vitesse d'aspiration"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    for (bad, what) in [
+        ("téléporteur rect (0, 0) (0.02, 0.02) vers (0.5, 0.1)", "hors du domaine"),
+        ("solide rect (0.1, 0.1) (0.12, 0.12) \"acier\"\ntéléporteur rect (0, 0) (0.02, 0.02) vers (0.11, 0.11)", "dans un solide"),
+        ("puits rect (0.1, 0.1) (0.12, 0.12)
+téléporteur rect (0, 0) (0.02, 0.02) vers (0.11, 0.11)", "autre cellule spéciale"),
+    ] {
+        let p = proto(&format!("départ scénario \"cuve vide\" grille 24 x 24 maille 1 cm\n{bad}\nsimuler 1 ms\n"));
+        let e = initial_state(&p, Path::new(".")).err().unwrap_or_else(|| panic!("{bad} : pas d'erreur"));
+        assert!(e.contains(what), "{bad} : {e}");
+    }
+}
+
+#[test]
 fn a_body_follows_motion_and_force_laws_written_as_formulas() {
     use super::mp_bodies::{LinLaw, RotLaw};
     // lecture : lois de translation, de rotation, force et couple d'un corps libre ; formules vérifiées à la lecture
@@ -1192,6 +1237,94 @@ simuler jusqu'à ce que T en (0.06, 0.015) > 320 K et max T dans partout < 1000 
     assert!((t_gpu - t_cpu).abs() < 0.05 * t_cpu, "arrêt : CPU {t_cpu} / GPU {t_gpu}");
 }
 
+/// instant d'une ligne du journal « [t = … s] … »
+fn log_time(l: &str) -> f64 {
+    l[l.find("t = ").unwrap() + 4..l.find(" s]").unwrap()].trim().parse().unwrap()
+}
+
+#[test]
+fn a_when_rule_acts_each_time_its_condition_becomes_true() {
+    // disque lâché dans l'air : « y < 15 cm » devient vrai une fois, à t = √(2 × 0.05 m / g) ; « y < 25 cm » l'est dès le départ
+    // (faite tout de suite, une seule fois) ; lecture et erreurs
+    let text = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+corps disque (0.15, 0.2) rayon 1 cm \"acier\" libre
+quand corps 1 y < 25 cm : marque \"déjà\"
+quand corps 1 y < 15 cm : marque \"passé\"
+simuler 0.15 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let marks = |what: &str| -> Vec<f64> { r.log.iter().filter(|l| l.contains(&format!("repère « {what} »"))).map(|l| log_time(l)).collect() };
+    let (deja, passe) = (marks("déjà"), marks("passé"));
+    let expect = (2.0 * 0.05 / 9.81f64).sqrt();
+    eprintln!("quand : « déjà » à {deja:?}, « passé » à {passe:?} (chute de 5 cm : {expect:.4} s)");
+    assert!(deja == [0.0], "{deja:?}\n{}", r.log.join("\n"));
+    // (au premier pas qui franchit le seuil, jamais avant)
+    assert!(passe.len() == 1 && passe[0] >= expect - 2e-4 && passe[0] < expect + 5e-3, "{passe:?}\n{}", r.log.join("\n"));
+    assert!(r.log.iter().any(|l| l.contains("ligne 4 : quand corps 1 y < 0.15 m — 1 fois")), "{}", r.log.join("\n"));
+    for (bad, what) in [
+        ("quand corps 1 y < 0.1 : simuler 1 s", "une seule action"),
+        ("quand corps 1 y < 0.1", "il faut « : »"),
+        ("quand stats < 3 : marque \"x\"", "relevé"),
+        ("toutes les 1 s : quand corps 1 y < 0.1 : marque \"x\"", "règle « quand »"),
+        ("quand corps 1 y < 0.1 : quand corps 1 y > 0.2 : pause", "autre règle"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // une pause sur un événement est permise
+    assert!(parse("départ scénario \"cuve vide\"\nquand max T dans partout > 400 K : pause\n", None).is_ok());
+}
+
+/// cuve d'air fermée (18 × 16 mailles) gonflée par un compresseur dans sa paroi gauche (0.5 m/s sur 2 cm : la pression monte
+/// d'environ γ p Q / V ≈ 49 kPa/s) ; soupape de 2 cm dans le couvercle, ouverte au-dessus de 104 kPa, refermée sous 102 kPa
+const SAFETY_VALVE: &str = "départ scénario \"cuve vide\" grille 30 x 24 maille 1 cm
+bord haut ouvert
+pas max 2 ms
+solide rect (0.05, 0.02) (0.25, 0.2) \"acier\"
+effacer rect (0.06, 0.03) (0.24, 0.19)
+effacer rect (0.05, 0.1) (0.06, 0.12)
+pompe rect (0.05, 0.1) (0.06, 0.12) (0.5, 0) m/s
+effacer rect (0.14, 0.19) (0.16, 0.2)
+vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+quand p en (0.15, 0.1) > 104 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) ouverte
+quand p en (0.15, 0.1) < 102 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+mesurer toutes les 2 ms : p en (0.15, 0.1) comme \"p cuve\"
+simuler 0.3 s
+";
+
+/// (nombre d'ouvertures de la soupape, pression la plus haute, pression la plus basse après la première ouverture)
+fn safety_valve_run(gpu: bool) -> (usize, f64, f64) {
+    let mut r = Runner::new(proto(SAFETY_VALVE), Path::new("."), None, Some(gpu)).unwrap();
+    assert!(r.gpu.is_some() == gpu, "{}", r.log.join("\n"));
+    run_to_end(&mut r);
+    let opened = r.log.iter().find(|l| l.contains("ligne 10 : quand") && l.ends_with(" fois")).unwrap_or_else(|| panic!("{}", r.log.join("\n")));
+    let n: usize = opened[opened.find("— ").unwrap() + "— ".len()..opened.len() - " fois".len()].parse().unwrap();
+    let c = r.columns.iter().position(|c| c.starts_with("p cuve")).unwrap();
+    let first = r.log.iter().find(|l| l.contains("ligne 10 : condition vraie")).map(|l| log_time(l)).unwrap_or(f64::INFINITY);
+    let pmax = r.rows.iter().map(|row| row[c]).fold(f64::MIN, f64::max);
+    let pmin = r.rows.iter().filter(|row| row[0] > first).map(|row| row[c]).fold(f64::MAX, f64::min);
+    eprintln!("soupape ({}) : {n} ouvertures, la première à {first:.4} s ; p entre {pmin:.0} et {pmax:.0} Pa", if gpu { "GPU" } else { "CPU" });
+    (n, pmax, pmin)
+}
+
+#[test]
+fn when_rules_make_a_safety_valve_that_holds_the_pressure_of_a_pumped_vessel() {
+    // sans soupape la pression monterait à ≈ 116 kPa en 0.3 s ; avec, elle reste dans la fourchette, la soupape s'ouvrant et se
+    // refermant plusieurs fois
+    let (n, pmax, pmin) = safety_valve_run(false);
+    assert!(n >= 5, "la soupape ne s'est ouverte que {n} fois");
+    assert!(pmax < 104.5e3 && pmin > 101.5e3, "pression entre {pmin} et {pmax} Pa");
+    // le GPU suit les mêmes règles (relevées après chaque série de pas, pas à pas près du seuil et après chaque action)
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let (ng, pmax_g, pmin_g) = safety_valve_run(true);
+    assert!(ng + 1 >= n && ng <= n + 1, "ouvertures : CPU {n}, GPU {ng}");
+    assert!(pmax_g < 104.5e3 && pmin_g > 101.5e3, "GPU : pression entre {pmin_g} et {pmax_g} Pa");
+}
+
 #[test]
 fn the_fluid_force_on_solid_cells_is_archimedes_and_the_hydrostatic_thrust() {
     // bloc de mailles solides entouré d'eau au repos : poussée d'Archimède ρ g A vers le haut, rien de côté ; muret qui retient
@@ -1229,6 +1362,101 @@ simuler 20 ms
     // erreur : zone hors du domaine
     let e = Runner::new(proto("départ scénario \"cuve vide\" grille 10 x 10\nmesurer toutes les 1 ms : force y sur rect (2, 2) (3, 3)\nsimuler 1 ms\n"), Path::new("."), None, Some(false)).err().unwrap();
     assert!(e.contains("hors du domaine"), "{e}");
+}
+
+#[test]
+fn the_forces_on_a_body_split_into_fluid_contacts_law_and_weight() {
+    use super::mp_experiment::{BodyQty, ForcePart};
+    let col = |r: &Runner, name: &str| -> usize {
+        r.columns.iter().position(|c| c == name).unwrap_or_else(|| panic!("colonne « {name} » absente : {:?}", r.columns))
+    };
+    // moyenne des n derniers relevés d'une colonne
+    let tail = |r: &Runner, c: usize, n: usize| -> f64 { r.rows[r.rows.len() - n..].iter().map(|row| row[c]).sum::<f64>() / n as f64 };
+    let water = |s: &MultiphaseSim| -> f64 {
+        let k = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        s.reg.phases[k].rho(101325.0, 293.15)
+    };
+    let mass = |s: &MultiphaseSim, k: usize| -> f64 {
+        let b = &s.bodies[k];
+        b.mass(b.density(s.reg.solids[b.material].rho))
+    };
+
+    // 1. disque d'acier FIXE dans l'eau au repos : le fluide le pousse vers le haut de ρ g π r² (Archimède), sans force de côté ni
+    //    couple ; ni contact ni loi ; avec le poids, la force totale est l'opposé de ce que son support retient
+    let text = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+remplir rect (0, 0) (0.3, 0.27) avec \"eau\" à 20 °C
+corps disque (0.15, 0.12) rayon 3 cm \"acier\"
+mesurer toutes les 10 ms : corps 1 fx, corps 1 fy, corps 1 couple, corps 1 fy contact, corps 1 fy loi, corps 1 fy total comme \"bilan\"
+simuler 50 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (fx, fy, tq) = (col(&r, "corps 1 fx (N/m)"), col(&r, "corps 1 fy (N/m)"), col(&r, "corps 1 couple (N)"));
+    let (fc, fl, ft) = (col(&r, "corps 1 fy contact (N/m)"), col(&r, "corps 1 fy loi (N/m)"), col(&r, "bilan (N/m)"));
+    let row = r.rows.last().unwrap().clone();
+    let g = -r.sim.gravity[1];
+    let archi = water(&r.sim) * g * std::f64::consts::PI * 9e-4;
+    let w = mass(&r.sim, 0) * g;
+    eprintln!(
+        "disque fixe : fluide ({:.4}, {:.4}) N/m, couple {:.2e} N, Archimède {archi:.4} ; total {:.4} = fluide − poids ({w:.4})",
+        row[fx], row[fy], row[tq], row[ft]
+    );
+    assert!((row[fy] / archi - 1.0).abs() < 1e-3, "poussée {} pour {archi}", row[fy]);
+    assert!(row[fx].abs() < 1e-3 * archi && row[tq].abs() < 1e-3 * archi * 0.03, "force de côté {} ou couple {}", row[fx], row[tq]);
+    assert!(row[fc] == 0.0 && row[fl] == 0.0, "contact {} et loi {} sur un corps fixe", row[fc], row[fl]);
+    assert!((row[ft] - (row[fy] - w)).abs() < 1e-9 * w, "total {} pour {}", row[ft], row[fy] - w);
+
+    // 2. disque d'acier LIBRE posé au fond de l'eau : le fond porte son poids moins la poussée d'Archimède, et la somme des forces
+    //    (M a) s'annule au repos
+    let text = "départ scénario \"cuve vide\" grille 40 x 30 maille 5 mm
+remplir rect (0, 0) (0.2, 0.12) avec \"eau\" à 20 °C
+corps disque (0.1, 0.02) rayon 2 cm \"acier\" libre
+mesurer toutes les 10 ms : corps 1 fy, corps 1 fy contact, corps 1 fy total, corps 1 vy
+simuler 0.3 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (fy, fc, ft) = (col(&r, "corps 1 fy (N/m)"), col(&r, "corps 1 fy contact (N/m)"), col(&r, "corps 1 fy total (N/m)"));
+    let g = -r.sim.gravity[1];
+    let archi = water(&r.sim) * g * std::f64::consts::PI * 4e-4;
+    let w = mass(&r.sim, 0) * g;
+    let (f, c, t) = (tail(&r, fy, 10), tail(&r, fc, 10), tail(&r, ft, 10));
+    eprintln!("disque posé : fluide {f:.4} (Archimède {archi:.4}), contact {c:.4} (poids − Archimède {:.4}), total {t:.2e} N/m", w - archi);
+    assert!((f / archi - 1.0).abs() < 1e-2, "poussée {f} pour {archi}");
+    assert!((c / (w - archi) - 1.0).abs() < 1e-2, "le fond porte {c} pour {}", w - archi);
+    assert!(t.abs() < 1e-2 * w, "somme des forces {t} sur un corps au repos");
+
+    // 3. bilan exact à chaque pas, M (Vⁿ⁺¹ − Vⁿ) / dt = fluide + contacts + loi + poids, en translation comme en rotation : disque
+    //    lancé de biais dans l'eau, tiré par un ressort et un couple en formules, qui frappe le fond
+    let p = proto(
+        "départ scénario \"cuve vide\" grille 40 x 30 maille 5 mm
+remplir rect (0, 0) (0.2, 0.12) avec \"eau\" à 20 °C
+corps disque (0.1, 0.035) rayon 2 cm \"acier\" libre vitesse (0.1, -0.3) force formule \"-20*(x - x0)\" \"3\" couple formule \"0.002\"
+",
+    );
+    let (mut s, _, _) = initial_state(&p, Path::new(".")).unwrap();
+    let m = mass(&s, 0);
+    let ib = s.bodies[0].density(s.reg.solids[s.bodies[0].material].rho) * s.bodies[0].shape.polar_moment();
+    let scale = [m * 9.81, m * 9.81, m * 9.81 * 0.02];
+    let (mut touched, mut worst, mut steps) = (false, 0.0f64, 0);
+    while s.time < 0.15 {
+        let (v0, w0) = (s.bodies[0].vel, s.bodies[0].omega);
+        let dt = s.step();
+        assert!(dt > 0.0, "pas refusé à t = {}", s.time);
+        steps += 1;
+        let b = &s.bodies[0];
+        let total = [BodyQty::Fx(ForcePart::Total), BodyQty::Fy(ForcePart::Total), BodyQty::Torque(ForcePart::Total)].map(|q| q.value(&s, 0));
+        let ma = [m * (b.vel[0] - v0[0]) / dt, m * (b.vel[1] - v0[1]) / dt, ib * (b.omega - w0) / dt];
+        for r in 0..3 {
+            worst = worst.max((total[r] - ma[r]).abs() / scale[r]);
+        }
+        let law = [BodyQty::Fy(ForcePart::Law), BodyQty::Torque(ForcePart::Law)].map(|q| q.value(&s, 0));
+        assert!(law == [3.0, 0.002], "loi {law:?}");
+        touched |= BodyQty::Fy(ForcePart::Contact).value(&s, 0) > 0.0;
+    }
+    eprintln!("bilan sur {steps} pas : écart relatif au plus {worst:.2e} ; contact avec le fond : {touched}");
+    assert!(touched, "le disque n'a pas touché le fond");
+    assert!(worst < 1e-9, "fluide + contacts + loi + poids s'écartent de M a de {worst} (relatif)");
 }
 
 #[test]

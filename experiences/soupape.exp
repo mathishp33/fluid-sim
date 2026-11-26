@@ -1,0 +1,24 @@
+# Soupape de sécurité : un compresseur gonfle une cuve d'air fermée (0.5 m/s à travers 2 cm de paroi : la pression monte d'environ
+# 49 kPa/s) ; une soupape de 2 cm dans le couvercle s'ouvre au-dessus de 104 kPa et se referme sous 102 kPa (deux règles « quand »
+# aux seuils écartés : une hystérésis). La pression oscille dans cette fourchette au lieu de monter sans fin.
+#   fluid-sim experience experiences/soupape.exp
+
+départ scénario "Cuve vide" grille 30 x 24 maille 1 cm
+bord haut ouvert
+pas max 2 ms
+
+# cuve d'acier aux parois de 1 cm, compresseur dans la paroi gauche, soupape fermée dans le couvercle
+solide rect (0.05, 0.02) (0.25, 0.2) "acier"
+effacer rect (0.06, 0.03) (0.24, 0.19)
+effacer rect (0.05, 0.1) (0.06, 0.12)
+pompe rect (0.05, 0.1) (0.06, 0.12) (0.5, 0) m/s
+effacer rect (0.14, 0.19) (0.16, 0.2)
+vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+
+# la soupape
+quand p en (0.15, 0.1) > 104 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) ouverte
+quand p en (0.15, 0.1) < 102 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+
+mesurer toutes les 2 ms : p en (0.15, 0.1) comme "pression dans la cuve"
+
+simuler 1 s

@@ -77,6 +77,12 @@ pub struct MultiphaseSim {
     /// part du frottement (contraintes visqueuses) dans `body_force`
     #[serde(skip)]
     pub body_force_visc: Vec<[f64; 3]>,
+    /// force des contacts (bords, solides, autres corps ; amortisseur compris) et force d'une loi en formule sur chaque corps libre à la
+    /// dernière projection (N/m, couple N) ; vides sans corps libre
+    #[serde(skip)]
+    pub body_contact: Vec<[f64; 3]>,
+    #[serde(skip)]
+    pub body_applied: Vec<[f64; 3]>,
     /// volume (fraction de maille) que les corps libres ont déplacé dans chaque maille pendant ce pas (`push_fluid`) ; vide sans
     /// corps libre
     #[serde(skip)]
@@ -349,6 +355,8 @@ impl MultiphaseSim {
             body_owner: vec![],
             body_force: vec![],
             body_force_visc: vec![],
+            body_contact: vec![],
+            body_applied: vec![],
             push_src: vec![],
             contact_springs: vec![],
             rho_mix: vec![1.0; n],

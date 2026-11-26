@@ -119,6 +119,7 @@ Chaque maille a une seule pression (équilibre mécanique) et, par groupe de pha
 | Coefficient de restitution | amortissement c réglé (dichotomie sur le schéma réel) pour que la vitesse de rebond vaille e fois celle d'arrivée | rebond réglable de 0 (choc mou) à 1 |
 | Mouvements imposés | vitesse constante + oscillation sinusoïdale intégrée exactement ; ou lois en formules (position, vitesse, accélération, angle, rotation) | piston, batteur à vagues, agitateur, bielle–manivelle |
 | Forces en formules | force et couple ajoutés à un corps libre, explicites | ressort F = −k (x − x₀), amortisseur, moteur |
+| Bilan des forces d'un corps | M (Vⁿ⁺¹ − Vⁿ)/dt = F_fluide + F_contacts + F_loi + M g, au pas près (amortisseur des contacts à la vitesse obtenue) | mesures `corps n fx \| fy \| couple [contact \| loi \| total]` : ce que subit un corps, poste par poste |
 
 ## 9. Bords et cellules spéciales (`mp_cells.rs`)
 

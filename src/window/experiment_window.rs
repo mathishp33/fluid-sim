@@ -44,11 +44,28 @@ enum CiTool {
     Sink,
     Emitter,
     Grille,
+    Valve,
+    Pump,
+    Accelerator,
+    Teleporter,
 }
 
 impl CiTool {
-    const ALL: [CiTool; 9] =
-        [CiTool::Fill, CiTool::Solid, CiTool::Body, CiTool::Temperature, CiTool::Clear, CiTool::Ignite, CiTool::Sink, CiTool::Emitter, CiTool::Grille];
+    const ALL: [CiTool; 13] = [
+        CiTool::Fill,
+        CiTool::Solid,
+        CiTool::Body,
+        CiTool::Temperature,
+        CiTool::Clear,
+        CiTool::Ignite,
+        CiTool::Sink,
+        CiTool::Emitter,
+        CiTool::Grille,
+        CiTool::Valve,
+        CiTool::Pump,
+        CiTool::Accelerator,
+        CiTool::Teleporter,
+    ];
     fn name(self) -> &'static str {
         match self {
             CiTool::Fill => "Remplir d'un fluide ou d'un mélange",
@@ -60,6 +77,10 @@ impl CiTool {
             CiTool::Sink => "Puits",
             CiTool::Emitter => "Émetteur",
             CiTool::Grille => "Grille (arrête les grains)",
+            CiTool::Valve => "Vanne (ouverture réglable)",
+            CiTool::Pump => "Pompe / compresseur (débit imposé)",
+            CiTool::Accelerator => "Accélérateur (force de volume)",
+            CiTool::Teleporter => "Téléporteur (aspire ici, rejette ailleurs)",
         }
     }
 }
@@ -155,6 +176,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
   pompe <zone> (0.5, 0) m/s   (débit volumique fixé à travers la zone ; en aval fermé, compresseur ; (0, 0) la retire)
+  téléporteur <zone> vers (x, y) [0.5 m/s] [rayon 2 cm]   (aspire dans la zone, rejette le même débit autour de (x, y))
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"] | sortie (vx, vy)   (vitesse vers l'extérieur)
   champ T|vx|vy|fraction \"eau\"|solide \"acier\"  fichier \"f.csv|f.png\" [origine haut|bas] [valeurs a b]
         | formule \"300 + 50*exp(-((x-0.2)^2+(y-0.1)^2)/0.02^2)\"     [dans <zone>] [à T]
@@ -169,9 +191,11 @@ TEMPS, MESURES, SORTIES
   simuler jusqu'à ce que max T dans partout < 400 K [ou corps 1 y < 5 cm] [au plus 10 s]   (relevé comme une mesure ; < <= > >= ; et | ou)
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
+  quand p en (0.15, 0.1) > 104 kPa [et | ou …] : <action>   (règle : faite chaque fois que la condition devient vraie ; aussi « pause »)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
+     corps 1 fx|fy|couple contact|loi|total   (force des contacts, de la loi en formule, ou bilan avec le poids : M a d'un corps libre)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
      débit [massique] [\"eau\"] à travers ligne (x, y1) (x, y2)   (ligne verticale ou horizontale ; m²/s ou kg/(m·s), vers +x ou +y)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
@@ -228,6 +252,16 @@ pub struct ExperimentWindow {
     emit_v: [f64; 2],
     grille_hole_mm: f64,
     grille_open: f64,
+    /// vanne : part ouverte (0 fermée, 1 ouverte) ; pompe : vitesse imposée (m/s) ; accélérateur (m/s²)
+    valve_open: f64,
+    pump_v: [f64; 2],
+    acc_a: [f64; 2],
+    /// téléporteur : destination (m, choisie d'un clic sur l'image quand `tp_picking`), aspiration (m/s), rayon de la destination
+    /// (mailles)
+    tp_dest: Option<[f64; 2]>,
+    tp_picking: bool,
+    tp_speed: f64,
+    tp_radius: usize,
     /// outil « Corps » : fixe, à mouvement imposé ou libre (poussé par l'écoulement, avec ses contacts) ; vitesse (m/s) et rotation
     /// (°/s) imposées ou de départ ; oscillation imposée (amplitudes, période) ; pivot sur le bord ; axes bloqués d'un corps libre (x,
     /// y, rotation) ; masse volumique propre (kg/m³, 0 : celle du matériau) ; rebond et frottement (corps libre) ; température de
@@ -317,6 +351,13 @@ impl ExperimentWindow {
             emit_v: [0.0, 1.0],
             grille_hole_mm: 10.0,
             grille_open: 0.6,
+            valve_open: 0.0,
+            pump_v: [0.5, 0.0],
+            acc_a: [0.0, 20.0],
+            tp_dest: None,
+            tp_picking: false,
+            tp_speed: 0.5,
+            tp_radius: 2,
             body_mode: BodyMode::Fixed,
             body_v: [0.0, 0.0],
             body_omega: 0.0,
@@ -883,6 +924,34 @@ impl ExperimentWindow {
                 ui.add(egui::Slider::new(&mut self.grille_hole_mm, 0.5..=50.0).logarithmic(true).text("Trous (mm)"));
                 ui.add(egui::Slider::new(&mut self.grille_open, 0.1..=0.9).text("Fraction ouverte"));
             }
+            CiTool::Valve => {
+                ui.add(egui::Slider::new(&mut self.valve_open, 0.0..=1.0).text("Ouverture (0 fermée, 1 ouverte)"));
+                ui.weak("Vanne à guillotine : la part ouverte part de la gauche ou du bas, le long du plus grand côté de la zone ; le reste est fermé à l'écoulement et garde son fluide. Le même geste pendant l'expérience l'ouvre ou la ferme à cet instant.");
+            }
+            CiTool::Pump => {
+                ui.add(egui::Slider::new(&mut self.pump_v[0], -5.0..=5.0).text("Vitesse x (m/s)"));
+                ui.add(egui::Slider::new(&mut self.pump_v[1], -5.0..=5.0).text("Vitesse y (m/s)"));
+                ui.weak("Débit volumique imposé à travers la zone, fermée sur ses côtés ; en aval fermé, la pression monte (compresseur). (0, 0) retire la pompe.");
+            }
+            CiTool::Accelerator => {
+                ui.add(egui::Slider::new(&mut self.acc_a[0], -50.0..=50.0).text("Accélération x (m/s²)"));
+                ui.add(egui::Slider::new(&mut self.acc_a[1], -50.0..=50.0).text("Accélération y (m/s²)"));
+                ui.weak("Force de volume sur le fluide de la zone, dès le départ et jusqu'à la fin (« pendant <durée> » dans le protocole pour la limiter) ; elle agit au déroulement, l'aperçu n'en montre que la zone.");
+            }
+            CiTool::Teleporter => {
+                let label = if self.tp_picking { "Cliquez la destination sur l'image…" } else { "Choisir la destination" };
+                if ui.button(label).clicked() {
+                    self.tp_picking = !self.tp_picking;
+                }
+                match self.tp_dest {
+                    Some(d) => ui.label(format!("Destination : {}", fmt_point(d))),
+                    None => ui.weak("Pas encore de destination"),
+                };
+                ui.add(egui::Slider::new(&mut self.tp_speed, 0.0..=10.0).text("Aspiration (m/s)"));
+                let r_m = fmt_num(self.tp_radius as f64 * dx);
+                ui.add(egui::Slider::new(&mut self.tp_radius, 0..=20).text(format!("Rayon de la destination (mailles) = {r_m} m")));
+                ui.weak("Le fluide aspiré dans la zone peinte (composition, température) ressort avec le même débit autour de la destination.");
+            }
             _ => {}
         }
         ui.horizontal(|ui| {
@@ -1035,7 +1104,27 @@ impl ExperimentWindow {
             CiTool::Sink => format!("puits {z} {} m/s", fmt_num(self.sink_rate)),
             CiTool::Emitter => format!("émetteur {z} \"{}\" {} m/s à {t}", self.fluid, fmt_point(self.emit_v)),
             CiTool::Grille => format!("grille {z} trous {} m ouverte {}", fmt_num(self.grille_hole_mm * 1e-3), fmt_num(self.grille_open)),
+            CiTool::Valve => match (self.valve_open * 1000.0).round() / 10.0 {
+                o if o <= 0.0 => format!("vanne {z} fermée"),
+                o if o >= 100.0 => format!("vanne {z} ouverte"),
+                o => format!("vanne {z} ouverte {} %", fmt_num(o)),
+            },
+            CiTool::Pump => format!("pompe {z} {} m/s", fmt_point(Self::rounded(self.pump_v))),
+            CiTool::Accelerator => format!("accélérer {z} de {} m/s²", fmt_point(Self::rounded(self.acc_a))),
+            CiTool::Teleporter => match self.tp_dest {
+                Some(d) => {
+                    let dx = self.shown().map_or(0.01, |s| s.dx);
+                    let r = fmt_num(self.tp_radius as f64 * dx);
+                    format!("téléporteur {z} vers {} {} m/s rayon {r} m", fmt_point(d), fmt_num((self.tp_speed * 1000.0).round() / 1000.0))
+                }
+                None => "# téléporteur : choisissez d'abord sa destination".into(),
+            },
         }
+    }
+
+    /// vecteur d'un curseur arrondi au millième (lignes lisibles)
+    fn rounded(v: [f64; 2]) -> [f64; 2] {
+        v.map(|x| (x * 1000.0).round() / 1000.0)
     }
 
     /// action d'une ligne, lue par le même analyseur que le protocole
@@ -1353,6 +1442,22 @@ impl ExperimentWindow {
             self.drag_start = None;
             return;
         }
+        // téléporteur : un clic choisit sa destination ; sans destination, pas de geste
+        if self.tool == CiTool::Teleporter && (self.tp_picking || self.tp_dest.is_none()) {
+            if self.tp_picking && left_released {
+                if let Some(c) = self.hovered {
+                    let d = self.center_of(c);
+                    self.tp_dest = Some(d);
+                    self.tp_picking = false;
+                    self.status = format!("Destination du téléporteur : {} — peignez maintenant la zone qui aspire", fmt_point(d));
+                }
+            } else if !self.tp_picking && left_down && self.hovered.is_some() {
+                self.status = "Téléporteur : choisissez d'abord sa destination (bouton du panneau, puis clic sur l'image)".into();
+            }
+            self.stroke.clear();
+            self.drag_start = None;
+            return;
+        }
         if left_down {
             if let Some(c) = self.hovered {
                 match self.shape {
@@ -1467,11 +1572,20 @@ impl ExperimentWindow {
                 painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, Color32::from_rgb(150, 190, 255))));
             }
         }
+        let dx = self.shown().map_or(0.01, |s| s.dx);
         for (s, _) in &p.steps {
             if let Step::Do(a) = s {
                 if let Some(z) = a.zone() {
                     let col = if matches!(a, Action::Heat { .. } | Action::Accelerate { .. }) { Color32::from_rgb(255, 160, 40) } else { Color32::from_gray(220) };
                     self.draw_zone(painter, rect, z, col);
+                }
+                // destination d'un téléporteur
+                let inner = match a {
+                    Action::Periodic { action, .. } | Action::When { action, .. } => action.as_ref(),
+                    _ => a,
+                };
+                if let Action::Teleporter { dest, radius, .. } = inner {
+                    self.draw_zone(painter, rect, &Zone::Disque { c: *dest, r: radius.max(0.5 * dx) }, Color32::from_rgb(0, 230, 255));
                 }
             }
         }
@@ -1494,6 +1608,12 @@ impl ExperimentWindow {
                 b: [(a.0.max(b.0) + 1) as f64 * dx, (a.1.max(b.1) + 1) as f64 * dx],
             };
             self.draw_zone(painter, rect, &z, Color32::YELLOW);
+        }
+        // destination du téléporteur en cours de réglage
+        if self.tab == Tab::Initial && self.tool == CiTool::Teleporter {
+            if let Some(d) = self.tp_dest {
+                self.draw_zone(painter, rect, &Zone::Disque { c: d, r: (self.tp_radius as f64 + 0.5) * dx }, Color32::from_rgb(0, 230, 255));
+            }
         }
         if self.tab == Tab::Initial && self.runner.is_none() && self.shape == Shape::Brush {
             if let Some(c) = self.hovered {
@@ -1637,6 +1757,72 @@ mod tests {
         assert_eq!(s.temp[s.idx(5, 3)], 500.0);
         assert!(s.temp[s.idx(20, 20)] < 400.0);
         assert!(w.errors.is_empty(), "{:?}", w.errors);
+    }
+
+    #[test]
+    fn every_special_cell_tool_adds_its_line_and_lands_in_the_preview() {
+        use crate::simulation::multi::mp_cells::MpEffect;
+        let ctx = egui::Context::default();
+        let mut w = window("départ scénario \"cuve vide\" grille 40 x 30 maille 1 cm\nsimuler 10 ms\n");
+        w.tab = Tab::Initial;
+        w.shape = Shape::Rect;
+        frame(&ctx, &mut w, vec![]);
+        frame(&ctx, &mut w, vec![]);
+        let paint = |w: &mut ExperimentWindow, tool: CiTool, a: (usize, usize), b: (usize, usize)| {
+            // (le panneau de l'outil change de taille : l'image se recale avant qu'on vise une maille)
+            w.tool = tool;
+            frame(&ctx, w, vec![]);
+            frame(&ctx, w, vec![]);
+            let path = [at(w, a.0, a.1), at(w, b.0, b.1)];
+            drag(&ctx, w, &path);
+        };
+        let count = |w: &ExperimentWindow, kind: &str| w.preview.as_ref().unwrap().special.iter().filter(|e| e.map_or(false, |e| e.kind_name() == kind)).count();
+        paint(&mut w, CiTool::Sink, (2, 2), (3, 3));
+        assert!(w.text.contains("puits rect (0.02, 0.02) (0.04, 0.04) 0.2 m/s"), "{}", w.text);
+        w.fluid = "eau".into();
+        paint(&mut w, CiTool::Emitter, (6, 2), (7, 3));
+        assert!(w.text.contains("émetteur rect (0.06, 0.02) (0.08, 0.04) \"eau\" (0, 1) m/s"), "{}", w.text);
+        paint(&mut w, CiTool::Grille, (10, 2), (13, 2));
+        assert!(w.text.contains("grille rect (0.1, 0.02) (0.14, 0.03) trous 0.01 m ouverte 0.6"), "{}", w.text);
+        // vanne à demi ouverte : 2 mailles fermées sur 4, celles de droite
+        w.valve_open = 0.5;
+        paint(&mut w, CiTool::Valve, (16, 2), (19, 2));
+        assert!(w.text.contains("vanne rect (0.16, 0.02) (0.2, 0.03) ouverte 50 %"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        assert!(s.special[s.idx(16, 2)].is_none() && s.special[s.idx(19, 2)] == Some(MpEffect::Valve));
+        w.pump_v = [0.5, 0.0];
+        paint(&mut w, CiTool::Pump, (22, 2), (23, 3));
+        assert!(w.text.contains("pompe rect (0.22, 0.02) (0.24, 0.04) (0.5, 0) m/s"), "{}", w.text);
+        w.acc_a = [0.0, 20.0];
+        paint(&mut w, CiTool::Accelerator, (26, 2), (27, 3));
+        assert!(w.text.contains("accélérer rect (0.26, 0.02) (0.28, 0.04) de (0, 20) m/s²"), "{}", w.text);
+        // téléporteur : sans destination, pas de ligne ; un clic la choisit, puis le geste pose les sources
+        let lines = w.text.lines().count();
+        paint(&mut w, CiTool::Teleporter, (30, 2), (31, 3));
+        assert!(w.text.lines().count() == lines && w.status.contains("destination"), "{} / {}", w.text, w.status);
+        w.tp_picking = true;
+        paint(&mut w, CiTool::Teleporter, (30, 20), (30, 20));
+        assert!(w.tp_dest.map_or(false, |d| (d[0] - 0.305).abs() < 1e-12 && (d[1] - 0.205).abs() < 1e-12) && !w.tp_picking, "{:?}", w.tp_dest);
+        assert_eq!(w.text.lines().count(), lines);
+        paint(&mut w, CiTool::Teleporter, (30, 2), (31, 3));
+        assert!(w.text.contains("téléporteur rect (0.3, 0.02) (0.32, 0.04) vers (0.305, 0.205) 0.5 m/s rayon 0.02 m"), "{}", w.text);
+        assert!(w.errors.is_empty(), "{:?}\n{}", w.errors, w.text);
+        assert_eq!([count(&w, "Puits"), count(&w, "Émetteur"), count(&w, "Grille"), count(&w, "Vanne"), count(&w, "Pompe")], [4, 4, 4, 2, 4]);
+        let s = w.preview.as_ref().unwrap();
+        let dst = s.idx(30, 20);
+        let tp: Vec<MpEffect> = s.special.iter().filter_map(|e| *e).filter(|e| e.kind_name() == "Téléporteur").collect();
+        assert!(tp.len() == 4 && tp.iter().all(|e| *e == MpEffect::Teleporter { dest: dst, speed: 0.5, radius: 2 }), "{tp:?}");
+        // l'accélérateur agit au déroulement : ses mailles sont posées au départ
+        let mut r = Runner::new(parse_all(&w.text).unwrap().remove(0), Path::new("."), None, Some(false)).unwrap();
+        loop {
+            match r.advance(Duration::from_secs(60)).clone() {
+                RunState::Finished => break,
+                RunState::Failed(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        let s = &r.sim;
+        assert!(s.special[s.idx(26, 2)] == Some(MpEffect::Accelerator { ax: 0.0, ay: 20.0 }), "{:?}", s.special[s.idx(26, 2)]);
     }
 
     #[test]

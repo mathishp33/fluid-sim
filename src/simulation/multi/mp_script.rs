@@ -403,7 +403,7 @@ impl<'a> P<'a> {
                 BodyQty::Angle => Dim::Angle,
                 BodyQty::Vx | BodyQty::Vy => Dim::Speed,
                 BodyQty::Rotation => Dim::AngSpeed,
-                BodyQty::Fx | BodyQty::Fy | BodyQty::Torque => Dim::Plain,
+                BodyQty::Fx(_) | BodyQty::Fy(_) | BodyQty::Torque(_) => Dim::Plain,
                 BodyQty::Temp => Dim::Temp,
             },
         };
@@ -575,7 +575,7 @@ impl<'a> P<'a> {
             }
             ("corps", _) => {
                 let n = self.count("le numéro du corps (1 pour le premier posé)")?;
-                let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple, température)")?;
+                let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple [contact | loi | total], température)")?;
                 let q = match w.as_str() {
                     "x" => BodyQty::X,
                     "y" => BodyQty::Y,
@@ -583,9 +583,25 @@ impl<'a> P<'a> {
                     "vx" => BodyQty::Vx,
                     "vy" => BodyQty::Vy,
                     "rotation" => BodyQty::Rotation,
-                    "fx" => BodyQty::Fx,
-                    "fy" => BodyQty::Fy,
-                    "couple" => BodyQty::Torque,
+                    "fx" | "fy" | "couple" => {
+                        // force du fluide (par défaut), des contacts, d'une loi en formule, ou totale (avec le poids)
+                        use super::mp_experiment::ForcePart as F;
+                        let part = if self.eat_w("contact") {
+                            F::Contact
+                        } else if self.eat_w("loi") {
+                            F::Law
+                        } else if self.eat_w("total") || self.eat_w("totale") {
+                            F::Total
+                        } else {
+                            self.eat_w("fluide");
+                            F::Fluid
+                        };
+                        match w.as_str() {
+                            "fx" => BodyQty::Fx(part),
+                            "fy" => BodyQty::Fy(part),
+                            _ => BodyQty::Torque(part),
+                        }
+                    }
                     "t" | "temperature" => BodyQty::Temp,
                     o => return self.err(format!("grandeur « {o} » d'un corps : x, y, angle, vx, vy, rotation, fx, fy, couple, température")),
                 };
@@ -624,7 +640,39 @@ impl<'a> P<'a> {
 }
 
 /// « : <action> » d'une action datée ou répétée : le reste de la ligne, lu comme une commande d'une seule action
-fn timed_action(p: &mut P, ln: usize) -> R<Action> {
+/// <relevé> < | ≤ | > | ≥ <seuil> [et | ou <relevé> … <seuil>]… : les comparaisons, et leur lien (« ou » : vrai si l'une l'est)
+fn condition(p: &mut P) -> R<(Vec<Clause>, bool)> {
+    let mut clauses = vec![];
+    let mut any: Option<bool> = None;
+    loop {
+        let measure = p.measure()?;
+        if measure == Measure::Stats {
+            return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
+        }
+        let cmp = match p.peek() {
+            Some(Tok::Cmp(c)) => *c,
+            _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
+        };
+        p.i += 1;
+        let value = p.threshold(&measure)?;
+        clauses.push(Clause { measure, cmp, value });
+        let link = if p.eat_w("et") {
+            false
+        } else if p.eat_w("ou") {
+            true
+        } else {
+            break;
+        };
+        if any.is_some_and(|a| a != link) {
+            return p.err("« et » et « ou » ne se mélangent pas dans une même condition (pas de parenthèses)");
+        }
+        any = Some(link);
+    }
+    Ok((clauses, any.unwrap_or(false)))
+}
+
+/// action après « : » d'une action datée, répétée ou d'une règle « quand » (`pause_ok` : une pause est permise, pour « quand »)
+fn timed_action(p: &mut P, ln: usize, pause_ok: bool) -> R<Action> {
     if !p.eat(&Tok::Colon) {
         return p.err(format!("il faut « : » puis l'action{}", p.here()));
     }
@@ -637,10 +685,16 @@ fn timed_action(p: &mut P, ln: usize) -> R<Action> {
     p.i = p.t.len();
     let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
     match inner.steps.pop() {
-        Some((Step::Do(a), _)) if only && inner.steps.is_empty() && !matches!(a, Action::Periodic { .. } | Action::Pause) => Ok(a),
-        _ => p.err(
-            "une action datée ou répétée porte sur une seule action (remplir, chauffer, bord, corps…), pas sur simuler, mesurer, pause ni une autre action datée",
-        ),
+        Some((Step::Do(a), _))
+            if only && inner.steps.is_empty() && !matches!(a, Action::Periodic { .. } | Action::When { .. }) && (pause_ok || a != Action::Pause) =>
+        {
+            Ok(a)
+        }
+        _ => p.err(if pause_ok {
+            "une règle « quand » porte sur une seule action (remplir, chauffer, vanne, bord, corps, marque, pause…), pas sur simuler, mesurer ni une action datée, répétée ou une autre règle"
+        } else {
+            "une action datée ou répétée porte sur une seule action (remplir, chauffer, vanne, bord, corps…), pas sur simuler, mesurer, pause ni une autre action datée, répétée ou une règle « quand »"
+        }),
     }
 }
 
@@ -719,13 +773,19 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                     break;
                 }
             }
-            let action = timed_action(p, ln)?;
+            let action = timed_action(p, ln, false)?;
             push(proto, Action::Periodic { period, start, end, action: Box::new(action) }, ln);
+        }
+        "quand" => {
+            // quand <condition> : <action> — faite chaque fois que la condition devient vraie (relevée après chaque pas)
+            let (clauses, any) = condition(p)?;
+            let action = timed_action(p, ln, true)?;
+            push(proto, Action::When { clauses, any, action: Box::new(action) }, ln);
         }
         "a" => {
             // à <t> : <action> — faite une fois, à l'instant t pile, en parallèle du déroulement (geste enregistré par la fenêtre…)
             let t = p.quantity(Dim::Time, "l'instant de l'action")?;
-            let action = timed_action(p, ln)?;
+            let action = timed_action(p, ln, false)?;
             push(proto, Action::Periodic { period: f64::INFINITY, start: Some(t), end: Some(t), action: Box::new(action) }, ln);
         }
         "calcul" => {
@@ -791,32 +851,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 if !p.eat_w("que") {
                     return p.err(format!("il faut « jusqu'à ce que <relevé> < <valeur> »{}", p.here()));
                 }
-                let mut clauses = vec![];
-                let mut any: Option<bool> = None;
-                loop {
-                    let measure = p.measure()?;
-                    if measure == Measure::Stats {
-                        return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
-                    }
-                    let cmp = match p.peek() {
-                        Some(Tok::Cmp(c)) => *c,
-                        _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
-                    };
-                    p.i += 1;
-                    let value = p.threshold(&measure)?;
-                    clauses.push(Clause { measure, cmp, value });
-                    let link = if p.eat_w("et") {
-                        false
-                    } else if p.eat_w("ou") {
-                        true
-                    } else {
-                        break;
-                    };
-                    if any.is_some_and(|a| a != link) {
-                        return p.err("« et » et « ou » ne se mélangent pas dans une même condition (pas de parenthèses)");
-                    }
-                    any = Some(link);
-                }
+                let (clauses, any) = condition(p)?;
                 let limit = if p.eat_w("au") {
                     if !p.eat_w("plus") {
                         return p.err(format!("il faut « au plus <durée> »{}", p.here()));
@@ -829,7 +864,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 } else {
                     None
                 };
-                Step::UntilCond { clauses, any: any.unwrap_or(false), limit }
+                Step::UntilCond { clauses, any, limit }
             } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
             } else {
@@ -1155,6 +1190,26 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             p.end()?;
             push(proto, Action::Pump { zone, v }, ln);
         }
+        "teleporteur" => {
+            // téléporteur <zone> vers (x, y) [v m/s] [rayon r] : aspire à v (0.5 m/s par défaut), rejette le même débit autour de (x, y)
+            let zone = p.zone()?;
+            if !p.eat_w("vers") {
+                return p.err(format!("il faut « vers (x, y) », la destination du téléporteur{}", p.here()));
+            }
+            let dest = p.point()?;
+            let (mut speed, mut radius) = (0.5, 0.0);
+            while !p.done() {
+                if p.eat_w("rayon") {
+                    radius = p.quantity(Dim::Length, "le rayon de la destination")?;
+                    if !(radius >= 0.0) {
+                        return p.err("le rayon de la destination est positif (0 : la seule maille de destination)");
+                    }
+                } else {
+                    speed = p.quantity(Dim::Speed, "la vitesse d'aspiration (ou « rayon r »)")?;
+                }
+            }
+            push(proto, Action::Teleporter { zone, dest, speed, radius }, ln);
+        }
         "vanne" => {
             // vanne <zone> [fermée | ouverte [fraction | n %]] — vanne à guillotine, fermée par défaut
             let zone = p.zone()?;
@@ -1344,7 +1399,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         o => {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
-                 allumer, puits, émetteur, grille, bord, champ, gravité, pas max, sauver état, marque, pause, calcul, matériaux, balayage)"
+                 allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
+                 calcul, matériaux, balayage, toutes les, à, quand)"
             ))
         }
     }

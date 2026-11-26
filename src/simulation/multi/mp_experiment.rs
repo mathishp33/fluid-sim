@@ -249,6 +249,27 @@ pub enum Measure {
     Flux { fluid: Option<String>, mass: bool, a: [f64; 2], b: [f64; 2], label: Option<String> },
 }
 
+/// Force mesurée sur un corps : celle du fluide (pression et frottement), des contacts, d'une loi en formule, ou leur somme avec
+/// le poids (la force nette, M a pour un corps libre)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ForcePart {
+    Fluid,
+    Contact,
+    Law,
+    Total,
+}
+
+impl ForcePart {
+    fn suffix(self) -> &'static str {
+        match self {
+            ForcePart::Fluid => "",
+            ForcePart::Contact => " contact",
+            ForcePart::Law => " loi",
+            ForcePart::Total => " total",
+        }
+    }
+}
+
 /// Grandeur mesurée sur un corps rigide.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BodyQty {
@@ -258,9 +279,9 @@ pub enum BodyQty {
     Vx,
     Vy,
     Rotation,
-    Fx,
-    Fy,
-    Torque,
+    Fx(ForcePart),
+    Fy(ForcePart),
+    Torque(ForcePart),
     Temp,
 }
 
@@ -273,9 +294,9 @@ impl BodyQty {
             BodyQty::Vx => "vx",
             BodyQty::Vy => "vy",
             BodyQty::Rotation => "rotation",
-            BodyQty::Fx => "fx",
-            BodyQty::Fy => "fy",
-            BodyQty::Torque => "couple",
+            BodyQty::Fx(_) => "fx",
+            BodyQty::Fy(_) => "fy",
+            BodyQty::Torque(_) => "couple",
             BodyQty::Temp => "température",
         }
     }
@@ -285,16 +306,30 @@ impl BodyQty {
             BodyQty::Angle => "°",
             BodyQty::Vx | BodyQty::Vy => "m/s",
             BodyQty::Rotation => "°/s",
-            BodyQty::Fx | BodyQty::Fy => "N/m",
-            BodyQty::Torque => "N",
+            BodyQty::Fx(_) | BodyQty::Fy(_) => "N/m",
+            BodyQty::Torque(_) => "N",
             BodyQty::Temp => "K",
         }
     }
-    /// valeur sur le corps k (NaN s'il n'existe pas) ; forces : celles du fluide à la dernière projection (couple autour du centre de
-    /// masse, par mètre de profondeur)
-    fn value(&self, sim: &MultiphaseSim, k: usize) -> f64 {
+    /// valeur sur le corps k (NaN s'il n'existe pas) ; forces : celles de la dernière projection (couple autour du centre de masse, par
+    /// mètre de profondeur)
+    pub(crate) fn value(&self, sim: &MultiphaseSim, k: usize) -> f64 {
         let Some(b) = sim.bodies.get(k) else { return f64::NAN };
-        let f = sim.body_force.get(k).copied().unwrap_or([f64::NAN; 3]);
+        let part = |p: ForcePart| -> [f64; 3] {
+            let fluid = sim.body_force.get(k).copied().unwrap_or([f64::NAN; 3]);
+            let contact = sim.body_contact.get(k).copied().unwrap_or([0.0; 3]);
+            let law = sim.body_applied.get(k).copied().unwrap_or([0.0; 3]);
+            match p {
+                ForcePart::Fluid => fluid,
+                ForcePart::Contact => contact,
+                ForcePart::Law => law,
+                ForcePart::Total => {
+                    let m = b.density(sim.reg.solids[b.material].rho) * b.shape.area();
+                    let w = [m * sim.gravity[0], m * sim.gravity[1], 0.0];
+                    std::array::from_fn(|r| fluid[r] + contact[r] + law[r] + w[r])
+                }
+            }
+        };
         match self {
             BodyQty::X => b.pos[0],
             BodyQty::Y => b.pos[1],
@@ -302,9 +337,9 @@ impl BodyQty {
             BodyQty::Vx => b.vel[0],
             BodyQty::Vy => b.vel[1],
             BodyQty::Rotation => b.omega.to_degrees(),
-            BodyQty::Fx => f[0],
-            BodyQty::Fy => f[1],
-            BodyQty::Torque => f[2],
+            BodyQty::Fx(p) => part(*p)[0],
+            BodyQty::Fy(p) => part(*p)[1],
+            BodyQty::Torque(p) => part(*p)[2],
             BodyQty::Temp => b.temp,
         }
     }
@@ -489,6 +524,9 @@ pub enum Action {
     Valve { zone: Zone, open: f64 },
     /// pompe (compresseur) : vitesse `v` imposée sur les faces des mailles fluides de la zone
     Pump { zone: Zone, v: [f64; 2] },
+    /// téléporteur : les mailles de la zone aspirent à `speed` m/s ; le fluide absorbé (composition, température) ressort avec le même
+    /// débit volumique sur le disque de rayon `radius` (m, arrondi en mailles ; 0 : la seule maille) autour de `dest`
+    Teleporter { zone: Zone, dest: [f64; 2], speed: f64, radius: f64 },
     Boundary { side: usize, spec: BoundarySpec },
     Field { qty: FieldQty, source: FieldSource, zone: Zone, temp: Option<f64> },
     Gravity([f64; 2]),
@@ -502,6 +540,9 @@ pub enum Action {
     /// action répétée toutes les `period` secondes, de `start` (sinon l'instant où la ligne est atteinte) à `end` (sinon sans fin),
     /// en parallèle du déroulement : chaque fois à l'heure pile
     Periodic { period: f64, start: Option<f64>, end: Option<f64>, action: Box<Action> },
+    /// règle « quand <condition> : <action> », en parallèle du déroulement dès que sa ligne est atteinte : l'action est faite chaque
+    /// fois que la condition devient vraie (relevée après chaque pas ; tout de suite si elle l'est déjà)
+    When { clauses: Vec<Clause>, any: bool, action: Box<Action> },
 }
 
 impl Action {
@@ -510,7 +551,10 @@ impl Action {
     pub fn is_instant_edit(&self) -> bool {
         match self {
             Action::Periodic { start, action, .. } => start.map_or(true, |s| s <= 0.0) && action.is_instant_edit(),
-            _ => !matches!(self, Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause),
+            _ => !matches!(
+                self,
+                Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause | Action::When { .. }
+            ),
         }
     }
     /// zone de l'action (pour l'afficher sur l'image)
@@ -529,8 +573,9 @@ impl Action {
             | Action::Grille { zone, .. }
             | Action::Valve { zone, .. }
             | Action::Pump { zone, .. }
+            | Action::Teleporter { zone, .. }
             | Action::Field { zone, .. } => Some(zone),
-            Action::Periodic { action, .. } => action.zone(),
+            Action::Periodic { action, .. } | Action::When { action, .. } => action.zone(),
             _ => None,
         }
     }
@@ -747,7 +792,10 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
     }
     for (s, line) in &proto.steps {
         let Step::Do(a) = s else { continue };
-        let a = if let Action::Periodic { action, .. } = a { action.as_ref() } else { a };
+        let a = match a {
+            Action::Periodic { action, .. } | Action::When { action, .. } => action.as_ref(),
+            _ => a,
+        };
         match a {
             Action::Fill { fluid: f, .. } => fluid(f, *line, false, &mut errs),
             Action::Emitter { fluid: f, .. } => fluid(f, *line, true, &mut errs),
@@ -938,6 +986,21 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             sim.refresh();
             Ok(n)
         }
+        Action::Teleporter { zone, dest, speed, radius } => {
+            let (lx, ly) = (sim.nx as f64 * sim.dx, sim.ny as f64 * sim.dx);
+            if !(dest[0] >= 0.0 && dest[0] < lx && dest[1] >= 0.0 && dest[1] < ly) {
+                return Err(format!("la destination {} du téléporteur est hors du domaine", fmt_point(*dest)));
+            }
+            let d = sim.idx((dest[0] / sim.dx) as usize, (dest[1] / sim.dx) as usize);
+            if sim.is_solid(d) {
+                return Err(format!("la destination {} du téléporteur est dans un solide", fmt_point(*dest)));
+            }
+            // (une zone qui couvre la destination la laisse libre, comme le pinceau)
+            if sim.special[d].is_some() {
+                return Err(format!("la destination {} du téléporteur est sur une autre cellule spéciale", fmt_point(*dest)));
+            }
+            effect(sim, zone, MpEffect::Teleporter { dest: d, speed: *speed, radius: (radius / sim.dx).round() as usize })
+        }
         Action::Boundary { side, spec } => {
             let k = *side;
             match spec {
@@ -990,7 +1053,7 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             sim.dt_max = *d;
             Ok(0)
         }
-        Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause => Ok(0),
+        Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause | Action::When { .. } => Ok(0),
         // (conditions initiales : sa première fois ; le déroulement la répète)
         Action::Periodic { action, .. } => apply_action(sim, action, base),
     }
@@ -1079,7 +1142,8 @@ fn display_slug(d: super::mp_view::MpDisplay) -> &'static str {
     }
 }
 
-/// une comparaison d'une condition d'arrêt en cours : relevé, comparaison, seuil, nom et unité du relevé, dernier relevé (t, valeur)
+/// une comparaison d'une condition en cours : relevé, comparaison, seuil, nom et unité du relevé, dernier relevé (t, valeur), relevé
+/// le plus éloigné du seuil depuis que la comparaison est fausse
 struct CondClause {
     probe: Probe,
     cmp: Cmp,
@@ -1087,6 +1151,7 @@ struct CondClause {
     name: String,
     unit: String,
     last: Option<(f64, f64)>,
+    far: Option<(f64, f64)>,
 }
 
 /// condition d'arrêt en cours : comparaisons reliées par « et » (toutes) ou « ou » (`any`) ; `near` : franchissement prévu avant la
@@ -1110,6 +1175,39 @@ impl Cond {
     fn holds(&self, xs: &[f64]) -> bool {
         let mut it = self.clauses.iter().zip(xs).map(|(c, &x)| c.cmp.holds(x, c.value));
         if self.any { it.any(|b| b) } else { it.all(|b| b) }
+    }
+    /// relevés `xs` à l'instant t (pas dt) : les garde comme derniers relevés et prévoit, d'après la tendance des deux derniers, si la
+    /// condition encore fausse va devenir vraie dans moins de deux séries de 8 pas (`near`) — « ou » : l'une des comparaisons
+    /// encore fausses ; « et » : toutes
+    fn track(&mut self, t: f64, dt: f64, xs: &[f64]) {
+        let any = self.any;
+        let mut near = !any;
+        let soon = |from: Option<(f64, f64)>, x: f64, value: f64| match from {
+            Some((t0, x0)) if t > t0 && x != x0 => {
+                let eta = (value - x) / ((x - x0) / (t - t0));
+                eta >= 0.0 && eta < 16.0 * dt
+            }
+            _ => false,
+        };
+        for (cl, &x) in self.clauses.iter_mut().zip(xs) {
+            if cl.cmp.holds(x, cl.value) {
+                cl.far = None;
+            } else {
+                if cl.far.map_or(true, |(_, xf)| (cl.value - x).abs() > (cl.value - xf).abs()) {
+                    cl.far = Some((t, x));
+                }
+                // tendance du dernier intervalle, ou depuis le relevé le plus éloigné du seuil : une sonde qui oscille (ondes de
+                // pression…) trompe la première — un compresseur qui démarre faisait sauter le seuil d'une série de 8 pas au GPU
+                let close = soon(cl.last, x, cl.value) || soon(cl.far, x, cl.value);
+                if any {
+                    near |= close;
+                } else {
+                    near &= close;
+                }
+            }
+            cl.last = Some((t, x));
+        }
+        self.near = near;
     }
     /// « 0.099 m ; 412 K »
     fn values_text(&self, xs: &[f64]) -> String {
@@ -1396,6 +1494,14 @@ struct Periodic {
     count: usize,
 }
 
+/// règle « quand » en cours : condition, action, condition vraie au dernier relevé, nombre de fois où l'action a été faite
+struct WhenRule {
+    cond: Cond,
+    action: Action,
+    on: bool,
+    count: usize,
+}
+
 struct Timed {
     cells: Vec<usize>,
     /// température cible (chauffage) ou accélération (ax, ay)
@@ -1422,6 +1528,8 @@ pub struct Runner {
     cond: Option<Cond>,
     timed: Vec<Timed>,
     periodic: Vec<Periodic>,
+    /// règles « quand … : … »
+    when: Vec<WhenRule>,
     /// journal muet (répétitions au-delà de la troisième)
     quiet: bool,
     probes: Vec<Probe>,
@@ -1483,6 +1591,7 @@ impl Runner {
             cond: None,
             timed: vec![],
             periodic: vec![],
+            when: vec![],
             quiet: false,
             probes: vec![],
             stats: false,
@@ -1526,11 +1635,13 @@ impl Runner {
             }
         }
         for (s, _) in &self.proto.steps {
-            if let Step::UntilCond { clauses, .. } = s {
-                for c in clauses {
-                    if let Measure::Flux { a, b, .. } = &c.measure {
-                        lines.push((*a, *b));
-                    }
+            let clauses = match s {
+                Step::UntilCond { clauses, .. } | Step::Do(Action::When { clauses, .. }) => clauses,
+                _ => continue,
+            };
+            for c in clauses {
+                if let Measure::Flux { a, b, .. } = &c.measure {
+                    lines.push((*a, *b));
                 }
             }
         }
@@ -1644,7 +1755,11 @@ impl Runner {
                 (Probe { kind: ProbeKind::Mass(k), cells, fluid_only: true }, name, "kg/m".to_string())
             }
             Measure::Body { index, q, label } => {
-                let name = label.clone().unwrap_or_else(|| format!("corps {} {}", index + 1, q.name()));
+                let sfx = match q {
+                    BodyQty::Fx(p) | BodyQty::Fy(p) | BodyQty::Torque(p) => p.suffix(),
+                    _ => "",
+                };
+                let name = label.clone().unwrap_or_else(|| format!("corps {} {}{sfx}", index + 1, q.name()));
                 (Probe { kind: ProbeKind::Body(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
             }
             Measure::SolidForce { axis, zone, label } => {
@@ -1720,7 +1835,7 @@ impl Runner {
                     let mut parts = vec![];
                     for cl in &clauses {
                         match self.make_probe(&cl.measure) {
-                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None }),
+                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
                             Ok(None) => {
                                 self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
                                 return &self.state;
@@ -1732,11 +1847,13 @@ impl Runner {
                         }
                     }
                     self.sync_host();
-                    let mut c = Cond { clauses: parts, any, line, near: false };
+                    // (pas de tendance avant deux relevés : un pas à la fois, sinon le GPU ferait d'emblée une série de 8 pas)
+                    let mut c = Cond { clauses: parts, any, line, near: true };
                     let xs = c.values(&self.sim);
                     let t = self.sim.time;
                     for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
                         cl.last = Some((t, x));
+                        cl.far = (!cl.cmp.holds(x, cl.value)).then_some((t, x));
                     }
                     if c.holds(&xs) {
                         self.note(format!("ligne {line} : {} déjà vrai ({})", c.text(), c.values_text(&xs)));
@@ -1844,6 +1961,16 @@ impl Runner {
 
     /// après des actions : cibles de chauffage recalculées, état renvoyé au GPU s'il a changé
     fn finish_edits(&mut self, edited: bool, heat: bool) {
+        if edited || heat {
+            // l'état a changé (vanne, chauffage…) : les tendances relevées avant ne disent plus rien, les conditions en cours sont
+            // relevées pas à pas jusqu'aux suivantes (sans quoi le GPU vidait une cuve pendant une série de pas)
+            if let Some(c) = &mut self.cond {
+                c.near = true;
+            }
+            for w in &mut self.when {
+                w.cond.near = true;
+            }
+        }
         if heat {
             self.apply_heat_targets();
         }
@@ -1854,6 +1981,55 @@ impl Runner {
                 g.sync_heat_targets(&self.sim);
             }
         }
+    }
+
+    /// Règles « quand » après un pas : l'action d'une règle est faite si sa condition, fausse au relevé précédent, est vraie (le
+    /// journal note les trois premières fois). Une pause arrête la tournée (les règles suivantes sont relevées au pas suivant).
+    fn check_when(&mut self) {
+        self.sync_host();
+        let (t, dt) = (self.sim.time, self.sim.last_dt);
+        let (mut edited, mut heat) = (false, false);
+        for k in 0..self.when.len() {
+            let xs = self.when[k].cond.values(&self.sim);
+            let holds = self.when[k].cond.holds(&xs);
+            let fire = holds && !self.when[k].on;
+            {
+                let w = &mut self.when[k];
+                w.on = holds;
+                w.cond.track(t, dt, &xs);
+                if holds {
+                    w.cond.near = false;
+                }
+            }
+            if !fire {
+                continue;
+            }
+            let (action, line, count) = {
+                let w = &mut self.when[k];
+                w.count += 1;
+                (w.action.clone(), w.cond.line, w.count)
+            };
+            if count <= 3 {
+                let text = self.when[k].cond.values_text(&xs);
+                self.note(format!("ligne {line} : condition vraie ({text})"));
+            } else if count == 4 {
+                self.note(format!("ligne {line} : fois suivantes non notées au journal"));
+            }
+            self.quiet = count > 3;
+            let r = self.do_action(&action, line);
+            self.quiet = false;
+            match r {
+                Ok((e, h)) => {
+                    edited |= e;
+                    heat |= h;
+                }
+                Err(()) => return,
+            }
+            if self.state != RunState::Running {
+                break;
+            }
+        }
+        self.finish_edits(edited, heat);
     }
 
     /// Actions répétées dues à l'instant `now` (à `eps` près), dans l'ordre de leurs échéances : (état modifié, chauffages changés).
@@ -1926,6 +2102,41 @@ impl Runner {
                     let (e, h) = self.fire_due(now, eps)?;
                     edited |= e;
                     heat |= h;
+                }
+                Action::When { clauses, any, action } => {
+                    let mut parts = vec![];
+                    for cl in clauses {
+                        match self.make_probe(&cl.measure) {
+                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
+                            Ok(None) => {
+                                self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
+                                return Err(());
+                            }
+                            Err(e) => {
+                                self.fail(format!("ligne {line} : {e}"));
+                                return Err(());
+                            }
+                        }
+                    }
+                    self.sync_host();
+                    let mut cond = Cond { clauses: parts, any: *any, line, near: false };
+                    let xs = cond.values(&self.sim);
+                    let t = self.sim.time;
+                    for (cl, &x) in cond.clauses.iter_mut().zip(&xs) {
+                        cl.last = Some((t, x));
+                        cl.far = (!cl.cmp.holds(x, cl.value)).then_some((t, x));
+                    }
+                    let on = cond.holds(&xs);
+                    // (pas de tendance avant deux relevés : un pas à la fois tant que la règle attend sa condition)
+                    cond.near = !on;
+                    let now_text = if on { " : déjà vrai, faite maintenant" } else { "" };
+                    self.note(format!("ligne {line} : quand {} : {} — {} au départ{now_text}", cond.text(), describe(action), cond.values_text(&xs)));
+                    self.when.push(WhenRule { cond, action: (**action).clone(), on, count: on as usize });
+                    if on {
+                        let (e, h) = self.do_action(action, line)?;
+                        edited |= e;
+                        heat |= h;
+                    }
                 }
                 Action::Mark(t) => self.note(format!("ligne {line} : repère « {t} »")),
                 Action::SaveState(name) => self.save_state(name, line),
@@ -2139,7 +2350,7 @@ impl Runner {
         match &mut self.gpu {
             Some(g) => {
                 // (condition d'arrêt près de son seuil : un pas à la fois, pour s'arrêter au bon pas)
-                let near = self.cond.as_ref().is_some_and(|c| c.near);
+                let near = self.cond.as_ref().is_some_and(|c| c.near) || self.when.iter().any(|w| w.cond.near);
                 let k = if cap.is_infinite() && !near { ((remaining / pred) * 0.5).floor().clamp(1.0, 8.0) as usize } else { 1 };
                 if k > 1 {
                     // série de k pas : bornés pour que la série s'arrête avant l'échéance
@@ -2169,29 +2380,14 @@ impl Runner {
                 self.note(format!("ligne {} : {} atteint ({})", c.line, c.text(), c.values_text(&xs)));
                 self.target = None;
             } else {
-                // tendance des deux derniers relevés : franchissement prévu dans moins de deux séries de 8 pas ? « ou » : celui d'une
-                // comparaison encore fausse ; « et » : celui de toutes les comparaisons encore fausses
-                let c = self.cond.as_mut().unwrap();
-                let any = c.any;
-                let mut near = !any;
-                for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
-                    if !cl.cmp.holds(x, cl.value) {
-                        let close = match cl.last {
-                            Some((t0, x0)) if t > t0 && x != x0 => {
-                                let eta = (cl.value - x) / ((x - x0) / (t - t0));
-                                eta >= 0.0 && eta < 16.0 * dt
-                            }
-                            _ => false,
-                        };
-                        if any {
-                            near |= close;
-                        } else {
-                            near &= close;
-                        }
-                    }
-                    cl.last = Some((t, x));
-                }
-                c.near = near;
+                self.cond.as_mut().unwrap().track(t, dt, &xs);
+            }
+        }
+        // règles « quand » : relevées après chaque pas, l'action est faite quand la condition devient vraie
+        if !self.when.is_empty() {
+            self.check_when();
+            if self.state != RunState::Running {
+                return;
             }
         }
         for k in 0..self.series.len() {
@@ -2294,6 +2490,11 @@ impl Runner {
     }
 
     fn finish(&mut self) {
+        for k in 0..self.when.len() {
+            let w = &self.when[k];
+            let msg = format!("ligne {} : quand {} — {} fois", w.cond.line, w.cond.text(), w.count);
+            self.note(msg);
+        }
         for k in 0..self.periodic.len() {
             let p = &self.periodic[k];
             let msg = if p.period.is_infinite() {
@@ -2434,12 +2635,20 @@ fn describe(a: &Action) -> String {
         }
         Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
+        Action::When { clauses, any, action } => {
+            let n = clauses.len();
+            let what = if n == 1 { "une comparaison".to_string() } else { format!("{n} comparaisons reliées par « {} »", if *any { "ou" } else { "et" }) };
+            format!("quand ({what}) : {}", describe(action))
+        }
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),
         Action::Ignite { zone, temp } => format!("allumer {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Sink { zone, rate } => format!("puits {} ({} m/s)", zone.label(), fmt_num(*rate)),
         Action::Emitter { zone, fluid, .. } => format!("émetteur de « {fluid} » {}", zone.label()),
         Action::Grille { zone, .. } => format!("grille {}", zone.label()),
         Action::Pump { zone, v } => format!("pompe {} à {} m/s", zone.label(), fmt_point(*v)),
+        Action::Teleporter { zone, dest, speed, radius } => {
+            format!("téléporteur {} vers {} ({} m/s, rayon {} m)", zone.label(), fmt_point(*dest), fmt_num(*speed), fmt_num(*radius))
+        }
         Action::Valve { zone, open } => match *open {
             o if o <= 0.0 => format!("vanne {} fermée", zone.label()),
             o if o >= 1.0 => format!("vanne {} ouverte", zone.label()),

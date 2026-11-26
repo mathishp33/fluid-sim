@@ -117,8 +117,27 @@ EXPERIENCES.md (protocoles).
   autres cœurs travaillent. Le multigrille sur 160×120 et moins reste limité par la taille des régions (~10–20 µs).
 
 ### Cellules spéciales
-- [M] Nouvelles cellules spéciales : porte / vanne (ouverture réglable), compresseur, autres… La grille existe (arrête les grains,
-  laisse passer le fluide). Une porte sur charnière peut déjà se faire avec un corps libre sur pivot (clapet, SOLID.md).
+- [M] Existent : puits, émetteur, accélérateur, téléporteur, grille, vanne à guillotine (fermée, ouverte, ouverture en fraction ou
+  en %), pompe / compresseur ; toutes posables par protocole et au pinceau dans la fenêtre d'expérience (vanne et pompe aussi dans
+  la fenêtre multiphasique). Une porte sur charnière se fait avec un corps libre sur pivot (clapet, SOLID.md) ; une soupape de
+  sécurité ou un thermostat tout ou rien, avec deux règles `quand` aux seuils écartés (`experiences/soupape.exp`). À ajouter :
+- [M] Régulateur proportionnel (PI) : puissance de chauffe ou ouverture de vanne qui suit l'écart d'une sonde à sa consigne, au lieu
+  du tout ou rien des règles `quand` — bain-marie, couveuse, débit régulé.
+- [M] Clapet anti-retour en mailles : faces qui ne laissent passer l'écoulement que dans un sens (le clapet sur pivot existe, mais
+  c'est un corps : CPU seulement, et cher). Dans la projection : fermer les faces où le flux s'inverserait, puis résoudre à nouveau.
+- [M] Paroi mobile : solide dont la surface glisse à vitesse imposée (tapis roulant, cylindre qui tourne en mailles) ; donnerait la
+  cavité entraînée par son couvercle, essai de référence de la viscosité (Ghia, Ghia et Shin 1982).
+- [M] Ventilateur à courbe Δp(Q) : saut de pression imposé à travers la zone, qui baisse quand le débit monte (Δp = Δp₀ (1 −
+  Q/Q_max)), au lieu du débit fixé de la pompe : le débit s'ajuste aux pertes du circuit.
+- [M] Membrane sélective : faces ouvertes à une seule phase — évent qui laisse passer le gaz et retient le liquide, filtre qui
+  retient une poudre.
+- [M] Couche éponge (bord absorbant) : mailles qui ramènent doucement la vitesse au repos, pour que vagues et ondes de pression ne
+  se réfléchissent pas sur les bords (bac à vagues, explosion à l'air libre).
+- [M] Chauffe-fluide à puissance imposée (W/m³ dans le fluide : résistance plongée, effet Joule, micro-ondes) : « chauffer » vise
+  une température ; une puissance connue sert aux essais de convection à flux imposé (Rayleigh–Bénard).
+- [M] Trémie : émetteur de grains à débit massique et à fraction choisie (sablier, charbon qui alimente un feu) ; l'émetteur
+  remplit sa maille d'une seule phase, ce qui ne convient pas à une poudre (à vérifier).
+- [M] Évent intérieur : maille à pression imposée au milieu du domaine (cheminée, prise d'air), comme un bord ouvert.
 
 ---
 
@@ -230,6 +249,15 @@ détail dans les documents de conception et l'historique git.
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d
   [affichage]` (série d'images pour une animation).
+- Corps : mesures `corps n fx | fy | couple contact | loi | total` (force des contacts, d'une loi en formule, ou bilan avec le
+  poids : M a au pas près, vérifié à 2e-14) ; disque fixe immergé : Archimède à 4e-6 près ; disque posé au fond : le fond porte
+  son poids moins la poussée à 0.3 % près.
+- Cellules spéciales : `téléporteur <zone> vers (x, y) [v] [rayon r]` en protocole ; vanne, pompe, accélérateur et téléporteur
+  (destination choisie d'un clic) posables dans la fenêtre d'expérience, vanne et pompe dans la fenêtre multiphasique.
+- Protocoles : règles `quand <condition> : <action>` (faite chaque fois que la condition devient vraie, relevée après chaque pas ;
+  aussi `pause`) : soupape de sécurité (`experiences/soupape.exp` : pression tenue entre 102.2 et 104.1 kPa, au lieu de monter de
+  49 kPa/s), thermostat tout ou rien. CPU et GPU au même pas : le GPU relève pas à pas près d'un seuil (tendance prise aussi depuis
+  le relevé le plus éloigné, qu'une sonde qui oscille ne trompe pas) et après chaque action ; les conditions d'arrêt en profitent.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir
