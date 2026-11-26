@@ -699,3 +699,39 @@ sauver image \"vitesse\" vitesse
     assert!(r.log.iter().any(|l| l.contains("image vitesse (640 × 480)")), "{}", r.log.join("\n"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_protocol_saves_an_image_series_at_regular_intervals() {
+    use super::mp_view::MpDisplay;
+    let p = proto("départ scénario \"cuve vide\"\nimages toutes les 50 ms température\nimages chaque 0.1 s\nsimuler 1 s\n");
+    assert_eq!(p.images.iter().map(|&(t, d, _)| (t, d)).collect::<Vec<_>>(), [(0.05, MpDisplay::Temperature), (0.1, MpDisplay::Phases)]);
+    for (bad, what) in [
+        ("images toutes les 0 s", "positive"),
+        ("images toutes les 1 s couleur", "affichage"),
+        ("images 1 s", "toutes les"),
+        ("images toutes les 1 s\nimages toutes les 2 s phases", "une seule série"),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // barrage : une image de la vitesse toutes les 20 ms pendant 0.1 s, au départ compris
+    let dir = tmp_dir("serie");
+    let text = "départ scénario \"Rupture de barrage\" grille 40 x 30 maille 1 cm
+images toutes les 20 ms vitesse
+simuler 0.1 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), Some(dir.clone()), Some(false)).unwrap();
+    run_to_end(&mut r);
+    let sub = dir.join("images-vitesse");
+    let mut names: Vec<String> = std::fs::read_dir(&sub)
+        .unwrap_or_else(|e| panic!("{} : {e}\n{}", sub.display(), r.log.join("\n")))
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["0000.png", "0001.png", "0002.png", "0003.png", "0004.png", "0005.png"], "{}", r.log.join("\n"));
+    let bytes = std::fs::read(sub.join("0003.png")).unwrap();
+    let rd = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+    assert_eq!((rd.info().width, rd.info().height), (640, 480));
+    assert!(r.log.iter().any(|l| l.contains("6 images (vitesse) toutes les 0.02 s dans images-vitesse/")), "{}", r.log.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

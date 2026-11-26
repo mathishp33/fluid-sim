@@ -551,6 +551,8 @@ pub struct Protocol {
     pub gpu: Option<bool>,
     /// période des mesures (s)
     pub period: Option<f64>,
+    /// séries d'images PNG à intervalles réguliers : (période, affichage, ligne)
+    pub images: Vec<(f64, super::mp_view::MpDisplay, usize)>,
     pub measures: Vec<(Measure, usize)>,
     pub steps: Vec<(Step, usize)>,
     /// texte du protocole (après substitution du balayage)
@@ -929,6 +931,34 @@ struct Probe {
     fluid_only: bool,
 }
 
+/// série d'images PNG à intervalles réguliers : `0000.png`, `0001.png`… dans `images-<affichage>/` du dossier des résultats
+struct ImageSeries {
+    period: f64,
+    display: super::mp_view::MpDisplay,
+    line: usize,
+    /// prochaine image (None : la série n'a pas commencé)
+    next: Option<f64>,
+    /// instant de la dernière image
+    last: Option<f64>,
+    count: usize,
+}
+
+/// nom de dossier d'un affichage (sans accent ni espace)
+fn display_slug(d: super::mp_view::MpDisplay) -> &'static str {
+    use super::mp_view::MpDisplay as D;
+    match d {
+        D::Phases => "phases",
+        D::Pressure => "pression",
+        D::Temperature => "temperature",
+        D::Velocity => "vitesse",
+        D::Density => "masse-volumique",
+        D::Vapor => "vapeur",
+        D::Divergence => "divergence",
+        D::Flame => "flamme",
+        D::HeatRelease => "chaleur",
+    }
+}
+
 /// condition d'arrêt en cours : relevé, comparaison, seuil, ligne du protocole, nom et unité du relevé
 struct Cond {
     probe: Probe,
@@ -1105,6 +1135,8 @@ pub struct Runner {
     /// journal (actions, avertissements)
     pub log: Vec<String>,
     next_sample: Option<f64>,
+    /// séries d'images à intervalles réguliers (`images toutes les …`)
+    series: Vec<ImageSeries>,
     pub state: RunState,
     /// fin prévue (temps simulé)
     pub t_end: f64,
@@ -1158,6 +1190,7 @@ impl Runner {
             rows: vec![],
             log: vec![],
             next_sample: None,
+            series: vec![],
             state: RunState::Running,
             line: 0,
             csv: None,
@@ -1504,6 +1537,15 @@ impl Runner {
             self.note(format!("ligne {line} : sauver image « {name} » — pas de dossier de résultats, rien d'écrit"));
             return;
         };
+        let path = dir.join(format!("{name}.png"));
+        match self.write_png(&path, display) {
+            Ok((w, h)) => self.note(format!("ligne {line} : image {} ({w} × {h}) : {}", display.name().to_lowercase(), path.display())),
+            Err(e) => self.fail(format!("ligne {line} : sauver image : {e}")),
+        }
+    }
+
+    /// Écrit l'image PNG d'un champ (dimensions en retour).
+    fn write_png(&mut self, path: &Path, display: super::mp_view::MpDisplay) -> Result<(usize, usize), String> {
         self.sync_host();
         let (nx, ny) = (self.sim.nx, self.sim.ny);
         let mut rgba = vec![];
@@ -1517,19 +1559,13 @@ impl Runner {
                 big[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
             }
         }
-        let path = dir.join(format!("{name}.png"));
-        let write = || -> Result<(), String> {
-            let f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut wr = enc.write_header().map_err(|e| e.to_string())?;
-            wr.write_image_data(&big).map_err(|e| e.to_string())
-        };
-        match write() {
-            Ok(()) => self.note(format!("ligne {line} : image {} ({w} × {h}) : {}", display.name().to_lowercase(), path.display())),
-            Err(e) => self.fail(format!("ligne {line} : sauver image : {e}")),
-        }
+        let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+        wr.write_image_data(&big).map_err(|e| e.to_string())?;
+        Ok((w, h))
     }
 
     fn fail(&mut self, msg: String) {
@@ -1657,6 +1693,18 @@ impl Runner {
                 c.last = Some((t, x));
             }
         }
+        for k in 0..self.series.len() {
+            let Some(next) = self.series[k].next else { continue };
+            if self.sim.time >= next - eps {
+                self.series_frame(k);
+                let (t, s) = (self.sim.time, &mut self.series[k]);
+                let mut n = next;
+                while n <= t + eps {
+                    n += s.period;
+                }
+                s.next = Some(n);
+            }
+        }
         if let Some(ns) = self.next_sample {
             if self.sim.time >= ns - eps {
                 self.sample();
@@ -1676,6 +1724,46 @@ impl Runner {
                 self.sample();
                 self.next_sample = Some(self.sim.time + p);
             }
+        }
+        if self.series.is_empty() && !self.proto.images.is_empty() {
+            if self.out_dir.is_none() {
+                self.note("images à intervalles réguliers : pas de dossier de résultats, rien d'écrit".into());
+            }
+            self.series = self
+                .proto
+                .images
+                .iter()
+                .map(|&(period, display, line)| ImageSeries { period, display, line, next: None, last: None, count: 0 })
+                .collect();
+        }
+        for k in 0..self.series.len() {
+            if self.series[k].next.is_none() {
+                self.series_frame(k);
+                let s = &mut self.series[k];
+                s.next = Some(self.sim.time + s.period);
+            }
+        }
+    }
+
+    /// image suivante de la série k (dans `images-<affichage>/` du dossier des résultats)
+    fn series_frame(&mut self, k: usize) {
+        let Some(dir) = self.out_dir.clone() else { return };
+        let (display, count, line) = (self.series[k].display, self.series[k].count, self.series[k].line);
+        let dir = dir.join(format!("images-{}", display_slug(display)));
+        if count == 0 {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.fail(format!("ligne {line} : images : {e}"));
+                return;
+            }
+        }
+        match self.write_png(&dir.join(format!("{count:04}.png")), display) {
+            Ok(_) => {
+                let t = self.sim.time;
+                let s = &mut self.series[k];
+                s.count += 1;
+                s.last = Some(t);
+            }
+            Err(e) => self.fail(format!("ligne {line} : images : {e}")),
         }
     }
 
@@ -1709,6 +1797,24 @@ impl Runner {
             let last = self.rows.last().map(|r| r[0]);
             if last.map_or(true, |t| self.sim.time > t + 1e-12 * (1.0 + t.abs())) {
                 self.sample();
+            }
+        }
+        for k in 0..self.series.len() {
+            let t = self.sim.time;
+            if self.series[k].next.is_some() && self.series[k].last.map_or(true, |l| t > l + 1e-12 * (1.0 + l.abs())) {
+                self.series_frame(k);
+            }
+            let s = &self.series[k];
+            if self.out_dir.is_some() {
+                let msg = format!(
+                    "ligne {} : {} images ({}) toutes les {} s dans images-{}/",
+                    s.line,
+                    s.count,
+                    s.display.name().to_lowercase(),
+                    fmt_num(s.period),
+                    display_slug(s.display)
+                );
+                self.note(msg);
             }
         }
         self.sync_host();

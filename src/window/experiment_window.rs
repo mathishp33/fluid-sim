@@ -120,6 +120,7 @@ ACTIONS À DURÉE
 
 TEMPS, MESURES, SORTIES
   simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\" · sauver image \"nom\" [température | vitesse | …]
+  images toutes les 50 ms [phases | température | vitesse | …]   (série d'images PNG dans images-<affichage>/)
   simuler jusqu'à ce que max T dans partout < 400 K [au plus 10 s]   (relevé comme une mesure ; < <= > >=)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
@@ -629,6 +630,7 @@ impl ExperimentWindow {
                     ("bord", "bord haut ouvert"),
                     ("sauver état", "sauver état \"etat\""),
                     ("sauver image", "sauver image \"image\" température"),
+                    ("images", "images toutes les 50 ms phases"),
                     ("marque", "marque \"repère\""),
                     ("pause", "pause"),
                     ("balayage", "balayage T0 = 300 K, 350 K, 400 K"),

@@ -356,6 +356,32 @@ impl<'a> P<'a> {
         let v = self.number(what)?;
         Ok(self.opt_unit(dim, v)?.0)
     }
+    /// affichage d'une image (phases par défaut)
+    fn display(&mut self) -> R<super::mp_view::MpDisplay> {
+        use super::mp_view::MpDisplay as D;
+        let Some(w) = self.peek_w() else { return Ok(D::Phases) };
+        let d = match w {
+            "phases" => D::Phases,
+            "temperature" | "t" => D::Temperature,
+            "pression" | "p" => D::Pressure,
+            "vitesse" => D::Velocity,
+            "densite" | "rho" | "masse" => D::Density,
+            "vapeur" => D::Vapor,
+            "divergence" => D::Divergence,
+            "flamme" => D::Flame,
+            "chaleur" => D::HeatRelease,
+            o => {
+                return self.err(format!(
+                    "affichage « {o} » inconnu : phases, température, pression, vitesse, masse volumique, vapeur, divergence, flamme, chaleur"
+                ))
+            }
+        };
+        self.i += 1;
+        if d == D::Density {
+            self.eat_w("volumique");
+        }
+        Ok(d)
+    }
     /// seuil d'une condition, dans l'unité où le relevé est mesuré (K, Pa, m/s, m ; angles en degrés, rotations en °/s)
     fn threshold(&mut self, m: &Measure) -> R<f64> {
         let dim = match m {
@@ -637,6 +663,26 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 o => return p.err(format!("calcul « {o} » : « cpu » ou « gpu »")),
             });
             p.end()?;
+        }
+        "images" | "image" => {
+            // images toutes les <durée> [affichage] : une série d'images PNG (plusieurs séries possibles)
+            if p.eat_w("toutes") {
+                if !p.eat_w("les") {
+                    return p.err("il faut « images toutes les <durée> [affichage] »");
+                }
+            } else if !p.eat_w("chaque") {
+                return p.err(format!("il faut « images toutes les <durée> [affichage] »{}", p.here()));
+            }
+            let period = p.quantity(Dim::Time, "la période des images")?;
+            if !(period > 0.0) {
+                return p.err("la période des images doit être positive");
+            }
+            let display = p.display()?;
+            p.end()?;
+            if proto.images.iter().any(|(_, d, _)| *d == display) {
+                return p.err("une seule série d'images par affichage");
+            }
+            proto.images.push((period, display, ln));
         }
         "mesurer" | "mesure" => {
             if p.eat_w("toutes") {
@@ -1060,33 +1106,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 if name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.') {
                     return p.err(format!("nom d'image « {name} » : un simple nom de fichier, sans dossier"));
                 }
-                use super::mp_view::MpDisplay as D;
-                let display = match p.peek_w() {
-                    None => D::Phases,
-                    Some(w) => {
-                        let d = match w {
-                            "phases" => D::Phases,
-                            "temperature" | "t" => D::Temperature,
-                            "pression" | "p" => D::Pressure,
-                            "vitesse" => D::Velocity,
-                            "densite" | "rho" | "masse" => D::Density,
-                            "vapeur" => D::Vapor,
-                            "divergence" => D::Divergence,
-                            "flamme" => D::Flame,
-                            "chaleur" => D::HeatRelease,
-                            o => {
-                                return p.err(format!(
-                                    "affichage « {o} » inconnu : phases, température, pression, vitesse, masse volumique, vapeur, divergence, flamme, chaleur"
-                                ))
-                            }
-                        };
-                        p.i += 1;
-                        if d == D::Density {
-                            p.eat_w("volumique");
-                        }
-                        d
-                    }
-                };
+                let display = p.display()?;
                 p.end()?;
                 push(proto, Action::SaveImage { name, display }, ln);
                 return Ok(());

@@ -9,11 +9,10 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 ## 1. Prioritaire
 
 ### Organisation et interface
-- [M] Intégrer la fenêtre d'expérience à la fenêtre de départ (`starting_window.rs`).
 - [M] Améliorer la fenêtre d'expérience : mouvement imposé, pivot et axes bloqués dans l'outil « Corps » (qui pose des corps fixes
   ou libres, avec masse volumique, rebond, frottement et température ; le reste passe par la commande `corps`) ; conditions
   composées (« et », « ou ») ; gestes à la souris enregistrés en actions datées pendant une expérience ; flux à travers une ligne
-  (les flux de masse des faces ne sont gardés que toutes phases confondues) ; images à intervalles réguliers ; sondes interpolées.
+  (les flux de masse des faces ne sont gardés que toutes phases confondues) ; sondes interpolées.
 
 ### Bords du domaine
 - [M+1] Plus de types de bords : sortie à vitesse imposée, périodiques, sortie convective. Existent : [M] bord ouvert à pression
@@ -208,7 +207,8 @@ détail dans les documents de conception et l'historique git.
 - Protocoles : `simuler jusqu'à ce que <relevé> < <seuil> [au plus d]` (condition d'arrêt sur une mesure, CPU et GPU).
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
-- Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats).
+- Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d
+  [affichage]` (série d'images pour une animation).
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir
