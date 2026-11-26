@@ -228,8 +228,11 @@ chauffer rect (0.1, 0) (0.2, 0.01) à $T pendant 3 s
   - résumé : nombre de conditions initiales et d'actions, mesures, fin prévue ;
   - dossier des résultats.
 - **Onglet « Conditions initiales »**, comme les pinceaux de la fenêtre multiphasique :
-  - remplir, solide (passif, isotherme, chauffant), corps rigide fixe (disque au clic, rectangle tiré : ligne `corps`), température,
+  - remplir, solide (passif, isotherme, chauffant), corps rigide (disque au clic, rectangle tiré : ligne `corps`), température,
     effacer, allumer, puits, émetteur, grille ;
+  - le corps est fixe, à mouvement imposé (vitesse, rotation, oscillation de période donnée) ou libre (vitesse et rotation de
+    départ, masse volumique propre, rebond, frottement, axes bloqués), éventuellement sur un pivot au milieu d'un côté de sa boîte
+    (sur un pivot, seule la rotation compte), à sa température propre ou à celle du fluide ;
   - au pinceau rond (rayon en mailles, affiché en mètres) ou au rectangle tiré à la souris.
 - **Chaque geste devient une ligne du protocole**, insérée avant le premier `simuler`, par exemple
   `remplir trait (0.055, 0.055) (0.155, 0.085) rayon 0.02 avec "eau" à 293.15 K`.

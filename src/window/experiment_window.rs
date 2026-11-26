@@ -64,6 +64,48 @@ impl CiTool {
     }
 }
 
+/// mouvement d'un corps posé par l'outil « Corps »
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BodyMode {
+    Fixed,
+    Imposed,
+    Free,
+}
+
+/// pivot d'un corps posé par l'outil : milieu d'un côté de sa boîte (charnière)
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PivotAt {
+    None,
+    Left,
+    Right,
+    Bottom,
+    Top,
+}
+
+impl PivotAt {
+    const ALL: [PivotAt; 5] = [PivotAt::None, PivotAt::Left, PivotAt::Right, PivotAt::Bottom, PivotAt::Top];
+    fn name(self) -> &'static str {
+        match self {
+            PivotAt::None => "aucun",
+            PivotAt::Left => "bord gauche",
+            PivotAt::Right => "bord droit",
+            PivotAt::Bottom => "bord bas",
+            PivotAt::Top => "bord haut",
+        }
+    }
+    /// point du pivot pour un corps de boîte (lo, hi)
+    fn point(self, lo: [f64; 2], hi: [f64; 2]) -> Option<[f64; 2]> {
+        let (mx, my) = (0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]));
+        match self {
+            PivotAt::None => None,
+            PivotAt::Left => Some([lo[0], my]),
+            PivotAt::Right => Some([hi[0], my]),
+            PivotAt::Bottom => Some([mx, lo[1]]),
+            PivotAt::Top => Some([mx, hi[1]]),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Shape {
     Brush,
@@ -181,9 +223,19 @@ pub struct ExperimentWindow {
     emit_v: [f64; 2],
     grille_hole_mm: f64,
     grille_open: f64,
-    /// outil « Corps » : libre (poussé par l'écoulement, avec ses contacts) ou fixe ; masse volumique propre (kg/m³, 0 : celle du
-    /// matériau) ; rebond et frottement (corps libre) ; température de départ propre (sinon celle du fluide ambiant)
-    body_free: bool,
+    /// outil « Corps » : fixe, à mouvement imposé ou libre (poussé par l'écoulement, avec ses contacts) ; vitesse (m/s) et rotation
+    /// (°/s) imposées ou de départ ; oscillation imposée (amplitudes, période) ; pivot sur le bord ; axes bloqués d'un corps libre (x,
+    /// y, rotation) ; masse volumique propre (kg/m³, 0 : celle du matériau) ; rebond et frottement (corps libre) ; température de
+    /// départ propre (sinon celle du fluide ambiant)
+    body_mode: BodyMode,
+    body_v: [f64; 2],
+    body_omega: f64,
+    body_osc: bool,
+    body_osc_v: [f64; 2],
+    body_osc_omega: f64,
+    body_period: f64,
+    body_pivot: PivotAt,
+    body_locked: [bool; 3],
     body_rho: f64,
     body_rebound: f64,
     body_friction: f64,
@@ -260,7 +312,15 @@ impl ExperimentWindow {
             emit_v: [0.0, 1.0],
             grille_hole_mm: 10.0,
             grille_open: 0.6,
-            body_free: false,
+            body_mode: BodyMode::Fixed,
+            body_v: [0.0, 0.0],
+            body_omega: 0.0,
+            body_osc: false,
+            body_osc_v: [0.0, 0.0],
+            body_osc_omega: 0.0,
+            body_period: 1.0,
+            body_pivot: PivotAt::None,
+            body_locked: [false; 3],
             body_rho: 0.0,
             body_rebound: crate::simulation::multi::mp_bodies::DEFAULT_RESTITUTION,
             body_friction: crate::simulation::multi::mp_bodies::DEFAULT_FRICTION,
@@ -738,19 +798,51 @@ impl ExperimentWindow {
         }
         if self.tool == CiTool::Body {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.body_free, false, "Fixe");
-                ui.selectable_value(&mut self.body_free, true, "Libre (poussé par l'écoulement)");
+                ui.selectable_value(&mut self.body_mode, BodyMode::Fixed, "Fixe");
+                ui.selectable_value(&mut self.body_mode, BodyMode::Imposed, "Mouvement imposé");
+                ui.selectable_value(&mut self.body_mode, BodyMode::Free, "Libre (poussé par l'écoulement)");
             });
-            if self.body_free {
+            if self.body_mode != BodyMode::Fixed {
+                egui::ComboBox::from_label("Pivot (charnière)").selected_text(self.body_pivot.name()).show_ui(ui, |ui| {
+                    for p in PivotAt::ALL {
+                        ui.selectable_value(&mut self.body_pivot, p, p.name());
+                    }
+                });
+                let start = if self.body_mode == BodyMode::Free { " de départ" } else { "" };
+                let pivot = self.body_pivot != PivotAt::None;
+                if !pivot {
+                    ui.add(egui::Slider::new(&mut self.body_v[0], -2.0..=2.0).text(format!("vx{start} (m/s)")));
+                    ui.add(egui::Slider::new(&mut self.body_v[1], -2.0..=2.0).text(format!("vy{start} (m/s)")));
+                }
+                ui.add(egui::Slider::new(&mut self.body_omega, -720.0..=720.0).text(format!("Rotation{start} (°/s, + : sens trigonométrique)")));
+                if self.body_mode == BodyMode::Imposed {
+                    ui.checkbox(&mut self.body_osc, "Oscillation (sinusoïdale, s'ajoute ; retour au départ à chaque période)");
+                    if self.body_osc {
+                        if !pivot {
+                            ui.add(egui::Slider::new(&mut self.body_osc_v[0], -2.0..=2.0).text("Amplitude vx (m/s)"));
+                            ui.add(egui::Slider::new(&mut self.body_osc_v[1], -2.0..=2.0).text("Amplitude vy (m/s)"));
+                        }
+                        ui.add(egui::Slider::new(&mut self.body_osc_omega, -720.0..=720.0).text("Amplitude de rotation (°/s)"));
+                        ui.add(egui::Slider::new(&mut self.body_period, 0.02..=10.0).logarithmic(true).text("Période (s)"));
+                    }
+                }
+            }
+            if self.body_mode == BodyMode::Free {
                 ui.add(egui::Slider::new(&mut self.body_rho, 0.0..=20000.0).text("Masse volumique propre (kg/m³, 0 : celle du matériau)"));
                 ui.add(egui::Slider::new(&mut self.body_rebound, 0.0..=1.0).text("Rebond (restitution)"));
                 ui.add(egui::Slider::new(&mut self.body_friction, 0.0..=1.5).text("Frottement (Coulomb)"));
+                ui.horizontal(|ui| {
+                    ui.label("Bloqué :");
+                    ui.checkbox(&mut self.body_locked[0], "x");
+                    ui.checkbox(&mut self.body_locked[1], "y");
+                    ui.checkbox(&mut self.body_locked[2], "rotation");
+                });
             }
             ui.checkbox(&mut self.body_own_temp, "Température propre (sinon celle du fluide ambiant)");
             if self.body_own_temp {
                 ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));
             }
-            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille) ; mouvement imposé, pivot, axes bloqués : commande « corps » du protocole (docs/EXPERIENCES.md).");
+            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille) ; pivot au milieu d'un côté de la boîte du corps ; sur un pivot, seule la rotation compte. Polygones et angles : commande « corps » du protocole (docs/EXPERIENCES.md).");
         }
         if matches!(self.tool, CiTool::Fill | CiTool::Temperature | CiTool::Emitter | CiTool::Solid) {
             ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));
@@ -854,12 +946,42 @@ impl ExperimentWindow {
         format!("{} K", fmt_num(t))
     }
 
-    /// options de la ligne `corps` de l'outil (vide pour un corps fixe à la température ambiante)
-    fn body_options(&self) -> String {
+    /// options de la ligne `corps` de l'outil pour un corps de boîte (lo, hi) (vide pour un corps fixe à la température ambiante)
+    fn body_options(&self, lo: [f64; 2], hi: [f64; 2]) -> String {
         use crate::simulation::multi::mp_bodies::{DEFAULT_FRICTION, DEFAULT_RESTITUTION};
+        let r = |v: f64, k: f64| fmt_num((v * k).round() / k);
         let mut o = String::new();
-        if self.body_free {
+        if self.body_mode != BodyMode::Fixed {
+            // sur un pivot, seule la rotation compte
+            let pivot = self.body_pivot.point(lo, hi);
+            if pivot.is_none() && self.body_v != [0.0, 0.0] {
+                o += &format!(" vitesse ({}, {})", r(self.body_v[0], 1e3), r(self.body_v[1], 1e3));
+            }
+            if self.body_omega != 0.0 {
+                o += &format!(" rotation {}", r(self.body_omega, 10.0));
+            }
+            if self.body_mode == BodyMode::Imposed && self.body_osc {
+                let lin = pivot.is_none() && self.body_osc_v != [0.0, 0.0];
+                if lin {
+                    o += &format!(" oscillation ({}, {})", r(self.body_osc_v[0], 1e3), r(self.body_osc_v[1], 1e3));
+                }
+                if self.body_osc_omega != 0.0 {
+                    o += &format!(" oscillation rotation {}", r(self.body_osc_omega, 10.0));
+                }
+                if lin || self.body_osc_omega != 0.0 {
+                    o += &format!(" période {} s", r(self.body_period, 1e3));
+                }
+            }
+            if let Some(p) = pivot {
+                o += &format!(" pivot {}", fmt_point([(p[0] * 1e4).round() / 1e4, (p[1] * 1e4).round() / 1e4]));
+            }
+        }
+        if self.body_mode == BodyMode::Free {
             o += " libre";
+            let axes: Vec<&str> = ["x", "y", "rotation"].iter().zip(self.body_locked).filter(|(_, l)| *l).map(|(a, _)| *a).collect();
+            if !axes.is_empty() {
+                o += &format!(" bloqué {}", axes.join(" et "));
+            }
             if self.body_rho > 0.0 {
                 o += &format!(" masse volumique {} kg/m3", fmt_num(self.body_rho.round()));
             }
@@ -889,13 +1011,19 @@ impl ExperimentWindow {
                 SolidThermal::Heater => format!("solide {z} \"{}\" chauffant {} W/m³ à {t}", self.solid, fmt_num(self.thermal_power)),
             },
             CiTool::Body => {
-                let shape = match zone {
-                    Zone::Rect { a, b } => format!("corps rect {} {} \"{}\"", fmt_point(*a), fmt_point(*b), self.solid),
-                    Zone::Disque { c, r } => format!("corps disque {} rayon {} \"{}\"", fmt_point(*c), fmt_num(*r), self.solid),
-                    Zone::Trait { pts, r } if !pts.is_empty() => format!("corps disque {} rayon {} \"{}\"", fmt_point(pts[0]), fmt_num(*r), self.solid),
+                let disc = |c: [f64; 2], r: f64| ([c[0] - r, c[1] - r], [c[0] + r, c[1] + r]);
+                let (shape, (lo, hi)) = match zone {
+                    Zone::Rect { a, b } => (
+                        format!("corps rect {} {} \"{}\"", fmt_point(*a), fmt_point(*b), self.solid),
+                        ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]),
+                    ),
+                    Zone::Disque { c, r } => (format!("corps disque {} rayon {} \"{}\"", fmt_point(*c), fmt_num(*r), self.solid), disc(*c, *r)),
+                    Zone::Trait { pts, r } if !pts.is_empty() => {
+                        (format!("corps disque {} rayon {} \"{}\"", fmt_point(pts[0]), fmt_num(*r), self.solid), disc(pts[0], *r))
+                    }
                     _ => return format!("# corps : forme non prise en charge ({z})"),
                 };
-                format!("{shape}{}", self.body_options())
+                format!("{shape}{}", self.body_options(lo, hi))
             }
             CiTool::Clear => format!("effacer {z}"),
             CiTool::Ignite => format!("allumer {z} à {t}"),
@@ -1500,7 +1628,7 @@ mod tests {
         // corps libre, léger, qui rebondit peu, posé chaud
         w.shape = Shape::Brush;
         w.solid = "acier".into();
-        w.body_free = true;
+        w.body_mode = BodyMode::Free;
         w.body_rho = 600.0;
         w.body_rebound = 0.2;
         w.body_own_temp = true;
@@ -1512,6 +1640,53 @@ mod tests {
         assert_eq!(s.bodies.len(), 3);
         let b = &s.bodies[2];
         assert!(b.is_free() && b.rho == Some(600.0) && (b.restitution - 0.2).abs() < 1e-12 && (b.temp - 353.15).abs() < 1e-9);
+        assert!(w.errors.is_empty(), "{:?}", w.errors);
+        // mouvement imposé : translation et oscillation de rotation (°/s dans la ligne, rad/s dans le corps)
+        use crate::simulation::multi::mp_bodies::{Dof, Motion};
+        w.body_mode = BodyMode::Imposed;
+        w.body_own_temp = false;
+        w.body_v = [0.2, 0.0];
+        w.body_osc = true;
+        w.body_osc_omega = 90.0;
+        w.body_period = 0.5;
+        let path = [at(&w, 10, 22)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("\"acier\" vitesse (0.2, 0) oscillation rotation 90 période 0.5 s\n"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        assert_eq!(s.bodies.len(), 4, "{:?}", w.errors);
+        match s.bodies[3].motion {
+            Motion::Imposed { v, omega, osc_v, osc_omega, period } => assert!(
+                v == [0.2, 0.0] && omega == 0.0 && osc_v == [0.0, 0.0] && (osc_omega - 90f64.to_radians()).abs() < 1e-12 && period == 0.5,
+                "{:?}",
+                s.bodies[3].motion
+            ),
+            ref m => panic!("{m:?}"),
+        }
+        // palette sur une charnière au milieu du haut : seule la rotation compte (la vitesse réglée n'est pas écrite)
+        w.body_osc = false;
+        w.body_omega = -45.0;
+        w.body_pivot = PivotAt::Top;
+        w.shape = Shape::Rect;
+        let path = [at(&w, 30, 15), at(&w, 31, 22)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("corps rect (0.3, 0.15) (0.32, 0.23) \"acier\" rotation -45 pivot (0.31, 0.23)\n"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        let b = &s.bodies[4];
+        assert!(b.pivot == Some([0.31, 0.23]), "{b:?}");
+        assert!(matches!(b.motion, Motion::Imposed { v: [0.0, 0.0], .. }), "{:?}", b.motion);
+        // corps libre aux axes bloqués : il ne fait que monter et descendre
+        w.body_mode = BodyMode::Free;
+        w.body_pivot = PivotAt::None;
+        w.body_omega = 0.0;
+        w.body_v = [0.0, 0.0];
+        w.body_locked = [true, false, true];
+        w.shape = Shape::Brush;
+        let path = [at(&w, 34, 24)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("\"acier\" libre bloqué x et rotation masse volumique 600 kg/m3 rebond 0.2\n"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        let b = &s.bodies[5];
+        assert!(b.is_free() && b.dof == Dof { x: false, y: true, rot: false }, "{b:?}");
         assert!(w.errors.is_empty(), "{:?}", w.errors);
         // l'image se rend avec les corps
         for d in [MpDisplay::Phases, MpDisplay::Temperature] {

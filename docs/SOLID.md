@@ -403,8 +403,9 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   trace de 1e-6 dans les mailles entièrement couvertes. `clear_bodies` rend le fluide.
 - Les ouvertures des faces (§ 6.2) entrent dans la projection, le transport, la percolation, la conduction et la diffusion des
   espèces.
-- La commande `corps disque | rect | polygone … "matériau" [angle a]` des protocoles (EXPERIENCES.md) et l'outil « Corps rigide
-  fixe » de la fenêtre d'expérience (disque au clic, rectangle tiré) posent les corps.
+- La commande `corps disque | rect | polygone … "matériau" [angle a]` des protocoles (EXPERIENCES.md) et l'outil « Corps rigide »
+  de la fenêtre d'expérience (disque au clic, rectangle tiré ; fixe, à mouvement imposé ou libre, pivot, axes bloqués depuis les
+  étapes 2 et 3) posent les corps.
 - La « masse du corps dans ρ » prévue au départ n'est pas utile pour un corps fixe : la part couverte ne bouge pas, seule l'inertie
   du fluide compte. Elle reviendra avec les corps libres.
 - Le corps n'échangeait pas encore de chaleur avec le fluide (fait à l'étape 5 : il échange avec le fluide qui le borde ; la trace
