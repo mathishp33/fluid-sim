@@ -596,6 +596,47 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn a_pump_moves_a_fixed_volume_flow_and_compresses_the_gas_downstream() {
+    let p = proto("départ scénario \"cuve vide\"\npompe rect (0.1, 0.04) (0.11, 0.06) (0.5, 0)\ncompresseur partout (0, 0)\n");
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(matches!(acts[0], Action::Pump { v, .. } if *v == [0.5, 0.0]) && matches!(acts[1], Action::Pump { v, .. } if *v == [0.0, 0.0]));
+    // boîte d'air fermée coupée par un mur, sauf une ouverture de 2 cm où souffle la pompe, de gauche à droite à 0.5 m/s : le débit
+    // volumique est v A, quoi qu'il arrive ; l'air se comprime à droite et se détend à gauche
+    let text = "départ scénario \"cuve vide\" grille 20 x 10 maille 1 cm
+bord haut mur
+solide rect (0.1, 0) (0.11, 0.1) \"acier\"
+effacer rect (0.1, 0.04) (0.11, 0.06)
+pompe rect (0.1, 0.04) (0.11, 0.06) (0.5, 0)
+mesurer toutes les 10 ms : moyenne p dans rect (0, 0) (0.1, 0.1), moyenne p dans rect (0.11, 0) (0.2, 0.1), débit à travers ligne (0.1, 0.04) (0.1, 0.06)
+simuler 0.1 s
+";
+    let check = |r: &Runner, what: &str| -> f64 {
+        let log = r.log.join("\n");
+        assert!(log.contains("pompe rect (0.1, 0.04) (0.11, 0.06) à (0.5, 0) m/s — 2 mailles"), "{what}\n{log}");
+        for row in &r.rows[1..] {
+            assert!((row[4] / (0.5 * 0.02) - 1.0).abs() < 1e-4, "{what} : débit volumique {} pour v A = 0.01 m²/s à t = {}", row[4], row[0]);
+        }
+        let last = r.rows.last().unwrap();
+        let dp = last[3] - last[2];
+        eprintln!("{what} : pompe, Δp droite − gauche = {:.0} Pa après {:.2} s", dp, last[0]);
+        assert!(dp > 1e4, "{what} : la pompe ne comprime pas l'air de droite (Δp = {dp} Pa)");
+        dp
+    };
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let cpu = check(&r, "CPU");
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let mut g = Runner::new(proto(text), Path::new("."), None, Some(true)).unwrap();
+    assert!(g.gpu.is_some(), "{}", g.log.join("\n"));
+    run_to_end(&mut g);
+    let gpu = check(&g, "GPU");
+    assert!((gpu / cpu - 1.0).abs() < 0.05, "Δp : GPU {gpu} / CPU {cpu}");
+}
+
+#[test]
 fn a_valve_closes_its_cells_to_the_flow_and_opens_like_a_gate() {
     // lecture : fermée (par défaut), ouverte, ouverte en fraction ou en pourcentage
     let p = proto(

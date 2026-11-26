@@ -154,6 +154,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
+  pompe <zone> (0.5, 0) m/s   (débit volumique fixé à travers la zone ; en aval fermé, compresseur ; (0, 0) la retire)
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"] | sortie (vx, vy)   (vitesse vers l'extérieur)
   champ T|vx|vy|fraction \"eau\"|solide \"acier\"  fichier \"f.csv|f.png\" [origine haut|bas] [valeurs a b]
         | formule \"300 + 50*exp(-((x-0.2)^2+(y-0.1)^2)/0.02^2)\"     [dans <zone>] [à T]

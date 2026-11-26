@@ -38,10 +38,14 @@ pub enum MpEffect {
     /// maille FERMÉE d'une vanne : ses faces sont fermées à l'écoulement, son fluide reste (la part ouverte d'une vanne est faite de
     /// mailles ordinaires)
     Valve,
+    /// pompe (ou compresseur) : impose la vitesse (vx, vy) m/s sur les faces de la maille vers ses voisines fluides — vx sur les faces
+    /// verticales, vy sur les horizontales — d'où un débit volumique fixé à travers la zone, fermée sur ses côtés ; en aval fermé, la
+    /// pression monte. Son fluide reste et la traverse.
+    Pump { vx: f64, vy: f64 },
 }
 
 impl MpEffect {
-    pub const KINDS: [&'static str; 6] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille", "Vanne"];
+    pub const KINDS: [&'static str; 7] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille", "Vanne", "Pompe"];
     pub fn kind_name(&self) -> &'static str {
         match self {
             MpEffect::Sink { .. } => "Puits",
@@ -50,6 +54,7 @@ impl MpEffect {
             MpEffect::Teleporter { .. } => "Téléporteur",
             MpEffect::Grille { .. } => "Grille",
             MpEffect::Valve => "Vanne",
+            MpEffect::Pump { .. } => "Pompe",
         }
     }
 }
@@ -242,6 +247,8 @@ impl MultiphaseSim {
                 Some(MpEffect::Grille { .. }) => fx.fix_faces(i, j, 0.0),
                 // maille fermée d'une vanne : faces fermées, fluide gardé (ni épinglée, ni vidée)
                 Some(MpEffect::Valve) => fx.fix_faces(i, j, 0.0),
+                // pompe : vitesse imposée sur ses faces (fluide gardé, il la traverse)
+                Some(MpEffect::Pump { vx, vy }) => fx.fix_pump(i, j, vx, vy),
                 Some(MpEffect::Teleporter { dest, speed, radius }) if self.tp_dest_ok(c, dest) => {
                     pin[c] = Some(PinInfo { kind: 1, phase: self.ambient_phase, temp: self.t_ambient, tp_dest: Some(dest) });
                     match tp_groups.iter_mut().find(|g| g.0 == dest) {
@@ -543,6 +550,23 @@ impl FixedFaces<'_> {
         }
         if self.free(ii, jj + 1) {
             self.pf_v[(j + 1) * nx + i] = s;
+        }
+    }
+    /// Pompe : vitesse (vx, vy) imposée sur les faces vers des voisines fluides, vx sur les faces de u, vy sur celles de v (les faces
+    /// communes à deux mailles de la pompe reçoivent la même valeur).
+    fn fix_pump(&mut self, i: usize, j: usize, vx: f64, vy: f64) {
+        let (nx, ii, jj) = (self.nx, i as isize, j as isize);
+        if self.free(ii - 1, jj) {
+            self.pf_u[j * (nx + 1) + i] = vx;
+        }
+        if self.free(ii + 1, jj) {
+            self.pf_u[j * (nx + 1) + i + 1] = vx;
+        }
+        if self.free(ii, jj - 1) {
+            self.pf_v[j * nx + i] = vy;
+        }
+        if self.free(ii, jj + 1) {
+            self.pf_v[(j + 1) * nx + i] = vy;
         }
     }
     /// Émetteur : buse. La composante sortante (vx, vy) est imposée sur les faces concernées et TOUTES les autres faces ouvertes sont

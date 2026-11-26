@@ -998,6 +998,7 @@ impl MultiphaseGpu {
                 Some(MpEffect::Accelerator { .. }) => ovl[c] = col(0xff, 0, 0xff) + 1,
                 Some(MpEffect::Grille { .. }) => ovl[c] = col(0x9a, 0x9a, 0xa0) + 1,
                 Some(MpEffect::Valve) => ovl[c] = col(0xd0, 0x80, 0x30) + 1,
+                Some(MpEffect::Pump { .. }) => ovl[c] = col(0xff, 0xc0, 0x00) + 1,
                 Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     ovl[c] = col(0, 0, 0xff) + 1;
                     if dest < n {

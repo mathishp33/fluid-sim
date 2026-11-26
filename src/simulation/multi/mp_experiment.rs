@@ -487,6 +487,8 @@ pub enum Action {
     /// vanne à guillotine sur la zone : la part `open` (0 fermée à 1 ouverte) de ses rangées le long de son plus grand côté, depuis la
     /// gauche ou le bas, est ouverte ; le reste est fermé (faces fermées, fluide gardé)
     Valve { zone: Zone, open: f64 },
+    /// pompe (compresseur) : vitesse `v` imposée sur les faces des mailles fluides de la zone
+    Pump { zone: Zone, v: [f64; 2] },
     Boundary { side: usize, spec: BoundarySpec },
     Field { qty: FieldQty, source: FieldSource, zone: Zone, temp: Option<f64> },
     Gravity([f64; 2]),
@@ -526,6 +528,7 @@ impl Action {
             | Action::Emitter { zone, .. }
             | Action::Grille { zone, .. }
             | Action::Valve { zone, .. }
+            | Action::Pump { zone, .. }
             | Action::Field { zone, .. } => Some(zone),
             Action::Periodic { action, .. } => action.zone(),
             _ => None,
@@ -920,6 +923,20 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             }
             sim.refresh();
             Ok(closed)
+        }
+        Action::Pump { zone, v } => {
+            // mailles fluides sans autre effet ; une pompe déjà posée change de vitesse, (0, 0) la retire
+            let mut n = 0;
+            for (i, j) in cells(sim, zone) {
+                let c = sim.idx(i, j);
+                if sim.is_solid(c) || !matches!(sim.special[c], None | Some(MpEffect::Pump { .. })) {
+                    continue;
+                }
+                sim.special[c] = if *v == [0.0, 0.0] { None } else { Some(MpEffect::Pump { vx: v[0], vy: v[1] }) };
+                n += 1;
+            }
+            sim.refresh();
+            Ok(n)
         }
         Action::Boundary { side, spec } => {
             let k = *side;
@@ -2381,6 +2398,7 @@ fn describe(a: &Action) -> String {
         Action::Sink { zone, rate } => format!("puits {} ({} m/s)", zone.label(), fmt_num(*rate)),
         Action::Emitter { zone, fluid, .. } => format!("émetteur de « {fluid} » {}", zone.label()),
         Action::Grille { zone, .. } => format!("grille {}", zone.label()),
+        Action::Pump { zone, v } => format!("pompe {} à {} m/s", zone.label(), fmt_point(*v)),
         Action::Valve { zone, open } => match *open {
             o if o <= 0.0 => format!("vanne {} fermée", zone.label()),
             o if o >= 1.0 => format!("vanne {} ouverte", zone.label()),

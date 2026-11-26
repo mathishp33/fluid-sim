@@ -1052,6 +1052,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                 Some(MpEffect::Accelerator { .. }) => put(c, [0xff, 0x00, 0xff]),
                 Some(MpEffect::Grille { .. }) => put(c, [0x9a, 0x9a, 0xa0]),
                 Some(MpEffect::Valve) => put(c, [0xd0, 0x80, 0x30]),
+                Some(MpEffect::Pump { .. }) => put(c, [0xff, 0xc0, 0x00]),
                 Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     put(c, [0x00, 0x00, 0xff]);
                     if dest < nx * ny {
@@ -1177,6 +1178,7 @@ pub fn cell_info(sim: &MultiphaseSim, i: usize, j: usize) -> Vec<(String, String
         Some(MpEffect::Accelerator { ax, ay }) => v.push(("Cellule spéciale".into(), format!("accélérateur ({ax:.2}, {ay:.2}) m/s²"))),
         Some(MpEffect::Grille { hole, open }) => v.push(("Cellule spéciale".into(), format!("grille, trous de {:.1} mm, {:.0} % ouverte", hole * 1e3, open * 100.0))),
         Some(MpEffect::Valve) => v.push(("Cellule spéciale".into(), "vanne fermée (faces fermées, fluide gardé)".into())),
+        Some(MpEffect::Pump { vx, vy }) => v.push(("Cellule spéciale".into(), format!("pompe à ({vx:.2}, {vy:.2}) m/s"))),
         Some(MpEffect::Teleporter { dest, speed, radius }) => v.push((
             "Cellule spéciale".into(),
             format!("téléporteur → ({}, {}), rayon {radius}, {speed:.2} m/s", dest % sim.nx, dest / sim.nx),
@@ -1247,6 +1249,7 @@ pub enum EffectFile {
     Grille { hole: f64, open: f64 },
     /// maille fermée d'une vanne
     Valve,
+    Pump { vx: f64, vy: f64 },
     Teleporter {
         dest: usize,
         speed: f64,
@@ -1284,6 +1287,7 @@ pub fn scene_to_json(sim: &MultiphaseSim) -> Result<String, String> {
             Some(MpEffect::Accelerator { ax, ay }) => f.effects.push((c, EffectFile::Accelerator { ax, ay })),
             Some(MpEffect::Grille { hole, open }) => f.effects.push((c, EffectFile::Grille { hole, open })),
             Some(MpEffect::Valve) => f.effects.push((c, EffectFile::Valve)),
+            Some(MpEffect::Pump { vx, vy }) => f.effects.push((c, EffectFile::Pump { vx, vy })),
             Some(MpEffect::Teleporter { dest, speed, radius }) => f.effects.push((c, EffectFile::Teleporter { dest, speed, radius })),
             None => {}
         }
@@ -1327,6 +1331,7 @@ pub fn scene_from_json(sim: &mut MultiphaseSim, json: &str) -> Result<Vec<String
             EffectFile::Accelerator { ax, ay } => Some(MpEffect::Accelerator { ax: *ax, ay: *ay }),
             EffectFile::Grille { hole, open } => Some(MpEffect::Grille { hole: *hole, open: *open }),
             EffectFile::Valve => Some(MpEffect::Valve),
+            EffectFile::Pump { vx, vy } => Some(MpEffect::Pump { vx: *vx, vy: *vy }),
             EffectFile::Teleporter { dest, speed, radius } => Some(MpEffect::Teleporter { dest: *dest, speed: *speed, radius: *radius }),
             EffectFile::Emitter { vx, vy, phase, temp } => match sim.reg.phases.iter().position(|p| &p.name == phase) {
                 Some(k) => Some(MpEffect::Emitter { vx: *vx, vy: *vy, phase: k, temp: *temp }),

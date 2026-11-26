@@ -1135,6 +1135,13 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             p.end()?;
             push(proto, Action::Emitter { zone, fluid, v, temp }, ln);
         }
+        "pompe" | "compresseur" => {
+            // pompe <zone> (vx, vy) : vitesse imposée sur les faces de la zone ; (0, 0) retire la pompe
+            let zone = p.zone()?;
+            let v = p.vector(Dim::Speed, "la vitesse de la pompe")?;
+            p.end()?;
+            push(proto, Action::Pump { zone, v }, ln);
+        }
         "vanne" => {
             // vanne <zone> [fermée | ouverte [fraction | n %]] — vanne à guillotine, fermée par défaut
             let zone = p.zone()?;
