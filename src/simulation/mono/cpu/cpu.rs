@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use crate::simulation::fluid::{Boundary, BoundaryType, CellEffect, CellType, FluidSim, GridBoundary};
+use crate::simulation::mono::fluid::{Boundary, BoundaryType, CellEffect, CellType, FluidSim, GridBoundary};
 
 const CFL: f32 = 0.9;
 // CFL des sous-pas de scalaires en ordre 2 : le MUSCL à limiteur van Leer (facteur de pente <= 2) est TVD

@@ -11,7 +11,7 @@
 //!    p_sat(T) intégrée analytiquement ; les décalages d'énergie e0 sont fixés pour que h_v − h_l = L(T) EXACTEMENT
 //!    (la chaleur latente restituée par le bilan d'énergie est donc celle utilisée par p_sat : cohérence thermodynamique).
 
-use super::materials::PropertyLaw;
+use crate::simulation::materials::PropertyLaw;
 use serde::{Deserialize, Serialize};
 
 /// Température et pression de l'état standard thermochimique (enthalpies de formation, entropies standard).

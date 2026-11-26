@@ -1,20 +1,19 @@
 # Solveur multiphasique (CPU, f64) — notes d'intégration
 
-## Fichiers (dans le même dossier que `materials.rs`)
-`phases.rs`, `vof.rs`, `multiphase.rs`, `mp_advect.rs`, `mp_pressure.rs`, `mp_force.rs`, `mp_thermo.rs`, `mp_step.rs`, `mp_tests.rs`
-GPU : `mp_gpu_params.rs`, `gpu_multiphase.rs`, `multiphase.template.wgsl` (généré par `python3 build_wgsl.py` à partir de `mpgpu/*.wgsl`), banc de test `gpu_run.js`
-Expériences reproductibles (protocoles, fenêtre d'expérience, ligne de commande) : `mp_experiment.rs`, `mp_script.rs`, `mp_fields.rs`,
-`window/experiment_window.rs` — voir EXPERIENCES.md. Solides mobiles (à venir) : voir SOLID.md.
-
-```rust
-// simulation/mod.rs
-pub mod phases;  pub mod vof;  pub mod multiphase;
-pub mod mp_advect; pub mod mp_pressure; pub mod mp_force; pub mod mp_thermo; pub mod mp_step;
-pub mod mp_gpu_params; pub mod gpu_multiphase;   // GPU (wgpu + pollster + bytemuck)
-#[cfg(test)] mod mp_tests;
-```
-Le module est **indépendant** de `FluidSim` (qui reste inchangé) : même grille MAC, mais variables propres
-(masses partielles par phase, énergie interne). Aucune modification de `cpu.rs/gpu.rs/fluid.rs` n'est nécessaire.
+## Fichiers (`src/simulation/multi/`)
+- Cœur : `multiphase.rs` (état `MultiphaseSim`), `phases.rs` (matériaux : phases, réactions, registre), `vof.rs` (géométrie PLIC),
+  `mp_step.rs` (pas de temps, filet de sécurité), `mp_advect.rs` (transport), `mp_pressure.rs` et `mp_mg.rs` (pression implicite,
+  multigrille), `mp_force.rs` (forces), `mp_thermo.rs` (conduction, changements de phase, travail de pression), `mp_groups.rs` (une
+  température par groupe de phases), `mp_species.rs` (diffusion, chimie), `mp_cells.rs` (cellules spéciales), `mp_par.rs` (fils).
+- Grains (GRANULAIRE.md) : `mp_granular.rs`, `mp_friction.rs`, `mp_percolation.rs`. Corps rigides (SOLID.md) : `mp_bodies.rs`,
+  `mp_contacts.rs`, `mp_body_heat.rs`.
+- Expériences (EXPERIENCES.md) : `mp_experiment.rs`, `mp_script.rs`, `mp_fields.rs`. Scénarios, pinceaux et rendu sans egui :
+  `mp_view.rs` ; état complet : `mp_state.rs` ; bibliothèque de matériaux : `mp_materials.rs`.
+- GPU : `gpu_multiphase.rs` (hôte wgpu) et `mp_gpu/*.wgsl` (noyaux, assemblés à la compilation).
+- Essais : `mp_tests.rs`, `mp_chem_tests.rs`, `mp_gpu_tests.rs`, `mp_experiment_tests.rs`, `mp_perf_tests.rs`, et les `mod tests` des
+  modules.
+- Les lois de propriétés (`PropertyLaw`, `materials.rs`) sont communes avec le solveur monophasique (`src/simulation/mono/`), dont le
+  multiphasique est indépendant.
 
 ## Utilisation
 ```rust
@@ -34,12 +33,12 @@ Convention : j croît vers le **haut** (gravité (0, −9.81)) ; l'affichage doi
 | Gaz | gaz parfait, cv = cp − R, μ(T) Sutherland, k(T) |
 | Liquide | équation de Tait (eau : B = 3,07e8 Pa, n = 7,15 → c = 1482 m/s, K = 2,2 GPa), ρ(T) de Kell (maximum à 4 °C), μ(T) Vogel |
 | Interface | VOF géométrique PLIC (formules analytiques), flux conservatifs, N phases (priorité liquides puis gaz) |
-| Pression | faiblement compressible **implicite** (Helmholtz, κ_eff du mélange à entropie constante, Newton + PCG/IC(0)) : dt non limité par le son |
+| Pression | faiblement compressible **implicite** (Helmholtz, κ_eff du mélange à entropie constante, Newton + gradient conjugué préconditionné par multigrille) : dt non limité par le son |
 | Forces | gravité, viscosité (tenseur symétrique, μ variable), tension de surface CSF + courbure par fonctions de hauteur |
 | Énergie | énergie interne conservative, conduction (k harmonique, fluides + solides), travail −p∇·u |
 | Changement de phase | p_sat(T) Clausius–Clapeyron avec chaleur latente de Kirchhoff cohérente avec les enthalpies (h_v − h_l = L(T) exactement) ; interface résolue : ancrage de Hardt–Wondra à T_sat ; germes : Schnerr–Sauer ; limité par la masse, l'énergie et le retour à p = p_sat |
 | Solides | cellules étanches avec ρ, cp, k propres (conduction fluide↔solide) |
-| Bords | parois (glissement libre) ou ouverts : `Bc::Open { p }`, p au point le plus haut du domaine, la pression du bord suivant l'hydrostatique du fluide AMBIANT (`open_face_pressure`) ; ce qui entre est l'ambiant à `t_ambient`. À pression constante, une boîte d'air ouverte sur les côtés sous la gravité se mettait à 9 m/s (ρ g H d'écart entre le haut et le bas d'un côté) |
+| Bords | parois (glissement libre) ou ouverts : `Bc::Open { p }`, p au point le plus haut du domaine, la pression du bord suivant l'hydrostatique du fluide AMBIANT (`open_face_pressure`, colonne compressible au second ordre) ; ce qui entre est l'ambiant à `t_ambient`. À pression constante, une boîte d'air ouverte sur les côtés sous la gravité se mettait à 9 m/s (ρ g H d'écart entre le haut et le bas d'un côté) ; à masse volumique constante, un vent parasite croissait sans fin (4 mm/s après 5 s). Entrées de bord à vitesse imposée |
 
 ## Validation (tests, `cargo test --release`)
 hydrostatique (courants 5e-11 m/s, p_fond exact) · Δp = β/κ·ΔT de l'eau confinée (0,25 %) · ballottement ω² = gk·tanh(kh) (+1 %) ·
@@ -53,33 +52,22 @@ valeur transportée reconstruite par minmod, u = q/ρ_new borné par les voisins
 `maccormack` reste désactivé (non conservatif avec ρ_eau/ρ_air = 1000).
 
 ## Portage GPU (wgpu / WGSL, f32)
-* Un seul buffer de stockage `S` + un uniforme de 512 octets : pas de limite de nombre de buffers ; taille limitée par `max_buffer_size` (~128 Mo ⇒ ≲ 380²–512²).
-* Les noyaux WGSL ont été EXÉCUTÉS (Chromium headless/WebGPU SwiftShader) et comparés au CPU : hydrostatique, barrage (12 et 60 pas), Laplace, ébullition (≈4 % d'écart de vitesse après 15 pas : sensibilité chaotique f32).
-* `gpu_multiphase.rs` (hôte wgpu) : **NON compilé ni exécuté** (pas de crate wgpu hors ligne). Il reproduit l'orchestration de `gpu_run.js`. Attendez-vous à des ajustements d'API mineurs selon votre version de wgpu.
-* Pression : PCG-Jacobi à nombre d'itérations FIXE (`pcg_iter`, défaut 6·max(nx,ny)) ; converge mal sur grandes grilles (un multigrille serait préférable).
-* Limites GPU : ≤ 4 phases, ≤ 4 solides, changement de phase sur la première paire seulement, pas de diagnostic de flux aux frontières, relecture complète de S à chaque pas (lent ; à remplacer par une relecture partielle/périodique pour l'affichage), dt choisi côté CPU.
+* GPU RÉSIDENT : l'état reste sur le GPU ; ~256 octets relus par série de pas (dt, itérations, drapeaux), l'image rendue sur le GPU,
+  l'état complet relu seulement pour les statistiques, les outils et la sauvegarde. Un seul buffer de stockage `S` (tranches aux
+  décalages `O_*` générés par l'hôte) et un uniforme de paramètres : pas de limite de nombre de buffers.
+* Mêmes formules que le CPU, en f32 : jusqu'à 32 fluides, groupes de phases, chimie et flammes épaissies, rayonnement, Dalton,
+  ébullition et cavitation, cellules spéciales, entrées de bord, grains (frottement, percolation, solidification). Pas de temps,
+  Newton + gradient conjugué multigrille, sous-pas et filet de sécurité décidés sur le GPU. Les scènes avec des corps rigides se
+  calculent sur le CPU (`gpu_unsupported_reason`).
+* Accord avec le CPU vérifié par `mp_gpu_tests.rs` : un pas parti du même état, puis des durées entières (MESURES.md § 6). Un seul
+  périphérique wgpu par processus (`shared_gpu`), accès un fil à la fois (`GPU_IO`).
+* Limites f32 connues : boîte fermée entièrement remplie de liquide, fermeture à ~1e-7 près (BUGFIXES.md).
 
-## Intégration egui
-Nouveaux fichiers : `simulation/mp_view.rs` (scénarios, pinceaux, rendu RGBA, stats — SANS egui, compilé et testé), `window/multiphase_window.rs`
-(fenêtre egui + enum `SimWindow`), `window/starting_window.rs` (remplacement complet : case « Multiphase solver », choix du scénario).
-Branchement (3 lignes) :
-```rust
-// simulation/mod.rs
-pub mod mp_view; pub mod mp_gpu_params; pub mod gpu_multiphase;
-// window/mod.rs
-pub mod multiphase_window;
-// là où vous créez la fenêtre de simulation (main.rs / app) : FluidWindow → SimWindow
-use crate::window::multiphase_window::SimWindow;
-let win = SimWindow::new(&settings);        // choisit FluidWindow ou MultiphaseWindow selon settings.multiphase
-match win.ui(ctx) { WindowAction::BackToSettings => ..., _ => {} }   // même WindowAction qu'avant
-```
-`main_window.rs` n'est pas modifié. `config.json` : deux champs ajoutés (`multiphase`, `mp_scenario`), absents ⇒ valeurs par défaut.
-Interface : scénarios (barrage, goutte, ballottement, ébullition sur plaque, huile/eau/air, cuve vide), affichages (phases, pression, T, vitesse, ρ, vapeur),
-pinceaux (ajouter air/eau/vapeur/huile à T choisie, solides acier/verre, effacer, chauffer, pousser), bords ouverts/fermés en direct, options physiques,
-vitesse visée ×temps réel (le pas est adaptatif, la fenêtre calcule autant de pas que le budget de 14 ms le permet), bascule CPU/GPU, stats par phase, infos de cellule.
-Statut : `mp_view.rs` testé (6 scénarios exécutés et rendus, outils de pinceau) ; `multiphase_window.rs`, `starting_window.rs` et `gpu_multiphase.rs`
-NON compilés ici (egui/wgpu absents) — ils n'utilisent que des appels egui déjà présents dans `main_window.rs`, sauf `ComboBox::from_label`/`Window::open` identiques.
-Limites : bord « Inlet » non géré en multiphasique ; gravité 0 de l'écran de démarrage ⇒ 9,81 ; mode GPU : relecture complète à chaque pas.
+## Interface (egui, `src/window/`)
+`starting_window.rs` (réglages, choix du solveur), `multiphase_window.rs` (scénarios, pinceaux de matériaux, cellules spéciales,
+bords en direct, options physiques, bascule CPU / GPU, fils CPU, profil du pas, état complet), `material_editor.rs` (matériaux,
+mélanges, réactions, paires de fusion), `experiment_window.rs` (protocoles d'expérience). Le rendu et les scénarios sont dans
+`mp_view.rs`, sans egui (testés). Convention : j croît vers le haut ; l'affichage inverse l'axe y.
 
 ## Limites connues (honnêtes)
 * CPU : f64, référence. GPU : voir ci-dessus.

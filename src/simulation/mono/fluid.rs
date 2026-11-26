@@ -2,7 +2,7 @@ use std::cmp::PartialEq;
 use std::fmt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use crate::simulation::gpu::gpu::{GpuContext, GpuFields, StepConfig};
+use crate::simulation::mono::gpu::gpu::{GpuContext, GpuFields, StepConfig};
 use crate::simulation::materials::{FluidKind, FluidMaterial};
 
 // Vocabulaire (à ne pas confondre) :

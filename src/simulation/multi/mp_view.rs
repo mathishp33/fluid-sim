@@ -1463,7 +1463,7 @@ mod tests {
         assert!(build_scenario_with(&lib, MpScenario::DamBreak, 32, 24, 0.01, 9.81).is_ok());
         // un fluide en plus (3 liquides) : l'huile / eau / air tourne toujours
         let mut lib = MaterialLibrary::default();
-        let mut extra = lib.template_fluid(crate::simulation::phases::PhaseKind::Liquid);
+        let mut extra = lib.template_fluid(crate::simulation::multi::phases::PhaseKind::Liquid);
         extra.name = "glycérine".into();
         lib.fluids.push(extra);
         let mut s = build_scenario_with(&lib, MpScenario::OilWaterAir, 32, 24, 0.01, 9.81).unwrap();
@@ -1502,6 +1502,6 @@ mod tests {
         render_rgba(&s, RenderOpts { display: MpDisplay::Divergence, ..base }, &mut a);
         assert_eq!(a.len(), 40 * 30 * 4);
         // le GPU résident gère les extras (cellules spéciales, solides thermiques, entrées)
-        assert!(crate::simulation::gpu_multiphase::gpu_unsupported_reason(&s).is_none());
+        assert!(crate::simulation::multi::gpu_multiphase::gpu_unsupported_reason(&s).is_none());
     }
 }

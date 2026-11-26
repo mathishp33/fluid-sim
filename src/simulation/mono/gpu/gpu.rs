@@ -1,4 +1,4 @@
-use crate::simulation::fluid::{BoundaryType, CellEffect, CellType, GridBoundary};
+use crate::simulation::mono::fluid::{BoundaryType, CellEffect, CellType, GridBoundary};
 
 // Doit correspondre EXACTEMENT à `struct Params` de fluid_sim.wgsl (28 scalaires = 112 octets, puis vec4 alignés sur 16).
 #[repr(C)]

@@ -93,11 +93,11 @@ impl MultiphaseSim {
 
 #[cfg(test)]
 mod tests {
-    use crate::simulation::multiphase::MultiphaseSim;
+    use crate::simulation::multi::multiphase::MultiphaseSim;
 
     fn scene(text: &str) -> MultiphaseSim {
-        let p = crate::simulation::mp_script::parse_all(text).unwrap_or_else(|e| panic!("{e:?}")).remove(0);
-        crate::simulation::mp_experiment::initial_state(&p, std::path::Path::new(".")).unwrap_or_else(|e| panic!("{e}")).0
+        let p = crate::simulation::multi::mp_script::parse_all(text).unwrap_or_else(|e| panic!("{e:?}")).remove(0);
+        crate::simulation::multi::mp_experiment::initial_state(&p, std::path::Path::new(".")).unwrap_or_else(|e| panic!("{e}")).0
     }
 
     /// énergie totale par mètre de profondeur : mailles (fluide et solides) et corps

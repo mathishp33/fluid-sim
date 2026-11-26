@@ -1,5 +1,5 @@
 //! Fenêtre egui du solveur multiphasique (CPU f64 ou GPU f32). Toute la logique (scénarios, pinceaux, rendu, stats, scènes) est dans
-//! `simulation::mp_view` / `mp_cells` (testées) ; ce fichier ne fait que l'interface. Mêmes conventions que `main_window.rs` :
+//! `simulation::multi::mp_view` / `mp_cells` (testées) ; ce fichier ne fait que l'interface. Mêmes conventions que `main_window.rs` :
 //!
 //!  * clic gauche : outil courant ; Ctrl + clic gauche : pose le type de cellule choisi (solide + comportement thermique, puits, émetteur,
 //!    accélérateur, téléporteur) ; clic droit : pousse le fluide ; clic milieu (ou Ctrl + milieu) : efface solide et effet ;
@@ -11,16 +11,16 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOptions};
 
-use crate::simulation::fluid::{Boundary, BoundaryType};
-use crate::simulation::gpu_multiphase::{gpu_unsupported_reason, MultiphaseGpu};
-use crate::simulation::mp_cells::{MpEffect, MpInlet, MpThermal};
-use crate::simulation::mp_materials::{MaterialLibrary, Roles};
-use crate::simulation::mp_view::{
+use crate::simulation::mono::fluid::{Boundary, BoundaryType};
+use crate::simulation::multi::gpu_multiphase::{gpu_unsupported_reason, MultiphaseGpu};
+use crate::simulation::multi::mp_cells::{MpEffect, MpInlet, MpThermal};
+use crate::simulation::multi::mp_materials::{MaterialLibrary, Roles};
+use crate::simulation::multi::mp_view::{
     apply_tool_with, brush_cells, build_scenario_with, cell_info, compute_stats, render_rgba, reset_flow, reset_temperature, scene_from_json,
     scene_to_json, sim_tools, tool_label, tool_name, MpDisplay, MpScenario, MpStats, MpTool, RenderOpts, ToolOpts, T_IGNITION,
 };
-use crate::simulation::mp_state::{is_state_file, state_from_bytes, state_to_bytes, StateFile};
-use crate::simulation::multiphase::{Bc, MultiphaseSim};
+use crate::simulation::multi::mp_state::{is_state_file, state_from_bytes, state_to_bytes, StateFile};
+use crate::simulation::multi::multiphase::{Bc, MultiphaseSim};
 use crate::window::main_window::WindowAction;
 use crate::window::material_editor::MaterialEditor;
 use crate::window::starting_window::{boundary_ui, save_settings, SimulationSettings};
@@ -251,7 +251,7 @@ impl MultiphaseWindow {
             last_fps: Instant::now(),
         };
         // solveur CPU : nombre de fils réglé automatiquement (voir mp_par)
-        crate::simulation::mp_par::set_auto(true);
+        crate::simulation::multi::mp_par::set_auto(true);
         w.refresh_warnings();
         w.apply_boundaries();
         w.stats = compute_stats(&w.sim);
@@ -1064,7 +1064,7 @@ impl MultiphaseWindow {
                         }
                     });
                     {
-                        use crate::simulation::mp_par;
+                        use crate::simulation::multi::mp_par;
                         ui.horizontal(|ui| {
                             let mut auto = mp_par::auto_threads();
                             if ui
@@ -1086,7 +1086,7 @@ impl MultiphaseWindow {
                     }
                     ui.label(format!(
                         "{} fil(s) ; dernier pas : {} PCG, {} Newton{}",
-                        crate::simulation::mp_par::threads(),
+                        crate::simulation::multi::mp_par::threads(),
                         self.sim.last_pressure_iters,
                         self.sim.last_newton_iters,
                         if self.sim.has_friction() { format!(", {} frottement", self.sim.last_friction_iters) } else { String::new() }
@@ -1635,7 +1635,7 @@ mod tests {
         let n0 = w.sim.reg.phases.len();
         // l'utilisateur ajoute un liquide miscible à l'eau, supprime l'huile
         let mut lib = w.lib.clone();
-        let mut alc = lib.template_fluid(crate::simulation::phases::PhaseKind::Liquid);
+        let mut alc = lib.template_fluid(crate::simulation::multi::phases::PhaseKind::Liquid);
         alc.name = "alcool".into();
         lib.fluids.push(alc);
         lib.set_miscible("eau", "alcool", true);

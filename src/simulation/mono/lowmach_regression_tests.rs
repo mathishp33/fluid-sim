@@ -1,5 +1,5 @@
 use super::fluid::*;
-use super::materials::*;
+use crate::simulation::materials::*;
 
 fn cpu_sim(w: usize, h: usize, dx: f32, mat: FluidMaterial, g: f32) -> FluidSim {
     let mut f = FluidSim::new(w, h, dx, mat, g);

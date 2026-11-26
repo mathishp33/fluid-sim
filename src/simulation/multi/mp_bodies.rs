@@ -1400,7 +1400,7 @@ impl super::multiphase::MultiphaseSim {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
-    use crate::simulation::mp_contacts::{CONTACT_PENETRATION, CONTACT_SKIN};
+    use crate::simulation::multi::mp_contacts::{CONTACT_PENETRATION, CONTACT_SKIN};
 
     #[test]
     fn shapes_have_their_exact_area_and_inertia() {
@@ -1500,9 +1500,9 @@ mod tests {
 
     #[test]
     fn a_body_in_the_scene_counts_in_the_closure_is_saved_and_keeps_the_scene_on_the_cpu() {
-        use crate::simulation::gpu_multiphase::gpu_unsupported_reason;
-        use crate::simulation::mp_state::{state_from_bytes, state_to_bytes};
-        use crate::simulation::mp_view::{build_scenario, render_rgba, MpDisplay, MpScenario, RenderOpts};
+        use crate::simulation::multi::gpu_multiphase::gpu_unsupported_reason;
+        use crate::simulation::multi::mp_state::{state_from_bytes, state_to_bytes};
+        use crate::simulation::multi::mp_view::{build_scenario, render_rgba, MpDisplay, MpScenario, RenderOpts};
         let mut s = build_scenario(MpScenario::Empty, 40, 30, 0.01, 9.81);
         assert!(!s.has_bodies() && gpu_unsupported_reason(&s).is_none());
         let c = s.idx(20, 15);
@@ -1541,12 +1541,12 @@ mod tests {
     }
 
     /// scène construite par un protocole (conditions initiales : départ + actions avant le premier « simuler »)
-    fn scene(text: &str) -> crate::simulation::multiphase::MultiphaseSim {
-        let p = crate::simulation::mp_script::parse_all(text).unwrap_or_else(|e| panic!("{e:?}")).remove(0);
-        crate::simulation::mp_experiment::initial_state(&p, std::path::Path::new(".")).unwrap_or_else(|e| panic!("{e}")).0
+    fn scene(text: &str) -> crate::simulation::multi::multiphase::MultiphaseSim {
+        let p = crate::simulation::multi::mp_script::parse_all(text).unwrap_or_else(|e| panic!("{e:?}")).remove(0);
+        crate::simulation::multi::mp_experiment::initial_state(&p, std::path::Path::new(".")).unwrap_or_else(|e| panic!("{e}")).0
     }
 
-    fn run_to(s: &mut crate::simulation::multiphase::MultiphaseSim, t: f64) {
+    fn run_to(s: &mut crate::simulation::multi::multiphase::MultiphaseSim, t: f64) {
         while s.time < t && !s.diverged {
             s.step();
         }
@@ -1555,7 +1555,7 @@ mod tests {
 
     #[test]
     fn placing_a_fixed_body_displaces_the_fluid_and_keeps_the_closure() {
-        use crate::simulation::mp_view::{build_scenario, MpScenario};
+        use crate::simulation::multi::mp_view::{build_scenario, MpScenario};
         let mut s = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
         let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
         let (m0, mass0) = (s.total_mass(eau), s.mass.clone());
@@ -1738,10 +1738,10 @@ mod tests {
              corps rect (0.02, 0) (0.06, 0.1) \"acier\" vitesse (0.05, 0) m/s\n",
         );
         let air = s.ambient_phase;
-        let region = |s: &crate::simulation::multiphase::MultiphaseSim, i0: usize| -> Vec<usize> {
+        let region = |s: &crate::simulation::multi::multiphase::MultiphaseSim, i0: usize| -> Vec<usize> {
             (0..s.ny).flat_map(|j| (i0..s.nx).map(move |i| j * 40 + i)).collect()
         };
-        let mass = |s: &crate::simulation::multiphase::MultiphaseSim, cs: &[usize]| cs.iter().map(|&c| s.mass[air][c]).sum::<f64>() * s.dx * s.dx;
+        let mass = |s: &crate::simulation::multi::multiphase::MultiphaseSim, cs: &[usize]| cs.iter().map(|&c| s.mass[air][c]).sum::<f64>() * s.dx * s.dx;
         let (c0, m0, p0, t0) = { let cs = region(&s, 6); (cs.clone(), mass(&s, &cs), s.p[cs[100]], s.temp[cs[100]]) };
         let _ = c0;
         run_to(&mut s, 2.0);
@@ -1823,7 +1823,7 @@ mod tests {
                 r > 0.05 && r < 0.1
             })
             .map(|(i, j)| {
-                let (a, bb) = crate::simulation::mp_view::cell_velocity(&s, i, j);
+                let (a, bb) = crate::simulation::multi::mp_view::cell_velocity(&s, i, j);
                 a.hypot(bb)
             })
             .fold(0.0, f64::max);
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     /// hauteur d'eau d'une colonne de mailles (m), d'après sa masse
-    fn water_level(s: &crate::simulation::multiphase::MultiphaseSim, eau: usize, i: usize) -> f64 {
+    fn water_level(s: &crate::simulation::multi::multiphase::MultiphaseSim, eau: usize, i: usize) -> f64 {
         (0..s.ny).map(|j| s.alpha[eau][s.idx(i, j)] * (1.0 - s.body_frac[s.idx(i, j)])).sum::<f64>() * s.dx
     }
 
@@ -2568,7 +2568,7 @@ mod tests {
         s.add_body(b).unwrap();
         // période : 2π √(I_q / (M g L)), I_q = M (r²/2 + L²), corrigée de l'amplitude (1 + θ0²/16)
         let t0 = 2.0 * PI * ((0.5 * r * r + l * l) / (9.81 * l)).sqrt() * (1.0 + th0 * th0 / 16.0);
-        let angle = |s: &crate::simulation::multiphase::MultiphaseSim| {
+        let angle = |s: &crate::simulation::multi::multiphase::MultiphaseSim| {
             let p = s.bodies[0].pos;
             (p[0] - q[0]).atan2(q[1] - p[1])
         };

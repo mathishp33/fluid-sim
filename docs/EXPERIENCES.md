@@ -247,9 +247,9 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 
 | Fichier | Rôle |
 |---|---|
-| `simulation/mp_experiment.rs` | modèle du protocole, zones, application des actions, déroulement (`Runner`), mesures, sorties, `run_cli` |
-| `simulation/mp_script.rs` | lecture du texte (unités, erreurs avec leur ligne), balayage, écriture des zones (`zone_text`), insertion des lignes de conditions initiales |
-| `simulation/mp_fields.rs` | champs de valeurs : CSV, PNG (crate `png`), formules, étalement sur la zone |
+| `simulation/multi/mp_experiment.rs` | modèle du protocole, zones, application des actions, déroulement (`Runner`), mesures, sorties, `run_cli` |
+| `simulation/multi/mp_script.rs` | lecture du texte (unités, erreurs avec leur ligne), balayage, écriture des zones (`zone_text`), insertion des lignes de conditions initiales |
+| `simulation/multi/mp_fields.rs` | champs de valeurs : CSV, PNG (crate `png`), formules, étalement sur la zone |
 | `window/experiment_window.rs` | la fenêtre egui |
 
 - **Les conditions initiales** sont le départ et les actions instantanées d'avant le premier `simuler` (`initial_state`). La fenêtre

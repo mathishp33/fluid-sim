@@ -1,10 +1,10 @@
 use egui::ComboBox;
 use serde::{Deserialize, Serialize};
 
-use crate::simulation::fluid::{Boundary, BoundaryType};
+use crate::simulation::mono::fluid::{Boundary, BoundaryType};
 use crate::simulation::materials::{FluidKind, FluidMaterial};
-use crate::simulation::mp_materials::MaterialLibrary;
-use crate::simulation::mp_view::{build_scenario_with, MpScenario};
+use crate::simulation::multi::mp_materials::MaterialLibrary;
+use crate::simulation::multi::mp_view::{build_scenario_with, MpScenario};
 use crate::window::material_editor::MaterialEditor;
 
 const CELL_SIZES: [(f32, &str); 4] = [(1e-3, "1 mm"), (1e-2, "1 cm"), (1e-1, "10 cm"), (1.0, "1 m")];

@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, ColorImage, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
 
-use crate::simulation::mp_experiment::{apply_action, fmt_num, fmt_point, initial_state, results_dir, Action, Measure, Protocol, RunState, Runner, Step, Zone};
-use crate::simulation::mp_script::{insert_initial_line, parse_all, zone_text};
-use crate::simulation::mp_view::{cell_info, compute_stats, render_rgba, MpDisplay, MpScenario, MpStats, RenderOpts};
-use crate::simulation::multiphase::MultiphaseSim;
+use crate::simulation::multi::mp_experiment::{apply_action, fmt_num, fmt_point, initial_state, results_dir, Action, Measure, Protocol, RunState, Runner, Step, Zone};
+use crate::simulation::multi::mp_script::{insert_initial_line, parse_all, zone_text};
+use crate::simulation::multi::mp_view::{cell_info, compute_stats, render_rgba, MpDisplay, MpScenario, MpStats, RenderOpts};
+use crate::simulation::multi::multiphase::MultiphaseSim;
 use crate::window::main_window::WindowAction;
 use crate::window::starting_window::SimulationSettings;
 
@@ -313,7 +313,7 @@ impl ExperimentWindow {
         let p = protos.into_iter().next().expect("au moins une variante");
         match initial_state(&p, &self.base_dir()) {
             Ok((sim, _, _)) => {
-                let errs = crate::simulation::mp_experiment::check_names(&p, &sim);
+                let errs = crate::simulation::multi::mp_experiment::check_names(&p, &sim);
                 self.errors = errs.iter().map(|(l, e)| format!("ligne {l} : {e}")).collect();
                 self.stats = compute_stats(&sim);
                 self.preview = Some(sim);

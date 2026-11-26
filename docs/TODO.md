@@ -9,8 +9,6 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 ## 1. Prioritaire
 
 ### Organisation et interface
-- [M+1] Séparer dans des dossiers la simulation multiphasique et la monophasique (`src/simulation/` mêle les deux : `mp_*`,
-  `gpu_multiphase.rs` d'un côté, `fluid.rs`, `cpu/`, `gpu/` de l'autre).
 - [M] Intégrer la fenêtre d'expérience à la fenêtre de départ (`starting_window.rs`).
 - [M] Améliorer la fenêtre d'expérience : outil « Corps » qui pose aussi des corps libres ou à mouvement imposé (aujourd'hui fixes
   seulement, le reste passe par la commande `corps`) ; conditions (« simuler jusqu'à ce que T max < 400 K ») ; gestes à la souris
@@ -192,9 +190,11 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 Résumé : une ligne par chantier. Les validations chiffrées sont dans MESURES.md, les défauts corrigés en route dans BUGFIXES.md, le
 détail dans les documents de conception et l'historique git.
 
-### Documentation (2026-11-26)
+### Documentation et organisation (2026-11-26)
 - TODO trié et élagué ; MESURES.md (la simulation face aux références) et BUGFIXES.md (défauts connus et corrigés) ; documents
   rangés dans `docs/` ; README refait.
+- Code rangé en deux dossiers : `src/simulation/mono/` (monophasique) et `src/simulation/multi/` (multiphasique), lois de propriétés
+  communes dans `src/simulation/materials.rs` ; anciens fichiers WGSL et `build_wgsl.py`, inutilisés depuis le 2026-11-19, retirés.
 
 ### Solides mobiles (2026-11-24 → 26, voir SOLID.md)
 - Étude et architecture (domaine fictif à une vitesse, repli monolithique), choix validés le 2026-11-24.

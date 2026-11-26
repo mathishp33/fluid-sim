@@ -5,8 +5,8 @@
 use egui::{ComboBox, DragValue, Ui};
 
 use crate::simulation::materials::PropertyLaw;
-use crate::simulation::mp_materials::{ChangeDef, FusionDef, MaterialLibrary, MixtureDef, ReactionDef};
-use crate::simulation::phases::{Eos, Phase, PhaseKind, Radiator, Reaction, Registry, Thermal};
+use crate::simulation::multi::mp_materials::{ChangeDef, FusionDef, MaterialLibrary, MixtureDef, ReactionDef};
+use crate::simulation::multi::phases::{Eos, Phase, PhaseKind, Radiator, Reaction, Registry, Thermal};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum EditorTab {

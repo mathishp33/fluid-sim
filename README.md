@@ -51,6 +51,14 @@ Plus de 200 essais : bilans exacts, solutions analytiques, corrélations et exp�
 une heure sur la machine de développement (les essais GPU passent un par un). Les diagnostics longs sont ignorés par défaut
 (`cargo test --release -- --ignored nom_du_diagnostic`).
 
+## Code
+
+- `src/simulation/mono/` — solveur monophasique (`fluid.rs`, `cpu/`, `gpu/`) ;
+- `src/simulation/multi/` — solveur multiphasique (`multiphase.rs`, `mp_*.rs`, GPU : `gpu_multiphase.rs` et `mp_gpu/*.wgsl`) ;
+- `src/simulation/materials.rs` — lois de propriétés communes aux deux ;
+- `src/window/` — interface egui ;
+- `experiences/` — protocoles d'expérience d'exemple.
+
 ## Documentation (`docs/`)
 
 - **MESURES.md** — la simulation face aux valeurs de référence, chiffres à l'appui ;

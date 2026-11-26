@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::materials::PropertyLaw;
+use crate::simulation::materials::PropertyLaw;
 use super::phases::{Eos, Phase, PhaseKind, Radiator, Reaction, Registry, Solid, Thermal, MAX_PHASES, R_GAS};
 
 /// paire liquide ↔ vapeur (ébullition / condensation / cavitation) définie par noms

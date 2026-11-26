@@ -7,7 +7,7 @@ fn main() -> eframe::Result<()> {
     // `fluid-sim experience protocole.exp [--gpu] [--sortie dossier]` : expérience sans fenêtre (voir EXPERIENCES.md)
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("experience" | "expérience" | "exp")) {
-        std::process::exit(simulation::mp_experiment::run_cli(&args[1..]));
+        std::process::exit(simulation::multi::mp_experiment::run_cli(&args[1..]));
     }
     println!("Rayon threads: {}", rayon::current_num_threads());
 

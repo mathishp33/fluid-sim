@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::fluid::Boundary;
+use crate::simulation::mono::fluid::Boundary;
 use super::mp_materials::MaterialLibrary;
 use super::multiphase::MultiphaseSim;
 
@@ -125,7 +125,7 @@ fn check(s: &MultiphaseSim) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::mp_view::{apply_tool, build_scenario, MpScenario, MpTool};
+    use crate::simulation::multi::mp_view::{apply_tool, build_scenario, MpScenario, MpTool};
 
     fn same(a: &MultiphaseSim, b: &MultiphaseSim) -> bool {
         a.time == b.time

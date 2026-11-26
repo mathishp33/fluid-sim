@@ -6,9 +6,9 @@ use egui::{Color32, ColorImage, PointerButton, Sense, TextureHandle, TextureOpti
 use rayon::prelude::*;
 use rfd::FileDialog;
 
-use crate::simulation::fluid::{BoundaryType, CellEffect, ComputeMethod, FluidSim, ThermalCell};
+use crate::simulation::mono::fluid::{BoundaryType, CellEffect, ComputeMethod, FluidSim, ThermalCell};
 use crate::simulation::materials::FluidKind;
-use crate::simulation::fluid::CellType;
+use crate::simulation::mono::fluid::CellType;
 use crate::window::starting_window::SimulationSettings;
 use crate::window::starting_window::boundary_ui;
 
