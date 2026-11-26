@@ -674,6 +674,46 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             proto.materials = Some(p.string("le fichier de matériaux (.json, exporté par l'éditeur)")?);
             p.end()?;
         }
+        "toutes" | "chaque" => {
+            // toutes les <T> [à partir de <t0>] [jusqu'à <t1>] : <action> — répétée en parallèle du déroulement
+            if cmd == "toutes" && !p.eat_w("les") {
+                return p.err(format!("il faut « toutes les <période> : <action> »{}", p.here()));
+            }
+            let period = p.quantity(Dim::Time, "la période de répétition")?;
+            if !(period > 0.0) {
+                return p.err("la période de répétition doit être positive");
+            }
+            let (mut start, mut end) = (None, None);
+            loop {
+                if p.eat_w("a") {
+                    if !(p.eat_w("partir") && p.eat_w("de")) {
+                        return p.err(format!("il faut « à partir de <instant> »{}", p.here()));
+                    }
+                    start = Some(p.quantity(Dim::Time, "l'instant de la première fois")?);
+                } else if p.eat_w("jusqua") || p.eat_w("jusque") {
+                    end = Some(p.quantity(Dim::Time, "l'instant de la dernière fois")?);
+                } else {
+                    break;
+                }
+            }
+            if !p.eat(&Tok::Colon) {
+                return p.err(format!("il faut « : » puis l'action répétée{}", p.here()));
+            }
+            if p.done() {
+                return p.err("il manque l'action répétée après « : »");
+            }
+            // l'action : le reste de la ligne, lu comme une commande
+            let mut inner = Protocol::default();
+            let mut q = P { t: &p.t[p.i..], i: 0, ln };
+            parse_line(&mut q, &mut inner)?;
+            p.i = p.t.len();
+            let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
+            let action = match inner.steps.pop() {
+                Some((Step::Do(a), _)) if only && inner.steps.is_empty() && !matches!(a, Action::Periodic { .. } | Action::Pause) => a,
+                _ => return p.err("une répétition porte sur une seule action (remplir, chauffer, bord, corps…), pas sur simuler, mesurer, pause ni une autre répétition"),
+            };
+            push(proto, Action::Periodic { period, start, end, action: Box::new(action) }, ln);
+        }
         "calcul" => {
             let w = p.word("« cpu » ou « gpu »")?;
             proto.gpu = Some(match w.as_str() {

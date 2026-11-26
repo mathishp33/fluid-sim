@@ -596,6 +596,81 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn periodic_actions_repeat_on_time_alongside_the_protocol() {
+    // lecture : période, début et fin facultatifs, puis l'action après « : »
+    let p = proto(
+        "départ scénario \"cuve vide\"
+toutes les 0.5 s à partir de 1 s jusqu'à 3 s : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s
+chaque 20 ms : bord haut ouvert
+",
+    );
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(
+        matches!(acts[0], Action::Periodic { period, start: Some(s), end: Some(e), action } if *period == 0.5 && *s == 1.0 && *e == 3.0 && matches!(**action, Action::Heat { duration: Some(d), .. } if d == 0.1)),
+        "{:?}",
+        acts[0]
+    );
+    assert!(matches!(acts[1], Action::Periodic { period, start: None, end: None, action } if (*period - 0.02).abs() < 1e-15 && matches!(**action, Action::Boundary { side: 3, .. })));
+    for (bad, what) in [
+        ("toutes les 0 s : effacer partout", "positive"),
+        ("toutes les 1 s effacer partout", "« : »"),
+        ("toutes les 1 s :", "il manque l'action"),
+        ("toutes les 1 s : simuler 1 s", "une seule action"),
+        ("toutes les 1 s : toutes les 2 s : effacer partout", "une seule action"),
+        ("toutes les 1 s : mesurer toutes les 1 ms : stats", "une seule action"),
+        ("toutes 1 s : effacer partout", "toutes les"),
+        ("toutes les 1 s : voler", "commande"),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+
+    // à l'heure pile : repères à 0.05, 0.15, 0.25 et 0.35 s (le pas s'arrête sur chaque échéance) ; trois notés, puis le compte
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+toutes les 0.1 s à partir de 0.05 s jusqu'à 0.35 s : marque \"top\"
+simuler 0.5 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    for t in ["0.050000", "0.150000", "0.250000"] {
+        assert!(log.contains(&format!("[t = {t} s] ligne 2 : repère « top »")), "{t}\n{log}");
+    }
+    assert!(!log.contains("[t = 0.350000 s] ligne 2 : repère") && log.contains("répétitions suivantes non notées"), "{log}");
+    assert!(log.contains("ligne 2 : toutes les 0.1 s — 4 fois"), "{log}");
+
+    // vanne : la sortie du fond est ouverte 0.1 s sur 0.2 s — la cuve perd la moitié de ce qu'elle perdrait toujours ouverte
+    let text = "départ scénario \"cuve vide\" grille 20 x 30 maille 1 cm
+remplir rect (0, 0) (0.2, 0.2) avec \"eau\"
+toutes les 0.2 s : bord bas sortie (0, -0.05)
+toutes les 0.2 s à partir de 0.1 s : bord bas mur
+mesurer toutes les 0.1 s : masse \"eau\"
+simuler 1 s
+";
+    let check = |r: &Runner, what: &str| {
+        let log = r.log.join("\n");
+        assert!(log.contains("ligne 3 : toutes les 0.2 s — 6 fois") && log.contains("ligne 4 : toutes les 0.2 s — 5 fois"), "{what}\n{log}");
+        assert!(log.contains("[t = 0.100000 s] ligne 4 : bord bas : mur") && log.contains("[t = 0.200000 s] ligne 3 : bord bas : sortie"), "{what}\n{log}");
+        let eau = r.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let full = r.sim.reg.phases[eau].rho(101325.0, 293.15) * 0.05 * 0.2 * 1.0;
+        let lost = r.rows[0][2] - r.rows.last().unwrap()[2];
+        eprintln!("{what} : vanne ouverte une demi-période sur deux, {lost:.4} kg/m sortis (moitié du débit continu : {:.4})", 0.5 * full);
+        assert!((lost / (0.5 * full) - 1.0).abs() < 0.02, "{what} : {lost} kg/m sortis pour {}", 0.5 * full);
+    };
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    check(&r, "CPU");
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let mut g = Runner::new(proto(text), Path::new("."), None, Some(true)).unwrap();
+    assert!(g.gpu.is_some(), "{}", g.log.join("\n"));
+    run_to_end(&mut g);
+    check(&g, "GPU");
+}
+
+#[test]
 fn a_body_follows_motion_and_force_laws_written_as_formulas() {
     use super::mp_bodies::{LinLaw, RotLaw};
     // lecture : lois de translation, de rotation, force et couple d'un corps libre ; formules vérifiées à la lecture

@@ -147,12 +147,13 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   corps disque (x, y) rayon r \"acier\" | corps rect (x1, y1) (x2, y2) \"verre\" [angle 30] | corps polygone (x1, y1) (x2, y2) (x3, y3) \"acier\"
         (corps rigide aux bords lissés ; angle en degrés) — fixe, ou mouvement imposé :
         vitesse (vx, vy) · rotation 90 (°/s, rad/s, tr/min) · oscillation (vx, vy) période 1 s · oscillation rotation 30 période 2 s · pivot (x, y)
+        ou en formules (t, x, y, vx, vy, ax, ay, angle, rotation, x0, y0) : position | vitesse | accélération formule \"…\" \"…\" · angle | rotation formule \"…\"
         — ou libre, poussé par l'écoulement : libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse (vx, vy)] [masse volumique 600 kg/m³]
-          [rebond 0.5] [frottement 0.3]   (contacts contre les bords, les solides et les autres corps)
+          [rebond 0.5] [frottement 0.3] [force formule \"-100*(x - x0)\" \"0\"] [couple formule \"…\"]   (contacts contre les bords, les solides, les corps)
         — tout corps : à 80 °C   (température de départ ; il échange ensuite sa chaleur avec le fluide)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
-  bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"]
+  bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"] | sortie (vx, vy)   (vitesse vers l'extérieur)
   champ T|vx|vy|fraction \"eau\"|solide \"acier\"  fichier \"f.csv|f.png\" [origine haut|bas] [valeurs a b]
         | formule \"300 + 50*exp(-((x-0.2)^2+(y-0.1)^2)/0.02^2)\"     [dans <zone>] [à T]
   gravité (0, -9.81) · pas max 1 ms
@@ -164,6 +165,7 @@ TEMPS, MESURES, SORTIES
   simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\" · sauver image \"nom\" [température | vitesse | …]
   images toutes les 50 ms [phases | température | vitesse | …]   (série d'images PNG dans images-<affichage>/)
   simuler jusqu'à ce que max T dans partout < 400 K [ou corps 1 y < 5 cm] [au plus 10 s]   (relevé comme une mesure ; < <= > >= ; et | ou)
+  toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)

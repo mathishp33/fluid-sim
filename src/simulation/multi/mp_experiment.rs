@@ -494,12 +494,19 @@ pub enum Action {
     Mark(String),
     /// met l'expérience en pause (fenêtre) ; ignorée en ligne de commande
     Pause,
+    /// action répétée toutes les `period` secondes, de `start` (sinon l'instant où la ligne est atteinte) à `end` (sinon sans fin),
+    /// en parallèle du déroulement : chaque fois à l'heure pile
+    Periodic { period: f64, start: Option<f64>, end: Option<f64>, action: Box<Action> },
 }
 
 impl Action {
-    /// action qui modifie l'état sur-le-champ (et qu'on peut donc rejouer pour construire les conditions initiales)
+    /// action qui modifie l'état sur-le-champ (et qu'on peut donc rejouer pour construire les conditions initiales) ; une action
+    /// répétée dès le départ compte pour sa première fois
     pub fn is_instant_edit(&self) -> bool {
-        !matches!(self, Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause)
+        match self {
+            Action::Periodic { start, action, .. } => start.map_or(true, |s| s <= 0.0) && action.is_instant_edit(),
+            _ => !matches!(self, Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause),
+        }
     }
     /// zone de l'action (pour l'afficher sur l'image)
     pub fn zone(&self) -> Option<&Zone> {
@@ -516,6 +523,7 @@ impl Action {
             | Action::Emitter { zone, .. }
             | Action::Grille { zone, .. }
             | Action::Field { zone, .. } => Some(zone),
+            Action::Periodic { action, .. } => action.zone(),
             _ => None,
         }
     }
@@ -732,6 +740,7 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
     }
     for (s, line) in &proto.steps {
         let Step::Do(a) = s else { continue };
+        let a = if let Action::Periodic { action, .. } = a { action.as_ref() } else { a };
         match a {
             Action::Fill { fluid: f, .. } => fluid(f, *line, false, &mut errs),
             Action::Emitter { fluid: f, .. } => fluid(f, *line, true, &mut errs),
@@ -889,6 +898,22 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
                 BoundarySpec::Wall => {
                     sim.bc[k] = Bc::Wall;
                     sim.inlet[k] = None;
+                    // une entrée ou une sortie qui se ferme : vitesse normale des faces du bord à zéro tout de suite (le transport du
+                    // pas suivant, qui précède la projection, la garderait sinon un pas de plus)
+                    let (nx, ny) = (sim.nx, sim.ny);
+                    if k < 2 {
+                        let i = if k == 0 { 0 } else { nx };
+                        for j in 0..ny {
+                            let f = sim.uidx(i, j);
+                            sim.u[f] = 0.0;
+                        }
+                    } else {
+                        let j = if k == 2 { 0 } else { ny };
+                        for i in 0..nx {
+                            let f = sim.vidx(i, j);
+                            sim.v[f] = 0.0;
+                        }
+                    }
                 }
                 BoundarySpec::Open(p) => {
                     sim.bc[k] = Bc::Open { p: *p };
@@ -920,6 +945,8 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             Ok(0)
         }
         Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause => Ok(0),
+        // (conditions initiales : sa première fois ; le déroulement la répète)
+        Action::Periodic { action, .. } => apply_action(sim, action, base),
     }
 }
 
@@ -1312,6 +1339,16 @@ pub enum RunState {
 }
 
 /// action à durée en cours : chauffage (cibles) ou accélération (cellules « accélérateur » posées)
+/// action répétée en cours : prochaine fois, dernière permise, ligne du protocole, nombre de fois
+struct Periodic {
+    action: Action,
+    period: f64,
+    next: f64,
+    end: f64,
+    line: usize,
+    count: usize,
+}
+
 struct Timed {
     cells: Vec<usize>,
     /// température cible (chauffage) ou accélération (ax, ay)
@@ -1337,6 +1374,9 @@ pub struct Runner {
     /// condition d'arrêt en cours (`simuler jusqu'à ce que …`)
     cond: Option<Cond>,
     timed: Vec<Timed>,
+    periodic: Vec<Periodic>,
+    /// journal muet (répétitions au-delà de la troisième)
+    quiet: bool,
     probes: Vec<Probe>,
     stats: bool,
     /// en-têtes des colonnes des mesures (t, pas, puis les mesures)
@@ -1395,6 +1435,8 @@ impl Runner {
             target: None,
             cond: None,
             timed: vec![],
+            periodic: vec![],
+            quiet: false,
             probes: vec![],
             stats: false,
             columns: vec!["t (s)".into(), "pas".into()],
@@ -1490,6 +1532,9 @@ impl Runner {
     }
 
     fn note(&mut self, msg: String) {
+        if self.quiet {
+            return;
+        }
         self.log.push(format!("[t = {:.6} s] {msg}", self.sim.time));
     }
 
@@ -1713,12 +1758,92 @@ impl Runner {
             let Step::Do(a) = step else { break };
             self.line = line;
             self.pc += 1;
-            let now = self.sim.time;
-            match &a {
+            match self.do_action(&a, line) {
+                Ok((e, h)) => {
+                    edited |= e;
+                    heat |= h;
+                }
+                Err(()) => return,
+            }
+            if matches!(self.state, RunState::Paused(_)) {
+                break;
+            }
+        }
+        self.finish_edits(edited, heat);
+    }
+
+    /// après des actions : cibles de chauffage recalculées, état renvoyé au GPU s'il a changé
+    fn finish_edits(&mut self, edited: bool, heat: bool) {
+        if heat {
+            self.apply_heat_targets();
+        }
+        if edited {
+            self.upload();
+        } else if heat {
+            if let Some(g) = &mut self.gpu {
+                g.sync_heat_targets(&self.sim);
+            }
+        }
+    }
+
+    /// Actions répétées dues à l'instant `now` (à `eps` près), dans l'ordre de leurs échéances : (état modifié, chauffages changés).
+    fn fire_due(&mut self, now: f64, eps: f64) -> Result<(bool, bool), ()> {
+        let (mut edited, mut heat) = (false, false);
+        let mut fired = 0usize;
+        loop {
+            let due = (0..self.periodic.len())
+                .filter(|&k| self.periodic[k].next <= now + eps && self.periodic[k].next <= self.periodic[k].end + eps)
+                .min_by(|&a, &b| self.periodic[a].next.total_cmp(&self.periodic[b].next));
+            let Some(k) = due else { break };
+            fired += 1;
+            if fired > 10_000 {
+                self.fail(format!("ligne {} : action répétée trop souvent pour le pas de temps", self.periodic[k].line));
+                return Err(());
+            }
+            let (action, line, count) = {
+                let p = &mut self.periodic[k];
+                p.count += 1;
+                p.next += p.period;
+                (p.action.clone(), p.line, p.count)
+            };
+            if count == 4 {
+                self.note(format!("ligne {line} : répétitions suivantes non notées au journal"));
+            }
+            self.quiet = count > 3;
+            let r = self.do_action(&action, line);
+            self.quiet = false;
+            let (e, h) = r?;
+            edited |= e;
+            heat |= h;
+        }
+        Ok((edited, heat))
+    }
+
+    /// Exécute une action à l'instant présent : (état modifié, chauffages changés) ; Err : l'expérience a échoué. `Pause` met
+    /// l'expérience en pause ; une action répétée est enregistrée (et faite tout de suite si elle est due).
+    fn do_action(&mut self, a: &Action, line: usize) -> Result<(bool, bool), ()> {
+        let (mut edited, mut heat) = (false, false);
+        let now = self.sim.time;
+        {
+            match a {
                 Action::Pause => {
                     self.note(format!("ligne {line} : pause"));
                     self.state = RunState::Paused(format!("pause du protocole (ligne {line})"));
-                    break;
+                }
+                Action::Periodic { period, start, end, action } => {
+                    let mut next = start.unwrap_or(now);
+                    // (début passé : la phase est gardée, première fois à l'échéance suivante)
+                    if next < now {
+                        next += ((now - next) / period).ceil() * period;
+                    }
+                    let from = start.map_or(String::new(), |s| format!(" à partir de {} s", fmt_num(s)));
+                    let until = end.map_or(String::new(), |e| format!(" jusqu'à {} s", fmt_num(e)));
+                    self.note(format!("ligne {line} : toutes les {} s{from}{until} : {}", fmt_num(*period), describe(action)));
+                    self.periodic.push(Periodic { action: (**action).clone(), period: *period, next, end: end.unwrap_or(f64::INFINITY), line, count: 0 });
+                    let eps = 1e-12 * (1.0 + now.abs());
+                    let (e, h) = self.fire_due(now, eps)?;
+                    edited |= e;
+                    heat |= h;
                 }
                 Action::Mark(t) => self.note(format!("ligne {line} : repère « {t} »")),
                 Action::SaveState(name) => self.save_state(name, line),
@@ -1763,21 +1888,12 @@ impl Runner {
                     }
                     Err(e) => {
                         self.fail(format!("ligne {line} : {e}"));
-                        return;
+                        return Err(());
                     }
                 },
             }
         }
-        if heat {
-            self.apply_heat_targets();
-        }
-        if edited {
-            self.upload();
-        } else if heat {
-            if let Some(g) = &mut self.gpu {
-                g.sync_heat_targets(&self.sim);
-            }
-        }
+        Ok((edited, heat))
     }
 
     /// cibles de chauffage = celles des chauffages en cours (le dernier posé l'emporte sur une maille commune)
@@ -1841,6 +1957,7 @@ impl Runner {
     }
 
     fn fail(&mut self, msg: String) {
+        self.quiet = false;
         self.note(format!("ERREUR : {msg}"));
         self.state = RunState::Failed(msg);
         self.close_files();
@@ -1901,6 +2018,17 @@ impl Runner {
         // une échéance est atteinte à 1e-6 pas près (pas de pas minuscule pour un reste d'arrondi)
         let eps = (1e-12 * (1.0 + now.abs())).max(1e-6 * pred);
         self.expire(now, eps);
+        // actions répétées dues, à l'heure pile (les pas s'arrêtent sur leurs échéances)
+        if self.periodic.iter().any(|p| p.next <= now + eps && p.next <= p.end + eps) {
+            self.sync_host();
+            match self.fire_due(now, eps) {
+                Ok((e, h)) => self.finish_edits(e, h),
+                Err(()) => return,
+            }
+            if self.state != RunState::Running {
+                return;
+            }
+        }
         if now >= target - eps {
             self.target = None;
             if let Some(c) = self.cond.take() {
@@ -1910,7 +2038,12 @@ impl Runner {
             }
             return;
         }
-        let next = self.timed.iter().map(|t| t.end).fold(target, f64::min);
+        let next = self
+            .timed
+            .iter()
+            .map(|t| t.end)
+            .chain(self.periodic.iter().filter(|p| p.next <= p.end).map(|p| p.next))
+            .fold(target, f64::min);
         let remaining = next - now;
         let dt_max0 = self.sim.dt_max;
         let cap = if remaining <= pred * (1.0 + 1e-9) {
@@ -2078,6 +2211,11 @@ impl Runner {
     }
 
     fn finish(&mut self) {
+        for k in 0..self.periodic.len() {
+            let p = &self.periodic[k];
+            let msg = format!("ligne {} : toutes les {} s — {} fois", p.line, fmt_num(p.period), p.count);
+            self.note(msg);
+        }
         if self.proto.period.is_some() {
             let last = self.rows.last().map(|r| r[0]);
             if last.map_or(true, |t| self.sim.time > t + 1e-12 * (1.0 + t.abs())) {
@@ -2167,6 +2305,12 @@ fn describe(a: &Action) -> String {
                 if m.v != [0.0, 0.0] || m.omega != 0.0 {
                     parts.push(format!("vitesse de départ {} m/s, {} °/s", fmt_point(m.v), fmt_num(m.omega.to_degrees())));
                 }
+                if let Some(f) = &m.force {
+                    parts.push(format!("force « {} », « {} » N/m", f[0], f[1]));
+                }
+                if let Some(c) = &m.torque {
+                    parts.push(format!("couple « {c} » N"));
+                }
                 let p = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
                 format!("corps libre « {material} » {f}{a}{p}")
             } else if motion.is_fixed() {
@@ -2183,12 +2327,25 @@ fn describe(a: &Action) -> String {
                 if m.osc_v != [0.0, 0.0] || m.osc_omega != 0.0 {
                     parts.push(format!("oscillation {} m/s, {} °/s sur {} s", fmt_point(m.osc_v), fmt_num(m.osc_omega.to_degrees()), fmt_num(m.period)));
                 }
+                use super::mp_bodies::{LinLaw, RotLaw};
+                match &m.lin_law {
+                    Some(LinLaw::Position(f)) => parts.push(format!("position « {} », « {} » m", f[0], f[1])),
+                    Some(LinLaw::Velocity(f)) => parts.push(format!("vitesse « {} », « {} » m/s", f[0], f[1])),
+                    Some(LinLaw::Acceleration(f)) => parts.push(format!("accélération « {} », « {} » m/s²", f[0], f[1])),
+                    None => {}
+                }
+                match &m.rot_law {
+                    Some(RotLaw::Angle(f)) => parts.push(format!("angle « {f} » °")),
+                    Some(RotLaw::Rate(f)) => parts.push(format!("rotation « {f} » °/s")),
+                    None => {}
+                }
                 if let Some(q) = m.pivot {
                     parts.push(format!("pivot {}", fmt_point(q)));
                 }
                 format!("corps « {material} » {f}{a}, mouvement imposé : {}", parts.join(", "))
             }
         }
+        Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),
         Action::Ignite { zone, temp } => format!("allumer {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Sink { zone, rate } => format!("puits {} ({} m/s)", zone.label(), fmt_num(*rate)),

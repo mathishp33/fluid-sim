@@ -214,6 +214,8 @@ détail dans les documents de conception et l'historique git.
 - Corps : lois en formules (variables t, x, y, vx, vy, ax, ay, angle, rotation, x0, y0) — `position | vitesse | accélération
   formule`, `angle | rotation formule` pour un mouvement imposé (Runge–Kutta 4), `force | couple formule` ajoutés à un corps libre
   (ressort, amortisseur, moteur).
+- Protocoles : `toutes les T [à partir de t0] [jusqu'à t1] : <action>`, action répétée en parallèle du déroulement, à l'heure
+  pile (vanne, impulsions de chauffage) ; un bord qui redevient un mur arrête tout de suite l'écoulement de ses faces.
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d
