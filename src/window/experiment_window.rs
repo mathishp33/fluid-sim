@@ -126,6 +126,7 @@ TEMPS, MESURES, SORTIES
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
+     débit [massique] [\"eau\"] à travers ligne (x, y1) (x, y2)   (ligne verticale ou horizontale ; m²/s ou kg/(m·s), vers +x ou +y)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
 
 Résultats : résultats/<nom du protocole>/ à côté du protocole (mesures.csv, journal.txt, états .mps, copie du protocole).
@@ -1311,6 +1312,7 @@ impl ExperimentWindow {
                 Measure::Probe { zone, .. } | Measure::Mass { zone, .. } | Measure::SolidForce { zone, .. } => {
                     self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230))
                 }
+                Measure::Flux { a, b, .. } => self.draw_zone(painter, rect, &Zone::Trait { pts: vec![*a, *b], r: 0.0 }, Color32::from_rgb(60, 220, 230)),
                 Measure::Stats | Measure::Body { .. } => {}
             }
         }

@@ -244,6 +244,9 @@ pub enum Measure {
     Body { index: usize, q: BodyQty, label: Option<String> },
     /// force du fluide (composante x : 0, y : 1) sur les mailles solides de la zone, par mètre de profondeur
     SolidForce { axis: usize, zone: Zone, label: Option<String> },
+    /// débit volumique (m²/s) ou massique (`mass`, kg/(m·s)) d'un fluide pur, ou de tous, à travers le segment horizontal ou vertical
+    /// (a, b), le long des faces des mailles ; positif vers +x (segment vertical) ou +y (horizontal)
+    Flux { fluid: Option<String>, mass: bool, a: [f64; 2], b: [f64; 2], label: Option<String> },
 }
 
 /// Grandeur mesurée sur un corps rigide.
@@ -699,7 +702,7 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
     for (m, line) in &proto.measures {
         match m {
             Measure::Probe { q: Quantity::Fraction(f), .. } => fluid(f, *line, true, &mut errs),
-            Measure::Mass { fluid: f, .. } => fluid(f, *line, true, &mut errs),
+            Measure::Mass { fluid: f, .. } | Measure::Flux { fluid: Some(f), .. } => fluid(f, *line, true, &mut errs),
             _ => {}
         }
     }
@@ -921,6 +924,10 @@ enum ProbeKind {
     Body(usize, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
+    /// débit à travers des faces : fluide pur (sinon tous), massique, faces de u (ligne verticale) ou de v ; par face, son indice et
+    /// les mailles de part et d'autre (vers −, vers + ; usize::MAX hors du domaine) ; emplacements des faces dans `flux_acc` ; dernier
+    /// relevé (t, cumul, débit)
+    Flux { phase: Option<usize>, mass: bool, vertical: bool, faces: Vec<[usize; 3]>, slots: Vec<usize>, last: std::cell::Cell<Option<(f64, f64, f64)>> },
 }
 
 #[derive(Clone, Copy)]
@@ -1094,6 +1101,76 @@ fn point_value(sim: &MultiphaseSim, q: QtyR, p: [f64; 2], cell: usize, fluid_onl
     }
 }
 
+/// Débit à travers des faces, par mètre de profondeur : vitesse de chaque face × longueur dx × contenu de la maille amont (celle d'où
+/// vient le fluide ; au bord du domaine, la maille intérieure), fraction volumique (débit volumique, m²/s) ou masse volumique partielle
+/// (débit massique, kg/(m·s)) d'un fluide pur, ou de tous ; une maille solide ne contient rien. Signe : vers +x ou +y.
+fn flux_value(sim: &MultiphaseSim, phase: Option<usize>, mass: bool, vertical: bool, faces: &[[usize; 3]]) -> f64 {
+    let np = sim.reg.phases.len();
+    let content = |c: usize| -> f64 {
+        if sim.is_solid(c) {
+            return 0.0;
+        }
+        let one = |k: usize| if mass { sim.mass[k][c] } else { sim.alpha[k][c] };
+        match phase {
+            Some(k) => one(k),
+            None => (0..np).map(one).sum(),
+        }
+    };
+    let mut q = 0.0;
+    for &[f, lo, hi] in faces {
+        let vel = if vertical { sim.u[f] } else { sim.v[f] };
+        let up = if hi == usize::MAX || (vel > 0.0 && lo != usize::MAX) { lo } else { hi };
+        if vel != 0.0 {
+            q += vel * content(up);
+        }
+    }
+    q * sim.dx
+}
+
+/// Faces d'une ligne de débit (a, b) : verticale (faces de u) ou horizontale (faces de v), sur la ligne de faces la plus proche, celles
+/// dont le milieu est entre les extrémités ; par face, son indice et les mailles de part et d'autre (vers −, vers + ; usize::MAX hors du
+/// domaine).
+fn flux_faces(sim: &MultiphaseSim, a: [f64; 2], b: [f64; 2]) -> Result<(bool, Vec<[usize; 3]>), String> {
+    let (nx, ny, dx) = (sim.nx, sim.ny, sim.dx);
+    let (lx, ly) = (nx as f64 * dx, ny as f64 * dx);
+    let side = |i: usize, n: usize, c: usize| if i < n { c } else { usize::MAX };
+    let (vertical, faces): (bool, Vec<[usize; 3]>) = if a[0] == b[0] && a[0] >= -0.5 * dx && a[0] <= lx + 0.5 * dx {
+        let i = ((a[0] / dx).round().max(0.0) as usize).min(nx);
+        let faces = span(a[1], b[1], ny, dx)
+            .map(|j| [sim.uidx(i, j), if i > 0 { sim.idx(i - 1, j) } else { usize::MAX }, side(i, nx, sim.idx(i.min(nx - 1), j))])
+            .collect();
+        (true, faces)
+    } else if a[1] == b[1] && a[0] != b[0] && a[1] >= -0.5 * dx && a[1] <= ly + 0.5 * dx {
+        let j = ((a[1] / dx).round().max(0.0) as usize).min(ny);
+        let faces = span(a[0], b[0], nx, dx)
+            .map(|i| [sim.vidx(i, j), if j > 0 { sim.idx(i, j - 1) } else { usize::MAX }, side(j, ny, sim.idx(i, j.min(ny - 1)))])
+            .collect();
+        (false, faces)
+    } else {
+        (true, vec![])
+    };
+    if faces.is_empty() {
+        return Err(format!("la ligne {} {} est hors du domaine", fmt_point(a), fmt_point(b)));
+    }
+    Ok((vertical, faces))
+}
+
+/// rangées (colonnes) dont le centre est entre c1 et c2 (m) ; à défaut, celle du milieu du segment (aucune hors du domaine)
+fn span(c1: f64, c2: f64, n: usize, dx: f64) -> std::ops::Range<usize> {
+    let (lo, hi) = (c1.min(c2) / dx - 0.5, c1.max(c2) / dx - 0.5);
+    let k0 = (lo - 1e-9).ceil().max(0.0) as usize;
+    let k1 = (((hi + 1e-9).floor() + 1.0).max(0.0) as usize).min(n);
+    if k0 < k1 {
+        return k0..k1;
+    }
+    let m = 0.5 * (lo + hi) + 0.5;
+    if m < 0.0 || m > n as f64 {
+        return 0..0;
+    }
+    let k = (m.floor() as usize).min(n - 1);
+    k..k + 1
+}
+
 /// points voisins d'une position s (en points de la grille, bornée à [0, n − 1]) et poids du second
 fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
     let s = s.clamp(0.0, (n - 1) as f64);
@@ -1104,8 +1181,38 @@ fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
 
 impl Probe {
     fn value(&self, sim: &MultiphaseSim) -> f64 {
+        if let ProbeKind::Flux { phase, mass, vertical, faces, slots, last } = &self.kind {
+            // débit moyen depuis le relevé précédent : ce qu'a compté le transport ; au premier relevé, l'estimation instantanée
+            let np = sim.reg.phases.len();
+            let off = if *mass { np } else { 0 };
+            let total: f64 = slots
+                .iter()
+                .map(|&s| {
+                    let b = 2 * s * np + off;
+                    match phase {
+                        Some(k) => sim.flux_acc[b + k],
+                        None => sim.flux_acc[b..b + np].iter().sum(),
+                    }
+                })
+                .sum();
+            let t = sim.time;
+            return match last.get() {
+                Some((t0, a0, _)) if t > t0 => {
+                    let q = (total - a0) / (t - t0);
+                    last.set(Some((t, total, q)));
+                    q
+                }
+                Some((_, _, q)) => q,
+                None => {
+                    let q = flux_value(sim, *phase, *mass, *vertical, faces);
+                    last.set(Some((t, total, q)));
+                    q
+                }
+            };
+        }
         let a2 = sim.dx * sim.dx;
         match self.kind {
+            ProbeKind::Flux { .. } => unreachable!(),
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
@@ -1272,6 +1379,7 @@ impl Runner {
             wall: Instant::now(),
             proto,
         };
+        r.watch_flux_lines()?;
         r.compile_measures()?;
         r.log_header();
         if gpu.or(r.proto.gpu).unwrap_or(false) {
@@ -1288,6 +1396,32 @@ impl Runner {
             }
         }
         Ok(r)
+    }
+
+    /// Réserve les emplacements des faces de toutes les lignes de débit du protocole (mesures et conditions d'arrêt), avant la
+    /// création du GPU qui en fixe la place.
+    fn watch_flux_lines(&mut self) -> Result<(), String> {
+        let mut lines = vec![];
+        for (m, _) in &self.proto.measures {
+            if let Measure::Flux { a, b, .. } = m {
+                lines.push((*a, *b));
+            }
+        }
+        for (s, _) in &self.proto.steps {
+            if let Step::UntilCond { clauses, .. } = s {
+                for c in clauses {
+                    if let Measure::Flux { a, b, .. } = &c.measure {
+                        lines.push((*a, *b));
+                    }
+                }
+            }
+        }
+        for (a, b) in lines {
+            let (vertical, faces) = flux_faces(&self.sim, a, b)?;
+            let idx: Vec<usize> = faces.iter().map(|f| f[0]).collect();
+            self.sim.watch_faces(vertical, &idx);
+        }
+        Ok(())
     }
 
     fn enable_gpu(&mut self) {
@@ -1400,6 +1534,29 @@ impl Runner {
                 }
                 let name = label.clone().unwrap_or_else(|| format!("force {} sur {}", ["x", "y"][*axis], zone.label()));
                 (Probe { kind: ProbeKind::SolidForce(*axis), cells, fluid_only: false }, name, "N/m".to_string())
+            }
+            Measure::Flux { fluid, mass, a, b, label } => {
+                let phase = match fluid {
+                    Some(f) => Some(find_phase(&self.sim, f)?),
+                    None => None,
+                };
+                let (vertical, faces) = flux_faces(&self.sim, *a, *b)?;
+                // emplacements des faces, réservés au départ (`watch_flux_lines`)
+                let slots_of = if vertical { &self.sim.flux_slot_u } else { &self.sim.flux_slot_v };
+                let slots: Vec<usize> = faces.iter().map(|f| slots_of.get(f[0]).map_or(usize::MAX, |&s| s as usize)).collect();
+                if slots.iter().any(|&s| s == u32::MAX as usize || s == usize::MAX) {
+                    return Err(format!("débit à travers ligne {} {} : faces non suivies (ligne ajoutée après le départ)", fmt_point(*a), fmt_point(*b)));
+                }
+                let what = match fluid {
+                    Some(f) => format!("{f} "),
+                    None => String::new(),
+                };
+                let name = label
+                    .clone()
+                    .unwrap_or_else(|| format!("débit {}{what}à travers ligne {} {}", if *mass { "massique " } else { "" }, fmt_point(*a), fmt_point(*b)));
+                let unit = if *mass { "kg/(m·s)" } else { "m²/s" };
+                let kind = ProbeKind::Flux { phase, mass: *mass, vertical, faces, slots, last: std::cell::Cell::new(None) };
+                (Probe { kind, cells: vec![], fluid_only: true }, name, unit.to_string())
             }
         }))
     }

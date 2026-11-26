@@ -531,6 +531,7 @@ impl MultiphaseSim {
                 self.mass[k][r] += dm;
                 self.eg[g][d] -= de;
                 self.eg[g][r] += de;
+                self.count_transfer(k, d, r, vol * self.alpha[k][d] / af[d], dm);
             }
             touched[d] = true;
             touched[r] = true;

@@ -181,6 +181,9 @@ impl Layout {
     fn o(&self, name: &str) -> usize {
         self.map.get(name).unwrap_or_else(|| panic!("tampon GPU inconnu : {name}")).0
     }
+    fn len(&self, name: &str) -> usize {
+        self.map.get(name).unwrap_or_else(|| panic!("tampon GPU inconnu : {name}")).1
+    }
 }
 
 /// une commande de calcul : noyau, groupes de travail, emplacement de paramètres de lancement (décalage dynamique)
@@ -210,6 +213,7 @@ pub struct GpuStepInfo {
 #[derive(Clone, Default)]
 struct Baselines {
     boundary_flux: Vec<f64>,
+    flux_acc: Vec<f64>,
     transferred: Vec<f64>,
     energy_input: f64,
     chem_heat: f64,
@@ -333,6 +337,9 @@ impl MultiphaseGpu {
         for name in ["acc_on", "acc_x", "acc_y", "th_kind", "th_val", "heat_t", "ovl"] {
             sl.add(name, n);
         }
+        // faces suivies par les mesures de débit (`watch_faces`) : emplacement + 1, 0 pour aucune
+        sl.add("fw_u", nfu);
+        sl.add("fw_v", nfv);
         let pers_start = sl.total;
         sl.add("mass", np * n);
         sl.add("eps", n);
@@ -363,6 +370,8 @@ impl MultiphaseGpu {
         sl.add("acc_chem", n);
         sl.add("acc_xi", nre.max(1) * n);
         sl.add("acc_fu", nfus.max(1) * n);
+        // volume et masse de chaque phase passés par les faces suivies (comme `flux_acc`), depuis la dernière relecture
+        sl.add("flacc", sim.flux_acc.len());
         let pers_end = sl.total;
         // prédicteur-correcteur : u^{n+1} prédit, instantané de l'état persistant et de D
         sl.add("Up", nfu);
@@ -1085,6 +1094,16 @@ impl MultiphaseGpu {
                 }
             }
         }
+        // faces suivies par les mesures de débit (emplacements prévus à la création ; leurs cumuls repartent de zéro sur le GPU)
+        let cap = self.sl.len("flacc") / (2 * self.np.max(1));
+        for (name, slots) in [("fw_u", &sim.flux_slot_u), ("fw_v", &sim.flux_slot_v)] {
+            let o = self.sl.o(name);
+            for (f, &w) in slots.iter().enumerate() {
+                if w != u32::MAX && (w as usize) < cap {
+                    s[o + f] = (w + 1) as f32;
+                }
+            }
+        }
         self.queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(&s));
         // scalaires dynamiques
         let mut d = vec![0f32; D_LEN];
@@ -1098,6 +1117,7 @@ impl MultiphaseGpu {
         self.queue.write_buffer(&self.d_buf, 0, bytemuck::cast_slice(&d));
         self.base = Baselines {
             boundary_flux: sim.boundary_flux.clone(),
+            flux_acc: sim.flux_acc.clone(),
             transferred: sim.transferred.clone(),
             energy_input: sim.energy_input,
             chem_heat: sim.chem_heat,
@@ -1234,6 +1254,12 @@ impl MultiphaseGpu {
             self.base.frozen[q] += sum("acc_fu", q);
         }
         sim.frozen.clone_from(&self.base.frozen);
+        // débits suivis : emplacements prévus à la création du GPU (les autres restent ceux de l'hôte)
+        let o_fl = o("flacc");
+        for (i, a) in self.base.flux_acc.iter_mut().enumerate().take(self.sl.len("flacc")) {
+            *a += data[o_fl + i] as f64;
+        }
+        sim.flux_acc.clone_from(&self.base.flux_acc);
         sim.boundary_flux.clone_from(&self.base.boundary_flux);
         sim.transferred.clone_from(&self.base.transferred);
         sim.energy_input = self.base.energy_input;

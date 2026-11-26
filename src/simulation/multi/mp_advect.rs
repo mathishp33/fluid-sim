@@ -416,6 +416,7 @@ impl MultiphaseSim {
             let egp: Vec<SyncPtr<f64>> = self.eg.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
             let ep = SyncPtr(self.e.as_mut_ptr());
             let mfp = SyncPtr(if dir == 0 { self.mfx.as_mut_ptr() } else { self.mfy.as_mut_ptr() });
+            let fap = SyncPtr(self.flux_acc.as_mut_ptr());
             let (bvp, bkp) = (SyncPtr(bval.as_mut_ptr()), SyncPtr(bkind.as_mut_ptr()));
             let (ffr, dr, rr, igr, gtr, ftr, fgr, t_old) = (&ff, &donor, &recv, &inflow_ghost, &ghost_t, &face_t, &face_g, &t_old);
             let this = &*self;
@@ -429,6 +430,9 @@ impl MultiphaseSim {
                     let (d, r) = (dr[f], rr[f]);
                     let mut efg = [0.0f64; MAX_PHASES];
                     let mut mtot = 0.0;
+                    // face suivie par une mesure de débit (f : indice de la face dans u ou v) : volume et masse de chaque phase, signés
+                    let slot = if dir == 0 { this.flux_slot_u.get(f) } else { this.flux_slot_v.get(f) }.map_or(u32::MAX, |&s| s);
+                    let sgn = if dir == 0 { this.u[f].signum() } else { this.v[f].signum() };
                     // SAFETY (tout le bloc) : les cellules d et r appartiennent à la ligne (colonne) traitée par ce fil ; la face f aussi
                     unsafe {
                         for k in 0..np {
@@ -452,6 +456,11 @@ impl MultiphaseSim {
                             // jamais plus que la masse présente dans la donneuse (traces : α ≈ 0 et masse volumique de repli EOS)
                             let mf = if d != usize::MAX { (fk * rho_d).min((*mp[k].at(d)).max(0.0)) } else { fk * rho_d };
                             mtot += mf;
+                            if slot != u32::MAX {
+                                let b = 2 * slot as usize * np;
+                                *fap.at(b + k) += sgn * fk * a2;
+                                *fap.at(b + np + k) += sgn * mf * a2;
+                            }
                             efg[this.group_of[k]] += mf * this.reg.phases[k].e_int(t_d);
                             if d != usize::MAX {
                                 *awp[k].at(d) -= fk;

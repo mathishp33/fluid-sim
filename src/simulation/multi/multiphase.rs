@@ -146,6 +146,15 @@ pub struct MultiphaseSim {
     pub(crate) mfx: Vec<f64>,
     pub(crate) mfy: Vec<f64>,
     pub(crate) m_tot_old: Vec<f64>,
+    /// débits suivis (mesure « débit … à travers ligne ») : emplacement de chaque face de u et de v suivie (u32::MAX : aucune ; vides
+    /// tant qu'aucune face n'est suivie) ; volume et masse de chaque phase passés par chaque emplacement depuis le début, comptés par
+    /// le transport PLIC (m² et kg par m de profondeur, signés vers +x / +y) : `flux_acc[(2 · emplacement + 0 | 1) · np + k]`
+    #[serde(skip)]
+    pub(crate) flux_slot_u: Vec<u32>,
+    #[serde(skip)]
+    pub(crate) flux_slot_v: Vec<u32>,
+    #[serde(skip)]
+    pub flux_acc: Vec<f64>,
     /// advection de la quantité de mouvement conservative, cohérente avec les flux de masse du VOF (défaut) ; false = semi-lagrangien
     pub conservative_momentum: bool,
     /// Prédicteur-correcteur : le pas est d'abord calculé normalement (prédiction de u^{n+1}), puis refait depuis l'état n en
@@ -379,6 +388,9 @@ impl MultiphaseSim {
             mfx: vec![0.0; (nx + 1) * ny],
             mfy: vec![0.0; nx * (ny + 1)],
             m_tot_old: vec![0.0; n],
+            flux_slot_u: vec![],
+            flux_slot_v: vec![],
+            flux_acc: vec![],
             conservative_momentum: true,
             predictor_corrector: false,
             flame_thermo_substeps: 4,
@@ -435,6 +447,49 @@ impl MultiphaseSim {
     #[inline]
     pub fn vidx(&self, i: usize, j: usize) -> usize {
         j * self.nx + i
+    }
+    /// Suit ce qui passe par des faces de u (`vertical`) ou de v (indices) : emplacement de chaque face dans `flux_acc`, nouveau (à
+    /// zéro) si elle n'était pas encore suivie. Sur le GPU, à faire avant sa création (la place des emplacements y est fixée).
+    pub fn watch_faces(&mut self, vertical: bool, faces: &[usize]) -> Vec<usize> {
+        let np = self.reg.phases.len();
+        if self.flux_slot_u.is_empty() {
+            self.flux_slot_u = vec![u32::MAX; (self.nx + 1) * self.ny];
+            self.flux_slot_v = vec![u32::MAX; self.nx * (self.ny + 1)];
+        }
+        let mut out = vec![];
+        for &f in faces {
+            let n_slots = self.flux_acc.len() / (2 * np);
+            let s = if vertical { &mut self.flux_slot_u[f] } else { &mut self.flux_slot_v[f] };
+            if *s == u32::MAX {
+                *s = n_slots as u32;
+                self.flux_acc.resize((n_slots + 1) * 2 * np, 0.0);
+            }
+            out.push(*s as usize);
+        }
+        out
+    }
+    /// Volume `vol` (fraction de maille) et masse `dm` (kg/m³ de maille) de la phase k passés de la maille d à sa voisine r hors du
+    /// transport PLIC (sédimentation des grains, percolation) : comptés si leur face commune est suivie (débits mesurés).
+    #[inline]
+    pub(crate) fn count_transfer(&mut self, k: usize, d: usize, r: usize, vol: f64, dm: f64) {
+        if self.flux_slot_u.is_empty() {
+            return;
+        }
+        let (lo, hi) = (d.min(r), d.max(r));
+        let (i, j) = (hi % self.nx, hi / self.nx);
+        let slot = if hi == lo + 1 && i > 0 {
+            self.flux_slot_u[self.uidx(i, j)]
+        } else if hi == lo + self.nx {
+            self.flux_slot_v[self.vidx(i, j)]
+        } else {
+            return;
+        };
+        if slot != u32::MAX {
+            let (np, a2, sgn) = (self.reg.phases.len(), self.dx * self.dx, if r > d { 1.0 } else { -1.0 });
+            let b = 2 * slot as usize * np;
+            self.flux_acc[b + k] += sgn * vol * a2;
+            self.flux_acc[b + np + k] += sgn * dm * a2;
+        }
     }
     pub fn is_solid(&self, c: usize) -> bool {
         self.solid[c] >= 0

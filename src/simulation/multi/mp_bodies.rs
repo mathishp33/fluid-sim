@@ -1096,6 +1096,7 @@ impl super::multiphase::MultiphaseSim {
             let m = self.mass[k][from] * q;
             self.mass[k][from] -= m;
             self.mass[k][to] += m;
+            self.count_transfer(k, from, to, q * self.alpha[k][from], m);
         }
         for g in 0..self.eg.len() {
             let e = self.eg[g][from] * q;

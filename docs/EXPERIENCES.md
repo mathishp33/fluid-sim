@@ -195,6 +195,14 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
     moment du relevé : la pression de chaque maille fluide voisine, ramenée par l'hydrostatique au centre de la face commune. Les
     parois glissent : pas de frottement. Une face contre le bord du domaine ne reçoit rien (un solide posé sur le fond y est plaqué
     par la pression d'au-dessus) ;
+  - `débit [massique] ["fluide"] à travers ligne (x1, y1) (x2, y2)` : débit volumique (m²/s, soit m³/s par mètre de profondeur)
+    ou massique (kg/(m·s)) d'un fluide pur, ou de tout ce qui passe (fluides et grains), à travers une ligne verticale (même x aux
+    deux bouts) ou horizontale (même y). Elle suit la ligne de faces des mailles la plus proche, sur les faces dont le milieu est
+    entre ses extrémités. Positif vers +x (ligne verticale) ou +y (horizontale). C'est le débit MOYEN depuis le relevé précédent,
+    compté par le solveur lui-même : transport des phases, chute des grains dans le fluide, percolation, fluide chassé par un corps.
+    Débit × durée, sommé sur les intervalles des relevés, donne donc exactement ce qui a passé (au bit près sur le CPU, à la
+    précision du f32 sur le GPU). Au premier relevé, faute d'intervalle, c'est une estimation instantanée : vitesse des faces ×
+    contenu de la maille amont ;
   - `stats` : dt, itérations de pression, pas refaits, masse de chaque fluide, énergies cinétique et interne, T et p extrêmes,
     vitesse maximale, chaleur injectée, et, s'il y a de la chimie, chaleur de réaction, puissance chimique et énergie rayonnée.
 - **Libellés** : `comme "nom"` donne le titre de la colonne.
@@ -277,7 +285,9 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   - balayage ;
   - zones (un disque redonne exactement le pinceau) ;
   - champs CSV, PNG et formules, la fermeture restant juste ;
-  - échéances exactes ; mesurer sans effet sur le résultat ; même résultat avec 1 et 3 fils ;
+  - échéances exactes ; mesurer sans effet sur le résultat (débit compris) ; même résultat avec 1 et 3 fils ;
+  - sondes interpolées (champs linéaires rendus exactement) ; débit à travers une ligne : valeurs exactes sur un champ uniforme, débit
+    intégré égal à la masse passée (rupture de barrage, sable qui sédimente ; CPU au bit près, GPU) ;
   - chauffage tenu puis relâché ;
   - sorties ; reprise depuis un état enregistré au bit près ;
   - ligne de commande avec balayage ; protocoles d'exemple ;
@@ -288,7 +298,8 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 
 - Pas de boucles, hormis le balayage. Une condition d'arrêt (`simuler jusqu'à ce que …`) relie ses comparaisons par « et » ou par
   « ou », pas les deux à la fois : il n'y a pas de parenthèses.
-- Il n'y a pas de flux à travers une ligne.
+- Une ligne de débit est horizontale ou verticale (elle suit les faces des mailles) ; un débit à travers une ligne oblique se
+  mesure en ligne brisée, par plusieurs mesures.
 - Les gestes faits pendant une expérience ne sont pas enregistrés : la fenêtre ne peint qu'en mode « Conditions initiales ».
   Enregistrer en actions datées (« à t = 1.2 s, chauffer … ») ce que l'on fait à la souris pendant une expérience serait la suite.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,

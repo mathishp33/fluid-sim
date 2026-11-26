@@ -148,6 +148,18 @@ fn k_settle_delta(@builtin(global_invocation_id) g: vec3<u32>) {
         let de = dm * erel_k(s, tgrp(gs, dn));
         S[O_sdm + s * n + c] += select(dm, -dm, out);
         S[O_sde + gs * n + c] += select(de, -de, out);
+        // face gauche ou basse de c suivie par une mesure de débit (comptée une fois, par sa maille haute) : grains vers + si v > 0, le
+        // fluide en sens inverse (miroir de count_transfer)
+        var fw = 0u;
+        if (live && q == 0u) { fw = u32(S[O_fw_u + uidx(i, j)]); }
+        if (live && q == 2u) { fw = u32(S[O_fw_v + vidx(i, j)]); }
+        let fb = (max(fw, 1u) - 1u) * 2u * np;
+        let gsg = select(-1.0, 1.0, v > 0.0);
+        let a2 = P.dx * P.dx;
+        if (fw > 0u && dm > 0.0) {
+            S[O_flacc + fb + s] += gsg * dm * max(alpha(s, dn), 0.0) / max(mass(s, dn), 1e-30) * a2;
+            S[O_flacc + fb + np + s] += gsg * dm * a2;
+        }
         // le même volume de fluide de la receveuse remonte (composition et températures de la receveuse)
         let fr = max(fluid_fraction(rc), 1e-30);
         for (var k = 0u; k < np; k++) {
@@ -158,6 +170,10 @@ fn k_settle_delta(@builtin(global_invocation_id) g: vec3<u32>) {
             let dek = dmk * erel_k(k, tgrp(gk, rc));
             S[O_sdm + k * n + c] += select(-dmk, dmk, out);
             S[O_sde + gk * n + c] += select(-dek, dek, out);
+            if (fw > 0u && use_) {
+                S[O_flacc + fb + k] -= gsg * vol * alpha(k, rc) / fr * a2;
+                S[O_flacc + fb + np + k] -= gsg * dmk * a2;
+            }
         }
     }
     S[O_sdm + np * n + c] = select(0.0, 1.0, touched);

@@ -73,7 +73,7 @@ struct Snapshot {
     rho_mix: Vec<f64>, mu_cell: Vec<f64>, k_cell: Vec<f64>, boundary_flux: Vec<f64>, transferred: Vec<f64>, frozen: Vec<f64>, fusion_front: Vec<Vec<f64>>,
     energy_input: f64, tp_mix: super::mp_cells::TpMix,
     flame_factor: Vec<f64>, heat_release: Vec<f64>, chem_heat: f64, radiated: f64, reacted: Vec<f64>, dt_chem: f64,
-    mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>,
+    mfx: Vec<f64>, mfy: Vec<f64>, m_tot_old: Vec<f64>, flux_acc: Vec<f64>,
     time: f64, last_dt: f64, last_pressure_iters: usize, step_count: usize,
     dt_phase: f64, pressure_clamped: Vec<bool>,
     /// corps rigides (vide sans corps ; leurs fractions et faces se recalculent depuis leur position) et ressorts de leurs contacts
@@ -220,7 +220,7 @@ impl MultiphaseSim {
             energy_input: self.energy_input, tp_mix: self.tp_mix.clone(),
             flame_factor: self.flame_factor.clone(), heat_release: self.heat_release.clone(), chem_heat: self.chem_heat,
             radiated: self.radiated, reacted: self.reacted.clone(), dt_chem: self.dt_chem,
-            mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(),
+            mfx: self.mfx.clone(), mfy: self.mfy.clone(), m_tot_old: self.m_tot_old.clone(), flux_acc: self.flux_acc.clone(),
             time: self.time, last_dt: self.last_dt, last_pressure_iters: self.last_pressure_iters, step_count: self.step_count,
             dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
             bodies: self.bodies.clone(),
@@ -238,7 +238,7 @@ impl MultiphaseSim {
         self.energy_input = s.energy_input; self.tp_mix.clone_from(&s.tp_mix);
         self.flame_factor.clone_from(&s.flame_factor); self.heat_release.clone_from(&s.heat_release); self.chem_heat = s.chem_heat;
         self.radiated = s.radiated; self.reacted.clone_from(&s.reacted); self.dt_chem = s.dt_chem;
-        self.mfx.clone_from(&s.mfx); self.mfy.clone_from(&s.mfy); self.m_tot_old.clone_from(&s.m_tot_old);
+        self.mfx.clone_from(&s.mfx); self.mfy.clone_from(&s.mfy); self.m_tot_old.clone_from(&s.m_tot_old); self.flux_acc.clone_from(&s.flux_acc);
         self.time = s.time; self.last_dt = s.last_dt; self.last_pressure_iters = s.last_pressure_iters; self.step_count = s.step_count;
         self.dt_phase = s.dt_phase; self.pressure_clamped.clone_from(&s.pressure_clamped);
         if self.has_bodies() || !s.bodies.is_empty() {

@@ -208,6 +208,7 @@ impl MultiphaseSim {
                 self.mass[s][r] += dm;
                 self.eg[gs][d] -= de;
                 self.eg[gs][r] += de;
+                self.count_transfer(s, d, r, if rho_s > 0.0 { dm / rho_s } else { 0.0 }, dm);
                 // le même volume de fluide de la receveuse remonte (composition et températures de la receveuse)
                 let fluid_r: f64 = (0..np).filter(|&k| !self.reg.phases[k].is_granular()).map(|k| alpha0[k][r]).sum();
                 for k in 0..np {
@@ -221,6 +222,7 @@ impl MultiphaseSim {
                     self.mass[k][d] += dmk;
                     self.eg[gk][r] -= dek;
                     self.eg[gk][d] += dek;
+                    self.count_transfer(k, r, d, vol * alpha0[k][r] / fluid_r, dmk);
                 }
                 touched[d] = true;
                 touched[r] = true;

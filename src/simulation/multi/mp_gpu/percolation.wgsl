@@ -248,6 +248,14 @@ fn k_perc_delta(@builtin(global_invocation_id) g: vec3<u32>) {
         let af = S[O_pq_a + dn];
         let use_ = vol > 0.0 && af > 1e-12;
         touched = touched || use_;
+        // face gauche ou basse de c suivie par une mesure de débit (comptée une fois, par sa maille haute) : vers − si le fluide sort
+        // de c (miroir de count_transfer)
+        var fw = 0u;
+        if (use_ && q == 0u) { fw = u32(S[O_fw_u + uidx(i, j)]); }
+        if (use_ && q == 2u) { fw = u32(S[O_fw_v + vidx(i, j)]); }
+        let fb = (max(fw, 1u) - 1u) * 2u * np;
+        let psg = select(1.0, -1.0, out);
+        let a2 = P.dx * P.dx;
         for (var k = 0u; k < np; k++) {
             let mk = mass(k, dn);
             let take = use_ && !gran_k(k) && mk > 0.0;
@@ -256,6 +264,10 @@ fn k_perc_delta(@builtin(global_invocation_id) g: vec3<u32>) {
             let de = dm * erel_k(k, tgrp(gk, dn));
             S[O_sdm + k * n + c] += select(dm, -dm, out);
             S[O_sde + gk * n + c] += select(de, -de, out);
+            if (fw > 0u && take) {
+                S[O_flacc + fb + k] += psg * vol * alpha(k, dn) / max(af, 1e-30) * a2;
+                S[O_flacc + fb + np + k] += psg * dm * a2;
+            }
         }
     }
     S[O_sdm + np * n + c] = select(0.0, 1.0, touched);

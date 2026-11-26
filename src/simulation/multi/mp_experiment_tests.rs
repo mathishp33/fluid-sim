@@ -247,7 +247,7 @@ fn value_fields_from_csv_png_and_formulas_set_a_consistent_initial_state() {
 const TIMING: &str = "\
 départ scénario \"barrage\" grille 40 x 30 maille 1 cm
 pas max 1 ms
-mesurer toutes les 4 ms : stats, T en (0.05, 0.05), max vitesse dans partout
+mesurer toutes les 4 ms : stats, T en (0.05, 0.05), max vitesse dans partout, débit massique \"eau\" à travers ligne (0.1, 0) (0.1, 0.3)
 simuler 12.3 ms
 chauffer disque (0.05, 0.05) rayon 2 cm à 330 K pendant 7 ms
 accélérer rect (0.2, 0) (0.3, 0.05) de (0, 20) pendant 3 ms
@@ -275,8 +275,9 @@ fn actions_land_exactly_on_their_time_and_measuring_does_not_change_the_result()
     }
     assert_eq!(r.columns.len(), r.rows[0].len());
     assert!(r.columns[2].starts_with("T en (0.05, 0.05)"), "{:?}", r.columns);
-    // la même expérience sans mesures : état final identique au bit près
-    let quiet = run(&TIMING.replace("mesurer toutes les 4 ms : stats, T en (0.05, 0.05), max vitesse dans partout\n", ""), None);
+    // la même expérience sans mesures (le débit fait compter le transport sur ses faces) : état final identique au bit près
+    let quiet = run(&TIMING.replace("mesurer toutes les 4 ms : stats, T en (0.05, 0.05), max vitesse dans partout, débit massique \"eau\" à travers ligne (0.1, 0) (0.1, 0.3)\n", ""), None);
+    assert!(r.rows.iter().any(|row| row[4] > 0.1), "l'eau passe x = 10 cm : {:?}", r.rows.iter().map(|row| row[4]).collect::<Vec<_>>());
     assert_eq!(bincode::serialize(&quiet.sim).unwrap(), bincode::serialize(&r.sim).unwrap(), "mesurer a changé le résultat");
     // rejouée : mêmes nombres
     let again = run(TIMING, None);
@@ -592,6 +593,140 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
     assert!(log.contains("corps 1 y < -1 m non atteint au bout du temps permis"), "{log}");
     assert!(log.contains("corps 1 y < 1 m déjà vrai"), "{log}");
     assert!((r.sim.time - (t1 + 0.01 + 0.02)).abs() < 2e-6, "durées suivantes : t = {} (attendu {})", r.sim.time, t1 + 0.03);
+}
+
+#[test]
+fn the_flow_rate_through_a_line_is_measured_along_the_faces() {
+    // lecture
+    let p = proto("départ scénario \"cuve vide\"\nmesurer toutes les 1 ms : débit massique \"eau\" à travers ligne (0.1, 0) (0.1, 0.2) comme \"q\", débit à travers ligne (0, 0.1) (0.3, 0.1)\n");
+    assert_eq!(p.measures[0].0, Measure::Flux { fluid: Some("eau".into()), mass: true, a: [0.1, 0.0], b: [0.1, 0.2], label: Some("q".into()) });
+    assert_eq!(p.measures[1].0, Measure::Flux { fluid: None, mass: false, a: [0.0, 0.1], b: [0.3, 0.1], label: None });
+    for (bad, what) in [
+        ("débit à travers ligne (0.1, 0) (0.2, 0.1)", "horizontale ou verticale"),
+        ("débit \"eau\" ligne (0.1, 0) (0.1, 0.1)", "à travers ligne"),
+        ("débit à travers (0.1, 0) (0.1, 0.1)", "à travers ligne"),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\nmesurer toutes les 1 ms : {bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    let e = Runner::new(proto("départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm\nmesurer toutes les 1 ms : débit à travers ligne (0.5, 0) (0.5, 0.1)\nsimuler 1 ms\n"), Path::new("."), None, Some(false)).err().unwrap();
+    assert!(e.contains("hors du domaine"), "{e}");
+
+    // champ de vitesse uniforme au départ, eau au fond (5 rangées), air au-dessus : débits exacts
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+remplir rect (0, 0) (0.1, 0.05) avec \"eau\"
+champ vx formule \"0.2\"
+champ vy formule \"-0.1\"
+mesurer toutes les 1 ms : débit à travers ligne (0.05, 0) (0.05, 0.1), débit \"eau\" à travers ligne (0.05, 0) (0.05, 0.1), débit massique \"eau\" à travers ligne (0.05, 0) (0.05, 0.1), débit à travers ligne (0, 0.03) (0.1, 0.03), débit \"air\" à travers ligne (0, 0.03) (0.1, 0.03), débit à travers ligne (0.02, 0.06) (0.08, 0.06) comme \"q\"
+simuler 1 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert_eq!(r.columns[3], "débit eau à travers ligne (0.05, 0) (0.05, 0.1) (m²/s)", "{:?}", r.columns);
+    assert_eq!(r.columns[4], "débit massique eau à travers ligne (0.05, 0) (0.05, 0.1) (kg/(m·s))");
+    assert_eq!(r.columns[7], "q (m²/s)");
+    let row = &r.rows[0];
+    assert_eq!(row[0], 0.0);
+    // tout le fluide : 0.2 m/s sur 10 cm ; l'eau : sur 5 cm ; à travers y = 3 cm, l'eau descend (maille amont : celle du dessus) ; à
+    // travers y = 6 cm, de x = 2 à 8 cm, l'air descend
+    for (k, w) in [(2, 0.02), (3, 0.01), (5, -0.01), (6, 0.0), (7, -0.006)] {
+        assert!((row[k] - w).abs() < 1e-12, "{} : {} au lieu de {w}", r.columns[k], row[k]);
+    }
+    assert!(row[4] / row[3] > 990.0 && row[4] / row[3] < 1005.0, "masse volumique de l'eau : {}", row[4] / row[3]);
+
+    // le débit relevé est le débit moyen depuis le relevé précédent, compté par le transport : débit × durée, sommé sur les intervalles,
+    // donne exactement la masse passée. Bilan (masse passée au plus, plus grand écart) ; `sign` : −1 pour une zone du côté −
+    let balance = |r: &Runner, sign: f64| -> (f64, f64) {
+        let (m0, mut acc, mut worst, mut m_max) = (r.rows[0][2], 0.0f64, 0.0f64, 0.0f64);
+        for w in r.rows.windows(2) {
+            acc += sign * w[1][3] * (w[1][0] - w[0][0]);
+            worst = worst.max((acc - (w[1][2] - m0)).abs());
+            m_max = m_max.max((w[1][2] - m0).abs());
+        }
+        (m_max, worst)
+    };
+    // rupture de barrage : l'eau qui passe x = 20 cm est celle qui s'accumule à droite
+    let dam = "départ scénario \"Rupture de barrage\" grille 40 x 30 maille 1 cm
+mesurer toutes les 2 ms : masse \"eau\" dans rect (0.2, 0) (0.4, 0.3), débit massique \"eau\" à travers ligne (0.2, 0) (0.2, 0.3)
+simuler 0.3 s
+";
+    let mut r = Runner::new(proto(dam), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (m_max, worst) = balance(&r, 1.0);
+    eprintln!("barrage (CPU) : {m_max:.4} kg/m passés à droite au plus, écart au débit intégré {worst:.2e} kg/m");
+    assert!(m_max > 2.0, "l'eau n'est pas arrivée à droite : {m_max}");
+    assert!(worst < 1e-9 * m_max, "débit intégré et masse accumulée : écart {worst} pour {m_max}");
+    // sable qui tombe dans l'eau : le débit des grains compte aussi leur chute à travers le fluide (sédimentation)
+    let sand = "départ scénario \"sédimentation\" grille 15 x 20 maille 2 cm
+mesurer toutes les 10 ms : masse \"sable\" dans rect (0, 0) (0.3, 0.12), débit massique \"sable\" à travers ligne (0, 0.12) (0.3, 0.12)
+simuler 1.5 s
+";
+    let mut s = Runner::new(proto(sand), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut s);
+    let (s_max, s_worst) = balance(&s, -1.0);
+    eprintln!("sédimentation (CPU) : {s_max:.4} kg/m de sable passés sous 12 cm au plus, écart {s_worst:.2e} kg/m");
+    assert!(s_max > 0.5, "le sable n'est pas descendu sous 12 cm : {s_max}\n{}", s.log.join("\n"));
+    assert!(s_worst < 1e-9 * s_max, "sable : écart {s_worst} pour {s_max}");
+    // disque poussé à travers la ligne : l'eau qu'il chasse de maille en maille est comptée aussi
+    let body = "départ scénario \"cuve vide\" grille 30 x 20 maille 1 cm
+remplir rect (0, 0) (0.3, 0.12) avec \"eau\"
+corps disque (0.08, 0.06) rayon 2 cm \"acier\" vitesse (0.3, 0)
+mesurer toutes les 5 ms : masse \"eau\" dans rect (0.15, 0) (0.3, 0.2), débit massique \"eau\" à travers ligne (0.15, 0) (0.15, 0.2)
+simuler 0.3 s
+";
+    let mut b = Runner::new(proto(body), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut b);
+    let (b_max, b_worst) = balance(&b, 1.0);
+    eprintln!("corps poussé (CPU) : {b_max:.4} kg/m d'écart de masse à droite au plus, écart au débit intégré {b_worst:.2e} kg/m");
+    assert!(b.sim.bodies[0].pos[0] > 0.16 && b_max > 0.1, "le disque n'a pas passé la ligne : x = {}, {b_max}", b.sim.bodies[0].pos[0]);
+    assert!(b_worst < 1e-9 * b_max, "corps : écart {b_worst} pour {b_max}");
+    // lit fluidisé : l'air traverse le lit tassé par ses pores (percolation) ; entre deux lignes, la masse d'air et de sable change de
+    // ce qui entre par l'une moins ce qui sort par l'autre
+    let bed = "départ scénario \"lit fluidisé\" grille 20 x 40 maille 1 cm
+mesurer toutes les 5 ms : masse \"air\" dans rect (0, 0.05) (0.2, 0.1), débit massique \"air\" à travers ligne (0, 0.05) (0.2, 0.05), débit massique \"air\" à travers ligne (0, 0.1) (0.2, 0.1), masse \"sable grossier\" dans rect (0, 0.05) (0.2, 0.1), débit massique \"sable grossier\" à travers ligne (0, 0.05) (0.2, 0.05), débit massique \"sable grossier\" à travers ligne (0, 0.1) (0.2, 0.1)
+simuler 0.2 s
+";
+    let between = |r: &Runner, c: usize| -> (f64, f64, f64) {
+        let (m0, mut acc, mut worst, mut m_max, mut through) = (r.rows[0][c], 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for w in r.rows.windows(2) {
+            let dt = w[1][0] - w[0][0];
+            acc += (w[1][c + 1] - w[1][c + 2]) * dt;
+            through += w[1][c + 1].abs() * dt;
+            worst = worst.max((acc - (w[1][c] - m0)).abs());
+            m_max = m_max.max((w[1][c] - m0).abs());
+        }
+        (m_max, through, worst)
+    };
+    let mut f = Runner::new(proto(bed), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut f);
+    for (c, what) in [(2, "air"), (5, "sable")] {
+        let (m_max, through, worst) = between(&f, c);
+        eprintln!("lit fluidisé (CPU), {what} : passé {through:.4e} kg/m, variation {m_max:.4e} kg/m, écart {worst:.2e} kg/m");
+        assert!(through > 1e-3 && worst < 1e-9 * through.max(m_max), "lit, {what} : écart {worst} pour {through}");
+    }
+
+    // GPU : mêmes comptes (cumuls en f32 sur le GPU, repris en f64 à chaque relecture)
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    for (text, sign, cpu_max, what) in [(dam, 1.0, m_max, "barrage"), (sand, -1.0, s_max, "sédimentation")] {
+        let mut g = Runner::new(proto(text), Path::new("."), None, Some(true)).unwrap();
+        assert!(g.gpu.is_some(), "{}", g.log.join("\n"));
+        run_to_end(&mut g);
+        let (g_max, g_worst) = balance(&g, sign);
+        eprintln!("{what} (GPU) : {g_max:.4} kg/m au plus (CPU {cpu_max:.4}), écart au débit intégré {g_worst:.2e} kg/m");
+        assert!(g_worst < 1e-3 * g_max, "{what} (GPU) : écart {g_worst} pour {g_max}");
+        assert!((g_max / cpu_max - 1.0).abs() < 0.1, "{what} : GPU {g_max} / CPU {cpu_max}");
+    }
+    let mut g = Runner::new(proto(bed), Path::new("."), None, Some(true)).unwrap();
+    assert!(g.gpu.is_some(), "{}", g.log.join("\n"));
+    run_to_end(&mut g);
+    for (c, what) in [(2, "air"), (5, "sable")] {
+        let (m_max, through, worst) = between(&g, c);
+        eprintln!("lit fluidisé (GPU), {what} : passé {through:.4e} kg/m, variation {m_max:.4e} kg/m, écart {worst:.2e} kg/m");
+        assert!(through > 1e-3 && worst < 1e-3 * through.max(m_max), "lit (GPU), {what} : écart {worst} pour {through}");
+    }
 }
 
 #[test]

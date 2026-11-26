@@ -746,6 +746,10 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
         var eng: array<f32, NPMAX>;
         for (var gq = 0u; gq < P.ng; gq++) { eng[gq] = 0.0; }
         var mt = 0.0;
+        // face suivie par une mesure de débit : volume et masse de chaque phase, signés vers +x / +y (miroir de plic_sweep)
+        var fw = 0u; var fsg = 1.0;
+        if (dir == 0u) { fw = u32(S[O_fw_u + f]); if (S[O_U + f] < 0.0) { fsg = -1.0; } }
+        else { fw = u32(S[O_fw_v + f]); if (S[O_V + f] < 0.0) { fsg = -1.0; } }
         for (var k = 0u; k < np; k++) {
             var fk = S[O_fl_vol + f * np + k];
             if (fk == 0.0) { continue; }
@@ -775,6 +779,11 @@ fn k_sweep_seq(@builtin(global_invocation_id) g: vec3<u32>) {
             }
             eng[group_k(k)] += mf * erel_k(k, t_d);
             mt += mf;
+            if (fw > 0u) {
+                let b = (fw - 1u) * 2u * np;
+                S[O_flacc + b + k] += fsg * fk * a2;
+                S[O_flacc + b + np + k] += fsg * mf * a2;
+            }
         }
         for (var gq = 0u; gq < P.ng; gq++) {
             let en = eng[gq];
