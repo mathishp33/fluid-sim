@@ -1,6 +1,7 @@
 # TODO — Simulation de fluide en Rust
 
-Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux. Mis à jour le 2026-11-26.
+Légende : **[M]** multiphasique · **[1]** monophasique · **[M+1]** les deux. Mis à jour le 2026-11-26. Le solveur monophasique
+n'est plus suivi depuis le 2026-11-26 : il reste tel quel, ses points [1] pour mémoire seulement.
 À lire avec : MESURES.md (la simulation face aux références), BUGFIXES.md (défauts connus et corrigés), et les documents de
 conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (solveur), EXPERIENCES.md (protocoles).
 
@@ -11,9 +12,9 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 ### Organisation et interface
 
 ### Bords du domaine
-- [M+1] Plus de types de bords : périodiques, sortie convective. Existent : [M] bord ouvert à pression imposée (hydrostatique de
+- [M] Plus de types de bords : périodiques, sortie convective. Existent : bord ouvert à pression imposée (hydrostatique de
   l'ambiant, colonne compressible : le vent parasite des côtés ouverts est corrigé, 7.6e-8 m/s après 5 s au lieu de 4 mm/s), entrées
-  et sorties à vitesse imposée ; [1] entrée et sortie.
+  et sorties à vitesse imposée.
 
 ### Solides mobiles (voir SOLID.md ; étapes 0 à 4 et chaleur faites)
 - [M] GPU : les scènes avec des corps se calculent sur le CPU. Porter fractions et ouvertures des faces, couplage monolithique
@@ -142,7 +143,7 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 - [M] Auto-allumage seulement approximatif (mécanismes globaux à une étape, facteurs A recalés sur la vitesse de flamme).
 - [M] Jet de méthane : le pied de la flamme s'étale sur le fond à ~4 cm de la buse au lieu de s'accrocher à son bord.
 
-### Fidélité du solveur monophasique
+### Fidélité du solveur monophasique (plus suivi : laissé tel quel)
 - [1] Tenseur des contraintes complet : les termes ∇·(μ∇uᵀ) et −⅔μ∇·u sont omis. Ils comptent quand μ varie fortement sur une courte
   distance (flamme, jet à 1000 K). Demande de réécrire le traitement des parois.
 - [1] cp et diffusion du traceur constants (l'air : cp varie d'environ 3 % entre 300 et 600 K).
@@ -160,8 +161,8 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 
 ### Autre
 - [1] Optimiser la simulation de fluide.
-- [M+1] FLIP/PIC ?
-- [M+1] Indicateur de vorticité (affichage).
+- [M] FLIP/PIC ?
+- [M] Indicateur de vorticité (affichage).
 
 ---
 
