@@ -87,8 +87,9 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
   Gains à chercher : moins de noyaux par pas (fusion, moins d'itérations Newton / PCG / sous-pas lancées une à une), pas des noyaux
   plus rapides. À remesurer sur une carte dédiée (NVIDIA / AMD), et avec des grains (le frottement implicite et la percolation
   ajoutent des noyaux à chaque pas).
-- [M] Suite de tests : ~65 min sur la machine de développement (essais GPU un par un, mémoire juste), contre ~10 min avant le
-  2026-11-25 : la raccourcir (essais GPU plus courts, ou série rapide séparée des longues).
+- [M] Suite de tests : ~12 min sur la machine de développement libre (230 essais le 2026-11-26 ; jusqu'à 65 min la nuit, mémoire
+  juste), dont ~500 s pour les 34 essais GPU, passés un par un sur le périphérique partagé (le monophasique : ~60 s, ses doublons
+  retirés). La raccourcir : essais GPU sur des grilles ou des durées plus courtes, ou série rapide séparée des longues.
 - [M] GPU : contournements de bogues de lavapipe — tampons de commandes de ≤ 400 lancements : **coût nul mesuré** sur la Radeon
   (`MP_GPU_BATCH_OPS=1000000` : mêmes temps à ±10 % près), à garder. Restent non mesurés (en dur dans le WGSL) : dans les noyaux par
   groupe, boucles à borne uniforme (P.np / P.ng, appartenance au groupe par sélection) plutôt que sur les membres lus dans la table,
