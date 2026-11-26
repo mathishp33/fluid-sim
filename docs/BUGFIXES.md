@@ -54,6 +54,11 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
 - **Fermeture connue à ~1e-7 près** (masses en f32) : vapeur bruitée de ~1 % dans une cellule presque pleine de liquide.
 - **Corps rigides** : pas encore sur le GPU (les scènes avec corps se calculent sur le CPU).
 
+### Interface
+- **Simulateur monophasique inaccessible** : case « Multiphase solver » décochée, « Launch Simulation » ne fait rien. Depuis le
+  2026-11-19, `app.rs` ne lance plus que la fenêtre multiphasique ; la fenêtre monophasique (`FluidWindow`, `main_window.rs`) et le
+  choix entre les deux (`SimWindow`, `multiphase_window.rs`) existent toujours. Peut-être voulu : à décider.
+
 ### Numérique
 - **Advection PLIC** : flux appliqués face par face dans l'ordre des indices ; la forme « flux pure » diverge sur un jet d'eau dans
   l'air.

@@ -14,8 +14,9 @@ Deux solveurs sur une grille MAC 2D, avec une interface egui :
 cargo run --release
 ```
 
-La fenêtre de départ propose le simulateur monophasique ou le multiphasique (scénarios préréglés, pinceaux de matériaux, cellules
-spéciales, éditeur de matériaux), et la fenêtre d'expérience.
+La fenêtre de départ lance le simulateur multiphasique (scénarios préréglés, pinceaux de matériaux, cellules spéciales, éditeur de
+matériaux) et la fenêtre d'expérience. La fenêtre du simulateur monophasique (`main_window.rs`) existe toujours, mais l'écran de
+départ ne la lance plus (voir docs/BUGFIXES.md).
 
 Une expérience reproductible (protocole `.exp` en français, voir docs/EXPERIENCES.md) se rejoue sans fenêtre :
 
