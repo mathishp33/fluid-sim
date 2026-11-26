@@ -5,7 +5,7 @@
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Cmp, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
 };
 use super::mp_view::T_IGNITION;
 
@@ -35,10 +35,13 @@ enum Tok {
     Comma,
     Colon,
     Eq,
+    /// comparaison (<, ≤, >, ≥) d'une condition d'arrêt
+    Cmp(Cmp),
 }
 
 fn show(t: &Tok) -> String {
     match t {
+        Tok::Cmp(c) => format!("« {} »", c.symbol()),
         Tok::W(_, s) => format!("« {s} »"),
         Tok::N(v) => format!("le nombre {v}"),
         Tok::S(s) => format!("« \"{s}\" »"),
@@ -157,11 +160,24 @@ fn tokenize(line: &str, ln: usize) -> Result<Vec<Tok>, ScriptError> {
             ':' => Some(Tok::Colon),
             '=' => Some(Tok::Eq),
             '×' => Some(Tok::W("x".into(), "×".into())),
+            '≤' => Some(Tok::Cmp(Cmp::Le)),
+            '≥' => Some(Tok::Cmp(Cmp::Ge)),
             _ => None,
         };
         if let Some(t) = simple {
             out.push(t);
             i += 1;
+            continue;
+        }
+        if c == '<' || c == '>' {
+            let eq = i + 1 < n && cs[i + 1] == '=';
+            out.push(Tok::Cmp(match (c, eq) {
+                ('<', false) => Cmp::Lt,
+                ('<', true) => Cmp::Le,
+                ('>', false) => Cmp::Gt,
+                _ => Cmp::Ge,
+            }));
+            i += if eq { 2 } else { 1 };
             continue;
         }
         if matches!(c, '"' | '«' | '“') {
@@ -339,6 +355,32 @@ impl<'a> P<'a> {
     fn quantity(&mut self, dim: Dim, what: &str) -> R<f64> {
         let v = self.number(what)?;
         Ok(self.opt_unit(dim, v)?.0)
+    }
+    /// seuil d'une condition, dans l'unité où le relevé est mesuré (K, Pa, m/s, m ; angles en degrés, rotations en °/s)
+    fn threshold(&mut self, m: &Measure) -> R<f64> {
+        let dim = match m {
+            Measure::Probe { reduce: Reduce::Sum, .. } | Measure::Mass { .. } | Measure::Stats => Dim::Plain,
+            Measure::Probe { q, .. } => match q {
+                Quantity::T => Dim::Temp,
+                Quantity::P => Dim::Pressure,
+                Quantity::Vx | Quantity::Vy | Quantity::Speed => Dim::Speed,
+                Quantity::Rho => Dim::Density,
+                Quantity::Fraction(_) => Dim::Plain,
+                Quantity::HeatRelease => Dim::Power,
+            },
+            Measure::Body { q, .. } => match q {
+                BodyQty::X | BodyQty::Y => Dim::Length,
+                BodyQty::Angle => Dim::Angle,
+                BodyQty::Vx | BodyQty::Vy => Dim::Speed,
+                BodyQty::Rotation => Dim::AngSpeed,
+                BodyQty::Fx | BodyQty::Fy | BodyQty::Torque => Dim::Plain,
+                BodyQty::Temp => Dim::Temp,
+            },
+        };
+        let v = self.number("le seuil de la condition")?;
+        let (v, unit) = self.opt_unit(dim, v)?;
+        // angle et rotation écrits avec une unité : convertis en radians, à remettre en degrés comme la mesure
+        Ok(if unit && matches!(dim, Dim::Angle | Dim::AngSpeed) { v.to_degrees() } else { v })
     }
     fn point(&mut self) -> R<[f64; 2]> {
         if !self.eat(&Tok::LP) {
@@ -614,7 +656,35 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             p.end()?;
         }
         "simuler" | "avancer" => {
-            let step = if p.eat_w("jusqua") || p.eat_w("jusque") {
+            let step = if (p.eat_w("jusqua") || p.eat_w("jusque")) && p.eat_w("ce") {
+                // simuler jusqu'à ce que <relevé> < | ≤ | > | ≥ <seuil> [au plus <durée>]
+                if !p.eat_w("que") {
+                    return p.err(format!("il faut « jusqu'à ce que <relevé> < <valeur> »{}", p.here()));
+                }
+                let measure = p.measure()?;
+                if measure == Measure::Stats {
+                    return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
+                }
+                let cmp = match p.peek() {
+                    Some(Tok::Cmp(c)) => *c,
+                    _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
+                };
+                p.i += 1;
+                let value = p.threshold(&measure)?;
+                let limit = if p.eat_w("au") {
+                    if !p.eat_w("plus") {
+                        return p.err(format!("il faut « au plus <durée> »{}", p.here()));
+                    }
+                    let d = p.quantity(Dim::Time, "la durée maximale")?;
+                    if !(d > 0.0) {
+                        return p.err("la durée maximale doit être positive");
+                    }
+                    Some(d)
+                } else {
+                    None
+                };
+                Step::UntilCond { measure, cmp, value, limit }
+            } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
             } else {
                 let d = p.quantity(Dim::Time, "la durée à simuler")?;

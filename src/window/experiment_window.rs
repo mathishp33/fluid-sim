@@ -120,6 +120,7 @@ ACTIONS À DURÉE
 
 TEMPS, MESURES, SORTIES
   simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\"
+  simuler jusqu'à ce que max T dans partout < 400 K [au plus 10 s]   (relevé comme une mesure ; < <= > >=)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)

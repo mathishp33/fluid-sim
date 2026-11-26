@@ -515,3 +515,105 @@ fn the_command_line_runs_every_variant_of_a_protocol_file() {
     std::fs::write(dir.join("faux.exp"), "départ scénario \"cuve vide\"\nvoler\n").unwrap();
     assert_ne!(super::mp_experiment::run_cli(&[dir.join("faux.exp").display().to_string()]), 0);
 }
+
+#[test]
+fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
+    use super::mp_experiment::{BodyQty, Cmp};
+    // lecture : relevé comme une mesure, comparaison, seuil avec son unité, durée maximale facultative
+    let p = proto(
+        "départ scénario \"cuve vide\"
+         simuler jusqu'à ce que max T dans partout < 400 K au plus 5 s
+         simuler jusqu'à ce que corps 1 angle ≥ 0.5 rad
+         simuler jusqu'à ce que T en (0.1, 0.1) > 20 °C
+         simuler jusqu'à 2 s
+",
+    );
+    match &p.steps[0].0 {
+        Step::UntilCond { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, zone: Zone::Partout, .. }, cmp: Cmp::Lt, value, limit: Some(l) } => {
+            assert!(*value == 400.0 && *l == 5.0)
+        }
+        s => panic!("{s:?}"),
+    }
+    match &p.steps[1].0 {
+        Step::UntilCond { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value, limit: None } => {
+            assert!((value - 0.5f64.to_degrees()).abs() < 1e-9, "angle en degrés comme la mesure : {value}")
+        }
+        s => panic!("{s:?}"),
+    }
+    assert!(matches!(&p.steps[2].0, Step::UntilCond { cmp: Cmp::Gt, value, .. } if (*value - 293.15).abs() < 1e-9));
+    assert!(matches!(&p.steps[3].0, Step::Until(t) if *t == 2.0));
+    assert_eq!(p.planned_end(0.0), 5.0);
+    for (bad, what) in [
+        ("simuler jusqu'à ce que max T dans partout 400 K", "comparaison"),
+        ("simuler jusqu'à ce que stats < 3", "stats"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 au plus", "durée maximale"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 au plus -1 s", "positive"),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+
+    // déroulement : un disque d'acier tombe dans l'air ; l'expérience s'arrête au pas où il passe sous y = 0.1 m (chute libre :
+    // t = √(2 × 0.05 / g) = 0.101 s), puis continue normalement
+    let mut r = Runner::new(
+        proto(
+            "départ scénario \"cuve vide\" grille 20 x 40 maille 5 mm
+             corps disque (0.05, 0.15) rayon 1 cm \"acier\" libre
+             simuler jusqu'à ce que corps 1 y < 0.1 au plus 1 s
+             mesurer toutes les 1 ms : corps 1 y
+             simuler 10 ms
+             simuler jusqu'à ce que corps 1 y < -1 au plus 20 ms
+             simuler jusqu'à ce que corps 1 y < 1
+",
+        ),
+        Path::new("."),
+        None,
+        Some(false),
+    )
+    .unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    // [t = … s] ligne 3 : corps 1 y < 0.1 m atteint (y m)
+    let hit = r.log.iter().find(|l| l.contains("corps 1 y < 0.1 m atteint")).unwrap_or_else(|| panic!("{log}"));
+    let num = |s: &str| s.trim().parse::<f64>().unwrap();
+    let t1 = num(&hit[hit.find("t = ").unwrap() + 4..hit.find(" s]").unwrap()]);
+    let y1 = num(&hit[hit.rfind('(').unwrap() + 1..hit.rfind(" m)").unwrap()]);
+    let t_free = (2.0 * 0.05 / 9.81f64).sqrt();
+    eprintln!("condition atteinte à t = {t1:.5} s (chute libre : {t_free:.5}), y = {y1:.5} m");
+    // arrêt au premier pas sous le seuil : moins d'une maille de chute au-delà
+    assert!(y1 < 0.1 && y1 > 0.1 - r.sim.dx, "arrêt au pas où y passe sous 0.1 : y = {y1}");
+    // le corps avance à la vitesse du pas précédent : retard de ½ g t dt (2.5 % à des pas de 3 ms)
+    assert!((t1 / t_free - 1.0).abs() < 0.05, "temps de chute {t1} pour {t_free}");
+    assert!(log.contains("corps 1 y < -1 m non atteint au bout du temps permis"), "{log}");
+    assert!(log.contains("corps 1 y < 1 m déjà vrai"), "{log}");
+    assert!((r.sim.time - (t1 + 0.01 + 0.02)).abs() < 2e-6, "durées suivantes : t = {} (attendu {})", r.sim.time, t1 + 0.03);
+}
+
+#[test]
+fn a_condition_stops_the_gpu_run_like_the_cpu_run() {
+    // eau chauffée par le fond : la condition sur la température d'une sonde arrête le calcul au même moment sur le CPU et le GPU
+    let text = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm
+remplir rect (0, 0) (0.12, 0.08) avec \"eau\" à 20 °C
+chauffer rect (0.03, 0) (0.09, 0.02) à 360 K
+simuler jusqu'à ce que T en (0.06, 0.015) > 320 K au plus 5 s
+";
+    let stop = |r: &Runner| -> f64 {
+        let l = r.log.iter().find(|l| l.contains("> 320 K atteint")).unwrap_or_else(|| panic!("{}", r.log.join("\n")));
+        l[l.find("t = ").unwrap() + 4..l.find(" s]").unwrap()].trim().parse().unwrap()
+    };
+    let mut cpu = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut cpu);
+    let t_cpu = stop(&cpu);
+    assert!(t_cpu > 0.0 && t_cpu < 5.0 && (cpu.sim.time - t_cpu).abs() < 1e-6, "CPU : arrêt à {t_cpu}, t final {}", cpu.sim.time);
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let mut gpu = Runner::new(proto(text), Path::new("."), None, Some(true)).unwrap();
+    assert!(gpu.gpu.is_some(), "{}", gpu.log.join("\n"));
+    run_to_end(&mut gpu);
+    let t_gpu = stop(&gpu);
+    eprintln!("condition : CPU à {t_cpu:.4} s, GPU à {t_gpu:.4} s");
+    // le GPU vérifie après chaque série de pas (au plus 8) : même moment à quelques pas près
+    assert!((t_gpu - t_cpu).abs() < 0.05 * t_cpu, "arrêt : CPU {t_cpu} / GPU {t_gpu}");
+}

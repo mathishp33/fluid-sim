@@ -490,6 +490,34 @@ impl Action {
     }
 }
 
+/// Comparaison d'une condition d'arrêt (`simuler jusqu'à ce que <relevé> < v`)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cmp {
+    pub fn holds(self, x: f64, v: f64) -> bool {
+        match self {
+            Cmp::Lt => x < v,
+            Cmp::Le => x <= v,
+            Cmp::Gt => x > v,
+            Cmp::Ge => x >= v,
+        }
+    }
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Lt => "<",
+            Cmp::Le => "≤",
+            Cmp::Gt => ">",
+            Cmp::Ge => "≥",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     Do(Action),
@@ -497,6 +525,9 @@ pub enum Step {
     Simulate(f64),
     /// avance jusqu'à ce temps simulé
     Until(f64),
+    /// avance jusqu'à ce que le relevé `measure` vérifie `cmp value` (vérifié après chaque pas, ou chaque série de pas du GPU), au plus
+    /// pendant `limit` secondes si elle est donnée
+    UntilCond { measure: Measure, cmp: Cmp, value: f64, limit: Option<f64> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -532,6 +563,7 @@ impl Protocol {
             match s {
                 Step::Simulate(d) => t += d,
                 Step::Until(u) => t = t.max(*u),
+                Step::UntilCond { limit, .. } => t += limit.unwrap_or(0.0),
                 Step::Do(_) => {}
             }
         }
@@ -891,6 +923,26 @@ struct Probe {
     fluid_only: bool,
 }
 
+/// condition d'arrêt en cours : relevé, comparaison, seuil, ligne du protocole, nom et unité du relevé
+struct Cond {
+    probe: Probe,
+    cmp: Cmp,
+    value: f64,
+    line: usize,
+    name: String,
+    unit: String,
+    /// dernier relevé (t, valeur) ; franchissement prévu avant la prochaine série de pas du GPU (il repasse alors au pas unique)
+    last: Option<(f64, f64)>,
+    near: bool,
+}
+
+impl Cond {
+    /// « corps 1 y < 0.1 m »
+    fn text(&self) -> String {
+        format!("{} {} {} {}", self.name, self.cmp.symbol(), fmt_num(self.value), self.unit)
+    }
+}
+
 fn qty_value(sim: &MultiphaseSim, q: QtyR, c: usize) -> f64 {
     let (i, j) = (c % sim.nx, c / sim.nx);
     match q {
@@ -1002,6 +1054,8 @@ pub struct Runner {
     pub scenario: Option<usize>,
     pc: usize,
     target: Option<f64>,
+    /// condition d'arrêt en cours (`simuler jusqu'à ce que …`)
+    cond: Option<Cond>,
     timed: Vec<Timed>,
     probes: Vec<Probe>,
     stats: bool,
@@ -1057,6 +1111,7 @@ impl Runner {
             scenario,
             pc: 0,
             target: None,
+            cond: None,
             timed: vec![],
             probes: vec![],
             stats: false,
@@ -1130,52 +1185,12 @@ impl Runner {
 
     fn compile_measures(&mut self) -> Result<(), String> {
         let ms = self.proto.measures.clone();
-        let (nx, ny, dx) = (self.sim.nx, self.sim.ny, self.sim.dx);
         for (m, line) in ms {
-            let err = |e: String| format!("ligne {line} : {e}");
-            match m {
-                Measure::Stats => {
-                    if !self.stats {
-                        self.stats = true;
-                    }
-                }
-                Measure::Probe { q, reduce, zone, label } => {
-                    let qr = match &q {
-                        Quantity::T => QtyR::T,
-                        Quantity::P => QtyR::P,
-                        Quantity::Vx => QtyR::Vx,
-                        Quantity::Vy => QtyR::Vy,
-                        Quantity::Speed => QtyR::Speed,
-                        Quantity::Rho => QtyR::Rho,
-                        Quantity::Fraction(f) => QtyR::Frac(find_phase(&self.sim, f).map_err(err)?),
-                        Quantity::HeatRelease => QtyR::Heat,
-                    };
-                    let cells: Vec<usize> = zone.cells(nx, ny, dx).into_iter().map(|(i, j)| self.sim.idx(i, j)).collect();
-                    if cells.is_empty() {
-                        return Err(err(format!("la zone « {} » est hors du domaine", zone.label())));
-                    }
-                    let red = match reduce {
-                        Reduce::At => "",
-                        Reduce::Mean => "moyenne ",
-                        Reduce::Max => "max ",
-                        Reduce::Min => "min ",
-                        Reduce::Sum => "somme ",
-                    };
-                    let name = label.unwrap_or_else(|| format!("{red}{} {}", q.name(), zone.label()));
-                    self.columns.push(format!("{name} ({})", q.unit(reduce)));
-                    self.probes.push(Probe { kind: ProbeKind::Q(qr, reduce), cells, fluid_only: q.fluid_only() });
-                }
-                Measure::Mass { fluid, zone, label } => {
-                    let k = find_phase(&self.sim, &fluid).map_err(err)?;
-                    let cells: Vec<usize> = zone.cells(nx, ny, dx).into_iter().map(|(i, j)| self.sim.idx(i, j)).collect();
-                    let name = label.unwrap_or_else(|| format!("masse {fluid} {}", zone.label()));
-                    self.columns.push(format!("{name} (kg/m)"));
-                    self.probes.push(Probe { kind: ProbeKind::Mass(k), cells, fluid_only: true });
-                }
-                Measure::Body { index, q, label } => {
-                    let name = label.unwrap_or_else(|| format!("corps {} {}", index + 1, q.name()));
-                    self.columns.push(format!("{name} ({})", q.unit()));
-                    self.probes.push(Probe { kind: ProbeKind::Body(index, q), cells: vec![], fluid_only: false });
+            match self.make_probe(&m).map_err(|e| format!("ligne {line} : {e}"))? {
+                None => self.stats = true,
+                Some((probe, name, unit)) => {
+                    self.columns.push(format!("{name} ({unit})"));
+                    self.probes.push(probe);
                 }
             }
         }
@@ -1184,6 +1199,49 @@ impl Runner {
             self.columns.extend(c);
         }
         Ok(())
+    }
+
+    /// Sonde d'une mesure, son nom et son unité (en-tête de colonne « nom (unité) ») ; None pour `stats`.
+    fn make_probe(&self, m: &Measure) -> Result<Option<(Probe, String, String)>, String> {
+        let (nx, ny, dx) = (self.sim.nx, self.sim.ny, self.sim.dx);
+        Ok(Some(match m {
+            Measure::Stats => return Ok(None),
+            Measure::Probe { q, reduce, zone, label } => {
+                let qr = match q {
+                    Quantity::T => QtyR::T,
+                    Quantity::P => QtyR::P,
+                    Quantity::Vx => QtyR::Vx,
+                    Quantity::Vy => QtyR::Vy,
+                    Quantity::Speed => QtyR::Speed,
+                    Quantity::Rho => QtyR::Rho,
+                    Quantity::Fraction(f) => QtyR::Frac(find_phase(&self.sim, f)?),
+                    Quantity::HeatRelease => QtyR::Heat,
+                };
+                let cells: Vec<usize> = zone.cells(nx, ny, dx).into_iter().map(|(i, j)| self.sim.idx(i, j)).collect();
+                if cells.is_empty() {
+                    return Err(format!("la zone « {} » est hors du domaine", zone.label()));
+                }
+                let red = match reduce {
+                    Reduce::At => "",
+                    Reduce::Mean => "moyenne ",
+                    Reduce::Max => "max ",
+                    Reduce::Min => "min ",
+                    Reduce::Sum => "somme ",
+                };
+                let name = label.clone().unwrap_or_else(|| format!("{red}{} {}", q.name(), zone.label()));
+                (Probe { kind: ProbeKind::Q(qr, *reduce), cells, fluid_only: q.fluid_only() }, name, q.unit(*reduce).to_string())
+            }
+            Measure::Mass { fluid, zone, label } => {
+                let k = find_phase(&self.sim, fluid)?;
+                let cells: Vec<usize> = zone.cells(nx, ny, dx).into_iter().map(|(i, j)| self.sim.idx(i, j)).collect();
+                let name = label.clone().unwrap_or_else(|| format!("masse {fluid} {}", zone.label()));
+                (Probe { kind: ProbeKind::Mass(k), cells, fluid_only: true }, name, "kg/m".to_string())
+            }
+            Measure::Body { index, q, label } => {
+                let name = label.clone().unwrap_or_else(|| format!("corps {} {}", index + 1, q.name()));
+                (Probe { kind: ProbeKind::Body(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
+            }
+        }))
     }
 
     /// Avance l'expérience pendant au plus `budget` de temps réel (au moins un pas ou une action). Retourne l'état.
@@ -1217,6 +1275,35 @@ impl Runner {
                         self.note(format!("ligne {line} : « simuler jusqu'à {} s » déjà atteint", fmt_num(t)));
                     }
                     self.pc += 1;
+                }
+                Step::UntilCond { measure, cmp, value, limit } => {
+                    self.start_sampling();
+                    self.pc += 1;
+                    let (probe, name, unit) = match self.make_probe(&measure) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
+                            break;
+                        }
+                        Err(e) => {
+                            self.fail(format!("ligne {line} : {e}"));
+                            break;
+                        }
+                    };
+                    self.sync_host();
+                    let x = probe.value(&self.sim);
+                    let c = Cond { probe, cmp, value, line, name, unit, last: Some((self.sim.time, x)), near: false };
+                    if cmp.holds(x, value) {
+                        self.note(format!("ligne {line} : {} déjà vrai ({} {})", c.text(), fmt_num(x), c.unit));
+                    } else {
+                        let what = match limit {
+                            Some(d) => format!("au plus {} s", fmt_num(d)),
+                            None => "sans limite de durée".to_string(),
+                        };
+                        self.note(format!("ligne {line} : simuler jusqu'à ce que {} ({what}) — {} {} au départ", c.text(), fmt_num(x), c.unit));
+                        self.target = Some(limit.map_or(f64::INFINITY, |d| self.sim.time + d));
+                        self.cond = Some(c);
+                    }
                 }
             }
         }
@@ -1424,6 +1511,11 @@ impl Runner {
         self.expire(now, eps);
         if now >= target - eps {
             self.target = None;
+            if let Some(c) = self.cond.take() {
+                self.sync_host();
+                let x = c.probe.value(&self.sim);
+                self.note(format!("ligne {} : {} non atteint au bout du temps permis ({} {})", c.line, c.text(), fmt_num(x), c.unit));
+            }
             return;
         }
         let next = self.timed.iter().map(|t| t.end).fold(target, f64::min);
@@ -1438,7 +1530,9 @@ impl Runner {
         };
         match &mut self.gpu {
             Some(g) => {
-                let k = if cap.is_infinite() { ((remaining / pred) * 0.5).floor().clamp(1.0, 8.0) as usize } else { 1 };
+                // (condition d'arrêt près de son seuil : un pas à la fois, pour s'arrêter au bon pas)
+                let near = self.cond.as_ref().is_some_and(|c| c.near);
+                let k = if cap.is_infinite() && !near { ((remaining / pred) * 0.5).floor().clamp(1.0, 8.0) as usize } else { 1 };
                 if k > 1 {
                     // série de k pas : bornés pour que la série s'arrête avant l'échéance
                     self.sim.dt_max = dt_max0.min(remaining / (k as f64 + 1.0));
@@ -1457,6 +1551,27 @@ impl Runner {
         if self.sim.diverged {
             self.fail(format!("divergence numérique à t = {:.6} s (même à dt/1024, le pas donne un état invalide)", self.sim.time));
             return;
+        }
+        if self.cond.is_some() {
+            self.sync_host();
+            let (t, dt) = (self.sim.time, self.sim.last_dt);
+            let c = self.cond.as_mut().unwrap();
+            let x = c.probe.value(&self.sim);
+            if c.cmp.holds(x, c.value) {
+                let c = self.cond.take().unwrap();
+                self.note(format!("ligne {} : {} atteint ({} {})", c.line, c.text(), fmt_num(x), c.unit));
+                self.target = None;
+            } else {
+                // tendance des deux derniers relevés : franchissement prévu dans moins de deux séries de 8 pas ?
+                c.near = match c.last {
+                    Some((t0, x0)) if t > t0 && x != x0 => {
+                        let eta = (c.value - x) / ((x - x0) / (t - t0));
+                        eta >= 0.0 && eta < 16.0 * dt
+                    }
+                    _ => false,
+                };
+                c.last = Some((t, x));
+            }
         }
         if let Some(ns) = self.next_sample {
             if self.sim.time >= ns - eps {
