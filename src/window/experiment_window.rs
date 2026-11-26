@@ -279,7 +279,7 @@ impl ExperimentWindow {
         let g = if s.gravity > 0.0 { s.gravity as f64 } else { 9.81 };
         let sc = MpScenario::from_index(s.mp_scenario);
         format!(
-            "# Expérience — format : voir l'aide (bouton « Aide du format ») ou EXPERIENCES.md\n\
+            "# Expérience — format : voir l'aide (bouton « Aide du format ») ou docs/EXPERIENCES.md\n\
              départ scénario \"{}\" grille {nx} x {ny} maille {} gravité {}\n\
              mesurer toutes les 10 ms : stats\n\
              # conditions initiales : onglet « Conditions initiales » (pinceaux, champs de valeurs), ou lignes remplir / champ…\n\
@@ -719,7 +719,7 @@ impl ExperimentWindow {
             _ => {}
         }
         if self.tool == CiTool::Body {
-            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille) ; fixe pour l'instant — le mouvement viendra (SOLID.md).");
+            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille), fixe ; corps libres ou à mouvement imposé : commande « corps » du protocole (docs/EXPERIENCES.md).");
         }
         if matches!(self.tool, CiTool::Fill | CiTool::Temperature | CiTool::Emitter | CiTool::Solid) {
             ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));

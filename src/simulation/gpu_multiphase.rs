@@ -159,7 +159,7 @@ pub fn gpu_unsupported_reason(sim: &MultiphaseSim) -> Option<String> {
         return Some(format!("plus de {TP_CAP} destinations de téléporteurs"));
     }
     if sim.has_bodies() {
-        return Some(format!("{} corps rigide(s) : les solides mobiles se calculent sur le CPU pour l'instant (SOLID.md)", sim.bodies.len()));
+        return Some(format!("{} corps rigide(s) : les solides mobiles se calculent sur le CPU pour l'instant (docs/SOLID.md)", sim.bodies.len()));
     }
     None
 }

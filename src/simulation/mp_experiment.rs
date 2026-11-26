@@ -1636,7 +1636,7 @@ fn describe(a: &Action) -> String {
 
 const USAGE: &str = "usage : fluid-sim experience <protocole.exp> [--gpu | --cpu] [--sortie <dossier>] [--fils <n>]\n\
   Exécute le protocole sans fenêtre ; résultats dans <dossier>/<nom du protocole>/ (par défaut : résultats/ à côté du protocole).\n\
-  Format du protocole : voir EXPERIENCES.md.";
+  Format du protocole : voir docs/EXPERIENCES.md.";
 
 /// Dossier des résultats d'un protocole : <racine>/<nom>[/<variante>].
 pub fn results_dir(root: &Path, stem: &str, variant: &Option<(String, String)>) -> PathBuf {
