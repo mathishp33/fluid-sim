@@ -1044,6 +1044,20 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             };
             let spec = match p.word("mur, ouvert ou entrée")?.as_str() {
                 "mur" | "paroi" => BoundarySpec::Wall,
+                // sortie (vx, vy) : vitesse imposée vers l'extérieur ; « sortie » seule ou suivie d'une pression : bord ouvert
+                "sortie" if matches!(p.peek(), Some(Tok::LP)) => {
+                    let v = p.vector(Dim::Speed, "la vitesse de sortie")?;
+                    let out = match side {
+                        0 => -v[0],
+                        1 => v[0],
+                        2 => -v[1],
+                        _ => v[1],
+                    };
+                    if !(out > 0.0) {
+                        return p.err("la vitesse de sortie est dirigée vers l'extérieur du bord (vers la gauche pour le bord gauche, vers le bas pour le bas…)");
+                    }
+                    BoundarySpec::Outlet { v }
+                }
                 "ouvert" | "sortie" => BoundarySpec::Open(if p.done() { P_ATM } else { p.quantity(Dim::Pressure, "la pression du bord")? }),
                 "entree" => {
                     let v = p.vector(Dim::Speed, "la vitesse d'entrée")?;
@@ -1060,7 +1074,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                     }
                     BoundarySpec::Inlet { v, temp, fluid }
                 }
-                o => return p.err(format!("bord « {o} » : mur, ouvert [pression] ou entrée (vx, vy) [à T] [\"fluide\"]")),
+                o => return p.err(format!("bord « {o} » : mur, ouvert [pression], entrée (vx, vy) [à T] [\"fluide\"] ou sortie (vx, vy)")),
             };
             p.end()?;
             push(proto, Action::Boundary { side, spec }, ln);

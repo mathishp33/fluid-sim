@@ -112,6 +112,7 @@ d'expérience.
 | `bord gauche\|droite\|bas\|haut mur` | paroi |
 | `bord … ouvert [p]` | ouvert à la pression p (1 atm par défaut) au point le plus haut du bord |
 | `bord … entrée (vx, vy) [à T] ["fluide"]` | entrée à vitesse imposée (premier liquide par défaut) |
+| `bord … sortie (vx, vy)` | sortie à vitesse imposée, dirigée vers l'extérieur (pompe, vidange) : le fluide des mailles du bord sort à cette vitesse, quel qu'il soit ; seule la composante normale au bord compte. Sur une cuve fermée, la pression baisse (jusqu'à la cavitation d'un liquide) |
 | `champ …` | champ de valeurs, voir ci-dessous |
 | `gravité (gx, gy)` ou `gravité g` | gravité ; un nombre seul est dirigé vers le bas |
 | `pas max d` | pas de temps maximal |

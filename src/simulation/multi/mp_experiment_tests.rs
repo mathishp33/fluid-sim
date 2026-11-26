@@ -596,6 +596,54 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn an_outlet_draws_the_fluid_out_at_its_imposed_speed() {
+    // lecture : vitesse dirigée vers l'extérieur du bord ; « sortie » seule reste un bord ouvert
+    let p = proto("départ scénario \"cuve vide\"\nbord bas sortie (0, -0.05)\nbord droite sortie\nbord haut sortie (0.1, 2 cm/s)\n");
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(matches!(acts[0], Action::Boundary { side: 2, spec: BoundarySpec::Outlet { v } } if *v == [0.0, -0.05]), "{:?}", acts[0]);
+    assert!(matches!(acts[1], Action::Boundary { side: 1, spec: BoundarySpec::Open(p) } if *p == 101325.0), "{:?}", acts[1]);
+    assert!(matches!(acts[2], Action::Boundary { side: 3, spec: BoundarySpec::Outlet { v } } if (v[1] - 0.02).abs() < 1e-12), "{:?}", acts[2]);
+    for bad in ["bord bas sortie (0, 0.05)", "bord gauche sortie (0.1, 0)", "bord droite sortie (0, 0.3)"] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains("vers l'extérieur"), "{bad} : {e:?}");
+    }
+    // vidange par le fond, haut ouvert : l'eau sort à ρ v L (le débit mesuré au bord du bas), quelle que soit la hauteur
+    let text = "départ scénario \"cuve vide\" grille 20 x 30 maille 1 cm
+remplir rect (0, 0) (0.2, 0.2) avec \"eau\"
+bord bas sortie (0, -0.05)
+mesurer toutes les 50 ms : masse \"eau\", débit massique \"eau\" à travers ligne (0, 0) (0.2, 0)
+simuler 1 s
+";
+    let check = |r: &Runner, what: &str| {
+        let log = r.log.join("\n");
+        assert!(log.contains("bord bas : sortie à (0, -0.05) m/s"), "{log}");
+        let eau = r.sim.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+        let rho = r.sim.reg.phases[eau].rho(101325.0, 293.15);
+        let q = -rho * 0.05 * 0.2;
+        // (premier intervalle : la mise en route de l'écoulement, sa vitesse partant de zéro)
+        assert!((r.rows[1][3] / q - 1.0).abs() < 2e-2, "{what} : débit {} pour {q} au premier relevé", r.rows[1][3]);
+        for row in &r.rows[2..] {
+            assert!((row[3] / q - 1.0).abs() < 2e-3, "{what} : débit {} pour {q} à t = {}", row[3], row[0]);
+        }
+        let (first, last) = (&r.rows[0], r.rows.last().unwrap());
+        let lost = first[2] - last[2];
+        eprintln!("{what} : {lost:.5} kg/m sortis en {:.3} s (ρ v L t = {:.5})", last[0], -q * last[0]);
+        assert!((lost / (-q * last[0]) - 1.0).abs() < 2e-3, "{what} : {lost} kg/m sortis pour {}", -q * last[0]);
+    };
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    check(&r, "CPU");
+    let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+    if super::mp_gpu_tests::gpu_or_skip(&probe).is_none() {
+        return;
+    }
+    let mut g = Runner::new(proto(text), Path::new("."), None, Some(true)).unwrap();
+    assert!(g.gpu.is_some(), "{}", g.log.join("\n"));
+    run_to_end(&mut g);
+    check(&g, "GPU");
+}
+
+#[test]
 fn the_flow_rate_through_a_line_is_measured_along_the_faces() {
     // lecture
     let p = proto("départ scénario \"cuve vide\"\nmesurer toutes les 1 ms : débit massique \"eau\" à travers ligne (0.1, 0) (0.1, 0.2) comme \"q\", débit à travers ligne (0, 0.1) (0.3, 0.1)\n");

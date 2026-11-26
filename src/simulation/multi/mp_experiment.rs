@@ -324,6 +324,8 @@ pub enum BoundarySpec {
     Open(f64),
     /// paroi à vitesse imposée qui fait entrer un fluide
     Inlet { v: [f64; 2], temp: Option<f64>, fluid: Option<String> },
+    /// paroi à vitesse imposée, dirigée vers l'extérieur : le fluide des mailles du bord sort (pompe, vidange)
+    Outlet { v: [f64; 2] },
 }
 
 /// Grandeur d'un champ de valeurs (conditions initiales).
@@ -877,6 +879,11 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
                     };
                     sim.bc[k] = Bc::Wall;
                     sim.inlet[k] = Some(MpInlet { vx: v[0], vy: v[1], phase, temp: temp.unwrap_or(t_amb), offset: 0 });
+                }
+                BoundarySpec::Outlet { v } => {
+                    // une entrée de bord à vitesse sortante : rien n'entre, le fluide des mailles du bord sort à cette vitesse
+                    sim.bc[k] = Bc::Wall;
+                    sim.inlet[k] = Some(MpInlet { vx: v[0], vy: v[1], phase: sim.ambient_phase, temp: t_amb, offset: 0 });
                 }
             }
             Ok(0)
@@ -2171,6 +2178,7 @@ fn describe(a: &Action) -> String {
                 BoundarySpec::Wall => format!("bord {s} : mur"),
                 BoundarySpec::Open(p) => format!("bord {s} : ouvert à {} Pa", fmt_num(*p)),
                 BoundarySpec::Inlet { v, .. } => format!("bord {s} : entrée à {} m/s", fmt_point(*v)),
+                BoundarySpec::Outlet { v } => format!("bord {s} : sortie à {} m/s", fmt_point(*v)),
             }
         }
         Action::Field { qty, source, zone, .. } => {

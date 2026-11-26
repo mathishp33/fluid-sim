@@ -13,9 +13,9 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
   chauffer … ») ; aujourd'hui, la fenêtre ne peint qu'en mode « Conditions initiales ».
 
 ### Bords du domaine
-- [M+1] Plus de types de bords : sortie à vitesse imposée, périodiques, sortie convective. Existent : [M] bord ouvert à pression
-  imposée (hydrostatique de l'ambiant, colonne compressible : le vent parasite des côtés ouverts est corrigé, 7.6e-8 m/s après 5 s au
-  lieu de 4 mm/s) et entrées de bord ; [1] entrée et sortie.
+- [M+1] Plus de types de bords : périodiques, sortie convective. Existent : [M] bord ouvert à pression imposée (hydrostatique de
+  l'ambiant, colonne compressible : le vent parasite des côtés ouverts est corrigé, 7.6e-8 m/s après 5 s au lieu de 4 mm/s), entrées
+  et sorties à vitesse imposée ; [1] entrée et sortie.
 
 ### Solides mobiles (voir SOLID.md ; étapes 0 à 4 et chaleur faites)
 - [M] GPU : les scènes avec des corps se calculent sur le CPU. Porter fractions et ouvertures des faces, couplage monolithique
@@ -210,6 +210,7 @@ détail dans les documents de conception et l'historique git.
 - Protocoles : `débit [massique] ["fluide"] à travers ligne (x1, y1) (x2, y2)` ; le solveur compte, par phase, ce qui passe par les
   faces suivies (transport PLIC, chute des grains, percolation, fluide chassé par un corps ; CPU et GPU) : le débit intégré redonne
   exactement la masse passée.
+- Bords : `bord … sortie (vx, vy)`, sortie à vitesse imposée (pompe, vidange ; débit ρ v L exact, CPU et GPU).
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d
