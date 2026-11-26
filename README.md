@@ -2,7 +2,8 @@
 
 Deux solveurs sur une grille MAC 2D, avec une interface egui :
 
-- **monophasique** : un fluide (gaz low-Mach ou liquide), température, solides immobiles, sur CPU ou GPU (wgpu) ;
+- **monophasique** : un fluide (gaz low-Mach ou liquide), température, solides immobiles, sur CPU ou GPU (wgpu) ; sans fenêtre
+  depuis le 2026-11-26 (le multiphasique fait tout ce qu'elle faisait), il reste avec ses essais ;
 - **multiphasique** : plusieurs fluides à interfaces nettes (PLIC), pression implicite (Newton + gradient conjugué multigrille),
   tension de surface, ébullition, condensation, cavitation, évaporation, gel et fusion, chimie et flammes, poudres et grains (tas,
   lits, feux de charbon et de bois), solides mobiles (corps qui flottent, coulent, rebondissent et échangent leur chaleur). Le CPU
@@ -15,8 +16,7 @@ cargo run --release
 ```
 
 La fenêtre de départ lance le simulateur multiphasique (scénarios préréglés, pinceaux de matériaux, cellules spéciales, éditeur de
-matériaux) et la fenêtre d'expérience. La fenêtre du simulateur monophasique (`main_window.rs`) existe toujours, mais l'écran de
-départ ne la lance plus (voir docs/BUGFIXES.md).
+matériaux) et la fenêtre d'expérience.
 
 Une expérience reproductible (protocole `.exp` en français, voir docs/EXPERIENCES.md) se rejoue sans fenêtre :
 

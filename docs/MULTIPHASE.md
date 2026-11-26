@@ -64,7 +64,7 @@ valeur transportée reconstruite par minmod, u = q/ρ_new borné par les voisins
 * Limites f32 connues : boîte fermée entièrement remplie de liquide, fermeture à ~1e-7 près (BUGFIXES.md).
 
 ## Interface (egui, `src/window/`)
-`starting_window.rs` (réglages, choix du solveur), `multiphase_window.rs` (scénarios, pinceaux de matériaux, cellules spéciales,
+`starting_window.rs` (réglages, scénario, matériaux), `multiphase_window.rs` (scénarios, pinceaux de matériaux, cellules spéciales,
 bords en direct, options physiques, bascule CPU / GPU, fils CPU, profil du pas, état complet), `material_editor.rs` (matériaux,
 mélanges, réactions, paires de fusion), `experiment_window.rs` (protocoles d'expérience). Le rendu et les scénarios sont dans
 `mp_view.rs`, sans egui (testés). Convention : j croît vers le haut ; l'affichage inverse l'axe y.

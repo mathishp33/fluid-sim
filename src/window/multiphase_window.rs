@@ -1,5 +1,6 @@
 //! Fenêtre egui du solveur multiphasique (CPU f64 ou GPU f32). Toute la logique (scénarios, pinceaux, rendu, stats, scènes) est dans
-//! `simulation::multi::mp_view` / `mp_cells` (testées) ; ce fichier ne fait que l'interface. Mêmes conventions que `main_window.rs` :
+//! `simulation::multi::mp_view` / `mp_cells` (testées) ; ce fichier ne fait que l'interface. Conventions (celles de l'ancienne fenêtre
+//! monophasique) :
 //!
 //!  * clic gauche : outil courant ; Ctrl + clic gauche : pose le type de cellule choisi (solide + comportement thermique, puits, émetteur,
 //!    accélérateur, téléporteur) ; clic droit : pousse le fluide ; clic milieu (ou Ctrl + milieu) : efface solide et effet ;
@@ -21,7 +22,7 @@ use crate::simulation::multi::mp_view::{
 };
 use crate::simulation::multi::mp_state::{is_state_file, state_from_bytes, state_to_bytes, StateFile};
 use crate::simulation::multi::multiphase::{Bc, MultiphaseSim};
-use crate::window::main_window::WindowAction;
+use crate::window::WindowAction;
 use crate::window::material_editor::MaterialEditor;
 use crate::window::starting_window::{boundary_ui, save_settings, SimulationSettings};
 
@@ -1384,29 +1385,6 @@ impl MultiphaseWindow {
     }
 }
 
-/// Fenêtre de simulation : mono-phase (FluidWindow) ou multiphasique selon `settings.multiphase`.
-/// Dans le code qui possède la fenêtre (main.rs / app), remplacez `FluidWindow` par `SimWindow`.
-pub enum SimWindow {
-    Single(crate::window::main_window::FluidWindow),
-    Multi(Box<MultiphaseWindow>),
-}
-
-impl SimWindow {
-    pub fn new(settings: &SimulationSettings) -> Self {
-        if settings.multiphase {
-            SimWindow::Multi(Box::new(MultiphaseWindow::new(settings)))
-        } else {
-            SimWindow::Single(crate::window::main_window::FluidWindow::new(settings))
-        }
-    }
-    pub fn ui(&mut self, ctx: &egui::Context) -> WindowAction {
-        match self {
-            SimWindow::Single(w) => w.ui(ctx),
-            SimWindow::Multi(w) => w.ui(ctx),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,7 +1403,7 @@ mod tests {
     }
 
     fn settings() -> SimulationSettings {
-        SimulationSettings { multiphase: true, width: 320, height: 240, precision: 10, gravity: 9.81, mp_scenario: 5, ..Default::default() }
+        SimulationSettings { width: 320, height: 240, precision: 10, gravity: 9.81, mp_scenario: 5, ..Default::default() }
     }
 
     fn click_at(ctx: &egui::Context, w: &mut MultiphaseWindow, p: egui::Pos2, mods: Modifiers, button: egui::PointerButton) {

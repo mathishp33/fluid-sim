@@ -19,7 +19,7 @@ use crate::simulation::multi::mp_experiment::{apply_action, fmt_num, fmt_point, 
 use crate::simulation::multi::mp_script::{insert_initial_line, parse_all, zone_text};
 use crate::simulation::multi::mp_view::{cell_info, compute_stats, render_rgba, MpDisplay, MpScenario, MpStats, RenderOpts};
 use crate::simulation::multi::multiphase::MultiphaseSim;
-use crate::window::main_window::WindowAction;
+use crate::window::WindowAction;
 use crate::window::starting_window::SimulationSettings;
 
 const FRAME_BUDGET: Duration = Duration::from_millis(14);
@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     fn window(text: &str) -> ExperimentWindow {
-        let mut w = ExperimentWindow::new(&SimulationSettings { multiphase: true, ..Default::default() });
+        let mut w = ExperimentWindow::new(&SimulationSettings::default());
         w.text = text.into();
         w.rebuild_preview();
         assert!(w.errors.is_empty(), "{:?}", w.errors);

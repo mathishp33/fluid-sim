@@ -54,17 +54,19 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
 - **Fermeture connue à ~1e-7 près** (masses en f32) : vapeur bruitée de ~1 % dans une cellule presque pleine de liquide.
 - **Corps rigides** : pas encore sur le GPU (les scènes avec corps se calculent sur le CPU).
 
-### Interface
-- **Simulateur monophasique inaccessible** : case « Multiphase solver » décochée, « Launch Simulation » ne fait rien. Depuis le
-  2026-11-19, `app.rs` ne lance plus que la fenêtre multiphasique ; la fenêtre monophasique (`FluidWindow`, `main_window.rs`) et le
-  choix entre les deux (`SimWindow`, `multiphase_window.rs`) existent toujours. Peut-être voulu : à décider.
-
 ### Numérique
 - **Advection PLIC** : flux appliqués face par face dans l'ordre des indices ; la forme « flux pure » diverge sur un jet d'eau dans
   l'air.
 - **Suite de tests longue** (~65 min sur la machine de développement) : essais GPU un par un, mémoire juste (8 Go pour les essais).
 
 ## 2. Défauts corrigés
+
+### Interface (2026-11-26)
+- **« Launch Simulation » muet, case « Multiphase solver » décochée** : depuis le 2026-11-19, `app.rs` ne lançait plus que la fenêtre
+  multiphasique ; la fenêtre monophasique (`FluidWindow`, `main_window.rs`) et le choix entre les deux (`SimWindow`) restaient →
+  fenêtre monophasique retirée (elle ne sert plus), avec la case et les réglages du monophasique de l'écran de départ (fluide,
+  viscosité, conductivités, itérations de pression, couleur et traceur des bords) ; `popups.rs`, inutilisé depuis le 2026-11-08, retiré.
+  Le solveur monophasique reste, avec ses essais.
 
 ### Bords ouverts (2026-11-26)
 - **Vent parasite des bords ouverts** (multiphasique) : de l'air au repos dans une cuve aux côtés ouverts se mettait en mouvement,

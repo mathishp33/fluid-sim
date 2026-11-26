@@ -195,6 +195,8 @@ détail dans les documents de conception et l'historique git.
   rangés dans `docs/` ; README refait.
 - Code rangé en deux dossiers : `src/simulation/mono/` (monophasique) et `src/simulation/multi/` (multiphasique), lois de propriétés
   communes dans `src/simulation/materials.rs` ; anciens fichiers WGSL et `build_wgsl.py`, inutilisés depuis le 2026-11-19, retirés.
+- Fenêtre monophasique retirée (elle ne sert plus) : l'écran de départ lance le multiphasique ; le solveur monophasique reste pour
+  ses essais.
 
 ### Solides mobiles (2026-11-24 → 26, voir SOLID.md)
 - Étude et architecture (domaine fictif à une vitesse, repli monolithique), choix validés le 2026-11-24.

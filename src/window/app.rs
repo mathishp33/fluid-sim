@@ -1,5 +1,5 @@
 use crate::window::experiment_window::ExperimentWindow;
-use crate::window::main_window::WindowAction;
+use crate::window::WindowAction;
 use crate::window::multiphase_window::MultiphaseWindow;
 use crate::window::starting_window::{load_settings, Launch, StartingGui};
 
@@ -41,11 +41,7 @@ impl eframe::App for App {
             }
         } else if let Some(launch) = self.starting.ui(ctx) {
             match launch {
-                Launch::Simulation(settings) => {
-                    if settings.multiphase {
-                        self.simulation = Some(MultiphaseWindow::new(&settings));
-                    }
-                }
+                Launch::Simulation(settings) => self.simulation = Some(MultiphaseWindow::new(&settings)),
                 Launch::Experiment(settings) => self.experiment = Some(ExperimentWindow::new(&settings)),
             }
             ctx.request_repaint();
