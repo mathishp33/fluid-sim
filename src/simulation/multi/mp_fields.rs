@@ -179,7 +179,12 @@ pub struct Formula {
 struct FP<'a> {
     s: &'a [char],
     i: usize,
+    /// noms des variables, dans l'ordre des valeurs données à l'évaluation
+    vars: &'a [&'a str],
 }
+
+/// variables des formules de champs : position (m) et taille du domaine
+const FIELD_VARS: [&str; 4] = ["x", "y", "lx", "ly"];
 
 impl<'a> FP<'a> {
     fn ws(&mut self) {
@@ -325,14 +330,13 @@ impl<'a> FP<'a> {
                     }
                     return Ok(Expr::Call(f, args));
                 }
+                if let Some(k) = self.vars.iter().position(|v| *v == name) {
+                    return Ok(Expr::Var(k));
+                }
                 match name.as_str() {
-                    "x" => Ok(Expr::Var(0)),
-                    "y" => Ok(Expr::Var(1)),
-                    "lx" => Ok(Expr::Var(2)),
-                    "ly" => Ok(Expr::Var(3)),
                     "pi" => Ok(Expr::Num(std::f64::consts::PI)),
                     "e" => Ok(Expr::Num(std::f64::consts::E)),
-                    _ => Err(format!("formule : nom « {name} » inconnu (variables : x, y, lx, ly ; constantes : pi, e)")),
+                    _ => Err(format!("formule : nom « {name} » inconnu (variables : {} ; constantes : pi, e)", self.vars.join(", "))),
                 }
             }
             Some(c) => self.err(&format!("« {c} » inattendu")),
@@ -343,8 +347,12 @@ impl<'a> FP<'a> {
 
 impl Formula {
     pub fn parse(s: &str) -> Result<Formula, String> {
+        Self::parse_vars(s, &FIELD_VARS)
+    }
+    /// Formule en variables nommées `vars` (valeurs données dans le même ordre à `eval_vars`).
+    pub fn parse_vars(s: &str, vars: &[&str]) -> Result<Formula, String> {
         let cs: Vec<char> = s.chars().collect();
-        let mut p = FP { s: &cs, i: 0 };
+        let mut p = FP { s: &cs, i: 0, vars };
         let e = p.expr()?;
         if p.peek().is_some() {
             return p.err("texte en trop");
@@ -354,9 +362,13 @@ impl Formula {
     pub fn eval(&self, x: f64, y: f64, lx: f64, ly: f64) -> f64 {
         ev(&self.e, &[x, y, lx, ly])
     }
+    /// valeur pour les variables de `parse_vars`, dans leur ordre
+    pub fn eval_vars(&self, v: &[f64]) -> f64 {
+        ev(&self.e, v)
+    }
 }
 
-fn ev(e: &Expr, v: &[f64; 4]) -> f64 {
+fn ev(e: &Expr, v: &[f64]) -> f64 {
     match e {
         Expr::Num(a) => *a,
         Expr::Var(k) => v[*k],

@@ -369,11 +369,23 @@ pub struct BodyMotion {
     /// contacts : coefficient de restitution et de frottement (sinon ceux par défaut)
     pub restitution: Option<f64>,
     pub friction: Option<f64>,
+    /// lois en formules (variables `mp_bodies::LAW_VARS`) : translation et rotation imposées ; force (N/m) et couple (N) ajoutés à un
+    /// corps libre
+    pub lin_law: Option<super::mp_bodies::LinLaw>,
+    pub rot_law: Option<super::mp_bodies::RotLaw>,
+    pub force: Option<[String; 2]>,
+    pub torque: Option<String>,
 }
 
 impl BodyMotion {
     pub fn is_fixed(&self) -> bool {
-        !self.free && self.v == [0.0, 0.0] && self.omega == 0.0 && self.osc_v == [0.0, 0.0] && self.osc_omega == 0.0
+        !self.free
+            && self.v == [0.0, 0.0]
+            && self.omega == 0.0
+            && self.osc_v == [0.0, 0.0]
+            && self.osc_omega == 0.0
+            && self.lin_law.is_none()
+            && self.rot_law.is_none()
     }
 }
 
@@ -405,7 +417,7 @@ impl BodySpec {
 
     /// corps rigide de matériau `material`, tourné de `angle` (rad) autour de son centre de masse : fixe, à mouvement imposé ou libre
     pub fn body(&self, material: usize, angle: f64, temp: f64, motion: &BodyMotion) -> Result<super::mp_bodies::RigidBody, String> {
-        use super::mp_bodies::{Dof, Motion, RigidBody, Shape};
+        use super::mp_bodies::{Dof, ForceLaw, Motion, MotionLaw, RigidBody, Shape};
         let (shape, pos) = match self {
             BodySpec::Disc { c, r } => (Shape::Disc { r: *r }, *c),
             BodySpec::Rect { a, b } => {
@@ -433,8 +445,18 @@ impl BodySpec {
             // vitesse de départ (ramenée aux mouvements permis par `add_body`)
             b.vel = motion.v;
             b.omega = motion.omega;
+            if motion.force.is_some() || motion.torque.is_some() {
+                b.force_law = Some(Box::new(ForceLaw { force: motion.force.clone(), torque: motion.torque.clone(), start: pos }));
+            }
         } else if motion.is_fixed() {
             b.motion = Motion::Fixed;
+        } else if motion.lin_law.is_some() || motion.rot_law.is_some() {
+            let law = MotionLaw { lin: motion.lin_law.clone(), v: motion.v, rot: motion.rot_law.clone(), omega: motion.omega, start: pos };
+            b.motion = Motion::Law(Box::new(law));
+            b.pivot = motion.pivot;
+            // vitesse de départ d'une accélération imposée
+            b.vel = motion.v;
+            b.omega = motion.omega;
         } else {
             let m = motion;
             b.motion = Motion::Imposed { v: m.v, omega: m.omega, osc_v: m.osc_v, osc_omega: m.osc_omega, period: m.period };

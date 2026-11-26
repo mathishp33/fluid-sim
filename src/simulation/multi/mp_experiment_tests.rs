@@ -596,6 +596,80 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
 }
 
 #[test]
+fn a_body_follows_motion_and_force_laws_written_as_formulas() {
+    use super::mp_bodies::{LinLaw, RotLaw};
+    // lecture : lois de translation, de rotation, force et couple d'un corps libre ; formules vérifiées à la lecture
+    let p = proto(
+        "départ scénario \"cuve vide\"
+corps disque (0.1, 0.1) rayon 1 cm \"acier\" position formule \"x0 + 0.02*sin(2*pi*t/0.4)\" \"y0\" angle formule \"90*t\"
+corps disque (0.2, 0.1) rayon 1 cm \"acier\" accélération formule \"-2*vx\" \"-9.81\" vitesse (0.3, 0) rotation formule \"360\"
+corps disque (0.3, 0.1) rayon 1 cm \"acier\" libre force formule \"-100*(x - x0)\" \"-0.5*ay\" couple formule \"0\"
+",
+    );
+    let motions: Vec<&super::mp_experiment::BodyMotion> =
+        p.steps.iter().filter_map(|(s, _)| if let Step::Do(Action::Body { motion, .. }) = s { Some(motion) } else { None }).collect();
+    assert!(matches!(&motions[0].lin_law, Some(LinLaw::Position(f)) if f[1] == "y0") && matches!(&motions[0].rot_law, Some(RotLaw::Angle(_))));
+    assert!(matches!(&motions[1].lin_law, Some(LinLaw::Acceleration(_))) && motions[1].v == [0.3, 0.0] && matches!(&motions[1].rot_law, Some(RotLaw::Rate(_))));
+    assert!(motions[2].free && motions[2].force.is_some() && motions[2].torque.as_deref() == Some("0"));
+    let body = "corps disque (0.1, 0.1) rayon 1 cm \"acier\"";
+    for (bad, what) in [
+        ("position formule \"x0 + z\" \"y0\"", "« z » inconnu"),
+        ("position \"x0\" \"y0\"", "il faut « position formule"),
+        ("position formule \"x0\" \"y0\" vitesse formule \"1\" \"0\"", "une seule loi de translation"),
+        ("angle formule \"t\" rotation formule \"1\"", "une seule loi de rotation"),
+        ("libre position formule \"x0\" \"y0\"", "un corps libre suit l'écoulement"),
+        ("force formule \"0\" \"0\"", "corps « libre »"),
+        ("position formule \"x0\" \"y0\" vitesse (1, 0)", "deux translations"),
+        ("rotation 30 angle formule \"t\"", "deux rotations"),
+        ("position formule \"x0\" \"y0\" oscillation rotation 10 période 1 s", "oscillation"),
+        ("pivot (0.1, 0.11) vitesse formule \"1\" \"0\"", "sur un pivot"),
+    ] {
+        let e = parse_all(&format!("départ scénario \"cuve vide\"\n{body} {bad}\n")).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+
+    // mouvements imposés, comparés à leur solution exacte au bout de 0.1 s : position et angle posés à leur valeur, vitesse qui
+    // dépend de la position et accélération qui dépend de la vitesse intégrées (Runge–Kutta 4)
+    let text = "départ scénario \"cuve vide\" grille 40 x 20 maille 1 cm
+corps disque (0.1, 0.1) rayon 1 cm \"acier\" position formule \"x0 + 0.02*sin(2*pi*t/0.4)\" \"y0\" angle formule \"90*t\"
+corps disque (0.25, 0.15) rayon 1 cm \"acier\" accélération formule \"-2*vx\" \"-9.81\" vitesse (0.3, 0)
+corps disque (0.35, 0.05) rayon 1 cm \"acier\" vitesse formule \"-5*(x - 0.32)\" \"0\" rotation formule \"360\"
+simuler 0.1 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let b = &r.sim.bodies;
+    let close = |a: f64, b: f64, tol: f64, what: &str| assert!((a - b).abs() < tol, "{what} : {a} au lieu de {b}");
+    close(b[0].pos[0], 0.12, 1e-12, "position imposée");
+    close(b[0].vel[0], 0.0, 1e-6, "vitesse d'une position imposée (dérivée)");
+    close(b[0].angle, 9f64.to_radians(), 1e-12, "angle imposé");
+    close(b[1].pos[0], 0.25 + 0.15 * (1.0 - (-0.2f64).exp()), 1e-9, "x d'une accélération -2 vx");
+    close(b[1].pos[1], 0.15 - 0.5 * 9.81 * 0.01, 1e-9, "chute à g");
+    close(b[1].vel[0], 0.3 * (-0.2f64).exp(), 1e-9, "vitesse amortie");
+    close(b[1].vel[1], -0.981, 1e-9, "vitesse de chute");
+    close(b[1].acc[1], -9.81, 1e-6, "accélération mesurée sur le pas");
+    close(b[2].pos[0], 0.32 + 0.03 * (-0.5f64).exp(), 1e-9, "vitesse rappelée vers x = 0.32");
+    close(b[2].angle, 36f64.to_radians(), 1e-12, "rotation imposée");
+
+    // corps libre rappelé par un ressort (force en formule), lancé à 0.2 m/s dans l'air : il s'arrête au quart de période
+    // T/4 = (π/2) √(m/k), à A = v₀ √(m/k) de son départ
+    let text = "départ scénario \"cuve vide\" grille 40 x 20 maille 1 cm
+corps disque (0.2, 0.1) rayon 1 cm \"acier\" libre bloqué y et rotation vitesse (0.2, 0) force formule \"-100*(x - x0)\" \"0\"
+simuler jusqu'à ce que corps 1 vx < 0 au plus 1 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let b = &r.sim.bodies[0];
+    let m = b.mass(b.density(r.sim.reg.solids[b.material].rho));
+    let w = (100.0 / m).sqrt();
+    let hit = r.log.iter().find(|l| l.contains("corps 1 vx < 0 m/s atteint")).unwrap_or_else(|| panic!("{}", r.log.join("\n")));
+    let t = hit[hit.find("t = ").unwrap() + 4..hit.find(" s]").unwrap()].trim().parse::<f64>().unwrap();
+    eprintln!("ressort : arrêt à t = {t:.4} s (T/4 = {:.4}), x − x0 = {:.5} m (A = {:.5})", 0.5 * std::f64::consts::PI / w, b.pos[0] - 0.2, 0.2 / w);
+    assert!((t * w / (0.5 * std::f64::consts::PI) - 1.0).abs() < 0.02, "quart de période {t} pour {}", 0.5 * std::f64::consts::PI / w);
+    assert!(((b.pos[0] - 0.2) * w / 0.2 - 1.0).abs() < 0.02, "amplitude {} pour {}", b.pos[0] - 0.2, 0.2 / w);
+}
+
+#[test]
 fn an_outlet_draws_the_fluid_out_at_its_imposed_speed() {
     // lecture : vitesse dirigée vers l'extérieur du bord ; « sortie » seule reste un bord ouvert
     let p = proto("départ scénario \"cuve vide\"\nbord bas sortie (0, -0.05)\nbord droite sortie\nbord haut sortie (0.1, 2 cm/s)\n");

@@ -175,6 +175,57 @@ pub enum Motion {
     /// Mouvement imposé : le corps pousse le fluide, le fluide ne le pousse pas. Vitesse V(t) = v + osc_v sin(2πt/period) et rotation
     /// ω(t) = omega + osc_omega sin(2πt/period) (sans oscillation si period ≤ 0) ; sur un pivot, seule la rotation compte.
     Imposed { v: [f64; 2], omega: f64, osc_v: [f64; 2], osc_omega: f64, period: f64 },
+    /// Mouvement imposé par des formules (protocoles) : le corps pousse le fluide comme ci-dessus.
+    Law(Box<MotionLaw>),
+}
+
+/// Variables des formules de mouvement et de force : temps (s), centre du corps (m), sa vitesse (m/s), son accélération sur le
+/// dernier pas (m/s²), son angle (°) et sa rotation (°/s), sa position de départ (m).
+pub const LAW_VARS: [&str; 11] = ["t", "x", "y", "vx", "vy", "ax", "ay", "angle", "rotation", "x0", "y0"];
+
+/// Loi de translation d'un corps à mouvement imposé (formules en `LAW_VARS`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LinLaw {
+    /// position du centre (m)
+    Position([String; 2]),
+    /// vitesse (m/s)
+    Velocity([String; 2]),
+    /// accélération (m/s²), depuis la vitesse de départ du corps
+    Acceleration([String; 2]),
+}
+
+/// Loi de rotation d'un corps à mouvement imposé (formules en `LAW_VARS`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RotLaw {
+    /// angle (°)
+    Angle(String),
+    /// rotation (°/s)
+    Rate(String),
+}
+
+/// Mouvement imposé par des formules : translation et rotation, chacune à une loi ou, sans loi, à vitesse constante (`v`, `omega`
+/// rad/s) ; `start` : position de départ (x0, y0 des formules). Sur un pivot, seule la rotation compte.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MotionLaw {
+    pub lin: Option<LinLaw>,
+    pub v: [f64; 2],
+    pub rot: Option<RotLaw>,
+    pub omega: f64,
+    pub start: [f64; 2],
+}
+
+/// Force (N/m) et couple (N, autour du centre de masse) ajoutés à un corps libre, en formules de `LAW_VARS` : ressort, moteur, frein…
+/// Explicites (évalués au début du pas), avec la pesanteur et les contacts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ForceLaw {
+    pub force: Option<[String; 2]>,
+    pub torque: Option<String>,
+    pub start: [f64; 2],
+}
+
+/// valeur d'une formule de `LAW_VARS` (NaN si elle ne se lit pas : elle a été vérifiée à la lecture du protocole)
+fn law(f: &str, v: &[f64; 11]) -> f64 {
+    super::mp_fields::Formula::parse_vars(f, &LAW_VARS).map_or(f64::NAN, |e| e.eval_vars(v))
 }
 
 impl Motion {
@@ -196,12 +247,17 @@ pub struct RigidBody {
     /// vitesse du centre de masse (m/s) et vitesse de rotation (rad/s, sens trigonométrique)
     pub vel: [f64; 2],
     pub omega: f64,
+    /// accélération du centre sur le dernier pas (m/s² ; variables ax, ay des formules) et vitesse de la fin du pas précédent
+    pub acc: [f64; 2],
+    pub last_vel: [f64; 2],
     pub dof: Dof,
     /// point fixe autour duquel le corps tourne (charnière d'un clapet)
     pub pivot: Option<[f64; 2]>,
     pub motion: Motion,
     /// une température par corps (étape 5)
     pub temp: f64,
+    /// force et couple ajoutés à un corps libre (formules)
+    pub force_law: Option<Box<ForceLaw>>,
     /// masse volumique propre du corps (kg/m³), à la place de celle de son matériau (bouchon, flotteur, corps de densité donnée)
     pub rho: Option<f64>,
     /// contacts (mp_contacts.rs) : coefficient de restitution normal et coefficient de frottement de Coulomb
@@ -223,10 +279,13 @@ impl RigidBody {
             angle: 0.0,
             vel: [0.0, 0.0],
             omega: 0.0,
+            acc: [0.0, 0.0],
+            last_vel: [0.0, 0.0],
             dof: Dof::FREE,
             pivot: None,
             motion: Motion::Free,
             temp,
+            force_law: None,
             rho: None,
             restitution: DEFAULT_RESTITUTION,
             friction: DEFAULT_FRICTION,
@@ -307,7 +366,7 @@ impl RigidBody {
     pub fn constrained_velocity(&self, m: f64, i: f64, p: [f64; 2], l: f64) -> ([f64; 2], f64) {
         match self.motion {
             Motion::Fixed => ([0.0, 0.0], 0.0),
-            Motion::Imposed { .. } => (self.vel, self.omega),
+            Motion::Imposed { .. } | Motion::Law(_) => (self.vel, self.omega),
             Motion::Free => match self.pivot {
                 Some(q) => {
                     let r = sub(self.pos, q);
@@ -348,7 +407,43 @@ impl RigidBody {
 
     /// corps dont le mouvement est imposé ?
     pub fn is_imposed(&self) -> bool {
-        matches!(self.motion, Motion::Imposed { .. })
+        matches!(self.motion, Motion::Imposed { .. } | Motion::Law(_))
+    }
+
+    /// variables des formules de mouvement à l'instant t, pour l'état (pos, vel, acc, angle, omega)
+    fn law_vars(t: f64, pos: [f64; 2], vel: [f64; 2], acc: [f64; 2], angle: f64, omega: f64, start: [f64; 2]) -> [f64; 11] {
+        [t, pos[0], pos[1], vel[0], vel[1], acc[0], acc[1], angle.to_degrees(), omega.to_degrees(), start[0], start[1]]
+    }
+
+    /// force (N/m) et couple (N) de la loi d'un corps libre à l'instant t
+    pub fn law_force(&self, t: f64) -> [f64; 3] {
+        let Some(fl) = &self.force_law else { return [0.0; 3] };
+        let v = Self::law_vars(t, self.pos, self.vel, self.acc, self.angle, self.omega, fl.start);
+        let f = fl.force.as_ref().map_or([0.0, 0.0], |f| [law(&f[0], &v), law(&f[1], &v)]);
+        [f[0], f[1], fl.torque.as_ref().map_or(0.0, |c| law(c, &v))]
+    }
+
+    /// vitesse et rotation de la loi `l` à l'instant t pour l'état (pos, vel, angle, omega) : dérivée (centrée) d'une position ou
+    /// d'un angle imposés, formule d'une vitesse, ou vitesse portée par l'état (accélération imposée)
+    fn law_rates(l: &MotionLaw, t: f64, pos: [f64; 2], vel: [f64; 2], acc: [f64; 2], angle: f64, omega: f64) -> ([f64; 2], f64) {
+        let v = Self::law_vars(t, pos, vel, acc, angle, omega, l.start);
+        let h = 1e-6 * t.abs().max(1e-3);
+        let at = |tt: f64| Self::law_vars(tt, pos, vel, acc, angle, omega, l.start);
+        let lin = match &l.lin {
+            None => l.v,
+            Some(LinLaw::Position(f)) => {
+                let (a, b) = (at(t + h), at(t - h));
+                [(law(&f[0], &a) - law(&f[0], &b)) / (2.0 * h), (law(&f[1], &a) - law(&f[1], &b)) / (2.0 * h)]
+            }
+            Some(LinLaw::Velocity(f)) => [law(&f[0], &v), law(&f[1], &v)],
+            Some(LinLaw::Acceleration(_)) => vel,
+        };
+        let w = match &l.rot {
+            None => l.omega,
+            Some(RotLaw::Angle(f)) => (law(f, &at(t + h)) - law(f, &at(t - h))).to_radians() / (2.0 * h),
+            Some(RotLaw::Rate(f)) => law(f, &v).to_radians(),
+        };
+        (lin, w)
     }
 
     /// Vitesse du centre de masse et rotation imposées à l'instant t (sur un pivot : la vitesse du centre est ω × (G − pivot)).
@@ -356,6 +451,16 @@ impl RigidBody {
         match &self.motion {
             Motion::Fixed => ([0.0, 0.0], 0.0),
             Motion::Free => (self.vel, self.omega),
+            Motion::Law(l) => {
+                let (lin, w) = Self::law_rates(l, t, self.pos, self.vel, self.acc, self.angle, self.omega);
+                match self.pivot {
+                    Some(q) => {
+                        let r = sub(self.pos, q);
+                        ([-w * r[1], w * r[0]], w)
+                    }
+                    None => (lin, w),
+                }
+            }
             Motion::Imposed { v, omega, osc_v, osc_omega, period } => {
                 let s = if *period > 0.0 { (2.0 * std::f64::consts::PI * t / period).sin() } else { 0.0 };
                 let w = omega + osc_omega * s;
@@ -373,6 +478,10 @@ impl RigidBody {
     /// Mouvement imposé de t0 à t1 : intégrale EXACTE de la loi (la partie sinusoïdale revient pile à son point de départ à chaque
     /// période, quel que soit le pas) ; vitesses mises à celles de t1.
     pub fn move_imposed(&mut self, t0: f64, t1: f64) {
+        if let Motion::Law(l) = self.motion.clone() {
+            self.move_law(&l, t0, t1);
+            return;
+        }
         let Motion::Imposed { v, omega, osc_v, osc_omega, period } = self.motion.clone() else { return };
         let dt = t1 - t0;
         // ∫ sin(2πt/P) dt = P/(2π) (cos(2π t0/P) − cos(2π t1/P))
@@ -383,6 +492,62 @@ impl RigidBody {
             0.0
         };
         self.displace(v[0] * dt + osc_v[0] * k, v[1] * dt + osc_v[1] * k, omega * dt + osc_omega * k);
+        let (vv, w) = self.rates(t1);
+        self.vel = vv;
+        self.omega = w;
+    }
+}
+
+impl RigidBody {
+    /// Mouvement en formules de t0 à t1 : position et angle imposés posés à leur valeur de t1 (exacts) ; vitesse ou rotation imposées
+    /// et accélération imposée intégrées sur le pas (Runge–Kutta d'ordre 4, l'état étant (x, y, vx, vy, angle, rotation)) ; vitesses
+    /// mises à celles de t1. Sur un pivot, seule la rotation compte, et le centre tourne autour du pivot.
+    fn move_law(&mut self, l: &MotionLaw, t0: f64, t1: f64) {
+        let dt = t1 - t0;
+        let acc0 = self.acc;
+        // dérivée de l'état s = (x, y, vx, vy, θ, ω) (rad, rad/s) : lois intégrées seulement (les imposées en valeur sont posées après)
+        let deriv = |t: f64, s: &[f64; 6]| -> [f64; 6] {
+            let (pos, vel) = ([s[0], s[1]], [s[2], s[3]]);
+            let v = Self::law_vars(t, pos, vel, acc0, s[4], s[5], l.start);
+            let (dx, dv) = match &l.lin {
+                None => (l.v, [0.0, 0.0]),
+                Some(LinLaw::Position(_)) => ([0.0, 0.0], [0.0, 0.0]),
+                Some(LinLaw::Velocity(f)) => ([law(&f[0], &v), law(&f[1], &v)], [0.0, 0.0]),
+                Some(LinLaw::Acceleration(f)) => (vel, [law(&f[0], &v), law(&f[1], &v)]),
+            };
+            let da = match &l.rot {
+                None => l.omega,
+                Some(RotLaw::Angle(_)) => 0.0,
+                Some(RotLaw::Rate(f)) => law(f, &v).to_radians(),
+            };
+            [dx[0], dx[1], dv[0], dv[1], da, 0.0]
+        };
+        let s0 = [self.pos[0], self.pos[1], self.vel[0], self.vel[1], self.angle, self.omega];
+        let add = |a: &[f64; 6], k: &[f64; 6], h: f64| -> [f64; 6] { std::array::from_fn(|i| a[i] + h * k[i]) };
+        let k1 = deriv(t0, &s0);
+        let k2 = deriv(t0 + 0.5 * dt, &add(&s0, &k1, 0.5 * dt));
+        let k3 = deriv(t0 + 0.5 * dt, &add(&s0, &k2, 0.5 * dt));
+        let k4 = deriv(t1, &add(&s0, &k3, dt));
+        let mut s1: [f64; 6] = std::array::from_fn(|i| s0[i] + dt / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]));
+        // positions et angle imposés en valeur, à t1 (variables : l'état intégré)
+        let v1 = Self::law_vars(t1, [s1[0], s1[1]], [s1[2], s1[3]], acc0, s1[4], s1[5], l.start);
+        if let Some(LinLaw::Position(f)) = &l.lin {
+            s1[0] = law(&f[0], &v1);
+            s1[1] = law(&f[1], &v1);
+        }
+        if let Some(RotLaw::Angle(f)) = &l.rot {
+            s1[4] = law(f, &v1).to_radians();
+        }
+        match self.pivot {
+            Some(_) => self.displace(0.0, 0.0, s1[4] - self.angle),
+            None => {
+                self.pos = [s1[0], s1[1]];
+                self.angle = s1[4];
+            }
+        }
+        if let Some(LinLaw::Acceleration(_)) = &l.lin {
+            self.vel = [s1[2], s1[3]];
+        }
         let (vv, w) = self.rates(t1);
         self.vel = vv;
         self.omega = w;
@@ -946,6 +1111,12 @@ impl super::multiphase::MultiphaseSim {
             } else {
                 self.bodies[k].move_imposed(t0, t1);
             }
+            // accélération sur le pas (variables ax, ay des formules)
+            let b = &mut self.bodies[k];
+            if t1 > t0 {
+                b.acc = [(b.vel[0] - b.last_vel[0]) / (t1 - t0), (b.vel[1] - b.last_vel[1]) / (t1 - t0)];
+            }
+            b.last_vel = b.vel;
         }
         self.update_body_fractions();
         self.push_fluid(&old);
@@ -1295,7 +1466,9 @@ impl super::multiphase::MultiphaseSim {
                     // M Vⁿ + dt (M g + fu + hydro)
                     let vn = [b.vel[0], b.vel[1], b.omega];
                     let gf = [mb * g[0], mb * g[1], 0.0];
-                    let fc = contact[k];
+                    // contacts et force imposée par une formule (ressort, moteur…), explicites
+                    let lf = b.law_force(self.time);
+                    let fc: [f64; 3] = std::array::from_fn(|r| contact[k][r] + lf[r]);
                     let rhs: [f64; 3] = std::array::from_fn(|r| mass[r] * vn[r] + dt * (gf[r] + fu[r] + hydro[r] + fc[r]));
                     for r in 0..3 {
                         v0[r] = (0..3).map(|s| w[r][s] * rhs[s]).sum();
@@ -1352,6 +1525,7 @@ impl super::multiphase::MultiphaseSim {
                 }
             }
         }
+        b.last_vel = b.vel;
         let old = self.body_frac.clone();
         self.bodies.push(b);
         self.update_body_fractions();

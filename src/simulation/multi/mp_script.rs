@@ -865,6 +865,35 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let mut osc = false;
             let mut fixed_kw = false;
             let mut temp = None;
+            // formule(s) d'une loi de mouvement ou de force, vérifiées sur les variables de `LAW_VARS`
+            let law_formulas = |p: &mut P, n: usize, what: &str| -> R<Vec<String>> {
+                if !p.eat_w("formule") {
+                    return p.err(format!("il faut « {what} formule \"…\"{} »{}", if n == 2 { " \"…\"" } else { "" }, p.here()));
+                }
+                let mut out = vec![];
+                for k in 0..n {
+                    let f = p.string(&format!("la formule {} de {what}", ["x", "y"][k.min(1)]))?;
+                    if let Err(e) = super::mp_fields::Formula::parse_vars(&f, &super::mp_bodies::LAW_VARS) {
+                        return p.err(format!("{what} : {e}"));
+                    }
+                    out.push(f);
+                }
+                Ok(out)
+            };
+            let set_lin = |p: &mut P, motion: &mut BodyMotion, l: super::mp_bodies::LinLaw| -> R<()> {
+                if motion.lin_law.is_some() {
+                    return p.err("une seule loi de translation par corps : position, vitesse ou accélération en formule");
+                }
+                motion.lin_law = Some(l);
+                Ok(())
+            };
+            let set_rot = |p: &mut P, motion: &mut BodyMotion, l: super::mp_bodies::RotLaw| -> R<()> {
+                if motion.rot_law.is_some() {
+                    return p.err("une seule loi de rotation par corps : angle ou rotation en formule");
+                }
+                motion.rot_law = Some(l);
+                Ok(())
+            };
             // vitesse angulaire : degrés par seconde sans unité
             let ang_speed = |p: &mut P| -> R<f64> {
                 let v = p.number("la vitesse de rotation")?;
@@ -874,10 +903,30 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             while !p.done() {
                 match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement, à T)")?.as_str() {
                     "a" => temp = Some(p.quantity(Dim::Temp, "la température du corps")?),
+                    "angle" if p.peek_w() == Some("formule") => {
+                        let f = law_formulas(p, 1, "angle")?;
+                        set_rot(p, &mut motion, super::mp_bodies::RotLaw::Angle(f[0].clone()))?;
+                    }
                     "angle" => {
                         let v = p.number("l'angle")?;
                         let (v, unit) = p.opt_unit(Dim::Angle, v)?;
                         angle = if unit { v } else { v.to_radians() };
+                    }
+                    "position" => {
+                        let f = law_formulas(p, 2, "position")?;
+                        set_lin(p, &mut motion, super::mp_bodies::LinLaw::Position([f[0].clone(), f[1].clone()]))?;
+                    }
+                    "acceleration" => {
+                        let f = law_formulas(p, 2, "accélération")?;
+                        set_lin(p, &mut motion, super::mp_bodies::LinLaw::Acceleration([f[0].clone(), f[1].clone()]))?;
+                    }
+                    "force" => {
+                        let f = law_formulas(p, 2, "force")?;
+                        motion.force = Some([f[0].clone(), f[1].clone()]);
+                    }
+                    "couple" => {
+                        let f = law_formulas(p, 1, "couple")?;
+                        motion.torque = Some(f[0].clone());
                     }
                     "fixe" => fixed_kw = true,
                     "libre" => motion.free = true,
@@ -924,6 +973,14 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         }
                         motion.friction = Some(m);
                     }
+                    "vitesse" if p.peek_w() == Some("formule") => {
+                        let f = law_formulas(p, 2, "vitesse")?;
+                        set_lin(p, &mut motion, super::mp_bodies::LinLaw::Velocity([f[0].clone(), f[1].clone()]))?;
+                    }
+                    "rotation" if p.peek_w() == Some("formule") => {
+                        let f = law_formulas(p, 1, "rotation")?;
+                        set_rot(p, &mut motion, super::mp_bodies::RotLaw::Rate(f[0].clone()))?;
+                    }
                     "vitesse" => motion.v = p.vector(Dim::Speed, "la vitesse du corps")?,
                     "rotation" => motion.omega = ang_speed(p)?,
                     "oscillation" => {
@@ -945,13 +1002,34 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         return p.err(format!(
                             "option « {o} » inconnue après « corps » : angle <a>, fixe, libre, bloqué x | y | rotation, vitesse (vx, vy), \
                              rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>, \
-                             rebond <e>, frottement <μ>, à <T>"
+                             rebond <e>, frottement <μ>, à <T> ; lois en formules : position | vitesse | accélération formule \"…\" \"…\", \
+                             angle | rotation formule \"…\", force formule \"…\" \"…\", couple formule \"…\""
                         ))
                     }
                 }
             }
             if motion.free && fixed_kw {
                 return p.err("un corps est « fixe » ou « libre », pas les deux");
+            }
+            let laws = motion.lin_law.is_some() || motion.rot_law.is_some();
+            if motion.free && laws {
+                return p.err("un corps libre suit l'écoulement : pas de loi de mouvement imposée (« force formule » et « couple formule » s'ajoutent à un corps libre)");
+            }
+            if (motion.force.is_some() || motion.torque.is_some()) && !motion.free {
+                return p.err("« force formule » et « couple formule » s'appliquent à un corps « libre »");
+            }
+            if laws && osc {
+                return p.err("une loi en formule ne se combine pas avec une oscillation (la formule peut osciller)");
+            }
+            use super::mp_bodies::LinLaw;
+            if matches!(motion.lin_law, Some(LinLaw::Position(_)) | Some(LinLaw::Velocity(_))) && motion.v != [0.0, 0.0] {
+                return p.err("deux translations : « vitesse (vx, vy) » et la loi de position ou de vitesse (avec « accélération formule », elle est la vitesse de départ)");
+            }
+            if motion.rot_law.is_some() && motion.omega != 0.0 {
+                return p.err("deux rotations : « rotation ω » et la loi d'angle ou de rotation");
+            }
+            if motion.pivot.is_some() && motion.lin_law.is_some() {
+                return p.err("sur un pivot, seule la rotation compte : pas de loi de translation");
             }
             if motion.free && osc {
                 return p.err("un corps libre suit l'écoulement : pas d'oscillation imposée (« vitesse » et « rotation » donnent sa vitesse de départ)");

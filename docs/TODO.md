@@ -211,6 +211,9 @@ détail dans les documents de conception et l'historique git.
   faces suivies (transport PLIC, chute des grains, percolation, fluide chassé par un corps ; CPU et GPU) : le débit intégré redonne
   exactement la masse passée.
 - Bords : `bord … sortie (vx, vy)`, sortie à vitesse imposée (pompe, vidange ; débit ρ v L exact, CPU et GPU).
+- Corps : lois en formules (variables t, x, y, vx, vy, ax, ay, angle, rotation, x0, y0) — `position | vitesse | accélération
+  formule`, `angle | rotation formule` pour un mouvement imposé (Runge–Kutta 4), `force | couple formule` ajoutés à un corps libre
+  (ressort, amortisseur, moteur).
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d
