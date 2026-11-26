@@ -10,10 +10,10 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 
 ### Organisation et interface
 - [M] Intégrer la fenêtre d'expérience à la fenêtre de départ (`starting_window.rs`).
-- [M] Améliorer la fenêtre d'expérience : outil « Corps » qui pose aussi des corps libres ou à mouvement imposé (aujourd'hui fixes
-  seulement, le reste passe par la commande `corps`) ; conditions (« simuler jusqu'à ce que T max < 400 K ») ; gestes à la souris
-  enregistrés en actions datées pendant une expérience ; flux à travers une ligne ; images des champs (PNG) en sortie ; sondes
-  interpolées.
+- [M] Améliorer la fenêtre d'expérience : mouvement imposé, pivot et axes bloqués dans l'outil « Corps » (qui pose des corps fixes
+  ou libres, avec masse volumique, rebond, frottement et température ; le reste passe par la commande `corps`) ; conditions
+  (« simuler jusqu'à ce que T max < 400 K ») ; gestes à la souris enregistrés en actions datées pendant une expérience ; flux à travers
+  une ligne ; images des champs (PNG) en sortie ; sondes interpolées.
 
 ### Bords du domaine
 - [M+1] Plus de types de bords : sortie à vitesse imposée, périodiques, sortie convective. Existent : [M] bord ouvert à pression
@@ -205,6 +205,7 @@ détail dans les documents de conception et l'historique git.
   ; traînée des corps en mouvement corrigée (le fluide collé au corps comptait deux fois).
 - Étape 4 : contacts (bords, solides fixes, autres corps ; restitution et frottement ; peau de contact).
 - Étape 5, chaleur : une température par corps, échangée avec le fluide qui le borde (option `à T`, mesure `corps n température`).
+- Outil « Corps » de la fenêtre d'expérience : corps fixes ou libres, masse volumique propre, rebond, frottement, température.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

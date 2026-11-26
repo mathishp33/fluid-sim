@@ -53,7 +53,7 @@ impl CiTool {
         match self {
             CiTool::Fill => "Remplir d'un fluide ou d'un mélange",
             CiTool::Solid => "Solide",
-            CiTool::Body => "Corps rigide fixe (disque au clic, rectangle tiré)",
+            CiTool::Body => "Corps rigide (disque au clic, rectangle tiré)",
             CiTool::Temperature => "Température (composition gardée)",
             CiTool::Clear => "Effacer (solides, cellules spéciales)",
             CiTool::Ignite => "Allumer (noyau de gaz brûlés)",
@@ -177,6 +177,13 @@ pub struct ExperimentWindow {
     emit_v: [f64; 2],
     grille_hole_mm: f64,
     grille_open: f64,
+    /// outil « Corps » : libre (poussé par l'écoulement, avec ses contacts) ou fixe ; masse volumique propre (kg/m³, 0 : celle du
+    /// matériau) ; rebond et frottement (corps libre) ; température de départ propre (sinon celle du fluide ambiant)
+    body_free: bool,
+    body_rho: f64,
+    body_rebound: f64,
+    body_friction: f64,
+    body_own_temp: bool,
     stroke: Vec<[f64; 2]>,
     drag_start: Option<(usize, usize)>,
     drag_now: Option<(usize, usize)>,
@@ -249,6 +256,11 @@ impl ExperimentWindow {
             emit_v: [0.0, 1.0],
             grille_hole_mm: 10.0,
             grille_open: 0.6,
+            body_free: false,
+            body_rho: 0.0,
+            body_rebound: crate::simulation::multi::mp_bodies::DEFAULT_RESTITUTION,
+            body_friction: crate::simulation::multi::mp_bodies::DEFAULT_FRICTION,
+            body_own_temp: false,
             stroke: vec![],
             drag_start: None,
             drag_now: None,
@@ -719,7 +731,20 @@ impl ExperimentWindow {
             _ => {}
         }
         if self.tool == CiTool::Body {
-            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille), fixe ; corps libres ou à mouvement imposé : commande « corps » du protocole (docs/EXPERIENCES.md).");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.body_free, false, "Fixe");
+                ui.selectable_value(&mut self.body_free, true, "Libre (poussé par l'écoulement)");
+            });
+            if self.body_free {
+                ui.add(egui::Slider::new(&mut self.body_rho, 0.0..=20000.0).text("Masse volumique propre (kg/m³, 0 : celle du matériau)"));
+                ui.add(egui::Slider::new(&mut self.body_rebound, 0.0..=1.0).text("Rebond (restitution)"));
+                ui.add(egui::Slider::new(&mut self.body_friction, 0.0..=1.5).text("Frottement (Coulomb)"));
+            }
+            ui.checkbox(&mut self.body_own_temp, "Température propre (sinon celle du fluide ambiant)");
+            if self.body_own_temp {
+                ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));
+            }
+            ui.weak("Corps net aux bords lissés (fraction exacte de chaque maille) ; mouvement imposé, pivot, axes bloqués : commande « corps » du protocole (docs/EXPERIENCES.md).");
         }
         if matches!(self.tool, CiTool::Fill | CiTool::Temperature | CiTool::Emitter | CiTool::Solid) {
             ui.add(egui::Slider::new(&mut self.temp, 100.0..=3000.0).text("T (K)"));
@@ -823,6 +848,28 @@ impl ExperimentWindow {
         format!("{} K", fmt_num(t))
     }
 
+    /// options de la ligne `corps` de l'outil (vide pour un corps fixe à la température ambiante)
+    fn body_options(&self) -> String {
+        use crate::simulation::multi::mp_bodies::{DEFAULT_FRICTION, DEFAULT_RESTITUTION};
+        let mut o = String::new();
+        if self.body_free {
+            o += " libre";
+            if self.body_rho > 0.0 {
+                o += &format!(" masse volumique {} kg/m3", fmt_num(self.body_rho.round()));
+            }
+            if (self.body_rebound - DEFAULT_RESTITUTION).abs() > 1e-9 {
+                o += &format!(" rebond {}", fmt_num((self.body_rebound * 100.0).round() / 100.0));
+            }
+            if (self.body_friction - DEFAULT_FRICTION).abs() > 1e-9 {
+                o += &format!(" frottement {}", fmt_num((self.body_friction * 100.0).round() / 100.0));
+            }
+        }
+        if self.body_own_temp {
+            o += &format!(" à {}", Self::temp_text(self.temp));
+        }
+        o
+    }
+
     /// ligne du protocole pour l'outil courant sur une zone
     fn tool_line(&self, zone: &Zone) -> String {
         let z = zone_text(zone);
@@ -835,12 +882,15 @@ impl ExperimentWindow {
                 SolidThermal::Isothermal => format!("solide {z} \"{}\" isotherme {}", self.solid, Self::temp_text(self.thermal_temp)),
                 SolidThermal::Heater => format!("solide {z} \"{}\" chauffant {} W/m³ à {t}", self.solid, fmt_num(self.thermal_power)),
             },
-            CiTool::Body => match zone {
-                Zone::Rect { a, b } => format!("corps rect {} {} \"{}\"", fmt_point(*a), fmt_point(*b), self.solid),
-                Zone::Disque { c, r } => format!("corps disque {} rayon {} \"{}\"", fmt_point(*c), fmt_num(*r), self.solid),
-                Zone::Trait { pts, r } if !pts.is_empty() => format!("corps disque {} rayon {} \"{}\"", fmt_point(pts[0]), fmt_num(*r), self.solid),
-                _ => format!("# corps : forme non prise en charge ({z})"),
-            },
+            CiTool::Body => {
+                let shape = match zone {
+                    Zone::Rect { a, b } => format!("corps rect {} {} \"{}\"", fmt_point(*a), fmt_point(*b), self.solid),
+                    Zone::Disque { c, r } => format!("corps disque {} rayon {} \"{}\"", fmt_point(*c), fmt_num(*r), self.solid),
+                    Zone::Trait { pts, r } if !pts.is_empty() => format!("corps disque {} rayon {} \"{}\"", fmt_point(pts[0]), fmt_num(*r), self.solid),
+                    _ => return format!("# corps : forme non prise en charge ({z})"),
+                };
+                format!("{shape}{}", self.body_options())
+            }
             CiTool::Clear => format!("effacer {z}"),
             CiTool::Ignite => format!("allumer {z} à {t}"),
             CiTool::Sink => format!("puits {z} {} m/s", fmt_num(self.sink_rate)),
@@ -1437,6 +1487,22 @@ mod tests {
         assert_eq!(s.bodies.len(), 2);
         let area: f64 = s.body_frac.iter().sum::<f64>() * s.dx * s.dx;
         assert!((area - (std::f64::consts::PI * 9e-4 + 0.06 * 0.04)).abs() < 1e-9, "aire {area}");
+        assert!(w.errors.is_empty(), "{:?}", w.errors);
+        // corps libre, léger, qui rebondit peu, posé chaud
+        w.shape = Shape::Brush;
+        w.solid = "acier".into();
+        w.body_free = true;
+        w.body_rho = 600.0;
+        w.body_rebound = 0.2;
+        w.body_own_temp = true;
+        w.temp = 353.15;
+        let path = [at(&w, 20, 20)];
+        drag(&ctx, &mut w, &path);
+        assert!(w.text.contains("rayon 0.03 \"acier\" libre masse volumique 600 kg/m3 rebond 0.2 à 353.15 K"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        assert_eq!(s.bodies.len(), 3);
+        let b = &s.bodies[2];
+        assert!(b.is_free() && b.rho == Some(600.0) && (b.restitution - 0.2).abs() < 1e-12 && (b.temp - 353.15).abs() < 1e-9);
         assert!(w.errors.is_empty(), "{:?}", w.errors);
         // l'image se rend avec les corps
         for d in [MpDisplay::Phases, MpDisplay::Temperature] {
