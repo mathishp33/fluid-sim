@@ -162,7 +162,6 @@ conception SOLID.md (solides mobiles), GRANULAIRE.md (grains), MULTIPHASE.md (so
 ### Autre
 - [1] Optimiser la simulation de fluide.
 - [M] FLIP/PIC ?
-- [M] Indicateur de vorticité (affichage).
 
 ---
 
@@ -222,6 +221,8 @@ détail dans les documents de conception et l'historique git.
   faces) ; en aval fermé, le gaz se comprime (CPU et GPU).
 - Protocoles et fenêtre : action datée `à t : <action>` ; un geste fait pendant une expérience (en cours ou en pause) est fait tout
   de suite et inscrit ainsi, rejoué à l'heure pile.
+- Affichage « Vorticité » (rotationnel ∂v/∂x − ∂u/∂y rapporté à son maximum), dans les fenêtres, les images et les séries d'images
+  des protocoles ; CPU et GPU.
 - Les solides immobiles subissent des forces : mesure `force x | y sur <zone>` (force du fluide sur les mailles solides ; un corps
   fixe la mesurait déjà).
 - Protocoles : `sauver image "nom" [affichage]` (image PNG d'un champ dans le dossier des résultats) et `images toutes les d

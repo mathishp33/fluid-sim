@@ -369,11 +369,12 @@ impl<'a> P<'a> {
             "densite" | "rho" | "masse" => D::Density,
             "vapeur" => D::Vapor,
             "divergence" => D::Divergence,
+            "vorticite" | "rotationnel" => D::Vorticity,
             "flamme" => D::Flame,
             "chaleur" => D::HeatRelease,
             o => {
                 return self.err(format!(
-                    "affichage « {o} » inconnu : phases, température, pression, vitesse, masse volumique, vapeur, divergence, flamme, chaleur"
+                    "affichage « {o} » inconnu : phases, température, pression, vitesse, masse volumique, vapeur, divergence, vorticité, flamme, chaleur"
                 ))
             }
         };

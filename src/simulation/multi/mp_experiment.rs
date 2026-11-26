@@ -1073,6 +1073,7 @@ fn display_slug(d: super::mp_view::MpDisplay) -> &'static str {
         D::Density => "masse-volumique",
         D::Vapor => "vapeur",
         D::Divergence => "divergence",
+        D::Vorticity => "vorticite",
         D::Flame => "flamme",
         D::HeatRelease => "chaleur",
     }

@@ -1,15 +1,25 @@
 // ===== Rendu RGBA sur GPU (miroir de mp_view::render_rgba) : seule l'image (nx·ny·4 octets) est relue =====
-// P.rd_mode : 0 phases, 1 pression, 2 température, 3 vitesse, 4 masse volumique, 5 vapeur, 6 divergence, 7 flamme, 8 dégagement de chaleur
+// P.rd_mode : 0 phases, 1 pression, 2 température, 3 vitesse, 4 masse volumique, 5 vapeur, 6 divergence, 7 flamme, 8 dégagement de chaleur,
+// 9 vorticité
 // P.rd_flags : bit 0 = surcouche des effets, bit 1 = solides blancs
 
 fn cell_vel(i: u32, j: u32) -> vec2<f32> {
     return vec2<f32>(0.5 * (S[O_U + uidx(i, j)] + S[O_U + uidx(i + 1u, j)]), 0.5 * (S[O_V + vidx(i, j)] + S[O_V + vidx(i, j + 1u)]));
 }
+// rotationnel au centre de la maille, par maille (miroir de mp_view::vorticity_cells)
+fn vort_cells(i: u32, j: u32) -> f32 {
+    let il = select(i, i - 1u, i > 0u); let ir = min(i + 1u, P.nx - 1u);
+    let jb = select(j, j - 1u, j > 0u); let jt = min(j + 1u, P.ny - 1u);
+    var dvdx = 0.0; var dudy = 0.0;
+    if (ir > il) { dvdx = (cell_vel(ir, j).y - cell_vel(il, j).y) / f32(ir - il); }
+    if (jt > jb) { dudy = (cell_vel(i, jt).x - cell_vel(i, jb).x) / f32(jt - jb); }
+    return dvdx - dudy;
+}
 @compute @workgroup_size(64)
 fn k_rd_red(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
     let c = g.x;
     var v: array<f32, 8>;
-    v[0] = 1.0; v[1] = -3.0e38; v[2] = -3.0e38; v[3] = 0.0; v[4] = 1e-9; v[5] = 1e-9;
+    v[0] = 1.0; v[1] = -3.0e38; v[2] = -3.0e38; v[3] = 0.0; v[4] = 1e-9; v[5] = 1e-9; v[6] = 1e-9;
     if (c < ncell()) {
         let i = c % P.nx; let j = c / P.nx;
         let cv = cell_vel(i, j);
@@ -20,16 +30,17 @@ fn k_rd_red(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
             v[1] = -S[O_rho_mix + c];
             v[2] = S[O_rho_mix + c];
             v[5] = max(1e-9, abs(div_uv(i, j)));
+            v[6] = max(1e-9, abs(vort_cells(i, j)));
         }
     }
-    wg_reduce(v, 6u, 1u, l.x, w.x, 0u);
+    wg_reduce(v, 7u, 1u, l.x, w.x, 0u);
 }
 @compute @workgroup_size(256)
 fn k_rd_final(@builtin(local_invocation_id) l: vec3<u32>) {
     let nw = nwg_cells();
-    var r: array<f32, 6>;
-    for (var q = 0u; q < 6u; q++) { r[q] = final_reduce(q, nw, 1u, l.x); }
-    if (l.x == 0u) { for (var q = 0u; q < 6u; q++) { D[D_SCALE + q] = r[q]; } }
+    var r: array<f32, 7>;
+    for (var q = 0u; q < 7u; q++) { r[q] = final_reduce(q, nw, 1u, l.x); }
+    if (l.x == 0u) { for (var q = 0u; q < 7u; q++) { D[D_SCALE + q] = r[q]; } }
 }
 fn hsv(h_in: f32, s: f32, v: f32) -> vec3<f32> {
     let h = ((h_in % 360.0) + 360.0) % 360.0;
@@ -81,7 +92,7 @@ fn k_render(@builtin(global_invocation_id) g: vec3<u32>) {
     var pmax = P.rd_pscale;
     if (pmax <= 0.0) { pmax = D[D_SCALE + 0u]; }
     let rmin = -D[D_SCALE + 1u]; let rmax = D[D_SCALE + 2u];
-    let qmax = D[D_SCALE + 3u]; let smax = D[D_SCALE + 4u]; let dmax = D[D_SCALE + 5u];
+    let qmax = D[D_SCALE + 3u]; let smax = D[D_SCALE + 4u]; let dmax = D[D_SCALE + 5u]; let wmax = D[D_SCALE + 6u];
     let show = (P.rd_flags & 1u) != 0u;
     let white = (P.rd_flags & 2u) != 0u;
     let mode = P.rd_mode;
@@ -115,6 +126,7 @@ fn k_render(@builtin(global_invocation_id) g: vec3<u32>) {
             a = clamp(a, 0.0, 1.0);
             rgb = vec3<f32>(a, a, a);
         } else if (mode == 6u) { rgb = signed_rgb(div_uv(i, j), dmax); }
+        else if (mode == 9u) { rgb = signed_rgb(vort_cells(i, j), wmax); }
         else if (mode == 7u) {
             let col = phase_mix(c, 0.35);
             let b = blackbody(S[O_temp + c]);

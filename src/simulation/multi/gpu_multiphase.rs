@@ -2104,6 +2104,7 @@ impl MultiphaseGpu {
             M::Divergence => 6,
             M::Flame => 7,
             M::HeatRelease => 8,
+            M::Vorticity => 9,
         };
         p[52] = (o.show_effects as u32) | ((o.solids_white as u32) << 1);
         p[53] = (o.t_scale as f32).to_bits();

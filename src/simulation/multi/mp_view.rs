@@ -820,13 +820,25 @@ pub enum MpDisplay {
     Density,
     Vapor,
     Divergence,
+    /// rotationnel ∂v/∂x − ∂u/∂y (tourbillons : rouge dans le sens trigonométrique, bleu-vert dans l'autre)
+    Vorticity,
     Flame,
     HeatRelease,
 }
 
 impl MpDisplay {
-    pub const ALL: [MpDisplay; 9] =
-        [Self::Phases, Self::Pressure, Self::Temperature, Self::Velocity, Self::Density, Self::Vapor, Self::Divergence, Self::Flame, Self::HeatRelease];
+    pub const ALL: [MpDisplay; 10] = [
+        Self::Phases,
+        Self::Pressure,
+        Self::Temperature,
+        Self::Velocity,
+        Self::Density,
+        Self::Vapor,
+        Self::Divergence,
+        Self::Vorticity,
+        Self::Flame,
+        Self::HeatRelease,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::Phases => "PHASES",
@@ -836,6 +848,7 @@ impl MpDisplay {
             Self::Density => "MASSE VOLUMIQUE",
             Self::Vapor => "VAPEUR (fraction)",
             Self::Divergence => "DIVERGENCE (∇·u)",
+            Self::Vorticity => "VORTICITÉ (∂v/∂x − ∂u/∂y)",
             Self::Flame => "FLAMME (rayonnement des gaz chauds + front de réaction)",
             Self::HeatRelease => "DÉGAGEMENT DE CHALEUR (échelle log)",
         }
@@ -929,13 +942,14 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
         }
     }
     let qmax = sim.heat_release.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-    let mut dmax = 1e-9f64;
+    let (mut dmax, mut wmax) = (1e-9f64, 1e-9f64);
     for j in 0..ny {
         for i in 0..nx {
             let (vx, vy) = cell_velocity(sim, i, j);
             smax = smax.max((vx * vx + vy * vy).sqrt());
             if !sim.is_solid(sim.idx(i, j)) {
                 dmax = dmax.max(sim.divergence_of(&sim.u, &sim.v, i, j).abs());
+                wmax = wmax.max(vorticity_cells(sim, i, j).abs());
             }
         }
     }
@@ -979,6 +993,7 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
                         [x, x, x]
                     }
                     MpDisplay::Divergence => signed_rgb(sim.divergence_of(&sim.u, &sim.v, i, j), dmax),
+                    MpDisplay::Vorticity => signed_rgb(vorticity_cells(sim, i, j), wmax),
                     MpDisplay::HeatRelease => {
                         // 6 décades sous le maximum ; exothermique jaune→blanc, endothermique (dissociation) bleu
                         let q = sim.heat_release[c];
@@ -1068,6 +1083,16 @@ pub fn render_rgba(sim: &MultiphaseSim, o: RenderOpts, out: &mut Vec<u8>) {
 }
 
 /// vitesse au centre de la cellule (m/s) : moyenne des deux faces
+/// Rotationnel de la vitesse au centre de la maille (i, j), en différences centrées des vitesses des centres voisins (décentrées
+/// au bord), par maille : ∂v/∂x − ∂u/∂y × dx (s⁻¹ × dx ; l'affichage le rapporte à son maximum, comme le rendu GPU).
+pub fn vorticity_cells(sim: &MultiphaseSim, i: usize, j: usize) -> f64 {
+    let (il, ir) = (i.saturating_sub(1), (i + 1).min(sim.nx - 1));
+    let (jb, jt) = (j.saturating_sub(1), (j + 1).min(sim.ny - 1));
+    let dvdx = if ir > il { (cell_velocity(sim, ir, j).1 - cell_velocity(sim, il, j).1) / (ir - il) as f64 } else { 0.0 };
+    let dudy = if jt > jb { (cell_velocity(sim, i, jt).0 - cell_velocity(sim, i, jb).0) / (jt - jb) as f64 } else { 0.0 };
+    dvdx - dudy
+}
+
 pub fn cell_velocity(sim: &MultiphaseSim, i: usize, j: usize) -> (f64, f64) {
     let vx = 0.5 * (sim.u[sim.uidx(i, j)] + sim.u[sim.uidx(i + 1, j)]);
     let vy = 0.5 * (sim.v[sim.vidx(i, j)] + sim.v[sim.vidx(i, j + 1)]);
@@ -1514,5 +1539,33 @@ mod tests {
         assert_eq!(a.len(), 40 * 30 * 4);
         // le GPU résident gère les extras (cellules spéciales, solides thermiques, entrées)
         assert!(crate::simulation::multi::gpu_multiphase::gpu_unsupported_reason(&s).is_none());
+    }
+
+    #[test]
+    fn a_solid_rotation_shows_a_uniform_vorticity() {
+        // rotation solide u = −Ω (y − yc), v = Ω (x − xc) : rotationnel 2Ω partout (différences exactes sur un champ linéaire, au
+        // bord aussi) ; sens trigonométrique en rouge
+        let mut s = build_scenario(MpScenario::Empty, 20, 20, 0.01, 0.0);
+        let (om, xc, yc, dx) = (3.0, 0.1, 0.1, s.dx);
+        for j in 0..s.ny {
+            for i in 0..=s.nx {
+                let f = s.uidx(i, j);
+                s.u[f] = -om * ((j as f64 + 0.5) * dx - yc);
+            }
+        }
+        for j in 0..=s.ny {
+            for i in 0..s.nx {
+                let f = s.vidx(i, j);
+                s.v[f] = om * ((i as f64 + 0.5) * dx - xc);
+            }
+        }
+        for (i, j) in [(0, 0), (5, 5), (10, 12), (19, 3)] {
+            let w = vorticity_cells(&s, i, j);
+            assert!((w - 2.0 * om * dx).abs() < 1e-12, "({i}, {j}) : {w} au lieu de {}", 2.0 * om * dx);
+        }
+        let mut a = vec![];
+        render_rgba(&s, RenderOpts::new(MpDisplay::Vorticity, 100.0, 0.0), &mut a);
+        let p = ((20 - 1 - 10) * 20 + 10) * 4;
+        assert_eq!([a[p], a[p + 1], a[p + 2]], [255, 0, 0], "rotation trigonométrique : rouge");
     }
 }

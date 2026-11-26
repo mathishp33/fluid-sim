@@ -178,7 +178,7 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 | `marque "texte"` | repère dans le journal |
 | `sauver état "nom"` | écrit `nom.mps` dans le dossier des résultats |
 | `images toutes les d [affichage]` | série d'images PNG, de quoi faire une animation : `images-<affichage>/0000.png`, `0001.png`… dans le dossier des résultats, au premier `simuler`, puis toutes les d (aux mêmes instants que les mesures) et à la fin ; une série par affichage, plusieurs affichages possibles |
-| `sauver image "nom" [affichage]` | écrit `nom.png` dans le dossier des résultats : le rendu de la fenêtre, agrandi d'un facteur entier (au plus 16) jusqu'à ~800 pixels de côté ; affichage `phases` (par défaut), `température` (échelle ΔT 100 K), `pression`, `vitesse`, `masse volumique`, `vapeur`, `divergence`, `flamme` ou `chaleur` |
+| `sauver image "nom" [affichage]` | écrit `nom.png` dans le dossier des résultats : le rendu de la fenêtre, agrandi d'un facteur entier (au plus 16) jusqu'à ~800 pixels de côté ; affichage `phases` (par défaut), `température` (échelle ΔT 100 K), `pression`, `vitesse`, `masse volumique`, `vapeur`, `divergence`, `vorticité` (rotationnel ∂v/∂x − ∂u/∂y : rouge dans le sens trigonométrique, bleu-vert dans l'autre), `flamme` ou `chaleur` |
 
 ### Mesures
 
