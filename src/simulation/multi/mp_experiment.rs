@@ -171,6 +171,11 @@ pub fn fmt_num(x: f64) -> String {
     if s == "-0" { "0".into() } else { s.into() }
 }
 
+/// « 0.1 m », ou « 3 » sans unité (variable)
+fn with_unit(x: f64, unit: &str) -> String {
+    if unit.is_empty() { fmt_num(x) } else { format!("{} {unit}", fmt_num(x)) }
+}
+
 pub fn fmt_point(p: [f64; 2]) -> String {
     format!("({}, {})", fmt_num(p[0]), fmt_num(p[1]))
 }
@@ -249,6 +254,8 @@ pub enum Measure {
     Flux { fluid: Option<String>, mass: bool, a: [f64; 2], b: [f64; 2], label: Option<String> },
     /// temps simulé (s), surtout pour les conditions (`tant que temps < 2 s`, `quand temps > 1 s et …`)
     Time { label: Option<String> },
+    /// variable du protocole (indice dans `Protocol::vars`)
+    Var { var: usize, label: Option<String> },
 }
 
 /// Force mesurée sur un corps : celle du fluide (pression et frottement), des contacts, d'une loi en formule, ou leur somme avec
@@ -542,9 +549,11 @@ pub enum Action {
     /// action répétée toutes les `period` secondes, de `start` (sinon l'instant où la ligne est atteinte) à `end` (sinon sans fin),
     /// en parallèle du déroulement : chaque fois à l'heure pile
     Periodic { period: f64, start: Option<f64>, end: Option<f64>, action: Box<Action> },
+    /// variable du protocole (indice dans `Protocol::vars`) : `soit n = <valeur>`
+    Let { var: usize, value: LetValue },
     /// règle « quand <condition> : <action> », en parallèle du déroulement dès que sa ligne est atteinte : l'action est faite chaque
     /// fois que la condition devient vraie (relevée après chaque pas ; tout de suite si elle l'est déjà)
-    When { clauses: Vec<Clause>, any: bool, action: Box<Action> },
+    When { clauses: Vec<Clause>, logic: Logic, action: Box<Action> },
 }
 
 impl Action {
@@ -555,7 +564,14 @@ impl Action {
             Action::Periodic { start, action, .. } => start.map_or(true, |s| s <= 0.0) && action.is_instant_edit(),
             _ => !matches!(
                 self,
-                Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause | Action::When { .. }
+                Action::Heat { .. }
+                    | Action::Accelerate { .. }
+                    | Action::SaveState(_)
+                    | Action::SaveImage { .. }
+                    | Action::Mark(_)
+                    | Action::Pause
+                    | Action::When { .. }
+                    | Action::Let { .. }
             ),
         }
     }
@@ -611,12 +627,101 @@ impl Cmp {
     }
 }
 
+/// liaison des comparaisons d'une condition (indices dans sa liste de comparaisons) : une comparaison, toutes (« et »), l'une
+/// d'elles (« ou ») ; les parenthèses du protocole font les groupes
+#[derive(Clone, Debug, PartialEq)]
+pub enum Logic {
+    Leaf(usize),
+    All(Vec<Logic>),
+    Any(Vec<Logic>),
+}
+
+impl Logic {
+    /// vraie, d'après la vérité de chaque comparaison
+    pub fn eval(&self, truth: &[bool]) -> bool {
+        match self {
+            Logic::Leaf(i) => truth[*i],
+            Logic::All(c) => c.iter().all(|x| x.eval(truth)),
+            Logic::Any(c) => c.iter().any(|x| x.eval(truth)),
+        }
+    }
+    /// vraie, ou bientôt vraie (`close` : comparaison encore fausse dont le franchissement est prévu)
+    fn soon(&self, truth: &[bool], close: &[bool]) -> bool {
+        match self {
+            Logic::Leaf(i) => truth[*i] || close[*i],
+            Logic::All(c) => c.iter().all(|x| x.soon(truth, close)),
+            Logic::Any(c) => c.iter().any(|x| x.soon(truth, close)),
+        }
+    }
+    /// texte, chaque groupe intérieur entre parenthèses
+    fn text(&self, parts: &[String], top: bool) -> String {
+        let join = |c: &[Logic], sep: &str| {
+            let s = c.iter().map(|x| x.text(parts, false)).collect::<Vec<_>>().join(sep);
+            if top { s } else { format!("({s})") }
+        };
+        match self {
+            Logic::Leaf(i) => parts[*i].clone(),
+            Logic::All(c) => join(c, " et "),
+            Logic::Any(c) => join(c, " ou "),
+        }
+    }
+}
+
+/// valeur calculée d'un protocole : une formule en t (temps simulé, s) et en ses variables, gardée avec son texte
+#[derive(Clone, Debug)]
+pub struct Calc {
+    pub text: String,
+    f: super::mp_fields::Formula,
+}
+
+impl PartialEq for Calc {
+    fn eq(&self, o: &Calc) -> bool {
+        self.text == o.text
+    }
+}
+
+impl Calc {
+    /// `names` : « t », puis les variables du protocole dans l'ordre de leur première affectation (une formule lue avant que
+    /// d'autres s'y ajoutent reste juste : elles viennent après)
+    pub fn new(text: &str, names: &[&str]) -> Result<Calc, String> {
+        Ok(Calc { text: text.to_string(), f: super::mp_fields::Formula::parse_vars(&norm(text), names)? })
+    }
+    /// valeur pour (t, variables…)
+    pub fn eval(&self, vals: &[f64]) -> f64 {
+        self.f.eval_vars(vals)
+    }
+}
+
+/// seuil d'une comparaison : un nombre (dans l'unité du relevé), ou une valeur calculée à chaque relevé (variable, formule)
+#[derive(Clone, Debug, PartialEq)]
+pub enum Threshold {
+    Num(f64),
+    Calc(Calc),
+}
+
+impl Threshold {
+    fn get(&self, vals: &[f64]) -> f64 {
+        match self {
+            Threshold::Num(v) => *v,
+            Threshold::Calc(c) => c.eval(vals),
+        }
+    }
+}
+
+/// valeur affectée à une variable (`soit n = …`) : un nombre, un relevé (dans son unité, comme une mesure), une formule
+#[derive(Clone, Debug, PartialEq)]
+pub enum LetValue {
+    Num(f64),
+    Measure(Measure),
+    Calc(Calc),
+}
+
 /// une comparaison d'une condition d'arrêt : relevé (comme une mesure), comparaison, seuil dans l'unité du relevé
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clause {
     pub measure: Measure,
     pub cmp: Cmp,
-    pub value: f64,
+    pub value: Threshold,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -626,22 +731,22 @@ pub enum Step {
     Simulate(f64),
     /// avance jusqu'à ce temps simulé
     Until(f64),
-    /// avance jusqu'à ce que les comparaisons `clauses` soient toutes vraies (`any` : l'une d'elles), vérifiées après chaque pas (ou
+    /// avance jusqu'à ce que les comparaisons `clauses`, liées par `logic`, soient vraies, vérifiées après chaque pas (ou
     /// chaque série de pas du GPU), au plus pendant `limit` secondes si elle est donnée
-    UntilCond { clauses: Vec<Clause>, any: bool, limit: Option<f64> },
+    UntilCond { clauses: Vec<Clause>, logic: Logic, limit: Option<f64> },
     /// boucle « tant que <condition> [au plus d] » : la condition est relevée à chaque tour ; vraie, les étapes du corps sont faites,
     /// jusqu'au « fin » (étape `end`) qui ramène au test ; fausse (ou la durée `limit` écoulée depuis l'entrée), on passe après `end`
-    While { clauses: Vec<Clause>, any: bool, limit: Option<f64>, end: usize },
+    While { clauses: Vec<Clause>, logic: Logic, limit: Option<f64>, end: usize },
     /// boucle « répéter n fois » : son corps, jusqu'au « fin » (étape `end`), est fait n fois
     Repeat { n: usize, end: usize },
     /// « si <condition> » : vraie, la branche qui suit ; fausse, saut au premier « sinon » (étape `next`) ou au « fin » (`end`)
-    If { clauses: Vec<Clause>, any: bool, next: usize, end: usize },
+    If { clauses: Vec<Clause>, logic: Logic, next: usize, end: usize },
     /// « sinon » ou « sinon si <condition> » : atteint en suivant la branche d'avant, on passe après le « fin » (`end`) ; atteint par
     /// le saut d'une condition fausse, on entre dans sa branche (si sa propre condition est vraie ; sinon, saut à `next`)
-    Else { cond: Option<(Vec<Clause>, bool)>, next: usize, end: usize },
+    Else { cond: Option<(Vec<Clause>, Logic)>, next: usize, end: usize },
     /// règle « quand <condition> » en bloc : chaque fois que la condition devient vraie, les étapes jusqu'au « fin » (`end`) se
     /// déroulent en parallèle du protocole, attentes comprises ; le déroulement principal passe par-dessus
-    WhenBlock { clauses: Vec<Clause>, any: bool, end: usize },
+    WhenBlock { clauses: Vec<Clause>, logic: Logic, end: usize },
     /// « fin » d'un bloc (étape `start`) : retour au test d'une boucle ; sortie d'un « si » ; fin du corps d'une règle en bloc
     End { start: usize },
 }
@@ -671,6 +776,8 @@ pub struct Protocol {
     pub source: String,
     /// (nom, valeur) de la variante d'un balayage
     pub variant: Option<(String, String)>,
+    /// variables (`soit n = …`), dans l'ordre de leur première affectation ; leurs formules les nomment avec t (temps simulé)
+    pub vars: Vec<String>,
 }
 
 impl Protocol {
@@ -1117,7 +1224,14 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             sim.dt_max = *d;
             Ok(0)
         }
-        Action::Heat { .. } | Action::Accelerate { .. } | Action::SaveState(_) | Action::SaveImage { .. } | Action::Mark(_) | Action::Pause | Action::When { .. } => Ok(0),
+        Action::Heat { .. }
+        | Action::Accelerate { .. }
+        | Action::SaveState(_)
+        | Action::SaveImage { .. }
+        | Action::Mark(_)
+        | Action::Pause
+        | Action::When { .. }
+        | Action::Let { .. } => Ok(0),
         // (conditions initiales : sa première fois ; le déroulement la répète)
         Action::Periodic { action, .. } => apply_action(sim, action, base),
     }
@@ -1151,6 +1265,7 @@ enum ProbeKind {
     Point(QtyR, [f64; 2]),
     Mass(usize),
     Time,
+    Var(usize),
     Body(usize, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
@@ -1217,36 +1332,48 @@ struct CondClause {
     unit: String,
     last: Option<(f64, f64)>,
     far: Option<(f64, f64)>,
+    /// seuil écrit (nombre, ou valeur calculée à chaque relevé : `value` est sa valeur au dernier relevé)
+    threshold: Threshold,
 }
 
-/// condition d'arrêt en cours : comparaisons reliées par « et » (toutes) ou « ou » (`any`) ; `near` : franchissement prévu avant la
-/// prochaine série de pas du GPU (il repasse alors au pas unique)
+/// condition en cours : comparaisons liées par `logic` ; `near` : franchissement prévu avant la prochaine série de pas du GPU (il
+/// repasse alors au pas unique)
 struct Cond {
     clauses: Vec<CondClause>,
-    any: bool,
+    logic: Logic,
     line: usize,
     near: bool,
 }
 
 impl Cond {
-    /// « corps 1 y < 0.1 m ou max T partout > 400 K »
+    /// « corps 1 y < 0.1 m ou (max T partout > 400 K et temps > « t0 + 1 » (3 s)) » — un seuil calculé avec sa dernière valeur
     fn text(&self) -> String {
-        let parts: Vec<String> = self.clauses.iter().map(|c| format!("{} {} {} {}", c.name, c.cmp.symbol(), fmt_num(c.value), c.unit)).collect();
-        parts.join(if self.any { " ou " } else { " et " })
+        let parts: Vec<String> = self
+            .clauses
+            .iter()
+            .map(|c| match &c.threshold {
+                Threshold::Calc(k) => format!("{} {} « {} » ({})", c.name, c.cmp.symbol(), k.text, with_unit(c.value, &c.unit)),
+                Threshold::Num(_) => format!("{} {} {}", c.name, c.cmp.symbol(), with_unit(c.value, &c.unit)),
+            })
+            .collect();
+        self.logic.text(&parts, true)
     }
-    fn values(&self, sim: &MultiphaseSim) -> Vec<f64> {
-        self.clauses.iter().map(|c| c.probe.value(sim)).collect()
+    /// relevés (et seuils calculés) pour l'état `sim` et les valeurs (t, variables…)
+    fn values(&mut self, sim: &MultiphaseSim, vals: &[f64]) -> Vec<f64> {
+        for c in &mut self.clauses {
+            c.value = c.threshold.get(vals);
+        }
+        self.clauses.iter().map(|c| c.probe.value(sim, vals)).collect()
     }
     fn holds(&self, xs: &[f64]) -> bool {
-        let mut it = self.clauses.iter().zip(xs).map(|(c, &x)| c.cmp.holds(x, c.value));
-        if self.any { it.any(|b| b) } else { it.all(|b| b) }
+        let truth: Vec<bool> = self.clauses.iter().zip(xs).map(|(c, &x)| c.cmp.holds(x, c.value)).collect();
+        self.logic.eval(&truth)
     }
     /// relevés `xs` à l'instant t (pas dt) : les garde comme derniers relevés et prévoit, d'après la tendance des deux derniers, si la
-    /// condition encore fausse va devenir vraie dans moins de deux séries de 8 pas (`near`) — « ou » : l'une des comparaisons
-    /// encore fausses ; « et » : toutes
+    /// condition encore fausse va devenir vraie dans moins de deux séries de 8 pas (`near`) : chaque comparaison fausse a son
+    /// franchissement prévu ou non, et la liaison dit si cela suffit (« et » : toutes celles d'un groupe ; « ou » : l'une)
     fn track(&mut self, t: f64, dt: f64, xs: &[f64]) {
-        let any = self.any;
-        let mut near = !any;
+        let (mut truth, mut close) = (vec![], vec![]);
         let soon = |from: Option<(f64, f64)>, x: f64, value: f64| match from {
             Some((t0, x0)) if t > t0 && x != x0 => {
                 let eta = (value - x) / ((x - x0) / (t - t0));
@@ -1255,28 +1382,26 @@ impl Cond {
             _ => false,
         };
         for (cl, &x) in self.clauses.iter_mut().zip(xs) {
-            if cl.cmp.holds(x, cl.value) {
+            let holds = cl.cmp.holds(x, cl.value);
+            if holds {
                 cl.far = None;
+                close.push(false);
             } else {
                 if cl.far.map_or(true, |(_, xf)| (cl.value - x).abs() > (cl.value - xf).abs()) {
                     cl.far = Some((t, x));
                 }
                 // tendance du dernier intervalle, ou depuis le relevé le plus éloigné du seuil : une sonde qui oscille (ondes de
                 // pression…) trompe la première — un compresseur qui démarre faisait sauter le seuil d'une série de 8 pas au GPU
-                let close = soon(cl.last, x, cl.value) || soon(cl.far, x, cl.value);
-                if any {
-                    near |= close;
-                } else {
-                    near &= close;
-                }
+                close.push(soon(cl.last, x, cl.value) || soon(cl.far, x, cl.value));
             }
+            truth.push(holds);
             cl.last = Some((t, x));
         }
-        self.near = near;
+        self.near = self.logic.soon(&truth, &close);
     }
     /// « 0.099 m ; 412 K »
     fn values_text(&self, xs: &[f64]) -> String {
-        self.clauses.iter().zip(xs).map(|(c, &x)| format!("{} {}", fmt_num(x), c.unit)).collect::<Vec<_>>().join(" ; ")
+        self.clauses.iter().zip(xs).map(|(c, &x)| with_unit(x, &c.unit)).collect::<Vec<_>>().join(" ; ")
     }
 }
 
@@ -1446,7 +1571,8 @@ fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
 }
 
 impl Probe {
-    fn value(&self, sim: &MultiphaseSim) -> f64 {
+    /// valeur pour l'état `sim` ; `vals` : (t, variables du protocole…)
+    fn value(&self, sim: &MultiphaseSim, vals: &[f64]) -> f64 {
         if let ProbeKind::Flux { phase, mass, vertical, faces, slots, last } = &self.kind {
             // débit moyen depuis le relevé précédent : ce qu'a compté le transport ; au premier relevé, l'estimation instantanée
             let np = sim.reg.phases.len();
@@ -1481,6 +1607,7 @@ impl Probe {
             ProbeKind::Flux { .. } => unreachable!(),
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
             ProbeKind::Time => sim.time,
+            ProbeKind::Var(k) => vals.get(k + 1).copied().unwrap_or(f64::NAN),
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Point(q, p) => point_value(sim, q, p, self.cells[0], self.fluid_only),
@@ -1623,6 +1750,8 @@ pub struct Runner {
     pub scenario: Option<usize>,
     /// déroulement principal (étape, attente, boucles) ; suites des règles « quand » en bloc, en parallèle
     main: Seq,
+    /// valeurs des variables du protocole (0 avant leur première affectation)
+    vars: Vec<f64>,
     threads: Vec<Seq>,
     timed: Vec<Timed>,
     periodic: Vec<Periodic>,
@@ -1685,6 +1814,7 @@ impl Runner {
             library,
             scenario,
             main: Seq::default(),
+            vars: vec![],
             threads: vec![],
             timed: vec![],
             periodic: vec![],
@@ -1704,6 +1834,7 @@ impl Runner {
             proto,
         };
         r.main.end = r.proto.steps.len();
+        r.vars = vec![0.0; r.proto.vars.len()];
         r.watch_flux_lines()?;
         r.compile_measures()?;
         r.log_header();
@@ -1805,7 +1936,7 @@ impl Runner {
             match self.make_probe(&m).map_err(|e| format!("ligne {line} : {e}"))? {
                 None => self.stats = true,
                 Some((probe, name, unit)) => {
-                    self.columns.push(format!("{name} ({unit})"));
+                    self.columns.push(if unit.is_empty() { name } else { format!("{name} ({unit})") });
                     self.probes.push(probe);
                 }
             }
@@ -1824,6 +1955,10 @@ impl Runner {
             Measure::Stats => return Ok(None),
             Measure::Time { label } => {
                 (Probe { kind: ProbeKind::Time, cells: vec![], fluid_only: false }, label.clone().unwrap_or_else(|| "temps".into()), "s".to_string())
+            }
+            Measure::Var { var, label } => {
+                let name = label.clone().unwrap_or_else(|| self.proto.vars.get(*var).cloned().unwrap_or_default());
+                (Probe { kind: ProbeKind::Var(*var), cells: vec![], fluid_only: false }, name, String::new())
             }
             Measure::Probe { q, reduce, zone, label } => {
                 let qr = match q {
@@ -1935,10 +2070,10 @@ impl Runner {
         }
         match step {
             Step::Do(_) => self.run_actions(seq, main),
-            Step::While { clauses, any, limit, end } => self.loop_test(seq, line, &clauses, any, limit, end, outer),
+            Step::While { clauses, logic, limit, end } => self.loop_test(seq, line, &clauses, &logic, limit, end, outer),
             Step::Repeat { n, end } => self.repeat_test(seq, line, n, end, outer),
-            Step::If { clauses, any, next, .. } => {
-                if let Some((holds, text)) = self.eval_cond(line, &clauses, any) {
+            Step::If { clauses, logic, next, .. } => {
+                if let Some((holds, text)) = self.eval_cond(line, &clauses, &logic) {
                     self.note(format!("ligne {line} : si {text} — {}", if holds { "vrai" } else { "faux" }));
                     if holds {
                         seq.pc += 1;
@@ -1954,8 +2089,8 @@ impl Runner {
                     seq.jumped = None;
                     match cond {
                         None => seq.pc += 1,
-                        Some((clauses, any)) => {
-                            if let Some((holds, text)) = self.eval_cond(line, &clauses, any) {
+                        Some((clauses, logic)) => {
+                            if let Some((holds, text)) = self.eval_cond(line, &clauses, &logic) {
                                 self.note(format!("ligne {line} : sinon si {text} — {}", if holds { "vrai" } else { "faux" }));
                                 if holds {
                                     seq.pc += 1;
@@ -1980,12 +2115,12 @@ impl Runner {
                     seq.pc += 1;
                 }
             }
-            Step::WhenBlock { clauses, any, end } => {
+            Step::WhenBlock { clauses, logic, end } => {
                 // la règle est posée (une fois par ligne) ; son corps se déroule en parallèle, quand sa condition devient vraie
                 let start = seq.pc;
                 seq.pc = end + 1;
                 if !(line > 0 && self.registered(line)) {
-                    let _ = self.arm_rule(line, &clauses, any, None, Some((start, end)));
+                    let _ = self.arm_rule(line, &clauses, &logic, None, Some((start, end)));
                 }
             }
             Step::Simulate(d) => {
@@ -2006,15 +2141,16 @@ impl Runner {
                 }
                 seq.pc += 1;
             }
-            Step::UntilCond { clauses, any, limit } => {
+            Step::UntilCond { clauses, logic, limit } => {
                 if main {
                     self.start_sampling();
                 }
                 seq.pc += 1;
-                if let Some(mut c) = self.make_cond(line, &clauses, any) {
+                if let Some(mut c) = self.make_cond(line, &clauses, &logic) {
                     // (pas de tendance avant deux relevés : un pas à la fois, sinon le GPU ferait d'emblée une série de 8 pas)
                     c.near = true;
-                    let xs = c.values(&self.sim);
+                    let vals = self.var_values();
+                    let xs = c.values(&self.sim, &vals);
                     if c.holds(&xs) {
                         self.note(format!("ligne {line} : {} déjà vrai ({})", c.text(), c.values_text(&xs)));
                     } else {
@@ -2033,11 +2169,13 @@ impl Runner {
     }
 
     /// Condition prête à être suivie (sondes, premiers relevés gardés) ; None : l'expérience a échoué (relevé impossible)
-    fn make_cond(&mut self, line: usize, clauses: &[Clause], any: bool) -> Option<Cond> {
+    fn make_cond(&mut self, line: usize, clauses: &[Clause], logic: &Logic) -> Option<Cond> {
         let mut parts = vec![];
         for cl in clauses {
             match self.make_probe(&cl.measure) {
-                Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
+                Ok(Some((probe, name, unit))) => {
+                    parts.push(CondClause { probe, cmp: cl.cmp, value: f64::NAN, name, unit, last: None, far: None, threshold: cl.value.clone() })
+                }
                 Ok(None) => {
                     self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
                     return None;
@@ -2049,8 +2187,9 @@ impl Runner {
             }
         }
         self.sync_host();
-        let mut c = Cond { clauses: parts, any, line, near: false };
-        let xs = c.values(&self.sim);
+        let mut c = Cond { clauses: parts, logic: logic.clone(), line, near: false };
+        let vals = self.var_values();
+        let xs = c.values(&self.sim, &vals);
         let t = self.sim.time;
         for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
             cl.last = Some((t, x));
@@ -2060,9 +2199,10 @@ impl Runner {
     }
 
     /// relève une condition (boucle, « si ») : (vraie ?, « relevé op seuil (valeurs) ») ; None : l'expérience a échoué
-    fn eval_cond(&mut self, line: usize, clauses: &[Clause], any: bool) -> Option<(bool, String)> {
-        let c = self.make_cond(line, clauses, any)?;
-        let xs = c.values(&self.sim);
+    fn eval_cond(&mut self, line: usize, clauses: &[Clause], logic: &Logic) -> Option<(bool, String)> {
+        let mut c = self.make_cond(line, clauses, logic)?;
+        let vals = self.var_values();
+        let xs = c.values(&self.sim, &vals);
         Some((c.holds(&xs), format!("{} ({})", c.text(), c.values_text(&xs))))
     }
 
@@ -2182,6 +2322,29 @@ impl Runner {
         }
     }
 
+    /// (t, variables…) : les valeurs que nomment les formules du protocole
+    fn var_values(&self) -> Vec<f64> {
+        std::iter::once(self.sim.time).chain(self.vars.iter().copied()).collect()
+    }
+
+    /// texte d'un repère : chaque « {nom} » remplacé par la valeur de la variable
+    fn interpolate(&self, t: &str) -> String {
+        let (mut out, mut rest) = (String::new(), t);
+        while let Some(i) = rest.find('{') {
+            let Some(j) = rest[i..].find('}') else { break };
+            let name = norm(rest[i + 1..i + j].trim());
+            match self.proto.vars.iter().position(|v| *v == name) {
+                Some(k) => {
+                    out += &rest[..i];
+                    out += &fmt_num(self.vars[k]);
+                }
+                None => out += &rest[..i + j + 1],
+            }
+            rest = &rest[i + j + 1..];
+        }
+        out + rest
+    }
+
     /// une règle « quand » ou une répétition de cette ligne du protocole est déjà en place (ligne repassée dans une boucle)
     fn registered(&self, line: usize) -> bool {
         self.when.iter().any(|w| w.cond.line == line) || self.periodic.iter().any(|p| p.line == line)
@@ -2191,10 +2354,10 @@ impl Runner {
     /// l'entrée, on passe après son « fin » (étape `end`). Une boucle qui tourne sans que le temps avance (corps dont les attentes
     /// sont déjà atteintes) arrête l'expérience. `outer` : journal muet hors de la suite.
     #[allow(clippy::too_many_arguments)]
-    fn loop_test(&mut self, seq: &mut Seq, line: usize, clauses: &[Clause], any: bool, limit: Option<f64>, end: usize, outer: bool) {
+    fn loop_test(&mut self, seq: &mut Seq, line: usize, clauses: &[Clause], logic: &Logic, limit: Option<f64>, end: usize, outer: bool) {
         let k = seq.pc;
         let back = seq.jumped.take() == Some(k);
-        let Some((holds, text)) = self.eval_cond(line, clauses, any) else { return };
+        let Some((holds, text)) = self.eval_cond(line, clauses, logic) else { return };
         let now = self.sim.time;
         let eps = 1e-12 * (1.0 + now.abs());
         let st = seq.loops.entry(k).or_default();
@@ -2266,13 +2429,18 @@ impl Runner {
 
     /// Pose une règle « quand » : action d'une ligne, ou corps d'un bloc (étapes `start`..`end`) ; faite tout de suite si sa
     /// condition est déjà vraie
-    fn arm_rule(&mut self, line: usize, clauses: &[Clause], any: bool, action: Option<&Action>, body: Option<(usize, usize)>) -> Result<(bool, bool), ()> {
-        let Some(mut cond) = self.make_cond(line, clauses, any) else { return Err(()) };
-        let xs = cond.values(&self.sim);
+    fn arm_rule(&mut self, line: usize, clauses: &[Clause], logic: &Logic, action: Option<&Action>, body: Option<(usize, usize)>) -> Result<(bool, bool), ()> {
+        let Some(mut cond) = self.make_cond(line, clauses, logic) else { return Err(()) };
+        let vals = self.var_values();
+        let xs = cond.values(&self.sim, &vals);
         let on = cond.holds(&xs);
         // (pas de tendance avant deux relevés : un pas à la fois tant que la règle attend sa condition)
         cond.near = !on;
         let what = match (action, body) {
+            (Some(Action::Let { var, value }), _) => {
+                let name = self.proto.vars.get(*var).cloned().unwrap_or_default();
+                describe(&Action::Let { var: *var, value: value.clone() }).replacen("variable", &format!("soit {name}"), 1)
+            }
             (Some(a), _) => describe(a),
             (None, Some((a, b))) => {
                 let (l0, l1) = (self.proto.steps[a].1, self.proto.steps[b].1);
@@ -2344,7 +2512,8 @@ impl Runner {
         let (t, dt) = (self.sim.time, self.sim.last_dt);
         let (mut edited, mut heat) = (false, false);
         for k in 0..self.when.len() {
-            let xs = self.when[k].cond.values(&self.sim);
+            let vals = self.var_values();
+            let xs = self.when[k].cond.values(&self.sim, &vals);
             let holds = self.when[k].cond.holds(&xs);
             let fire = holds && !self.when[k].on;
             {
@@ -2400,8 +2569,9 @@ impl Runner {
             }
             let mut seq = self.threads.remove(k);
             seq.target = None;
-            if let Some(c) = seq.cond.take() {
-                let xs = c.values(&self.sim);
+            if let Some(mut c) = seq.cond.take() {
+                let vals = self.var_values();
+                let xs = c.values(&self.sim, &vals);
                 self.note(format!("ligne {} : {} non atteint au bout du temps permis ({})", c.line, c.text(), c.values_text(&xs)));
             }
             if let Some(s) = self.run_thread(seq) {
@@ -2423,9 +2593,10 @@ impl Runner {
         let (t, dt) = (self.sim.time, self.sim.last_dt);
         let mut k = 0;
         while k < self.threads.len() {
-            let (xs, holds) = match &self.threads[k].cond {
+            let vals = self.var_values();
+            let (xs, holds) = match &mut self.threads[k].cond {
                 Some(c) => {
-                    let xs = c.values(&self.sim);
+                    let xs = c.values(&self.sim, &vals);
                     let h = c.holds(&xs);
                     (xs, h)
                 }
@@ -2530,12 +2701,40 @@ impl Runner {
                     edited |= e;
                     heat |= h;
                 }
-                Action::When { clauses, any, action } => {
-                    let (e, h) = self.arm_rule(line, clauses, *any, Some(action), None)?;
+                Action::When { clauses, logic, action } => {
+                    let (e, h) = self.arm_rule(line, clauses, logic, Some(action), None)?;
                     edited |= e;
                     heat |= h;
                 }
-                Action::Mark(t) => self.note(format!("ligne {line} : repère « {t} »")),
+                Action::Mark(t) => {
+                    let t = self.interpolate(t);
+                    self.note(format!("ligne {line} : repère « {t} »"))
+                }
+                Action::Let { var, value } => {
+                    let v = match value {
+                        LetValue::Num(x) => *x,
+                        LetValue::Calc(c) => c.eval(&self.var_values()),
+                        LetValue::Measure(m) => match self.make_probe(m) {
+                            Ok(Some((probe, _, _))) => {
+                                self.sync_host();
+                                probe.value(&self.sim, &self.var_values())
+                            }
+                            Ok(None) => {
+                                self.fail(format!("ligne {line} : « stats » n'est pas une valeur"));
+                                return Err(());
+                            }
+                            Err(e) => {
+                                self.fail(format!("ligne {line} : {e}"));
+                                return Err(());
+                            }
+                        },
+                    };
+                    if let Some(x) = self.vars.get_mut(*var) {
+                        *x = v;
+                    }
+                    let name = self.proto.vars.get(*var).cloned().unwrap_or_default();
+                    self.note(format!("ligne {line} : soit {name} = {}", fmt_num(v)));
+                }
                 Action::SaveState(name) => self.save_state(name, line),
                 Action::SaveImage { name, display } => self.save_image(name, *display, line),
                 Action::Heat { zone, temp, duration } => {
@@ -2727,9 +2926,10 @@ impl Runner {
         }
         if now >= target - eps {
             self.main.target = None;
-            if let Some(c) = self.main.cond.take() {
+            if let Some(mut c) = self.main.cond.take() {
                 self.sync_host();
-                let xs = c.values(&self.sim);
+                let vals = self.var_values();
+                let xs = c.values(&self.sim, &vals);
                 self.note(format!("ligne {} : {} non atteint au bout du temps permis ({})", c.line, c.text(), c.values_text(&xs)));
             }
             return;
@@ -2779,7 +2979,8 @@ impl Runner {
         if self.main.cond.is_some() {
             self.sync_host();
             let (t, dt) = (self.sim.time, self.sim.last_dt);
-            let xs = self.main.cond.as_ref().unwrap().values(&self.sim);
+            let vals = self.var_values();
+            let xs = self.main.cond.as_mut().unwrap().values(&self.sim, &vals);
             if self.main.cond.as_ref().unwrap().holds(&xs) {
                 let c = self.main.cond.take().unwrap();
                 self.note(format!("ligne {} : {} atteint ({})", c.line, c.text(), c.values_text(&xs)));
@@ -2877,8 +3078,9 @@ impl Runner {
     fn sample(&mut self) {
         self.sync_host();
         let mut row = vec![self.sim.time, self.sim.steps_done() as f64];
+        let vals = self.var_values();
         for p in &self.probes {
-            row.push(p.value(&self.sim));
+            row.push(p.value(&self.sim, &vals));
         }
         if self.stats {
             row.extend(stats_values(&self.sim));
@@ -3053,9 +3255,14 @@ fn describe(a: &Action) -> String {
         }
         Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
-        Action::When { clauses, any, action } => {
+        Action::Let { value, .. } => match value {
+            LetValue::Num(v) => format!("variable = {}", fmt_num(*v)),
+            LetValue::Calc(c) => format!("variable = « {} »", c.text),
+            LetValue::Measure(_) => "variable = un relevé".into(),
+        },
+        Action::When { clauses, action, .. } => {
             let n = clauses.len();
-            let what = if n == 1 { "une comparaison".to_string() } else { format!("{n} comparaisons reliées par « {} »", if *any { "ou" } else { "et" }) };
+            let what = if n == 1 { "une comparaison".to_string() } else { format!("{n} comparaisons") };
             format!("quand ({what}) : {}", describe(action))
         }
         Action::Velocity { zone, v } => format!("vitesse {} {} m/s", zone.label(), fmt_point(*v)),

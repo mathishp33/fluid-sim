@@ -1,0 +1,14 @@
+# Compteur de rebonds : une bille d'acier lâchée de 29 cm rebondit sur le fond (restitution 0.8) ; une règle compte ses rebonds
+# (sa vitesse verticale redevient positive) dans la variable n, et l'expérience s'arrête au cinquième.
+#   fluid-sim experience experiences/compteur.exp
+
+départ scénario "Cuve vide" grille 30 x 40 maille 1 cm
+corps disque (0.15, 0.3) rayon 1 cm "acier" libre rebond 0.8
+
+soit n = 0
+quand corps 1 vy > 0.05 : soit n = "n + 1"
+
+mesurer toutes les 10 ms : corps 1 y comme "hauteur", n comme "rebonds"
+
+attendre que n >= 5 au plus 5 s
+marque "{n} rebonds"

@@ -193,6 +193,8 @@ TEMPS, MESURES, SORTIES
   tant que <condition> [au plus 10 s]   puis ses lignes, puis   fin   (boucle : condition relevée à chaque tour ; relevé « temps »)
   répéter 3 fois  …  fin    ·    si <condition>  …  sinon si <condition>  …  sinon  …  fin   (blocs, imbriquables)
   quand <condition>  …  fin   (règle en bloc : ses lignes, attentes comprises, se déroulent en parallèle du protocole)
+  conditions : (A et B) ou C ; seuil : nombre et unité, variable, ou \"formule\" en t et variables
+  soit n = 0 · soit p0 = p en (0.1, 0.1) · soit n = \"n + 1\"   (variable : relevé, nombre, formule ; marque \"{n} rebonds\")
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
   quand p en (0.15, 0.1) > 104 kPa [et | ou …] : <action>   (règle : faite chaque fois que la condition devient vraie ; aussi « pause »)
@@ -1599,7 +1601,7 @@ impl ExperimentWindow {
                     self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230))
                 }
                 Measure::Flux { a, b, .. } => self.draw_zone(painter, rect, &Zone::Trait { pts: vec![*a, *b], r: 0.0 }, Color32::from_rgb(60, 220, 230)),
-                Measure::Stats | Measure::Body { .. } | Measure::Time { .. } => {}
+                Measure::Stats | Measure::Body { .. } | Measure::Time { .. } | Measure::Var { .. } => {}
             }
         }
     }

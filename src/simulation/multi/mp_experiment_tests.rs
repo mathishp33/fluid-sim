@@ -531,22 +531,22 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
     );
     // une seule comparaison : la clause et le seuil
     let one = |k: usize| match &p.steps[k].0 {
-        Step::UntilCond { clauses, any: false, limit } if clauses.len() == 1 => (clauses[0].clone(), *limit),
+        Step::UntilCond { clauses, logic: super::mp_experiment::Logic::Leaf(0), limit } if clauses.len() == 1 => (clauses[0].clone(), *limit),
         s => panic!("{s:?}"),
     };
     match one(0) {
-        (Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, zone: Zone::Partout, .. }, cmp: Cmp::Lt, value }, Some(l)) => {
+        (Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, zone: Zone::Partout, .. }, cmp: Cmp::Lt, value: super::mp_experiment::Threshold::Num(value) }, Some(l)) => {
             assert!(value == 400.0 && l == 5.0)
         }
         s => panic!("{s:?}"),
     }
     match one(1) {
-        (Clause { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value }, None) => {
+        (Clause { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value: super::mp_experiment::Threshold::Num(value) }, None) => {
             assert!((value - 0.5f64.to_degrees()).abs() < 1e-9, "angle en degrés comme la mesure : {value}")
         }
         s => panic!("{s:?}"),
     }
-    assert!(matches!(one(2).0, Clause { cmp: Cmp::Gt, value, .. } if (value - 293.15).abs() < 1e-9));
+    assert!(matches!(one(2).0, Clause { cmp: Cmp::Gt, value: super::mp_experiment::Threshold::Num(value), .. } if (value - 293.15).abs() < 1e-9));
     assert!(matches!(&p.steps[3].0, Step::Until(t) if *t == 2.0));
     assert_eq!(p.planned_end(0.0), 5.0);
     for (bad, what) in [
@@ -1154,16 +1154,17 @@ fn a_condition_can_combine_comparisons_with_and_or() {
 ",
     );
     match &p.steps[0].0 {
-        Step::UntilCond { clauses, any: true, limit: Some(l) } if clauses.len() == 3 && *l == 2.0 => {
-            assert!(matches!(clauses[0], Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, .. }, cmp: Cmp::Gt, value } if value == 400.0));
-            assert!(matches!(clauses[1], Clause { measure: Measure::Body { index: 0, q: BodyQty::Y, .. }, cmp: Cmp::Lt, value } if (value - 0.05).abs() < 1e-12));
-            assert!(matches!(clauses[2], Clause { measure: Measure::Body { q: BodyQty::Angle, .. }, cmp: Cmp::Gt, value } if (value - 1.5f64.to_degrees()).abs() < 1e-9));
+        Step::UntilCond { clauses, logic: super::mp_experiment::Logic::Any(_), limit: Some(l) } if clauses.len() == 3 && *l == 2.0 => {
+            assert!(matches!(clauses[0], Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, .. }, cmp: Cmp::Gt, value: super::mp_experiment::Threshold::Num(value) } if value == 400.0));
+            assert!(matches!(clauses[1], Clause { measure: Measure::Body { index: 0, q: BodyQty::Y, .. }, cmp: Cmp::Lt, value: super::mp_experiment::Threshold::Num(value) } if (value - 0.05).abs() < 1e-12));
+            assert!(matches!(clauses[2], Clause { measure: Measure::Body { q: BodyQty::Angle, .. }, cmp: Cmp::Gt, value: super::mp_experiment::Threshold::Num(value) } if (value - 1.5f64.to_degrees()).abs() < 1e-9));
         }
         s => panic!("{s:?}"),
     }
-    assert!(matches!(&p.steps[1].0, Step::UntilCond { clauses, any: false, limit: None } if clauses.len() == 2));
+    assert!(matches!(&p.steps[1].0, Step::UntilCond { clauses, logic: super::mp_experiment::Logic::All(_), limit: None } if clauses.len() == 2));
     for (bad, what) in [
-        ("simuler jusqu'à ce que corps 1 y < 0.1 et corps 1 x > 0 ou corps 1 vy < 0", "ne se mélangent pas"),
+        ("simuler jusqu'à ce que corps 1 y < 0.1 et corps 1 x > 0 ou corps 1 vy < 0", "mettez des parenthèses"),
+        ("simuler jusqu'à ce que (corps 1 y < 0.1 ou corps 1 x > 0", "il manque « ) »"),
         ("simuler jusqu'à ce que corps 1 y < 0.1 et stats < 3", "stats"),
         ("simuler jusqu'à ce que corps 1 y < 0.1 ou corps 1 x 0.2", "comparaison"),
         ("simuler jusqu'à ce que corps 1 y < 0.1 et", ""),
@@ -1536,6 +1537,90 @@ simuler 1 ms
     let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
     run_to_end(&mut r);
     assert!(r.sim.mass[eau].iter().all(|&m| m > 0.0), "le bloc a rempli tout le domaine au départ");
+}
+
+#[test]
+fn conditions_take_parentheses_and_variables_count_store_and_compare() {
+    use super::mp_experiment::Logic;
+    let marks = |r: &Runner| -> Vec<(String, f64)> {
+        r.log.iter().filter_map(|l| l.find("repère « ").map(|i| (l[i + "repère « ".len()..l.rfind(" »").unwrap()].to_string(), log_time(l)))).collect()
+    };
+    // parenthèses : (A et B) ou C, relevé à 20, 30 et 50 ms
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+attendre 20 ms
+si (temps < 0.025 s et temps > 0.015 s) ou temps > 0.045 s
+    marque \"a\"
+fin
+attendre 10 ms
+si (temps < 0.025 s et temps > 0.015 s) ou temps > 0.045 s
+    marque \"b\"
+fin
+attendre 20 ms
+si (temps < 0.025 s et temps > 0.015 s) ou temps > 0.045 s
+    marque \"c\"
+fin
+";
+    let p = proto(text);
+    assert!(
+        matches!(&p.steps[1].0, Step::If { logic: Logic::Any(v), .. } if v.len() == 2 && v[0] == Logic::All(vec![Logic::Leaf(0), Logic::Leaf(1)]) && v[1] == Logic::Leaf(2)),
+        "{:?}",
+        p.steps[1].0
+    );
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let m = marks(&r);
+    assert!(m.len() == 2 && m[0].0 == "a" && (m[0].1 - 0.02).abs() < 1e-9 && m[1].0 == "c" && (m[1].1 - 0.05).abs() < 1e-9, "{m:?}");
+    assert!(r.log.iter().any(|l| l.contains("si (temps < 0.025 s et temps > 0.015 s) ou temps > 0.045 s")), "{}", r.log.join("\n"));
+
+    // variables : un compteur qu'une règle incrémente, un instant relevé repris dans des seuils calculés, une colonne de mesure, des
+    // repères qui montrent leurs valeurs
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+pas max 1 ms
+soit n = 0
+soit t0 = temps
+soit fin_attente = \"t0 + 0.02\"
+mesurer toutes les 10 ms : n, temps
+quand temps > \"fin_attente\" : soit n = \"n + 1\"
+répéter 3 fois
+    attendre 10 ms
+fin
+si n >= 1 et n < 2
+    marque \"n vaut {n}\"
+fin
+soit seuil = 104 kPa
+soit a = 30 °
+attendre que temps > \"t0 + 0.05\"
+marque \"fin : n = {n}, seuil = {seuil}, a = {a}\"
+";
+    let p = proto(text);
+    assert_eq!(p.vars, ["n", "t0", "fin_attente", "seuil", "a"]);
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    let m = marks(&r);
+    eprintln!("variables : {m:?}");
+    assert!(m.len() == 2 && m[0].0 == "n vaut 1" && (m[0].1 - 0.03).abs() < 1e-9, "{m:?}\n{log}");
+    assert_eq!(m[1].0, "fin : n = 1, seuil = 104000, a = 30", "{log}");
+    // (premier pas où temps > 0.05 s : celui de 50 ms, à l'arrondi des sommes de pas près)
+    assert!(m[1].1 >= 0.05 - 1e-9 && m[1].1 < 0.0515, "{m:?}");
+    assert!(log.contains("ligne 7 : soit n = 1") && log.contains("ligne 7 : quand temps > « fin_attente » (0.02 s) — 1 fois"), "{log}");
+    // colonne de la variable : 0, puis 1 dès que la règle a joué (juste après 20 ms)
+    let c = r.columns.iter().position(|c| c == "n").unwrap_or_else(|| panic!("{:?}", r.columns));
+    let at = |t: f64| r.rows.iter().find(|row| (row[0] - t).abs() < 1e-9).map(|row| row[c]);
+    assert!(at(0.01) == Some(0.0) && at(0.02) == Some(0.0) && at(0.03) == Some(1.0) && at(0.05) == Some(1.0), "{:?}", r.rows);
+
+    // lecture : erreurs
+    for (bad, what) in [
+        ("soit t = 3", "mot du protocole"),
+        ("soit n 3", "soit n = <valeur>"),
+        ("soit n = \"m + 1\"", "formule « m + 1 »"),
+        ("soit n = stats", "pas une valeur"),
+        ("marque \"{x}\"", "variable inconnue"),
+        ("si n > 0\nattendre 1 ms\nfin", "inconnue"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
 }
 
 #[test]

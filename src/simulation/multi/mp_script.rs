@@ -5,7 +5,8 @@
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Clause, Cmp, FieldQty, FieldSource, Measure, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, FieldQty, FieldSource, LetValue, Logic, Measure, Protocol, Quantity, Reduce, Start,
+    Step, ThermalSpec, Threshold, Zone,
 };
 use super::mp_view::T_IGNITION;
 
@@ -261,7 +262,17 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     ln: usize,
+    /// variables affectées par les lignes d'avant (`soit`) : seuils, relevés et formules peuvent les nommer
+    vars: Vec<String>,
 }
+
+/// mots qui ne peuvent pas nommer une variable (relevés, grandeurs, liaisons, fonctions des formules)
+const RESERVED: [&str; 51] = [
+    "t", "temps", "stats", "statistiques", "masse", "force", "debit", "corps", "moyenne", "max", "maximum", "min", "minimum", "somme",
+    "integrale", "temperature", "p", "pression", "vx", "vy", "vitesse", "v", "rho", "densite", "fraction", "chaleur", "puissance", "et",
+    "ou", "que", "au", "plus", "si", "sinon", "fin", "comme", "dans", "en", "pi", "e", "exp", "ln", "sqrt", "abs", "sin", "cos", "tan",
+    "pow", "hypot", "clamp", "step",
+];
 
 impl<'a> P<'a> {
     fn err<T>(&self, m: impl Into<String>) -> R<T> {
@@ -385,12 +396,46 @@ impl<'a> P<'a> {
         Ok(d)
     }
     /// seuil d'une condition, dans l'unité où le relevé est mesuré (K, Pa, m/s, m ; angles en degrés, rotations en °/s)
-    fn threshold(&mut self, m: &Measure) -> R<f64> {
+    /// formule en t (temps simulé) et en les variables déjà affectées
+    fn calc(&self, text: &str) -> R<Calc> {
+        let names: Vec<&str> = std::iter::once("t").chain(self.vars.iter().map(|s| s.as_str())).collect();
+        match Calc::new(text, &names) {
+            Ok(c) => Ok(c),
+            Err(e) => self.err(format!("formule « {text} » : {e}")),
+        }
+    }
+    /// unité facultative quelconque après un nombre : sa valeur SI (angles et vitesses de rotation en degrés, comme leurs relevés)
+    fn any_unit(&mut self, v: f64) -> f64 {
+        if let Some(Tok::W(w, _)) = self.peek() {
+            if let Some((d, f, off)) = unit_of(w) {
+                self.i += 1;
+                let x = v * f + off;
+                return if matches!(d, Dim::Angle | Dim::AngSpeed) { x.to_degrees() } else { x };
+            }
+        }
+        v
+    }
+    fn threshold(&mut self, m: &Measure) -> R<Threshold> {
+        // variable seule, ou formule en t et en variables : calculées à chaque relevé, dans l'unité du relevé
+        match self.peek() {
+            Some(Tok::S(s)) => {
+                let s = s.clone();
+                self.i += 1;
+                return Ok(Threshold::Calc(self.calc(&s)?));
+            }
+            Some(Tok::W(w, _)) if self.vars.contains(w) => {
+                let w = w.clone();
+                self.i += 1;
+                return Ok(Threshold::Calc(self.calc(&w)?));
+            }
+            _ => {}
+        }
         let dim = match m {
             Measure::Probe { reduce: Reduce::Sum, .. } | Measure::Mass { .. } | Measure::SolidForce { .. } | Measure::Flux { .. } | Measure::Stats => {
                 Dim::Plain
             }
             Measure::Time { .. } => Dim::Time,
+            Measure::Var { .. } => Dim::Plain,
             Measure::Probe { q, .. } => match q {
                 Quantity::T => Dim::Temp,
                 Quantity::P => Dim::Pressure,
@@ -411,7 +456,7 @@ impl<'a> P<'a> {
         let v = self.number("le seuil de la condition")?;
         let (v, unit) = self.opt_unit(dim, v)?;
         // angle et rotation écrits avec une unité : convertis en radians, à remettre en degrés comme la mesure
-        Ok(if unit && matches!(dim, Dim::Angle | Dim::AngSpeed) { v.to_degrees() } else { v })
+        Ok(Threshold::Num(if unit && matches!(dim, Dim::Angle | Dim::AngSpeed) { v.to_degrees() } else { v }))
     }
     fn point(&mut self) -> R<[f64; 2]> {
         if !self.eat(&Tok::LP) {
@@ -543,7 +588,9 @@ impl<'a> P<'a> {
             "somme" | "integrale" => Some(Reduce::Sum),
             _ => None,
         };
+        let var = self.vars.iter().position(|v| *v == w);
         let mut m = match (w.as_str(), reduce) {
+            _ if var.is_some() => Measure::Var { var: var.unwrap(), label: None },
             ("stats" | "statistiques", _) => Measure::Stats,
             ("temps", _) => Measure::Time { label: None },
             ("masse", _) => {
@@ -634,7 +681,8 @@ impl<'a> P<'a> {
                 | Measure::Body { label, .. }
                 | Measure::SolidForce { label, .. }
                 | Measure::Flux { label, .. }
-                | Measure::Time { label } => *label = Some(l),
+                | Measure::Time { label }
+                | Measure::Var { label, .. } => *label = Some(l),
                 Measure::Stats => return self.err("« comme » ne s'applique pas à « stats »"),
             }
         }
@@ -643,35 +691,60 @@ impl<'a> P<'a> {
 }
 
 /// « : <action> » d'une action datée ou répétée : le reste de la ligne, lu comme une commande d'une seule action
-/// <relevé> < | ≤ | > | ≥ <seuil> [et | ou <relevé> … <seuil>]… : les comparaisons, et leur lien (« ou » : vrai si l'une l'est)
-fn condition(p: &mut P) -> R<(Vec<Clause>, bool)> {
+/// <comparaison> [et | ou <comparaison>]… — une comparaison est « <relevé> < | ≤ | > | ≥ <seuil> » ou un groupe entre parenthèses :
+/// les comparaisons, et leur liaison
+fn condition(p: &mut P) -> R<(Vec<Clause>, Logic)> {
     let mut clauses = vec![];
-    let mut any: Option<bool> = None;
+    let logic = cond_group(p, &mut clauses)?;
+    Ok((clauses, logic))
+}
+
+/// suite de comparaisons (ou de groupes) liées par un seul mot : « et » ou « ou » (mêlés : parenthèses)
+fn cond_group(p: &mut P, clauses: &mut Vec<Clause>) -> R<Logic> {
+    let mut items = vec![cond_item(p, clauses)?];
+    let mut link: Option<bool> = None;
     loop {
-        let measure = p.measure()?;
-        if measure == Measure::Stats {
-            return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
-        }
-        let cmp = match p.peek() {
-            Some(Tok::Cmp(c)) => *c,
-            _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
-        };
-        p.i += 1;
-        let value = p.threshold(&measure)?;
-        clauses.push(Clause { measure, cmp, value });
-        let link = if p.eat_w("et") {
+        let l = if p.eat_w("et") {
             false
         } else if p.eat_w("ou") {
             true
         } else {
             break;
         };
-        if any.is_some_and(|a| a != link) {
-            return p.err("« et » et « ou » ne se mélangent pas dans une même condition (pas de parenthèses)");
+        if link.is_some_and(|a| a != l) {
+            return p.err("« et » et « ou » mêlés : mettez des parenthèses, par exemple « (A et B) ou C »");
         }
-        any = Some(link);
+        link = Some(l);
+        items.push(cond_item(p, clauses)?);
     }
-    Ok((clauses, any.unwrap_or(false)))
+    Ok(match (items.len(), link) {
+        (1, _) => items.pop().unwrap(),
+        (_, Some(true)) => Logic::Any(items),
+        _ => Logic::All(items),
+    })
+}
+
+/// une comparaison, ou un groupe « ( … ) »
+fn cond_item(p: &mut P, clauses: &mut Vec<Clause>) -> R<Logic> {
+    if p.eat(&Tok::LP) {
+        let g = cond_group(p, clauses)?;
+        if !p.eat(&Tok::RP) {
+            return p.err(format!("il manque « ) » à la fin du groupe{}", p.here()));
+        }
+        return Ok(g);
+    }
+    let measure = p.measure()?;
+    if measure == Measure::Stats {
+        return p.err("une condition porte sur un relevé (T en (x, y), max T dans <zone>, corps 1 y…), pas sur « stats »");
+    }
+    let cmp = match p.peek() {
+        Some(Tok::Cmp(c)) => *c,
+        _ => return p.err(format!("il faut une comparaison après le relevé : <, <=, >, >= (ou ≤, ≥){}", p.here())),
+    };
+    p.i += 1;
+    let value = p.threshold(&measure)?;
+    clauses.push(Clause { measure, cmp, value });
+    Ok(Logic::Leaf(clauses.len() - 1))
 }
 
 /// [au plus <durée>] après une condition
@@ -698,7 +771,7 @@ fn timed_action(p: &mut P, ln: usize, pause_ok: bool) -> R<Action> {
         return p.err("il manque l'action après « : »");
     }
     let mut inner = Protocol::default();
-    let mut q = P { t: &p.t[p.i..], i: 0, ln };
+    let mut q = P { t: &p.t[p.i..], i: 0, ln, vars: p.vars.clone() };
     parse_line(&mut q, &mut inner)?;
     p.i = p.t.len();
     let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
@@ -797,12 +870,12 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         "quand" => {
             // quand <condition> : <action> — faite chaque fois que la condition devient vraie (relevée après chaque pas) ; sans « : »,
             // un bloc jusqu'au « fin », déroulé en parallèle (attentes comprises)
-            let (clauses, any) = condition(p)?;
+            let (clauses, logic) = condition(p)?;
             if p.done() {
-                proto.steps.push((Step::WhenBlock { clauses, any, end: usize::MAX }, ln));
+                proto.steps.push((Step::WhenBlock { clauses, logic, end: usize::MAX }, ln));
             } else {
                 let action = timed_action(p, ln, true)?;
-                push(proto, Action::When { clauses, any, action: Box::new(action) }, ln);
+                push(proto, Action::When { clauses, logic, action: Box::new(action) }, ln);
             }
         }
         "a" => {
@@ -874,8 +947,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 if !p.eat_w("que") {
                     return p.err(format!("il faut « jusqu'à ce que <relevé> < <valeur> »{}", p.here()));
                 }
-                let (clauses, any) = condition(p)?;
-                Step::UntilCond { clauses, any, limit: opt_limit(p)? }
+                let (clauses, logic) = condition(p)?;
+                Step::UntilCond { clauses, logic, limit: opt_limit(p)? }
             } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
             } else {
@@ -887,6 +960,47 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             };
             p.end()?;
             proto.steps.push((step, ln));
+        }
+        "soit" => {
+            // soit <nom> = <relevé> | <nombre> [unité] | "<formule>" — variable du protocole (0 avant sa première affectation)
+            let name = p.word("le nom de la variable")?;
+            if !name.chars().next().is_some_and(|c| c.is_alphabetic()) || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return p.err(format!("« {name} » : un nom de variable est fait de lettres, de chiffres et de « _ », et commence par une lettre"));
+            }
+            if RESERVED.contains(&name.as_str()) {
+                return p.err(format!("« {name} » est un mot du protocole (relevé, liaison, fonction) : choisissez un autre nom de variable"));
+            }
+            if !p.eat(&Tok::Eq) {
+                return p.err(format!("il faut « soit {name} = <valeur> »{}", p.here()));
+            }
+            let var = match proto.vars.iter().position(|v| *v == name) {
+                Some(k) => k,
+                None => {
+                    proto.vars.push(name.clone());
+                    p.vars.push(name.clone());
+                    proto.vars.len() - 1
+                }
+            };
+            let value = match p.peek() {
+                Some(Tok::S(f)) => {
+                    let f = f.clone();
+                    p.i += 1;
+                    LetValue::Calc(p.calc(&f)?)
+                }
+                Some(Tok::N(_)) => {
+                    let v = p.number("la valeur")?;
+                    LetValue::Num(p.any_unit(v))
+                }
+                _ => {
+                    let m = p.measure()?;
+                    if m == Measure::Stats {
+                        return p.err("« stats » n'est pas une valeur : un relevé (T en (x, y), masse \"eau\", corps 1 y…), un nombre ou une formule");
+                    }
+                    LetValue::Measure(m)
+                }
+            };
+            p.end()?;
+            push(proto, Action::Let { var, value }, ln);
         }
         "attendre" => {
             // attendre <durée> | jusqu'à <instant> | [que | jusqu'à ce que] <condition> [au plus <durée>] — comme « simuler »
@@ -900,8 +1014,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Step::Until(p.quantity(Dim::Time, "l'instant à atteindre")?)
             } else {
                 p.eat_w("que");
-                let (clauses, any) = condition(p)?;
-                Step::UntilCond { clauses, any, limit: opt_limit(p)? }
+                let (clauses, logic) = condition(p)?;
+                Step::UntilCond { clauses, logic, limit: opt_limit(p)? }
             };
             p.end()?;
             proto.steps.push((step, ln));
@@ -911,10 +1025,10 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             if !p.eat_w("que") {
                 return p.err(format!("il faut « tant que <condition> »{}", p.here()));
             }
-            let (clauses, any) = condition(p)?;
+            let (clauses, logic) = condition(p)?;
             let limit = opt_limit(p)?;
             p.end()?;
-            proto.steps.push((Step::While { clauses, any, limit, end: usize::MAX }, ln));
+            proto.steps.push((Step::While { clauses, logic, limit, end: usize::MAX }, ln));
         }
         "fin" => {
             // fin [tant que | répéter | si | quand] : ferme le bloc ouvert le plus récent
@@ -936,9 +1050,9 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         }
         "si" => {
             // si <condition> … [sinon si <condition> …] [sinon …] fin
-            let (clauses, any) = condition(p)?;
+            let (clauses, logic) = condition(p)?;
             p.end()?;
-            proto.steps.push((Step::If { clauses, any, next: usize::MAX, end: usize::MAX }, ln));
+            proto.steps.push((Step::If { clauses, logic, next: usize::MAX, end: usize::MAX }, ln));
         }
         "sinon" => {
             let cond = if p.eat_w("si") { Some(condition(p)?) } else { None };
@@ -1456,6 +1570,16 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         }
         "marque" | "repere" => {
             let t = p.string("le texte du repère")?;
+            // « {nom} » : valeur d'une variable
+            let mut rest = t.as_str();
+            while let Some(i) = rest.find('{') {
+                let Some(j) = rest[i..].find('}') else { break };
+                let name = norm(rest[i + 1..i + j].trim());
+                if !p.vars.contains(&name) {
+                    return p.err(format!("« {{{}}} » dans le repère : variable inconnue (« soit {name} = … » d'abord)", &rest[i + 1..i + j]));
+                }
+                rest = &rest[i + j + 1..];
+            }
             p.end()?;
             push(proto, Action::Mark(t), ln);
         }
@@ -1468,7 +1592,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
-                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin)"
+                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit)"
             ))
         }
     }
@@ -1559,7 +1683,7 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
         if toks.is_empty() || matches!(toks.first(), Some(Tok::W(w, _)) if w == "balayage") {
             continue;
         }
-        let mut p = P { t: &toks, i: 0, ln };
+        let mut p = P { t: &toks, i: 0, ln, vars: proto.vars.clone() };
         let n0 = proto.steps.len();
         if let Err(e) = parse_line(&mut p, &mut proto) {
             let opens = match toks.first() {
