@@ -2595,3 +2595,66 @@ simuler 20 ms
         assert!(e.contains(what), "« {bad} » : {e}");
     }
 }
+
+// ------------------------------------------------------------------------------------------------- bords ouverts, pas effondré
+
+#[test]
+fn air_drawn_in_through_an_open_side_has_the_total_pressure_of_the_outside_and_settles() {
+    // un puits tire 1 m/s par le fond d'une cuve ouverte en haut (sans pesanteur) : l'air entre à 1 m/s, sa pression est celle du
+    // dehors moins ½ ρ v² (Bernoulli depuis le repos), dans toute la cuve
+    let r = run(
+        "départ scénario \"Cuve vide\" grille 20 x 20 maille 1 cm
+gravité (0, 0)
+puits rect (0, 0) (0.2, 0.01) 1 m/s
+mesurer toutes les 50 ms : p en (0.1, 0.195), vy en (0.1, 0.195), p en (0.05, 0.1)
+simuler 0.5 s
+",
+        None,
+    );
+    let last = r.rows.last().unwrap();
+    let (p_top, v_top, p_mid) = (last[column(&r, "p en (0.1, 0.195) (Pa)")], last[column(&r, "vy en (0.1, 0.195) (m/s)")], last[column(&r, "p en (0.05, 0.1) (Pa)")]);
+    let expect = 101325.0 - 0.5 * r.sim.ambient_density(101325.0) * v_top * v_top;
+    assert!((v_top + 1.0).abs() < 1e-6, "{v_top}");
+    assert!((p_top - expect).abs() < 1e-3 && (p_mid - p_top).abs() < 1e-6, "p {p_top} (milieu {p_mid}) pour {expect}");
+    // derrière un obstacle, l'écoulement s'établit ; avec la pression statique du dehors, le filet le plus rapide recevait plus
+    // d'énergie que ses voisins et accélérait sans fin (vitesse la plus grande de 3.4 à 4.7 m/s en 2 s ; sous un puits fort, une
+    // face du bord à 1000 m/s)
+    let r = run(
+        "départ scénario \"Cuve vide\" grille 30 x 30 maille 1 cm
+puits rect (0, 0) (0.3, 0.02) 2 m/s
+solide rect (0.1, 0.12) (0.2, 0.15) \"acier\"
+mesurer toutes les 0.5 s : max vitesse dans partout
+simuler 1.5 s
+",
+        None,
+    );
+    let v: Vec<f64> = r.rows.iter().map(|row| row[column(&r, "max vitesse partout (m/s)")]).collect();
+    eprintln!("vitesse la plus grande derrière l'obstacle : {v:?}");
+    assert!(v.len() == 4 && v[3] < 4.0 && (v[3] / v[1] - 1.0).abs() < 1e-3, "{v:?}");
+}
+
+#[test]
+fn a_collapsing_time_step_stops_the_run_with_its_reason() {
+    // une vitesse qui monte vers la limite (ici abaissée à 0.3 m/s : de l'eau qui tombe) : les pas acceptés raccourcissaient sans fin,
+    // sans état invalide, et le temps n'avançait plus
+    let p = proto(
+        "départ scénario \"Cuve vide\" grille 10 x 20 maille 1 cm
+remplir rect (0.03, 0.12) (0.07, 0.18) avec \"eau\" à 20 °C
+simuler 1 s
+",
+    );
+    let (mut sim, _, _) = initial_state(&p, Path::new(".")).unwrap();
+    sim.speed_limit = 0.3;
+    let mut steps = 0;
+    while !sim.diverged && steps < 20_000 {
+        sim.step();
+        steps += 1;
+    }
+    assert!(sim.diverged && sim.last_dt < super::mp_step::DT_COLLAPSE, "{steps} pas, dt {:e}, t {}", sim.last_dt, sim.time);
+    assert!(sim.time < 0.5 && steps < 20_000, "{steps} pas, t {}", sim.time);
+    // le protocole s'arrête avec la raison
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    r.sim.speed_limit = 0.3;
+    let e = run_until_failure(&mut r).expect("le pas effondré aurait dû arrêter l'expérience");
+    assert!(e.contains("le pas de temps s'effondre") && e.contains("une vitesse s'emballe"), "{e}");
+}

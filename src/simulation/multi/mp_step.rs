@@ -18,6 +18,10 @@ use super::multiphase::MultiphaseSim;
 pub(crate) const DT_GROWTH: f64 = 2.0;
 /// déplacement maximal de la surface d'un corps libre par pas, en mailles (voir `choose_dt`)
 pub(crate) const FREE_BODY_CFL: f64 = 0.15;
+/// pas de temps (s) en dessous duquel la simulation s'arrête (`diverged`), quand ce n'est pas l'appelant qui l'a borné si court : une
+/// vitesse qui s'emballe vers `speed_limit` fait accepter des pas toujours plus courts sans jamais d'état invalide, et le temps
+/// n'avançait plus (dt de 1e-20 s, sans message)
+pub const DT_COLLAPSE: f64 = 1e-12;
 
 pub(crate) static PROBE_CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -272,6 +276,9 @@ impl MultiphaseSim {
         let dt_max0 = self.dt_max;
         let dt = self.step_pc();
         if self.state_is_sane() && self.courant_ok(dt) {
+            if dt < DT_COLLAPSE && dt < 0.5 * dt_max0 {
+                self.diverged = true;
+            }
             return dt;
         }
         let mut dt_try = dt;
@@ -285,6 +292,9 @@ impl MultiphaseSim {
             if self.state_is_sane() && self.courant_ok(dt) {
                 self.dt_max = dt_max0;
                 self.closure_relax_scale = 1.0;
+                if self.last_dt < DT_COLLAPSE && self.last_dt < 0.5 * dt_max0 {
+                    self.diverged = true;
+                }
                 return self.last_dt;
             }
         }

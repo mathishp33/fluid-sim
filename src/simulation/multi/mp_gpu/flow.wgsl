@@ -985,6 +985,9 @@ fn open_p(pb: f32, rho: f32, drho: f32, x: f32, y: f32) -> f32 {
     let half = select(0.0, 0.125 * rho * drho * (P.gx * P.gx + P.gy * P.gy) * P.dx * P.dx, phi > 0.0);
     return pb + rho * phi * (1.0 + 0.5 * drho * phi) + half;
 }
+// pression d'une face de bord ouvert où le fluide du dehors ENTRE à v_in (> 0, vitesse de la face au début du pas) : sa pression
+// totale est celle du dehors (miroir de `face_velocities`)
+fn open_in(pb: f32, rho: f32, v_in: f32) -> f32 { let w = max(v_in, 0.0); return pb - 0.5 * rho * w * w; }
 fn face_u(f: u32) -> f32 {
     if (S[O_pfu_on + f] > 0.5) { return S[O_pfu + f]; }
     let i = f % (P.nx + 1u); let j = f / (P.nx + 1u);
@@ -997,13 +1000,13 @@ fn face_u(f: u32) -> f32 {
     if (i == 0u) {
         let b = cidx(0u, j);
         if (P.bc_l == 1u && !is_solid(b)) {
-            return us - dtv() / S[O_rho_mix + b] * (ptot(b) - open_p(P.pb_l, P.rho_l, P.drho_l, 0.0, (f32(j) + 0.5) * P.dx)) / (0.5 * P.dx);
+            return us - dtv() / S[O_rho_mix + b] * (ptot(b) - open_in(open_p(P.pb_l, P.rho_l, P.drho_l, 0.0, (f32(j) + 0.5) * P.dx), P.rho_l, S[O_U + f])) / (0.5 * P.dx);
         }
         return 0.0;
     }
     let a = cidx(P.nx - 1u, j);
     if (P.bc_r == 1u && !is_solid(a)) {
-        return us - dtv() / S[O_rho_mix + a] * (open_p(P.pb_r, P.rho_r, P.drho_r, f32(P.nx) * P.dx, (f32(j) + 0.5) * P.dx) - ptot(a)) / (0.5 * P.dx);
+        return us - dtv() / S[O_rho_mix + a] * (open_in(open_p(P.pb_r, P.rho_r, P.drho_r, f32(P.nx) * P.dx, (f32(j) + 0.5) * P.dx), P.rho_r, -S[O_U + f]) - ptot(a)) / (0.5 * P.dx);
     }
     return 0.0;
 }
@@ -1019,13 +1022,13 @@ fn face_v(f: u32) -> f32 {
     if (j == 0u) {
         let b = cidx(i, 0u);
         if (P.bc_b == 1u && !is_solid(b)) {
-            return vs - dtv() / S[O_rho_mix + b] * (ptot(b) - open_p(P.pb_b, P.rho_b, P.drho_b, (f32(i) + 0.5) * P.dx, 0.0)) / (0.5 * P.dx);
+            return vs - dtv() / S[O_rho_mix + b] * (ptot(b) - open_in(open_p(P.pb_b, P.rho_b, P.drho_b, (f32(i) + 0.5) * P.dx, 0.0), P.rho_b, S[O_V + f])) / (0.5 * P.dx);
         }
         return 0.0;
     }
     let a = cidx(i, P.ny - 1u);
     if (P.bc_t == 1u && !is_solid(a)) {
-        return vs - dtv() / S[O_rho_mix + a] * (open_p(P.pb_t, P.rho_t, P.drho_t, (f32(i) + 0.5) * P.dx, f32(P.ny) * P.dx) - ptot(a)) / (0.5 * P.dx);
+        return vs - dtv() / S[O_rho_mix + a] * (open_in(open_p(P.pb_t, P.rho_t, P.drho_t, (f32(i) + 0.5) * P.dx, f32(P.ny) * P.dx), P.rho_t, -S[O_V + f]) - ptot(a)) / (0.5 * P.dx);
     }
     return 0.0;
 }

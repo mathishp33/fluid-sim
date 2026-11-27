@@ -129,7 +129,7 @@ d'expérience.
 | `pompe <zone> (vx, vy)` (ou `compresseur …`) | pompe à débit volumique fixé : la vitesse vx est imposée sur les faces verticales des mailles fluides de la zone, vy sur leurs faces horizontales ; la zone est un conduit fermé sur ses côtés, que le fluide traverse à ce débit quoi qu'il arrive — en aval fermé, un gaz se comprime (compresseur). `pompe <zone> (0, 0)` la retire. CPU et GPU |
 | `vanne <zone> [fermée \| ouverte [f \| n %]]` | vanne à guillotine (fermée par défaut) : le long du plus grand côté de la zone, la part ouverte (fraction f de 0 à 1, ou n %) de ses rangées, depuis la gauche ou le bas, laisse passer l'écoulement ; les autres mailles ont leurs faces fermées et gardent leur fluide. À répéter pour l'ouvrir ou la fermer en cours d'expérience, par exemple `toutes les 0.2 s : vanne … ouverte` et `toutes les 0.2 s à partir de 0.1 s : vanne … fermée`. CPU et GPU |
 | `bord gauche\|droite\|bas\|haut mur` | paroi |
-| `bord … ouvert [p]` | ouvert à la pression p (1 atm par défaut) au point le plus haut du bord |
+| `bord … ouvert [p]` | ouvert à la pression p (1 atm par défaut) au point le plus haut du bord ; le fluide du dehors qui y entre a pour pression totale celle du dehors (p − ½ ρ v² à la face) |
 | `bord … entrée (vx, vy) [à T] ["fluide"]` | entrée à vitesse imposée (premier liquide par défaut) |
 | `bord … sortie (vx, vy)` | sortie à vitesse imposée, dirigée vers l'extérieur (pompe, vidange) : le fluide des mailles du bord sort à cette vitesse, quel qu'il soit ; seule la composante normale au bord compte. Sur une cuve fermée, la pression baisse (jusqu'à la cavitation d'un liquide) |
 | `champ …` | champ de valeurs, voir ci-dessous |

@@ -3405,8 +3405,23 @@ impl Runner {
             }
         }
         self.sim.dt_max = dt_max0;
-        if self.sim.diverged {
-            self.fail(format!("divergence numérique à t = {:.6} s (même à dt/1024, le pas donne un état invalide)", self.sim.time));
+        // pas effondré (aussi sur le GPU) : une vitesse s'emballe vers la limite, les pas acceptés raccourcissent sans fin
+        let collapse = super::mp_step::DT_COLLAPSE;
+        if self.sim.diverged || (self.sim.last_dt < collapse && remaining > 1e3 * collapse) {
+            self.sync_host();
+            let msg = if self.sim.last_dt < collapse {
+                format!(
+                    "le pas de temps s'effondre à t = {:.6} s (dt = {:.1e} s) : une vitesse s'emballe ({:.0} m/s, la limite est de {:.0} m/s)",
+                    self.sim.time,
+                    self.sim.last_dt,
+                    self.sim.max_speed(),
+                    self.sim.speed_limit
+                )
+            } else {
+                format!("divergence numérique à t = {:.6} s (même à dt/1024, le pas donne un état invalide)", self.sim.time)
+            };
+            self.sim.diverged = true;
+            self.fail(msg);
             return;
         }
         if self.main.cond.is_some() {

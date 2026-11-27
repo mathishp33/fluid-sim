@@ -154,7 +154,12 @@ impl MultiphaseSim {
         let bf = |a: f64, x: f64, ub: f64| if moving { a * x + a * (1.0 - a) * ub } else { a * x };
         let mut un = vec![0.0; (nx + 1) * ny];
         let mut vn = vec![0.0; nx * (ny + 1)];
-        // bords ouverts : pression hydrostatique du fluide ambiant le long du bord (voir `open_face_pressure`)
+        // bords ouverts : pression hydrostatique du fluide ambiant le long du bord (voir `open_face_pressure`) ; à une face où il
+        // ENTRE, c'est sa pression totale qui est celle du dehors (Bernoulli depuis le repos) : la pression statique de la face y
+        // perd ½ ρ v², v la vitesse de la face au début du pas (pas la prédite : elle porte la pesanteur du pas, que l'hydrostatique
+        // compense — de l'air au repos sous un bord ouvert y « entrait » à g dt). Avec la pression statique, un filet entrant plus
+        // vite recevait plus d'énergie que ses voisins et s'emballait (moulin sous un puits fort : 1000 m/s à une face du bord haut)
+        let inflow = |pb: f64, rho: f64, v_in: f64| pb - 0.5 * rho * v_in.max(0.0) * v_in.max(0.0);
         let rho_open: [f64; 4] = std::array::from_fn(|s| match self.bc[s] {
             Bc::Open { p } => self.ambient_density(p),
             Bc::Wall => 0.0,
@@ -179,14 +184,14 @@ impl MultiphaseSim {
                     }
                     (None, Some(b)) => match (self.bc[0], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[0], drho_open[0], 0.0, (j as f64 + 0.5) * dx);
+                            let pb = inflow(self.open_face_pressure(po, rho_open[0], drho_open[0], 0.0, (j as f64 + 0.5) * dx), rho_open[0], self.u[f]);
                             bf(ou(i, j), us[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[1], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[1], drho_open[1], lx, (j as f64 + 0.5) * dx);
+                            let pb = inflow(self.open_face_pressure(po, rho_open[1], drho_open[1], lx, (j as f64 + 0.5) * dx), rho_open[1], -self.u[f]);
                             bf(ou(i, j), us[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.u_body_vel(f))
                         }
                         _ => 0.0,
@@ -212,14 +217,14 @@ impl MultiphaseSim {
                     }
                     (None, Some(b)) => match (self.bc[2], self.is_solid(b)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[2], drho_open[2], (i as f64 + 0.5) * dx, 0.0);
+                            let pb = inflow(self.open_face_pressure(po, rho_open[2], drho_open[2], (i as f64 + 0.5) * dx, 0.0), rho_open[2], self.v[f]);
                             bf(ov(i, j), vs[f] - dt / self.rho_mix[b] * (p[b] - pb) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,
                     },
                     (Some(a), None) => match (self.bc[3], self.is_solid(a)) {
                         (Bc::Open { p: po }, false) => {
-                            let pb = self.open_face_pressure(po, rho_open[3], drho_open[3], (i as f64 + 0.5) * dx, ly);
+                            let pb = inflow(self.open_face_pressure(po, rho_open[3], drho_open[3], (i as f64 + 0.5) * dx, ly), rho_open[3], -self.v[f]);
                             bf(ov(i, j), vs[f] - dt / self.rho_mix[a] * (pb - p[a]) / (0.5 * dx), self.v_body_vel(f))
                         }
                         _ => 0.0,

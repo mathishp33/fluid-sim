@@ -1,6 +1,6 @@
 # Roue de moulin : un jet d'eau (3 cm de large, 2 m/s) tombe sur les pales de droite d'une roue à aubes libre, freinée par un frein
 # visqueux (couple -0.005 N par °/s) ; un puits au fond évacue l'eau. La roue part en sens horaire, accélère pendant une seconde, puis
-# se tient vers 205 °/s (34 tr/min) : le frein absorbe alors ≈ 3.7 W par mètre de profondeur, deux pour cent de la puissance du jet
+# se tient vers 215 °/s (36 tr/min) : le frein absorbe alors ≈ 4 W par mètre de profondeur, deux pour cent de la puissance du jet
 # (≈ 180 W/m) — une roue à aubes droites frappée par un jet étroit en rend peu. La rotation bat au passage de chaque pale.
 #   fluid-sim experience experiences/moulin.exp
 #

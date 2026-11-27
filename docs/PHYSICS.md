@@ -52,6 +52,7 @@ Chaque maille a une seule pression (équilibre mécanique) et, par groupe de pha
 | Pression faiblement compressible implicite (Helmholtz) | −∇·(dt/ρ_f ∇δp) + (κ_eff/dt) δp = (V − 1)/dt − ∇·(Ũ − uⁿ), uⁿ⁺¹ = Ũ − dt/ρ_f ∇δp | projection qui rend la vitesse compatible avec la fermeture ; l'acoustique implicite ne limite pas dt par la vitesse du son |
 | Parois | glissement libre : vitesse normale nulle, pas de frottement tangentiel | bords du domaine et mailles solides |
 | Bord ouvert, colonne compressible | p = p_o + ρ_a Φ (1 + ½ ρ′ Φ) + ⅛ ρ_a ρ′ (g dx)², Φ potentiel de pesanteur depuis le haut, ρ′ = dρ/dp | un côté ouvert suit l'hydrostatique de l'air extérieur, sans vent parasite (7.6e-8 m/s après 5 s) |
+| Bord ouvert, fluide qui entre | à une face où le fluide du dehors entre à v : p = p_bord − ½ ρ v² (sa pression totale est celle du dehors au repos, Bernoulli) | l'air aspiré par un bord ouvert ne s'emballe pas : un filet plus rapide ne reçoit pas plus d'énergie que ses voisins |
 
 ## 4. Chaleur
 

@@ -2,7 +2,7 @@
 
 Les défauts du simulateur : d'abord ceux qui restent (symptôme, cause connue ou supposée, parade), puis ceux qui ont été corrigés,
 du plus récent au plus ancien (symptôme → cause → correction, avec le commit). Les chiffres de validation sont dans MESURES.md, les
-tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
+tâches à venir dans TODO.md. Mis à jour le 2026-11-27.
 
 ## 1. Défauts connus
 
@@ -67,6 +67,21 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
   fenêtre monophasique retirée (elle ne sert plus), avec la case et les réglages du monophasique de l'écran de départ (fluide,
   viscosité, conductivités, itérations de pression, couleur et traceur des bords) ; `popups.rs`, inutilisé depuis le 2026-11-08, retiré.
   Le solveur monophasique reste, avec ses essais.
+
+### Bords ouverts, pas de temps (2026-11-27)
+- **Air aspiré par un bord ouvert qui s'emballe** (multiphasique, CPU et GPU) : une roue à aubes sous un jet, dans une cuve ouverte en
+  haut vidée par un puits fort (2 m/s) — une face du bord haut, contre la paroi gauche, aspirait l'air de plus en plus vite (30 m/s,
+  puis 1000 m/s en 15 ms) ; même derrière un simple obstacle, la vitesse la plus grande montait sans fin (3.4 à 4.7 m/s en 2 s). Le
+  bord imposait au fluide qui entre la pression statique du dehors : un filet plus rapide, à la pression plus basse en dedans (Bernoulli),
+  recevait plus d'énergie que ses voisins → à une face où le fluide du dehors ENTRE, sa pression totale est celle du dehors :
+  p = p_bord − ½ ρ v² (Bernoulli depuis le repos), v la vitesse de la face au début du pas (la vitesse prédite porte la pesanteur
+  du pas, que l'hydrostatique compense : avec elle, de l'air au repos sous des côtés ouverts se mettait à 0.1 m/s). L'air aspiré à
+  1 m/s a en dedans la pression du dehors moins 0.602 Pa (½ ρ v²), l'écoulement derrière l'obstacle s'établit à 3.815 m/s, l'air au
+  repos sous des côtés ouverts reste à 5e-8 m/s, la roue sous le puits fort va au bout.
+- **Simulation figée sans message** : une vitesse qui monte vers la limite (1000 m/s) fait accepter des pas toujours plus courts
+  sans jamais d'état invalide — dt tombait à 1e-20 s, le temps n'avançait plus → sous 1e-12 s (quand ce n'est pas l'échéance qui
+  borne le pas), la simulation s'arrête : « le pas de temps s'effondre à t = … (dt = …) : une vitesse s'emballe (… m/s, la limite est
+  de 1000 m/s) ».
 
 ### Bords ouverts (2026-11-26)
 - **Vent parasite des bords ouverts** (multiphasique) : de l'air au repos dans une cuve aux côtés ouverts se mettait en mouvement,
