@@ -286,6 +286,11 @@ détail dans les documents de conception et l'historique git.
   `experiences/composants/` (cylindre, moteur à deux temps, moteur à air, réservoir, soupape, chauffe par paliers) : les exemples
   refaits avec eux (mêmes relevés au bit près), un moteur posé deux fois (`deux_moteurs.exp`), un balayage passé à un composant
   (`avance.exp`).
+- Corps : mécanismes à un degré de liberté — `mécanisme "X"` (mené ou libre), roues `roue … sur "X" | engrène "R"` (dents en
+  développante de cercle calées sur la roue d'en face, ou pales), pièces en formules de la rotation `pièce … sur "X" position "…"
+  "…" angle "…"` (crémaillère, came, pendule) ; un vilebrequin est un mécanisme (ses roues tournent avec lui) ; relevés `mécanisme
+  "X" …` ; exemples `engrenages.exp`, `moulin.exp` et `agitateur.exp` (composant `roue_a_aubes.exp`), `came.exp` (composant
+  `excentrique.exp`) ; pendule en formules à 2e-5 près de sa période.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

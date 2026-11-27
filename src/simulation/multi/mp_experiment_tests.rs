@@ -1684,9 +1684,9 @@ attendre jusqu'à 3.5 ms
 
 /// énergie cinétique (J/m) des pièces du vilebrequin k et de son volant
 fn crank_energy(s: &MultiphaseSim, k: usize) -> f64 {
-    let ck = &s.cranks[k];
+    let ck = &s.mechanisms[k];
     let mut e = 0.5 * ck.inertia * ck.omega * ck.omega;
-    for &i in &ck.bodies {
+    for i in ck.bodies() {
         let b = &s.bodies[i];
         let rho = b.density(s.reg.solids[b.material].rho);
         e += 0.5 * rho * b.shape.area() * (b.vel[0].powi(2) + b.vel[1].powi(2)) + 0.5 * rho * b.shape.polar_moment() * b.omega.powi(2);
@@ -1720,8 +1720,8 @@ simuler 0.1 s
     let last = r.rows.last().unwrap();
     assert!((last[0] - 0.1).abs() < 1e-9 && (last[ct] - 0.5).abs() < 1e-9 && (last[cp] - 0.13).abs() < 1e-9, "{last:?}");
     // la bielle relie l'axe de manivelle à l'axe du piston ; les trois pièces sont menées
-    let ck = &r.sim.cranks[0];
-    let (a, b) = ck.pins(ck.theta);
+    let ck = &r.sim.mechanisms[0];
+    let (a, b) = ck.crank.as_ref().unwrap().pins(ck.theta);
     assert!(((b[0] - a[0]).hypot(b[1] - a[1]) - l).abs() < 1e-12);
     assert!(r.sim.bodies.len() == 3 && r.sim.bodies.iter().all(|b| b.motion == super::mp_bodies::Motion::Driven));
     // lecture : erreurs
@@ -1758,9 +1758,9 @@ simuler 0.2 s
     let e1 = crank_energy(&r.sim, 0);
     let c = column(&r, "vilebrequin 1 rotation (°/s)");
     let (wmin, wmax) = r.rows.iter().map(|row| row[c]).fold((f64::MAX, f64::MIN), |(a, b), w| (a.min(w), b.max(w)));
-    eprintln!("vilebrequin libre : énergie {e0:.5} → {e1:.5} J/m, rotation entre {wmin:.0} et {wmax:.0} °/s, {:.3} tour", r.sim.cranks[0].theta / std::f64::consts::TAU);
+    eprintln!("vilebrequin libre : énergie {e0:.5} → {e1:.5} J/m, rotation entre {wmin:.0} et {wmax:.0} °/s, {:.3} tour", r.sim.mechanisms[0].theta / std::f64::consts::TAU);
     assert!((e1 / e0 - 1.0).abs() < 1e-2, "énergie {e0} → {e1}");
-    assert!(wmax / wmin > 1.1 && r.sim.cranks[0].theta > 1.5 * std::f64::consts::PI, "rotation {wmin} … {wmax}");
+    assert!(wmax / wmin > 1.1 && r.sim.mechanisms[0].theta > 1.5 * std::f64::consts::PI, "rotation {wmin} … {wmax}");
 }
 
 #[test]
@@ -2237,7 +2237,7 @@ simuler 10 ms
     assert_eq!(r.sim.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), [
         "bille", "Borne", "a.manivelle", "a.bielle", "a.piston", "b.manivelle", "b.bielle", "b.piston"
     ]);
-    assert_eq!(r.sim.cranks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(r.sim.mechanisms.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     let last = r.rows.last().unwrap();
     let col = |n: &str| last[column(&r, n)];
     assert!(col("corps bille y (m)") < 0.2, "la bille tombe");
@@ -2417,13 +2417,181 @@ fn one_engine_component_placed_twice_runs_two_engines_on_their_own_rules() {
     assert!(rules[3].contains("Num(330.0)") && rules[1].contains("Num(355.0)"), "{rules:?}");
     let mut r = Runner::new(p, &dir, None, Some(false)).unwrap();
     run_to_end(&mut r);
-    assert_eq!(r.sim.cranks.len(), 2);
-    assert_eq!((r.sim.cranks[0].name.as_str(), r.sim.cranks[1].name.as_str()), ("gauche", "droite"));
-    assert!((r.sim.cranks[1].pivot[0] - 0.225).abs() < 1e-12, "{:?}", r.sim.cranks[1].pivot);
+    assert_eq!(r.sim.mechanisms.len(), 2);
+    assert_eq!((r.sim.mechanisms[0].name.as_str(), r.sim.mechanisms[1].name.as_str()), ("gauche", "droite"));
+    let pivot = r.sim.mechanisms[1].crank.as_ref().unwrap().pivot;
+    assert!((pivot[0] - 0.225).abs() < 1e-12, "{pivot:?}");
     let last = r.rows.last().unwrap();
     for side in ["gauche", "droite"] {
         let w = last[column(&r, &format!("{side} rotation (°/s)"))];
         assert!(w > 3000.0 && w < 4000.0, "{side} : {w} °/s");
         assert!(last[column(&r, &format!("{side} chambre (Pa)"))] > 1e5);
+    }
+}
+
+
+// ------------------------------------------------------------------------------------------------- mécanismes : roues et pièces
+
+/// aire commune de deux polygones convexes en sens trigonométrique (Sutherland–Hodgman)
+fn overlap_area(a: &[[f64; 2]], b: &[[f64; 2]]) -> f64 {
+    let cross = |p: [f64; 2], q: [f64; 2], x: [f64; 2]| (q[0] - p[0]) * (x[1] - p[1]) - (q[1] - p[1]) * (x[0] - p[0]);
+    let mut out = a.to_vec();
+    for k in 0..b.len() {
+        let (p, q) = (b[k], b[(k + 1) % b.len()]);
+        let input = std::mem::take(&mut out);
+        for i in 0..input.len() {
+            let (s, e) = (input[(i + input.len() - 1) % input.len()], input[i]);
+            let (ds, de) = (cross(p, q, s), cross(p, q, e));
+            let cut = || {
+                let t = ds / (ds - de);
+                [s[0] + t * (e[0] - s[0]), s[1] + t * (e[1] - s[1])]
+            };
+            match (ds >= 0.0, de >= 0.0) {
+                (true, true) => out.push(e),
+                (true, false) => out.push(cut()),
+                (false, true) => {
+                    out.push(cut());
+                    out.push(e);
+                }
+                _ => {}
+            }
+        }
+        if out.is_empty() {
+            return 0.0;
+        }
+    }
+    let n = out.len();
+    (0..n).map(|i| out[i][0] * out[(i + 1) % n][1] - out[(i + 1) % n][0] * out[i][1]).sum::<f64>().abs() / 2.0
+}
+
+#[test]
+fn gears_mesh_at_the_ratio_of_their_teeth_without_overlapping() {
+    // pignon de 12 dents mené à 300 tr/min (1800 °/s), roue de 24 dents qui l'engrène : 900 °/s en sens inverse
+    let text = "départ scénario \"cuve vide\" grille 130 x 90 maille 2 mm
+mécanisme \"train\" rotation 300 tr/min
+roue (0.045, 0.09) rayon 3.6 cm dents 12 \"acier\" sur \"train\" nom \"pignon\"
+roue (0.153, 0.09) rayon 7.2 cm dents 24 engrène \"pignon\" nom \"roue\"
+mesurer toutes les 2 ms : mécanisme \"train\" angle, corps \"pignon\" angle, corps \"roue\" angle, corps \"roue\" rotation
+simuler 12 ms
+";
+    let r = run(text, None);
+    let s = &r.sim;
+    assert_eq!(s.bodies.len(), 38);
+    assert_eq!((s.bodies[0].name.as_str(), s.bodies[12].name.as_str(), s.bodies[13].name.as_str(), s.bodies[37].name.as_str()), ("pignon", "pignon.dent12", "roue", "roue.dent24"));
+    let (ca, cp, cr, cw) = (column(&r, "mécanisme train angle (°)"), column(&r, "corps pignon angle (°)"), column(&r, "corps roue angle (°)"), column(&r, "corps roue rotation (°/s)"));
+    for w in r.rows.windows(2) {
+        let (d_meca, d_roue) = (w[1][ca] - w[0][ca], w[1][cr] - w[0][cr]);
+        assert!((w[1][cp] - w[0][cp] - d_meca).abs() < 1e-9 && (d_roue + 0.5 * d_meca).abs() < 1e-9, "{w:?}");
+        assert!((w[1][cw] + 900.0).abs() < 1e-9, "{w:?}");
+    }
+    // sur une dent du pignon (30°) : aucune dent dans une dent d'en face, aucune dans le disque de l'autre
+    let m = &s.mechanisms[0];
+    let mut worst: f64 = 0.0;
+    for step in 0..=60 {
+        let th = m.theta + (step as f64 / 60.0) * 30f64.to_radians();
+        let mut bodies = s.bodies.clone();
+        for (p, (c, a)) in m.pieces.iter().zip(m.body_poses(th)) {
+            bodies[p.body].pos = c;
+            bodies[p.body].angle = a;
+        }
+        let v: Vec<Vec<[f64; 2]>> = bodies.iter().map(|b| b.world_vertices()).collect();
+        for i in 0..13 {
+            for j in 13..38 {
+                worst = worst.max(overlap_area(&v[i], &v[j]));
+            }
+        }
+    }
+    assert!(worst < 1e-12, "dents qui se chevauchent : {worst} m²");
+    assert!(r.sim.state_is_sane());
+}
+
+#[test]
+fn a_free_wheel_spins_up_as_its_inertia_says_and_a_pendulum_piece_swings_with_its_period() {
+    // couple constant de 0.5 N sur un volant et une roue d'acier : ω = Γ t / I
+    let text = "départ scénario \"cuve vide\" grille 40 x 40 maille 5 mm
+mécanisme \"m\" libre inertie 0.01 couple \"0.5\"
+roue (0.1, 0.1) rayon 4 cm \"acier\" sur \"m\" nom \"volant\"
+mesurer toutes les 10 ms : mécanisme \"m\" rotation
+simuler 0.2 s
+";
+    let r = run(text, None);
+    let b = &r.sim.bodies[0];
+    let inertia = 0.01 + b.density(r.sim.reg.solids[b.material].rho) * b.shape.polar_moment();
+    let w = r.rows.last().unwrap()[column(&r, "mécanisme m rotation (°/s)")];
+    let expect = (0.5 * 0.2 / inertia).to_degrees();
+    assert!((w / expect - 1.0).abs() < 5e-3, "{w} °/s pour {expect}");
+    // pendule : une bille de 1 cm au bout d'un bras de 10 cm (pièce en formules, sans rotation propre), lâchée à 0.2 rad ; période
+    // 2π √(L/g) (1 + θ0²/16) aux petits angles
+    let text = "départ scénario \"cuve vide\" grille 40 x 40 maille 5 mm
+mécanisme \"p\" libre
+pièce disque (0.1, 0.05) rayon 1 cm \"acier\" sur \"p\" position \"0.1 + 0.1*sin(theta + 0.2)\" \"0.15 - 0.1*cos(theta + 0.2)\" nom \"bille\"
+mesurer toutes les 2 ms : mécanisme \"p\" rotation, corps \"bille\" x
+simuler 1.4 s
+";
+    let r = run(text, None);
+    let cw = column(&r, "mécanisme p rotation (°/s)");
+    // instants où la rotation change de signe (extrêmes du balancement)
+    let mut zeros = vec![];
+    for w in r.rows.windows(2) {
+        let (a, b) = (w[0][cw], w[1][cw]);
+        if a != 0.0 && (a > 0.0) != (b > 0.0) {
+            zeros.push(w[0][0] + (w[1][0] - w[0][0]) * a / (a - b));
+        }
+    }
+    assert!(zeros.len() >= 4, "{zeros:?}");
+    let period = 2.0 * (zeros[zeros.len() - 1] - zeros[0]) / (zeros.len() - 1) as f64;
+    let expect = 2.0 * std::f64::consts::PI * (0.1f64 / 9.81).sqrt() * (1.0 + 0.04 / 16.0);
+    eprintln!("pendule : période {period:.5} s pour {expect:.5} s");
+    assert!((period / expect - 1.0).abs() < 1e-2, "{period} s pour {expect} s");
+    // la bille reste à 10 cm de l'axe
+    let x = r.rows.iter().map(|row| row[column(&r, "corps bille x (m)")]).fold(f64::MIN, f64::max);
+    assert!((x - (0.1 + 0.1 * 0.2f64.sin())).abs() < 2e-3, "{x}");
+}
+
+#[test]
+fn pieces_ride_a_crank_shaft_and_mechanism_lines_report_their_errors() {
+    // une poulie sur l'arbre d'un vilebrequin (rapport −0.5 : une courroie croisée) et une crémaillère en formule
+    let text = "départ scénario \"cuve vide\" grille 40 x 30 maille 5 mm
+vilebrequin (0.06, 0.05) rayon 1 cm bielle 4 cm rotation 300 tr/min nom \"v\"
+roue (0.15, 0.05) rayon 2 cm sur \"v\" rapport -0.5 nom \"poulie\"
+pièce rect (0.1, 0.12) (0.14, 0.13) \"acier\" sur \"v\" position \"x0 + 0.01*theta\" \"y0\" nom \"crémaillère\"
+mesurer toutes les 5 ms : corps \"crémaillère\" x, corps \"poulie\" rotation, vilebrequin \"v\" tours, mécanisme 1 tours
+simuler 20 ms
+";
+    let r = run(text, None);
+    let last = r.rows.last().unwrap();
+    let turns = last[column(&r, "vilebrequin v tours (tr)")];
+    assert!((turns - 0.1).abs() < 1e-9, "{turns}");
+    assert_eq!(turns.to_bits(), last[column(&r, "mécanisme 1 tours (tr)")].to_bits());
+    assert!((last[column(&r, "corps crémaillère x (m)")] - (0.12 + 0.01 * turns * std::f64::consts::TAU)).abs() < 1e-12);
+    assert!((last[column(&r, "corps poulie rotation (°/s)")] + 900.0).abs() < 1e-9);
+    assert_eq!(r.sim.mechanisms[0].pieces.len(), 5);
+    // lecture : erreurs
+    let start = "départ scénario \"cuve vide\" grille 40 x 30 maille 5 mm\nmécanisme \"m\" rotation 60 tr/min\n";
+    for (bad, what) in [
+        ("roue (0.1, 0.1) rayon 2 cm", "il faut « sur"),
+        ("roue (0.1, 0.1) rayon 2 cm sur \"m\" dents 12 pales 4 longueur 1 cm", "dents ou des pales"),
+        ("roue (0.1, 0.1) rayon 2 cm sur \"m\" dents 4", "au moins 6 dents"),
+        ("roue (0.1, 0.1) rayon 2 cm sur \"m\" nom \"a\"\nroue (0.14, 0.1) rayon 2 cm engrène \"a\" rapport 2", "« rapport » : pour une roue « sur »"),
+        ("roue (0.1, 0.1) rayon 2 cm sur \"zz\"", "aucun mécanisme ne s'appelle « zz »"),
+        ("roue (0.1, 0.1) rayon 2 cm engrène \"r\"", "aucune roue ne s'appelle « r »"),
+        ("pièce disque (0.1, 0.1) rayon 1 cm \"acier\"", "il faut « sur"),
+        ("pièce disque (0.1, 0.1) rayon 1 cm sur \"m\" position \"x0 + vitesse\" \"y0\"", "variables : theta"),
+        ("mécanisme \"n\" inertie 1", "pour un mécanisme « libre »"),
+        ("mesurer toutes les 1 ms : mécanisme \"q\" angle", "aucun mécanisme ne s'appelle « q »"),
+    ] {
+        let e = parse(&format!("{start}{bad}\n"), None).unwrap_err();
+        assert!(e[0].msg.contains(what), "« {bad} » : {e:?}");
+    }
+    // pose : des roues qui ne se touchent pas, des dents de tailles différentes, des dents trop fines pour la maille
+    for (bad, what) in [
+        ("roue (0.1, 0.1) rayon 2 cm sur \"m\" nom \"a\"\nroue (0.16, 0.1) rayon 2 cm engrène \"a\"", "ne se touchent pas"),
+        ("roue (0.06, 0.08) rayon 4.5 cm dents 6 sur \"m\" nom \"a\"\nroue (0.15, 0.08) rayon 4.5 cm dents 8 engrène \"a\"", "tailles différentes"),
+        ("roue (0.06, 0.08) rayon 2 cm dents 12 sur \"m\"", "trop fines pour la maille"),
+        ("roue (0.06, 0.08) rayon 4.5 cm dents 6 sur \"m\" nom \"a\"\nroue (0.15, 0.08) rayon 4.5 cm engrène \"a\"", "une roue dentée engrène une roue dentée"),
+    ] {
+        let p = proto(&format!("{}{bad}\n", start.replace("grille 40 x 30", "grille 60 x 40")));
+        let e = initial_state(&p, Path::new(".")).err().unwrap_or_else(|| panic!("« {bad} » aurait dû être refusé"));
+        assert!(e.contains(what), "« {bad} » : {e}");
     }
 }

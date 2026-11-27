@@ -256,8 +256,8 @@ pub enum Measure {
     Time { label: Option<String> },
     /// variable du protocole (indice dans `Protocol::vars`)
     Var { var: usize, label: Option<String> },
-    /// grandeur d'un vilebrequin (par son rang dans l'ordre de pose, ou par son nom)
-    Crank { who: Who, q: CrankQty, label: Option<String> },
+    /// grandeur d'un mécanisme (par son nom, ou par son rang dans l'ordre de pose : parmi tous, `any`, ou parmi les vilebrequins)
+    Crank { who: Who, q: CrankQty, label: Option<String>, any: bool },
 }
 
 /// Corps ou vilebrequin d'un relevé : son rang dans l'ordre de pose (à partir de 0 ; « corps 2 » est le rang 1) ou son nom (option
@@ -340,7 +340,7 @@ impl CrankQty {
         }
     }
     fn value(self, sim: &MultiphaseSim, k: usize) -> f64 {
-        let Some(c) = sim.cranks.get(k) else { return f64::NAN };
+        let Some(c) = sim.mechanisms.get(k) else { return f64::NAN };
         match self {
             CrankQty::Angle => c.angle_deg(),
             CrankQty::Turns => c.theta / std::f64::consts::TAU,
@@ -654,6 +654,12 @@ pub enum Action {
     Let { var: usize, value: LetValue },
     /// vilebrequin, bielle, piston (et cylindre)
     Crank(CrankSpec),
+    /// mécanisme (arbre) sans pièce : `mécanisme "X" …`
+    Mechanism(MechSpec),
+    /// roue d'un mécanisme : `roue (x, y) rayon r … sur "X" | engrène "R"`
+    Wheel(WheelSpec),
+    /// pièce menée par un mécanisme, en formules : `pièce <forme> … sur "X" position "…" "…" angle "…"`
+    Piece(PieceSpec),
     /// action aux valeurs calculées (`{…}`, formules `calcs` dans l'ordre) : ses mots `toks` sont relus avec les valeurs de l'instant
     /// chaque fois qu'elle est faite ; `check` : la même lue avec ces valeurs à 1 (noms vérifiés au départ)
     Deferred { toks: Vec<super::mp_script::Tok>, calcs: Vec<Calc>, check: Box<Action> },
@@ -704,6 +710,63 @@ impl Action {
             _ => None,
         }
     }
+}
+
+/// Mécanisme nommé sans pièce (`mécanisme "X" …`) : ses roues et ses pièces s'y ajoutent (`roue … sur "X"`, `pièce … sur "X"`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MechSpec {
+    pub name: String,
+    /// libre ; sinon mené à `omega`
+    pub free: bool,
+    /// rotation imposée, ou de départ (rad/s)
+    pub omega: f64,
+    /// volant (kg·m par mètre de profondeur) et couple appliqué (formule en t, angle, tours, rotation ; N)
+    pub inertia: f64,
+    pub load: Option<String>,
+    /// angle de départ (°)
+    pub angle_deg: f64,
+}
+
+/// Sur quoi tourne une roue.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WheelOn {
+    /// sur l'arbre du mécanisme nommé, `ratio` fois son angle (1 : calée sur l'arbre ; une courroie : le rapport des poulies)
+    Shaft { mech: String, ratio: f64 },
+    /// engrène la roue nommée : même mécanisme, sens inverse, rapport des rayons
+    Mesh(String),
+}
+
+/// Roue (`roue (x, y) rayon r …`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WheelSpec {
+    pub center: [f64; 2],
+    /// rayon (primitif pour une roue dentée : celui où elle roule sur l'autre)
+    pub r: f64,
+    pub material: String,
+    pub on: WheelOn,
+    pub teeth: Option<usize>,
+    /// pales : nombre, longueur, épaisseur (None : un dixième du rayon, au moins une maille)
+    pub blades: Option<(usize, f64, Option<f64>)>,
+    /// angle de départ (°) ; une roue dentée qui en engrène une autre est calée sur elle
+    pub angle_deg: f64,
+    pub name: Option<String>,
+    pub temp: Option<f64>,
+}
+
+/// Pièce menée par un mécanisme, en formules (`pièce <forme> … sur "X" …`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PieceSpec {
+    pub shape: BodySpec,
+    pub material: String,
+    /// angle écrit (rad)
+    pub angle: f64,
+    pub mech: String,
+    /// position (m) et angle (°) en formules de `mp_mechanism::PIECE_VARS` ; None : ceux écrits
+    pub x: Option<String>,
+    pub y: Option<String>,
+    pub a: Option<String>,
+    pub name: Option<String>,
+    pub temp: Option<f64>,
 }
 
 /// Comparaison d'une condition d'arrêt (`simuler jusqu'à ce que <relevé> < v`)
@@ -1155,6 +1218,8 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
             Action::Solid { material, .. }
             | Action::Body { material, .. }
             | Action::Crank(CrankSpec { material, .. })
+            | Action::Wheel(WheelSpec { material, .. })
+            | Action::Piece(PieceSpec { material, .. })
             | Action::Field { qty: FieldQty::Solid(material), .. } => {
                 if let Err(e) = find_solid(sim, material) {
                     errs.push((*line, e));
@@ -1258,6 +1323,20 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             Ok(cs.len())
         }
         Action::Crank(spec) => add_crank(sim, spec, base),
+        Action::Mechanism(s) => {
+            let m = super::mp_mechanism::Mechanism::new(&s.name, s.angle_deg.to_radians(), s.omega, (!s.free).then_some(s.omega), s.inertia, s.load.clone());
+            sim.add_mechanism(m)?;
+            Ok(0)
+        }
+        Action::Wheel(s) => add_wheel(sim, s),
+        Action::Piece(s) => {
+            let mi = sim.mechanism_named(&s.mech).ok_or_else(|| no_mechanism(&s.mech))?;
+            let mat = find_solid(sim, &s.material)?;
+            let mut b = s.shape.body(mat, s.angle, s.temp.unwrap_or(t_amb), &BodyMotion::default())?;
+            b.name = s.name.clone().unwrap_or_default();
+            sim.add_formula_piece(mi, b, s.x.clone(), s.y.clone(), s.a.clone())?;
+            Ok(1)
+        }
         Action::Body { shape, material, angle, motion, temp, name } => {
             let s = find_solid(sim, material)?;
             let mut b = shape.body(s, *angle, temp.unwrap_or(t_amb), motion)?;
@@ -1460,27 +1539,49 @@ fn add_crank(sim: &mut MultiphaseSim, spec: &CrankSpec, base: &Path) -> Result<u
             apply_action(sim, &Action::Solid { zone, material: spec.material.clone(), thermal: ThermalSpec::Passive, temp: spec.temp }, base)?;
         }
     }
-    let ck = super::mp_mechanism::Crank {
-        pivot,
-        r: spec.r,
-        l: spec.l,
-        axis,
-        piston_h,
-        rod_len: 0.0,
-        bodies: [0; 3],
-        theta: spec.angle_deg.to_radians(),
-        omega: spec.omega,
-        driven: (!spec.free).then_some(spec.omega),
-        inertia: spec.inertia,
-        load: spec.load.clone(),
-        torque: 0.0,
-        applied: 0.0,
-        name: spec.name.clone().unwrap_or_default(),
-    };
+    let mut m = super::mp_mechanism::Mechanism::new(
+        &spec.name.clone().unwrap_or_default(),
+        spec.angle_deg.to_radians(),
+        spec.omega,
+        (!spec.free).then_some(spec.omega),
+        spec.inertia,
+        spec.load.clone(),
+    );
+    m.crank = Some(super::mp_mechanism::CrankGeom { pivot, r: spec.r, l: spec.l, axis, piston_h, rod_len: 0.0 });
     let w = (spec.r / 3.0).max(dx);
     let t = spec.temp.unwrap_or(sim.t_ambient);
-    sim.add_crank(ck, bore, w, mat, t)?;
+    sim.add_crank(m, bore, w, mat, t)?;
     Ok(3)
+}
+
+/// Pose une roue (`roue …`) : sur l'arbre d'un mécanisme, ou qui en engrène une autre (même mécanisme)
+fn add_wheel(sim: &mut MultiphaseSim, s: &WheelSpec) -> Result<usize, String> {
+    use super::mp_mechanism::Rim;
+    let mat = find_solid(sim, &s.material)?;
+    let rim = match (s.teeth, s.blades) {
+        (Some(n), _) => Rim::Teeth(n),
+        (None, Some((n, len, e))) => Rim::Blades(n, len, e.unwrap_or((s.r / 10.0).max(sim.dx))),
+        (None, None) => Rim::Plain,
+    };
+    let teeth = s.teeth.unwrap_or(0);
+    let (mi, ratio, angle_now) = match &s.on {
+        WheelOn::Shaft { mech, ratio } => {
+            let mi = sim.mechanism_named(mech).ok_or_else(|| no_mechanism(mech))?;
+            (mi, *ratio, s.angle_deg.to_radians())
+        }
+        WheelOn::Mesh(w) => {
+            let (mi, wi) = sim.wheel_named(w).ok_or_else(|| format!("aucune roue ne s'appelle « {w} » : il faut d'abord la poser, avec « nom \"{w}\" »"))?;
+            let (ratio, a) = sim.mesh(mi, wi, s.center, s.r, teeth)?;
+            (mi, ratio, if teeth > 0 { a } else { s.angle_deg.to_radians() })
+        }
+    };
+    let n0 = sim.bodies.len();
+    sim.add_wheel(mi, s.name.as_deref().unwrap_or(""), s.center, s.r, ratio, angle_now, rim, mat, s.temp.unwrap_or(sim.t_ambient))?;
+    Ok(sim.bodies.len() - n0)
+}
+
+fn no_mechanism(name: &str) -> String {
+    format!("aucun mécanisme ne s'appelle « {name} » : il faut d'abord sa ligne « mécanisme \"{name}\" » (ou « vilebrequin … nom \"{name}\" »)")
 }
 
 fn effect(sim: &mut MultiphaseSim, zone: &Zone, e: MpEffect) -> Result<usize, String> {
@@ -1512,7 +1613,8 @@ enum ProbeKind {
     Mass(usize),
     Time,
     Var(usize),
-    Crank(Who, CrankQty),
+    /// mécanisme : nommé, ou de rang donné parmi tous (true) ou parmi les vilebrequins (false)
+    Crank(Who, CrankQty, bool),
     Body(Who, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
@@ -1817,11 +1919,20 @@ fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
     (i0, i1, s - i0 as f64)
 }
 
+/// indice du mécanisme d'un relevé : par son nom, ou par son rang parmi tous (`any`) ou parmi les vilebrequins ; usize::MAX s'il n'y
+/// est pas
+fn mechanism_index(sim: &MultiphaseSim, who: &Who, any: bool) -> usize {
+    match who {
+        Who::Rank(k) if !any => sim.mechanisms.iter().enumerate().filter(|(_, m)| m.crank.is_some()).nth(*k).map_or(usize::MAX, |(i, _)| i),
+        _ => who.find(sim.mechanisms.iter().map(|m| m.name.as_str())),
+    }
+}
+
 impl Probe {
     /// valeur pour l'état `sim` ; `vals` : (t, variables du protocole…)
     fn value(&self, sim: &MultiphaseSim, vals: &[f64]) -> f64 {
         match &self.kind {
-            ProbeKind::Crank(who, q) => return q.value(sim, who.find(sim.cranks.iter().map(|c| c.name.as_str()))),
+            ProbeKind::Crank(who, q, any) => return q.value(sim, mechanism_index(sim, who, *any)),
             ProbeKind::Body(who, q) => return q.value(sim, who.find(sim.bodies.iter().map(|b| b.name.as_str()))),
             _ => {}
         }
@@ -2224,9 +2335,10 @@ impl Runner {
             Measure::Time { label } => {
                 (Probe { kind: ProbeKind::Time, cells: vec![], fluid_only: false }, label.clone().unwrap_or_else(|| "temps".into()), "s".to_string())
             }
-            Measure::Crank { who, q, label } => {
-                let name = label.clone().unwrap_or_else(|| format!("vilebrequin {} {}", who.label(), q.name()));
-                (Probe { kind: ProbeKind::Crank(who.clone(), *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
+            Measure::Crank { who, q, label, any } => {
+                let what = if *any { "mécanisme" } else { "vilebrequin" };
+                let name = label.clone().unwrap_or_else(|| format!("{what} {} {}", who.label(), q.name()));
+                (Probe { kind: ProbeKind::Crank(who.clone(), *q, *any), cells: vec![], fluid_only: false }, name, q.unit().to_string())
             }
             Measure::Var { var, label } => {
                 let name = label.clone().unwrap_or_else(|| self.proto.vars.get(*var).cloned().unwrap_or_default());
@@ -3581,6 +3693,35 @@ fn describe(a: &Action) -> String {
         Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
         Action::Deferred { .. } => "action aux valeurs calculées".into(),
+        Action::Mechanism(s) => {
+            let how = if s.free { "libre".to_string() } else { format!("mené à {} tr/min", fmt_num(s.omega * 60.0 / std::f64::consts::TAU)) };
+            format!("mécanisme « {} » — {how}", s.name)
+        }
+        Action::Wheel(s) => {
+            let rim = match (s.teeth, s.blades) {
+                (Some(n), _) => format!(", {n} dents"),
+                (None, Some((n, l, _))) => format!(", {n} pales de {} m", fmt_num(l)),
+                _ => String::new(),
+            };
+            let on = match &s.on {
+                WheelOn::Shaft { mech, ratio } if *ratio == 1.0 => format!("sur « {mech} »"),
+                WheelOn::Shaft { mech, ratio } => format!("sur « {mech} », rapport {}", fmt_num(*ratio)),
+                WheelOn::Mesh(w) => format!("qui engrène « {w} »"),
+            };
+            let name = s.name.as_ref().map_or(String::new(), |n| format!(" « {n} »"));
+            format!("roue{name} {} rayon {} m{rim}, « {} », {on}", fmt_point(s.center), fmt_num(s.r), s.material)
+        }
+        Action::Piece(s) => {
+            let mut f = vec![];
+            if s.x.is_some() || s.y.is_some() {
+                f.push(format!("position « {} », « {} »", s.x.as_deref().unwrap_or("x0"), s.y.as_deref().unwrap_or("y0")));
+            }
+            if let Some(a) = &s.a {
+                f.push(format!("angle « {a} »"));
+            }
+            let name = s.name.as_ref().map_or(String::new(), |n| format!(" « {n} »"));
+            format!("pièce{name} « {} » sur « {} »{}", s.material, s.mech, if f.is_empty() { " (immobile)".to_string() } else { format!(" : {}", f.join(", ")) })
+        }
         Action::Crank(c) => {
             let how = if c.free { "libre".to_string() } else { format!("mené à {} tr/min", fmt_num(c.omega * 60.0 / std::f64::consts::TAU)) };
             let cyl = if c.cylinder.is_some() { ", dans son cylindre" } else { "" };

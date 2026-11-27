@@ -1,0 +1,15 @@
+# Train d'engrenages : un moteur mène un pignon de 12 dents à 300 tr/min ; il engrène une roue intermédiaire de 18 dents, qui engrène
+# une roue de 24 dents. Les rapports sont exacts : la roue intermédiaire tourne à 200 tr/min en sens inverse, la dernière à 150
+# tr/min dans le sens du pignon (une roue intermédiaire ne change que le sens). Dents en développante de cercle, de module 6 mm (trois
+# mailles : il en faut au moins autant) ; elles chassent l'air pris entre elles : le moteur leur donne ≈ 2.7 W par mètre de
+# profondeur en moyenne, par à-coups (couple de 0.08 N en moyenne, jusqu'à 0.8 N quand une dent entre dans un creux).
+#   fluid-sim experience experiences/engrenages.exp
+
+départ scénario "Cuve vide" grille 180 x 90 maille 2 mm
+mécanisme "train" rotation 300 tr/min
+roue (0.05, 0.09) rayon 3.6 cm dents 12 "acier" sur "train" nom "pignon"
+roue (0.14, 0.09) rayon 5.4 cm dents 18 "acier" engrène "pignon" nom "intermédiaire"
+roue (0.266, 0.09) rayon 7.2 cm dents 24 "acier" engrène "intermédiaire" nom "roue"
+
+mesurer toutes les 5 ms : corps "pignon" rotation, corps "intermédiaire" rotation, corps "roue" rotation, mécanisme "train" couple, mécanisme "train" puissance
+simuler 0.5 s

@@ -1,0 +1,14 @@
+# Agitateur : la roue à aubes de « moulin.exp » (le composant « composants/roue_a_aubes.exp »), menée à vitesse imposée au fond
+# d'une cuve d'eau, pour trois vitesses (un balayage passé au composant ; résultats/agitateur/VITESSE=30/, …). L'eau la plus rapide
+# suit le bout des pales : 0.24, 0.47 et 0.96 m/s pour 0.22, 0.44 et 0.88 m/s au bout des pales à 30, 60 et 120 tr/min. Le couple
+# relevé, lui, est très bruité dans l'eau (bruit de pression des corps qui y bougent, voir TODO) : il se moyenne sur des tours
+# entiers.
+#   fluid-sim experience experiences/agitateur.exp
+
+départ scénario "Cuve vide" grille 60 x 50 maille 5 mm
+balayage VITESSE = 30, 60, 120
+remplir rect (0, 0) (0.3, 0.2) avec "eau" à 20 °C
+inclure "composants/roue_a_aubes.exp" avec NOM = "agitateur", X = 0.15, Y = 0.09, MOUVEMENT = rotation $VITESSE tr/min
+
+mesurer toutes les 20 ms : max vitesse dans rect (0, 0) (0.3, 0.2) comme "vitesse de l'eau"
+simuler 1 s

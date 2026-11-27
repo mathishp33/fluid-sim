@@ -176,6 +176,10 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   vilebrequin (x, y) rayon 2 cm bielle 6 cm \"acier\" [axe 90] [alésage 4 cm] [piston 1 cm] [cylindre] [chambre 1 cm] [angle 0]
         rotation 600 tr/min (mené) | libre [rotation …] [inertie 0.005] [couple \"-0.001*rotation\"]   (manivelle, bielle, piston)
         [nom \"gauche\"]   (relevés vilebrequin \"gauche\" angle ; pièces corps \"gauche.manivelle\" | \"gauche.bielle\" | \"gauche.piston\")
+  mécanisme \"train\" rotation 300 tr/min | libre [inertie 0.01] [couple \"-0.01*rotation\"]   (un arbre ; roues et pièces s'y ajoutent)
+  roue (x, y) rayon 3.6 cm [\"acier\"] sur \"train\" [rapport k] | engrène \"pignon\"   [dents 12 | pales 8 longueur 3 cm [épaisseur 1 cm]] [nom \"pignon\"]
+        (dents en développante, module 2r/n d'au moins trois mailles ; engrène : sens inverse, rapport des rayons)
+  pièce rect (x1, y1) (x2, y2) [\"acier\"] sur \"train\" position \"x0 + 0.02*theta\" \"y0\" [angle \"a0 + angle\"]   (formules de la rotation)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
@@ -207,7 +211,7 @@ TEMPS, MESURES, SORTIES
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur ; temps (temps simulé, pour les conditions)
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
      corps 1 fx|fy|couple contact|loi|total   (force des contacts, de la loi en formule, ou bilan avec le poids : M a d'un corps libre)
-     vilebrequin 1 angle|tours|rotation|couple|puissance   (angle depuis le point mort haut, de 0 à 360°)
+     vilebrequin 1 angle|tours|rotation|couple|puissance   (angle depuis le point mort haut, de 0 à 360°) · mécanisme \"train\" …
      corps \"bille\" y · vilebrequin \"gauche\" angle   (par leur nom)
   mesurer : <mesures>   (colonnes à la période d'une autre ligne : celles d'un composant) · mesurer toutes les 10 ms   (la période seule)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)

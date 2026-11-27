@@ -8,7 +8,7 @@
 
 use super::mp_experiment::{
     norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, CrankQty, CrankSpec, FieldQty, FieldSource, Includes, LetValue, Logic, Measure,
-    Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Threshold, Who, Zone,
+    MechSpec, PieceSpec, Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Threshold, WheelOn, WheelSpec, Who, Zone,
 };
 use std::path::Path;
 use super::mp_view::T_IGNITION;
@@ -290,15 +290,26 @@ fn tokenize(line: &str, ln: usize) -> Result<Vec<Tok>, ScriptError> {
 
 type R<T> = Result<T, ScriptError>;
 
+/// genre d'un objet nommé (vérification des noms en fin de lecture)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Body,
+    /// vilebrequin (un mécanisme à bielle-manivelle)
+    Crank,
+    /// mécanisme quelconque (`mécanisme "X"` ; un vilebrequin nommé en est un)
+    Mech,
+    Wheel,
+}
+
 struct P<'a> {
     t: &'a [Tok],
     i: usize,
     ln: usize,
     /// variables affectées par les lignes d'avant (`soit`) : seuils, relevés et formules peuvent les nommer
     vars: Vec<String>,
-    /// noms lus sur la ligne : relevés d'un objet nommé et objets nommés posés, (vilebrequin ?, nom) — vérifiés en fin de lecture
-    refs: Vec<(bool, String)>,
-    decls: Vec<(bool, String)>,
+    /// noms lus sur la ligne : objets nommés désignés (relevés, roues et pièces de mécanismes) et posés — vérifiés en fin de lecture
+    refs: Vec<(Kind, String)>,
+    decls: Vec<(Kind, String)>,
 }
 
 /// mots qui ne peuvent pas nommer une variable (relevés, grandeurs, liaisons, fonctions des formules)
@@ -382,17 +393,49 @@ impl<'a> P<'a> {
     }
     /// corps ou vilebrequin d'un relevé : son numéro (1 pour le premier posé) ou son nom entre guillemets (noté, pour la vérification
     /// de fin de lecture)
-    fn who(&mut self, what: &str, crank: bool) -> R<Who> {
+    fn who(&mut self, what: &str, kind: Kind) -> R<Who> {
         if let Some(Tok::S(s)) = self.peek() {
             let s = s.clone();
             self.i += 1;
             if s.trim().is_empty() {
                 return self.err("nom vide");
             }
-            self.refs.push((crank, s.clone()));
+            self.refs.push((kind, s.clone()));
             return Ok(Who::Name(s));
         }
         Ok(Who::Rank(self.count(what)? - 1))
+    }
+    /// nom (entre guillemets) d'un objet que la ligne désigne, noté pour la vérification de fin de lecture
+    fn named(&mut self, what: &str, kind: Kind) -> R<String> {
+        let s = self.string(what)?;
+        if s.trim().is_empty() {
+            return self.err("nom vide");
+        }
+        self.refs.push((kind, s.clone()));
+        Ok(s)
+    }
+    /// angle en degrés sans unité (ou avec la sienne)
+    fn degrees(&mut self, what: &str) -> R<f64> {
+        let v = self.number(what)?;
+        let (v, unit) = self.opt_unit(Dim::Angle, v)?;
+        Ok(if unit { v.to_degrees() } else { v })
+    }
+    /// vitesse de rotation en degrés par seconde sans unité (ou avec la sienne) : rad/s
+    fn rotation_speed(&mut self, what: &str) -> R<f64> {
+        let v = self.number(what)?;
+        let (v, unit) = self.opt_unit(Dim::AngSpeed, v)?;
+        Ok(if unit { v } else { v.to_radians() })
+    }
+    /// grandeur d'un vilebrequin ou d'un mécanisme
+    fn crank_qty(&mut self) -> R<CrankQty> {
+        Ok(match self.word("la grandeur du mécanisme (angle, tours, rotation, couple, puissance)")?.as_str() {
+            "angle" => CrankQty::Angle,
+            "tours" | "tour" => CrankQty::Turns,
+            "rotation" => CrankQty::Rotation,
+            "couple" => CrankQty::Torque,
+            "puissance" => CrankQty::Power,
+            o => return self.err(format!("grandeur « {o} » d'un mécanisme : angle, tours, rotation, couple, puissance")),
+        })
     }
     fn count(&mut self, what: &str) -> R<usize> {
         let v = self.number(what)?;
@@ -684,19 +727,15 @@ impl<'a> P<'a> {
                 Measure::Flux { fluid, mass, a, b, label: None }
             }
             ("vilebrequin", _) => {
-                let who = self.who("le vilebrequin : son numéro (1 pour le premier posé) ou son nom entre guillemets", true)?;
-                let q = match self.word("la grandeur du vilebrequin (angle, tours, rotation, couple, puissance)")?.as_str() {
-                    "angle" => CrankQty::Angle,
-                    "tours" | "tour" => CrankQty::Turns,
-                    "rotation" => CrankQty::Rotation,
-                    "couple" => CrankQty::Torque,
-                    "puissance" => CrankQty::Power,
-                    o => return self.err(format!("grandeur « {o} » d'un vilebrequin : angle, tours, rotation, couple, puissance")),
-                };
-                Measure::Crank { who, q, label: None }
+                let who = self.who("le vilebrequin : son numéro (1 pour le premier posé) ou son nom entre guillemets", Kind::Crank)?;
+                Measure::Crank { who, q: self.crank_qty()?, label: None, any: false }
+            }
+            ("mecanisme", _) => {
+                let who = self.who("le mécanisme : son numéro (1 pour le premier posé, vilebrequins compris) ou son nom entre guillemets", Kind::Mech)?;
+                Measure::Crank { who, q: self.crank_qty()?, label: None, any: true }
             }
             ("corps", _) => {
-                let who = self.who("le corps : son numéro (1 pour le premier posé) ou son nom entre guillemets", false)?;
+                let who = self.who("le corps : son numéro (1 pour le premier posé) ou son nom entre guillemets", Kind::Body)?;
                 let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple [contact | loi | total], température)")?;
                 let q = match w.as_str() {
                     "x" => BodyQty::X,
@@ -869,6 +908,53 @@ fn push(proto: &mut Protocol, a: Action, ln: usize) {
     proto.steps.push((Step::Do(a), ln));
 }
 
+/// forme d'un corps : disque (x, y) rayon r, rect (x1, y1) (x2, y2), polygone (x1, y1) (x2, y2) (x3, y3)…
+fn body_shape(p: &mut P) -> R<BodySpec> {
+    Ok(match p.word("la forme du corps (disque, rect, polygone)")?.as_str() {
+        "disque" | "cercle" => {
+            let c = p.point()?;
+            if !(p.eat_w("rayon") || p.eat_w("r")) {
+                return p.err(format!("il faut « rayon <r> » après le centre du disque{}", p.here()));
+            }
+            let r = p.quantity(Dim::Length, "le rayon")?;
+            if !(r > 0.0) {
+                return p.err("le rayon d'un corps doit être positif");
+            }
+            BodySpec::Disc { c, r }
+        }
+        "rect" | "rectangle" => {
+            let a = p.point()?;
+            p.eat_w("a");
+            let b = p.point()?;
+            BodySpec::Rect { a, b }
+        }
+        "polygone" => {
+            let mut pts = vec![p.point()?];
+            while p.peek() == Some(&Tok::LP) {
+                pts.push(p.point()?);
+            }
+            if pts.len() < 3 {
+                return p.err("un polygone a au moins 3 sommets");
+            }
+            BodySpec::Polygon(pts)
+        }
+        o => return p.err(format!("forme « {o} » : disque (x, y) rayon r, rect (x1, y1) (x2, y2) ou polygone (x1, y1) (x2, y2) (x3, y3)…")),
+    })
+}
+
+/// noms que pose une roue : la roue, son disque, ses dents ou ses pales
+fn wheel_names(s: &WheelSpec) -> Vec<(Kind, String)> {
+    let Some(n) = &s.name else { return vec![] };
+    let mut v = vec![(Kind::Wheel, n.clone()), (Kind::Body, n.clone())];
+    if let Some(k) = s.teeth {
+        v.extend((1..=k).map(|j| (Kind::Body, format!("{n}.dent{j}"))));
+    }
+    if let Some((k, _, _)) = s.blades {
+        v.extend((1..=k).map(|j| (Kind::Body, format!("{n}.pale{j}"))));
+    }
+    v
+}
+
 /// commandes qui ne sont pas des actions : leurs valeurs calculées {…} (seuils, durées, tours, « soit ») sont lues par elles-mêmes
 const NOT_ACTIONS: [&str; 19] = [
     "depart", "materiaux", "mesurer", "simuler", "avancer", "attendre", "tant", "repeter", "si", "sinon", "fin", "quand", "soit", "toutes",
@@ -890,8 +976,10 @@ fn deferred(p: &mut P, ln: usize) -> R<Action> {
         Ok(a) => {
             p.i = p.t.len();
             match &a {
-                Action::Crank(CrankSpec { name: Some(n), .. }) => p.decls.push((true, n.clone())),
-                Action::Body { name: Some(n), .. } => p.decls.push((false, n.clone())),
+                Action::Crank(CrankSpec { name: Some(n), .. }) => p.decls.push((Kind::Crank, n.clone())),
+                Action::Body { name: Some(n), .. } | Action::Piece(PieceSpec { name: Some(n), .. }) => p.decls.push((Kind::Body, n.clone())),
+                Action::Mechanism(MechSpec { name, .. }) => p.decls.push((Kind::Mech, name.clone())),
+                Action::Wheel(s) => p.decls.extend(wheel_names(s)),
                 _ => {}
             }
             Ok(Action::Deferred { toks, calcs, check: Box::new(a) })
@@ -1326,7 +1414,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         if n.trim().is_empty() {
                             return p.err("nom vide");
                         }
-                        p.decls.push((true, n.clone()));
+                        p.decls.push((Kind::Crank, n.clone()));
                         spec.name = Some(n);
                     }
                     "a" => spec.temp = Some(p.quantity(Dim::Temp, "la température des pièces")?),
@@ -1341,37 +1429,166 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             }
             push(proto, Action::Crank(spec), ln);
         }
-        "corps" => {
-            let shape = match p.word("la forme du corps (disque, rect, polygone)")?.as_str() {
-                "disque" | "cercle" => {
-                    let c = p.point()?;
-                    if !(p.eat_w("rayon") || p.eat_w("r")) {
-                        return p.err(format!("il faut « rayon <r> » après le centre du disque{}", p.here()));
+        "mecanisme" => {
+            // mécanisme "nom" [libre] [rotation ω] [inertie I] [couple "formule"] [angle a0]
+            let name = p.string("le nom du mécanisme (ses roues et ses pièces le désignent : « roue … sur \"nom\" »)")?;
+            if name.trim().is_empty() {
+                return p.err("nom vide");
+            }
+            let mut spec = MechSpec { name: name.clone(), free: false, omega: 0.0, inertia: 0.0, load: None, angle_deg: 0.0 };
+            while !p.done() {
+                match p.word("une option (libre, rotation, inertie, couple, angle)")?.as_str() {
+                    "libre" => spec.free = true,
+                    "rotation" => spec.omega = p.rotation_speed("la vitesse de rotation")?,
+                    "inertie" => {
+                        spec.inertia = p.number("l'inertie du volant (kg·m par mètre de profondeur)")?;
+                        if !(spec.inertia >= 0.0) {
+                            return p.err("l'inertie du volant est positive");
+                        }
                     }
-                    let r = p.quantity(Dim::Length, "le rayon")?;
-                    if !(r > 0.0) {
-                        return p.err("le rayon d'un corps doit être positif");
+                    "couple" => {
+                        p.eat_w("formule");
+                        let f = p.string("la formule du couple appliqué (N)")?;
+                        if let Err(e) = super::mp_fields::Formula::parse_vars(&f, &super::mp_mechanism::CRANK_VARS) {
+                            return p.err(format!("couple « {f} » : {e} (variables : t, angle, tours, rotation)"));
+                        }
+                        spec.load = Some(f);
                     }
-                    BodySpec::Disc { c, r }
+                    "angle" => spec.angle_deg = p.degrees("l'angle de départ")?,
+                    o => return p.err(format!("option « {o} » inconnue après « mécanisme » : libre, rotation ω, inertie I, couple \"formule\", angle a")),
                 }
-                "rect" | "rectangle" => {
-                    let a = p.point()?;
-                    p.eat_w("a");
-                    let b = p.point()?;
-                    BodySpec::Rect { a, b }
+            }
+            if !spec.free && (spec.inertia > 0.0 || spec.load.is_some()) {
+                return p.err("inertie et couple : pour un mécanisme « libre » (un mécanisme mené tourne à sa rotation)");
+            }
+            p.decls.push((Kind::Mech, name));
+            push(proto, Action::Mechanism(spec), ln);
+        }
+        "roue" => {
+            // roue (x, y) rayon r ["matériau"] sur "M" [rapport k] | engrène "R" ; [dents n | pales n longueur L [épaisseur e]]
+            //   [angle a] [nom "R"] [à T]
+            let center = p.point()?;
+            if !(p.eat_w("rayon") || p.eat_w("r")) {
+                return p.err(format!("il faut « rayon r » après le centre de la roue{}", p.here()));
+            }
+            let r = p.quantity(Dim::Length, "le rayon de la roue")?;
+            if !(r > 0.0) {
+                return p.err("le rayon d'une roue doit être positif");
+            }
+            let mut spec =
+                WheelSpec { center, r, material: "acier".into(), on: WheelOn::Mesh(String::new()), teeth: None, blades: None, angle_deg: 0.0, name: None, temp: None };
+            let (mut on, mut ratio) = (None, None);
+            while !p.done() {
+                // (le matériau, entre guillemets, n'importe où parmi les options)
+                if let Some(Tok::S(m)) = p.peek() {
+                    spec.material = m.clone();
+                    p.i += 1;
+                    continue;
                 }
-                "polygone" => {
-                    let mut pts = vec![p.point()?];
-                    while p.peek() == Some(&Tok::LP) {
-                        pts.push(p.point()?);
+                match p.word("une option (sur, engrène, rapport, dents, pales, angle, nom, à T) ou le matériau entre guillemets")?.as_str() {
+                    "sur" => on = Some(WheelOn::Shaft { mech: p.named("le mécanisme qui porte la roue", Kind::Mech)?, ratio: 1.0 }),
+                    "engrene" => on = Some(WheelOn::Mesh(p.named("la roue qu'elle engrène", Kind::Wheel)?)),
+                    "rapport" => {
+                        let k = p.number("le rapport (tours de la roue pour un tour de l'arbre ; négatif : sens inverse)")?;
+                        if !(k != 0.0 && k.is_finite()) {
+                            return p.err("le rapport d'une roue n'est pas nul");
+                        }
+                        ratio = Some(k);
                     }
-                    if pts.len() < 3 {
-                        return p.err("un polygone a au moins 3 sommets");
+                    "dents" => {
+                        let n = p.count("le nombre de dents")?;
+                        if n < 6 {
+                            return p.err("une roue dentée a au moins 6 dents");
+                        }
+                        spec.teeth = Some(n);
                     }
-                    BodySpec::Polygon(pts)
+                    "pales" => {
+                        let n = p.count("le nombre de pales")?;
+                        if !p.eat_w("longueur") {
+                            return p.err(format!("il faut « pales n longueur L [épaisseur e] »{}", p.here()));
+                        }
+                        let l = p.quantity(Dim::Length, "la longueur des pales")?;
+                        let e = if p.eat_w("epaisseur") { Some(p.quantity(Dim::Length, "l'épaisseur des pales")?) } else { None };
+                        if !(l > 0.0 && e.map_or(true, |e| e > 0.0)) {
+                            return p.err("longueur et épaisseur des pales positives");
+                        }
+                        spec.blades = Some((n, l, e));
+                    }
+                    "angle" => spec.angle_deg = p.degrees("l'angle de départ de la roue")?,
+                    "nom" => {
+                        let n = p.string("le nom de la roue")?;
+                        if n.trim().is_empty() {
+                            return p.err("nom vide");
+                        }
+                        spec.name = Some(n);
+                    }
+                    "a" => spec.temp = Some(p.quantity(Dim::Temp, "la température de la roue")?),
+                    o => return p.err(format!("option « {o} » inconnue après « roue » : sur \"mécanisme\" [rapport k] ou engrène \"roue\", dents n, pales n longueur L [épaisseur e], angle a, nom \"R\", à T")),
                 }
-                o => return p.err(format!("forme « {o} » : disque (x, y) rayon r, rect (x1, y1) (x2, y2) ou polygone (x1, y1) (x2, y2) (x3, y3)…")),
+            }
+            spec.on = match (on, ratio) {
+                (None, _) => return p.err("il faut « sur \"mécanisme\" » (la roue tourne avec son arbre) ou « engrène \"roue\" »"),
+                (Some(WheelOn::Shaft { mech, .. }), Some(k)) => WheelOn::Shaft { mech, ratio: k },
+                (Some(WheelOn::Mesh(_)), Some(_)) => {
+                    return p.err("« rapport » : pour une roue « sur » un mécanisme (une roue qui en engrène une autre tourne au rapport de leurs rayons)")
+                }
+                (Some(o), None) => o,
             };
+            if spec.teeth.is_some() && spec.blades.is_some() {
+                return p.err("une roue a des dents ou des pales, pas les deux");
+            }
+            p.decls.extend(wheel_names(&spec));
+            push(proto, Action::Wheel(spec), ln);
+        }
+        "piece" => {
+            // pièce <forme> ["matériau"] [angle a] sur "M" [position "x(θ)" "y(θ)"] [angle "a(θ)"] [nom "P"] [à T]
+            let shape = body_shape(p)?;
+            let mut spec = PieceSpec { shape, material: "acier".into(), angle: 0.0, mech: String::new(), x: None, y: None, a: None, name: None, temp: None };
+            let formula = |p: &mut P, what: &str| -> R<String> {
+                let f = p.string(what)?;
+                if let Err(e) = super::mp_fields::Formula::parse_vars(&norm(&f), &super::mp_mechanism::PIECE_VARS) {
+                    return p.err(format!("{what} « {f} » : {e} (variables : theta, angle, tours, x0, y0, a0)"));
+                }
+                Ok(f)
+            };
+            while !p.done() {
+                if let Some(Tok::S(m)) = p.peek() {
+                    spec.material = m.clone();
+                    p.i += 1;
+                    continue;
+                }
+                match p.word("une option (sur, position, angle, nom, à T) ou le matériau entre guillemets")?.as_str() {
+                    "sur" => spec.mech = p.named("le mécanisme qui mène la pièce", Kind::Mech)?,
+                    "position" => {
+                        p.eat_w("formule");
+                        spec.x = Some(formula(p, "la position x (m)")?);
+                        spec.y = Some(formula(p, "la position y (m)")?);
+                    }
+                    "angle" if matches!(p.peek(), Some(Tok::S(_))) => spec.a = Some(formula(p, "l'angle (°)")?),
+                    "angle" if p.peek_w() == Some("formule") => {
+                        p.i += 1;
+                        spec.a = Some(formula(p, "l'angle (°)")?);
+                    }
+                    "angle" => spec.angle = p.degrees("l'angle de la pièce")?.to_radians(),
+                    "nom" => {
+                        let n = p.string("le nom de la pièce")?;
+                        if n.trim().is_empty() {
+                            return p.err("nom vide");
+                        }
+                        p.decls.push((Kind::Body, n.clone()));
+                        spec.name = Some(n);
+                    }
+                    "a" => spec.temp = Some(p.quantity(Dim::Temp, "la température de la pièce")?),
+                    o => return p.err(format!("option « {o} » inconnue après « pièce » : sur \"mécanisme\", position \"x\" \"y\", angle \"a\" (formules), angle a, nom \"P\", à T")),
+                }
+            }
+            if spec.mech.is_empty() {
+                return p.err("il faut « sur \"mécanisme\" » : le mécanisme qui mène la pièce");
+            }
+            push(proto, Action::Piece(spec), ln);
+        }
+        "corps" => {
+            let shape = body_shape(p)?;
             let material = p.string("le matériau solide")?;
             let mut angle = 0.0;
             let mut motion = BodyMotion::default();
@@ -1517,7 +1734,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         if n.trim().is_empty() {
                             return p.err("nom vide");
                         }
-                        p.decls.push((false, n.clone()));
+                        p.decls.push((Kind::Body, n.clone()));
                         name = Some(n);
                     }
                     o => {
@@ -1842,7 +2059,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
                  calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit, \
-                 vilebrequin, zone \"nom\" = …, inclure, paramètre)"
+                 vilebrequin, mécanisme, roue, pièce, zone \"nom\" = …, inclure, paramètre)"
             ))
         }
     }
@@ -2003,9 +2220,9 @@ fn parse_lines(lines: &[(usize, String)], source: String, includes: Includes, va
     // une ligne d'ouverture mal écrite (son « fin » la ferme sans autre erreur)
     let mut open: Vec<(usize, usize, usize)> = vec![];
     let mut zones: Vec<NamedZone> = vec![];
-    // objets nommés posés (vilebrequin ?, nom) ; relevés qui en nomment un (vilebrequin ?, nom, ligne)
-    let mut decls: Vec<(bool, String)> = vec![];
-    let mut refs: Vec<(bool, String, usize)> = vec![];
+    // objets nommés posés (genre, nom) ; lignes qui en désignent un (genre, nom, ligne)
+    let mut decls: Vec<(Kind, String)> = vec![];
+    let mut refs: Vec<(Kind, String, usize)> = vec![];
     for (ln, l) in lines {
         let ln = *ln;
         let toks = match tokenize(l, ln) {
@@ -2067,18 +2284,29 @@ fn parse_lines(lines: &[(usize, String)], source: String, includes: Includes, va
             }
         }
     }
-    // relevés d'objets nommés : posés par le protocole (un état de départ enregistré peut en apporter d'autres)
-    if matches!(proto.start, Some((Start::Scenario { .. }, _))) {
-        let cranks: Vec<String> = decls.iter().filter(|d| d.0).map(|d| d.1.clone()).collect();
-        let mut bodies: Vec<String> = decls.iter().filter(|d| !d.0).map(|d| d.1.clone()).collect();
+    // objets nommés que des lignes désignent : posés par le protocole (un état de départ enregistré peut en apporter d'autres) ; une
+    // fois les autres erreurs corrigées (une ligne refusée ne pose pas ses noms), une erreur par nom et par ligne
+    refs.dedup();
+    if errs.is_empty() && matches!(proto.start, Some((Start::Scenario { .. }, _))) {
+        let of = |k: Kind| -> Vec<String> { decls.iter().filter(|d| d.0 == k).map(|d| d.1.clone()).collect() };
+        let cranks = of(Kind::Crank);
+        let mut mechs = of(Kind::Mech);
+        mechs.extend(cranks.iter().cloned());
+        let wheels = of(Kind::Wheel);
+        let mut bodies = of(Kind::Body);
         for c in &cranks {
             bodies.extend(super::mp_mechanism::CRANK_PARTS.iter().map(|part| format!("{c}.{part}")));
         }
-        for (crank, name, ln) in &refs {
-            let (known, what, line) = if *crank { (&cranks, "vilebrequin", "« vilebrequin … »") } else { (&bodies, "corps", "« corps … » (ou de son vilebrequin)") };
+        for (kind, name, ln) in &refs {
+            let (known, what, line) = match kind {
+                Kind::Crank => (&cranks, "aucun vilebrequin", "il faut « nom \"X\" » sur sa ligne « vilebrequin … »"),
+                Kind::Mech => (&mechs, "aucun mécanisme", "il faut d'abord sa ligne « mécanisme \"X\" » (ou « vilebrequin … nom \"X\" »)"),
+                Kind::Wheel => (&wheels, "aucune roue", "il faut « nom \"X\" » sur sa ligne « roue … »"),
+                Kind::Body => (&bodies, "aucun corps", "il faut « nom \"X\" » sur sa ligne (« corps », « pièce », « roue », ou son vilebrequin)"),
+            };
             if !known.iter().any(|k| norm(k) == norm(name)) {
                 let hint = if known.is_empty() { String::new() } else { format!(" ; noms posés : {}", known.join(", ")) };
-                errs.push(ScriptError { line: *ln, msg: format!("aucun {what} ne s'appelle « {name} » : il faut « nom \"{name}\" » sur sa ligne {line}{hint}") });
+                errs.push(ScriptError { line: *ln, msg: format!("{what} ne s'appelle « {name} » : {}{hint}", line.replace('X', name)) });
             }
         }
     }

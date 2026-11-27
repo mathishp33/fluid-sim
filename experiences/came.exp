@@ -1,0 +1,15 @@
+# Batteur à houle à came : une came excentrique (1 cm d'excentricité) menée à 120 tr/min pousse une plaque verticale plongée dans
+# un bassin de 10 cm d'eau ; la plaque va et vient de 2 cm deux fois par seconde et lève des vagues, qui courent vers le fond du
+# bassin et s'y réfléchissent : à 30 cm de la plaque, le niveau monte et descend de 8.4 à 11.9 cm. On relève aussi le couple qu'il
+# faut pour mener la came (bruité dans l'eau, voir TODO).
+#   fluid-sim experience experiences/came.exp
+#
+# La came et sa plaque sont le composant « composants/excentrique.exp » : deux pièces d'un mécanisme dont la position est une
+# formule de l'angle de l'arbre.
+
+départ scénario "Cuve vide" grille 120 x 50 maille 5 mm
+remplir rect (0, 0) (0.6, 0.1) avec "eau" à 20 °C
+inclure "composants/excentrique.exp" avec NOM = "batteur", X = 0.03, Y = 0.2, BAS = 0.005, MOUVEMENT = rotation 120 tr/min
+
+mesurer toutes les 10 ms : moyenne fraction "eau" dans rect (0.36, 0) (0.365, 0.2) comme "niveau à 30 cm (part des 20 cm)"
+simuler 3 s

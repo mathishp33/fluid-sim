@@ -79,8 +79,8 @@ struct Snapshot {
     /// corps rigides (vide sans corps ; leurs fractions et faces se recalculent depuis leur position) et ressorts de leurs contacts
     bodies: Vec<super::mp_bodies::RigidBody>,
     contact_springs: Vec<super::mp_contacts::ContactSpring>,
-    /// mécanismes (angle et vitesse des vilebrequins)
-    cranks: Vec<super::mp_mechanism::Crank>,
+    /// mécanismes (angle et vitesse de leur arbre)
+    mechanisms: Vec<super::mp_mechanism::Mechanism>,
 }
 
 impl MultiphaseSim {
@@ -227,7 +227,7 @@ impl MultiphaseSim {
             dt_phase: self.dt_phase, pressure_clamped: self.pressure_clamped.clone(),
             bodies: self.bodies.clone(),
             contact_springs: self.contact_springs.clone(),
-            cranks: self.cranks.clone(),
+            mechanisms: self.mechanisms.clone(),
         }
     }
 
@@ -248,7 +248,7 @@ impl MultiphaseSim {
             // fractions et faces : fonction exacte de la position des corps
             self.bodies.clone_from(&s.bodies);
             self.contact_springs.clone_from(&s.contact_springs);
-            self.cranks.clone_from(&s.cranks);
+            self.mechanisms.clone_from(&s.mechanisms);
             self.update_body_fractions();
         }
     }

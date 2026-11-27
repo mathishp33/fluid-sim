@@ -1,0 +1,15 @@
+# Roue de moulin : un jet d'eau (3 cm de large, 2 m/s) tombe sur les pales de droite d'une roue à aubes libre, freinée par un frein
+# visqueux (couple -0.005 N par °/s) ; un puits au fond évacue l'eau. La roue part en sens horaire, accélère pendant une seconde, puis
+# se tient vers 205 °/s (34 tr/min) : le frein absorbe alors ≈ 3.7 W par mètre de profondeur, deux pour cent de la puissance du jet
+# (≈ 180 W/m) — une roue à aubes droites frappée par un jet étroit en rend peu. La rotation bat au passage de chaque pale.
+#   fluid-sim experience experiences/moulin.exp
+#
+# La roue est le composant « composants/roue_a_aubes.exp » (le même, mené à vitesse imposée, sert d'agitateur dans « agitateur.exp »).
+
+départ scénario "Cuve vide" grille 60 x 70 maille 5 mm
+inclure "composants/roue_a_aubes.exp" avec NOM = "moulin", X = 0.15, Y = 0.2, MOUVEMENT = libre inertie 0.002 couple "-0.005*rotation"
+émetteur rect (0.2, 0.32) (0.23, 0.33) "eau" (0, -2) m/s à 20 °C
+puits rect (0, 0) (0.3, 0.01) 1 m/s
+
+mesurer toutes les 20 ms : masse "eau" comme "eau"
+simuler 2 s

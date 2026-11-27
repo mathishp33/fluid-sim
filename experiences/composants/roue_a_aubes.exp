@@ -1,0 +1,25 @@
+# Composant : roue à aubes sur son propre arbre — un disque et ses pales droites, menée (agitateur, « agitateur.exp ») ou libre sous
+# l'écoulement avec un volant et un frein (roue de moulin, « moulin.exp »).
+#   inclure "composants/roue_a_aubes.exp" avec NOM = "moulin", MOUVEMENT = libre inertie 0.002 couple "-0.005*rotation"
+#   inclure "composants/roue_a_aubes.exp" avec NOM = "pale", MOUVEMENT = rotation 60 tr/min
+#
+# MOUVEMENT est la suite de la ligne « mécanisme » : « rotation ω » (menée à cette vitesse) ou « libre [inertie I] [couple
+# "formule"] » (couple en N, formule en t, angle, tours, rotation en °/s : un frein « -k*rotation »).
+# Noms : le mécanisme « NOM », la roue « NOM.roue » (corps « NOM.roue », pales « NOM.roue.pale1 »…). Colonnes « NOM rotation »
+# (°/s), « NOM couple » (couple du fluide sur la roue, N par mètre de profondeur) et « NOM puissance » (W/m), à la période de
+# l'expérience.
+
+paramètre NOM = "roue"
+paramètre X = 0.15                    # axe (m)
+paramètre Y = 0.15
+paramètre RAYON = 4 cm                # rayon du disque
+paramètre PALES = 8
+paramètre LONGUEUR = 3 cm             # des pales, depuis le bord du disque
+paramètre EPAISSEUR = 1 cm
+paramètre MATIERE = "acier"
+paramètre MOUVEMENT = rotation 60 tr/min
+
+mécanisme $NOM $MOUVEMENT
+roue ($X, $Y) rayon $RAYON $MATIERE sur $NOM pales $PALES longueur $LONGUEUR épaisseur $EPAISSEUR nom "$NOM.roue"
+
+mesurer : mécanisme $NOM rotation comme "$NOM rotation", mécanisme $NOM couple comme "$NOM couple", mécanisme $NOM puissance comme "$NOM puissance"

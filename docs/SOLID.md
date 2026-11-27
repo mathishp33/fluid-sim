@@ -530,7 +530,27 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   aucune fuite ; moteur à air comprimé : énergie cinétique gagnée = travail de la force du fluide et de la pression à 1.2 % près.
   Exemple : `experiences/moteur.exp` (lumière de culasse menée par l'angle : admission, échappement ; ≈ 1300 tr/min).
 - Limites : une seule bielle par vilebrequin, cylindre suivant la grille ; pas de liaisons générales entre corps libres
-  (engrenages, plusieurs cylindres sur un vilebrequin).
+  (plusieurs cylindres sur un vilebrequin).
+
+**Mécanismes généraux : roues, engrenages, pièces en formules (fait le 2026-11-27).**
+- Un mécanisme est un arbre d'angle θ et ses pièces, corps menés dont la pose est une fonction de θ ; la bielle-manivelle en est
+  un (état complet en version 20). Pièces : roues — disque, avec ses dents ou ses pales, solidaires d'un plateau d'angle phase + k θ :
+  sur l'arbre (k = 1, ou le rapport d'une courroie), ou qui en engrènent une autre (k = −k′ r′/r, sens inverse) ; pièces quelconques
+  dont la position et l'angle sont des formules de la rotation (crémaillère, came et poussoir, levier, pendule). Même équation de
+  Lagrange ; dérivées exactes pour les pièces d'une roue, en différences centrées pour les autres.
+- Dents : en développante de cercle (angle de pression 20°, module m = 2r/n), un polygone convexe par dent, calées pour qu'une dent
+  tombe dans un creux de la roue d'en face (la place des dents au point de contact se garde en roulant) ; jeux d'au moins une
+  maille, une et demie au pied, pour que le fluide pris entre les dents s'échappe ; module d'au moins trois mailles. Des dents
+  trapézoïdales, essayées d'abord, se chevauchaient dans l'engrènement et coinçaient l'air dans des poches plus fines qu'une maille :
+  pointes de 35 kPa, divergence en 6 ms.
+- Validations (mp_experiment_tests.rs) : engrenage 12/24 mené à 300 tr/min : rapports exacts, aucune dent dans une autre sur un pas
+  de dent (aire commune < 1e-12 m²), air entre les dents à ±0.4 kPa ; roue libre sous un couple constant : ω = Γ t / I à 0.5 % ;
+  pendule (pièce en formules au bout d'un bras de 10 cm, lâchée à 0.2 rad) : période 0.63595 s pour 0.63596 s ; vilebrequin : mêmes
+  relevés qu'avant, au bit près. Exemples : `experiences/engrenages.exp`, `moulin.exp` (roue à aubes sous un jet),
+  `agitateur.exp`, `came.exp` (batteur à houle).
+- Limites : un degré de liberté par mécanisme (deux roues qui engrènent sont un seul mécanisme) ; pas d'engrenage composé (deux
+  roues sur un même axe se recouvrent en 2D) ; les pièces menées ne se touchent pas entre elles ; un corps libre rebondit sur une
+  pièce menée sans que le mécanisme sente le choc.
 
 ## 9. Choix (validés le 2026-11-24)
 

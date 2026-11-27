@@ -1104,8 +1104,8 @@ impl super::multiphase::MultiphaseSim {
     pub(crate) fn move_bodies(&mut self, t0: f64, t1: f64) {
         let old = self.body_frac.clone();
         // pièces des mécanismes : posées par eux (corps menés)
-        if !self.cranks.is_empty() {
-            self.advance_cranks(t0, t1);
+        if !self.mechanisms.is_empty() {
+            self.advance_mechanisms(t0, t1);
         }
         let (lx, ly) = (self.nx as f64 * self.dx, self.ny as f64 * self.dx);
         for k in 0..self.bodies.len() {
@@ -1567,7 +1567,7 @@ impl super::multiphase::MultiphaseSim {
         }
         let old = self.body_frac.clone();
         self.bodies.clear();
-        self.cranks.clear();
+        self.mechanisms.clear();
         self.body_frac.iter_mut().for_each(|a| *a = 0.0);
         self.displace_fluid(&old);
     }

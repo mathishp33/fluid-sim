@@ -1,0 +1,27 @@
+# Composant : came excentrique et son poussoir — un disque calé hors de l'axe d'un arbre (excentricité E), qui pousse vers la droite
+# une plaque verticale plaquée contre lui : la plaque va et vient de 2 E à chaque tour, x = x0 + E (cos θ − 1). Deux pièces en
+# formules d'un mécanisme (« came.exp » : un batteur à houle).
+#   inclure "composants/excentrique.exp" avec NOM = "batteur", X = 0.04, Y = 0.2, MOUVEMENT = rotation 120 tr/min
+#
+# MOUVEMENT est la suite de la ligne « mécanisme » : « rotation ω » (mené) ou « libre … ». La plaque, de largeur LARGEUR, descend
+# de l'axe de l'arbre jusqu'à BAS. Noms : le mécanisme « NOM », la came « NOM.came », la plaque « NOM.plaque ». Colonnes « NOM
+# couple » (couple du fluide ramené à l'arbre, N par mètre de profondeur) et « NOM plaque » (position x de la plaque), à la période
+# de l'expérience.
+
+paramètre NOM = "came"
+paramètre X = 0.04                    # axe de l'arbre (m)
+paramètre Y = 0.2
+paramètre E = 1 cm                    # excentricité
+paramètre RAYON = 1.5 cm              # rayon de la came
+paramètre LARGEUR = 1 cm              # de la plaque
+paramètre BAS = 0.02                  # bas de la plaque (m)
+paramètre MATIERE = "acier"
+paramètre MOUVEMENT = rotation 60 tr/min
+# calculé : bord gauche de la plaque, contre la came
+paramètre GAUCHE = $(X + E + RAYON)
+
+mécanisme $NOM $MOUVEMENT
+pièce disque ($(X + E), $Y) rayon $RAYON $MATIERE sur $NOM position "$(X) + $(E)*cos(theta)" "$(Y) + $(E)*sin(theta)" nom "$NOM.came"
+pièce rect ($GAUCHE, $BAS) ($(GAUCHE + LARGEUR), $(Y + RAYON)) $MATIERE sur $NOM position "x0 + $(E)*(cos(theta) - 1)" "y0" nom "$NOM.plaque"
+
+mesurer : mécanisme $NOM couple comme "$NOM couple", corps "$NOM.plaque" x comme "$NOM plaque"
