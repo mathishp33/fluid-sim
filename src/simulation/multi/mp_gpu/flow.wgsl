@@ -377,6 +377,30 @@ fn k_visc_xy(@builtin(global_invocation_id) g: vec3<u32>) {
             let mu = min(0.25 * (mu_exp(c0) + mu_exp(c1) + mu_exp(c2) + mu_exp(c3)), mu_node_cap(c0, c1, c2, c3));
             t = mu * ((S[O_U + uidx(i, j)] - S[O_U + uidx(i, j - 1u)]) / P.dx + (S[O_V + vidx(i, j)] - S[O_V + vidx(i - 1u, j)]) / P.dx);
         }
+    } else if ((j == 0u || j == P.ny) && i >= 1u && i < P.nx) {
+        // paroi adhérente en bas ou en haut : non-glissement à sa vitesse, la face voisine à une demi-maille (miroir de wall_node_txy)
+        let top = j == P.ny;
+        if (select(P.ns_b, P.ns_t, top) != 0u) {
+            let jc = select(0u, P.ny - 1u, top);
+            let a = cidx(i - 1u, jc); let b = cidx(i, jc);
+            if (!is_solid(a) && !is_solid(b)) {
+                let mu = min(0.5 * (mu_exp(a) + mu_exp(b)), mu_node_cap(a, b, a, b));
+                let du = S[O_U + uidx(i, jc)] - select(P.uw_b, P.uw_t, top);
+                t = 2.0 * mu * select(du, -du, top) / P.dx;
+            }
+        }
+    } else if ((i == 0u || i == P.nx) && j >= 1u && j < P.ny) {
+        // paroi adhérente à gauche ou à droite
+        let right = i == P.nx;
+        if (select(P.ns_l, P.ns_r, right) != 0u) {
+            let ic = select(0u, P.nx - 1u, right);
+            let a = cidx(ic, j - 1u); let b = cidx(ic, j);
+            if (!is_solid(a) && !is_solid(b)) {
+                let mu = min(0.5 * (mu_exp(a) + mu_exp(b)), mu_node_cap(a, b, a, b));
+                let dv = S[O_V + vidx(ic, j)] - select(P.uw_l, P.uw_r, right);
+                t = 2.0 * mu * select(dv, -dv, right) / P.dx;
+            }
+        }
     }
     S[O_w5 + q] = t;
 }

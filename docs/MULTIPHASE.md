@@ -71,7 +71,8 @@ mélanges, réactions, paires de fusion), `experiment_window.rs` (protocoles d'e
 
 ## Limites connues (honnêtes)
 * CPU : f64, référence. GPU : voir ci-dessus.
-* Parois en glissement libre ; pas d'angle de contact ; tension liquide–liquide non modélisée (seulement liquide–gaz).
+* Parois en glissement libre, sauf les bords déclarés adhérents ou mobiles (`no_slip`, `bord … mur adhérent | mobile`) ; pas
+  d'angle de contact ; tension liquide–liquide non modélisée (seulement liquide–gaz).
 * Vapeur et air ne se mélangent pas (pas de pression partielle / évaporation dans l'air humide) : l'ébullition utilise la pression totale.
 * Une seule T et une seule p par cellule (équilibre instantané entre phases d'une cellule mixte). cv(liquide) ≈ cp. Pas de chauffage visqueux. B(T) de Tait constant (c(80 °C) ≈ 1500 m/s au lieu de 1555).
 * p_sat de Clausius–Clapeyron/Kirchhoff : ±4 % par rapport aux tables (20–150 °C).

@@ -464,6 +464,9 @@ pub enum ThermalSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundarySpec {
     Wall,
+    /// mur ADHÉRENT (non-glissement), qui glisse à la vitesse `v` (m/s) le long du bord (0 : immobile) — paroi mobile, couvercle
+    /// d'une cavité entraînée, tapis
+    NoSlip { v: f64 },
     /// ouvert à la pression p (Pa) au point le plus haut du bord
     Open(f64),
     /// paroi à vitesse imposée qui fait entrer un fluide
@@ -1460,8 +1463,13 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
         }
         Action::Boundary { side, spec } => {
             let k = *side;
+            // (glissement libre, sauf un mur adhérent)
+            sim.no_slip[k] = match spec {
+                BoundarySpec::NoSlip { v } => Some(*v),
+                _ => None,
+            };
             match spec {
-                BoundarySpec::Wall => {
+                BoundarySpec::Wall | BoundarySpec::NoSlip { .. } => {
                     sim.bc[k] = Bc::Wall;
                     sim.inlet[k] = None;
                     // une entrée ou une sortie qui se ferme : vitesse normale des faces du bord à zéro tout de suite (le transport du
@@ -3839,6 +3847,8 @@ fn describe(a: &Action) -> String {
             let s = ["gauche", "droite", "bas", "haut"][*side];
             match spec {
                 BoundarySpec::Wall => format!("bord {s} : mur"),
+                BoundarySpec::NoSlip { v } if *v == 0.0 => format!("bord {s} : mur adhérent"),
+                BoundarySpec::NoSlip { v } => format!("bord {s} : mur mobile à {} m/s", fmt_num(*v)),
                 BoundarySpec::Open(p) => format!("bord {s} : ouvert à {} Pa", fmt_num(*p)),
                 BoundarySpec::Inlet { v, .. } => format!("bord {s} : entrée à {} m/s", fmt_point(*v)),
                 BoundarySpec::Outlet { v } => format!("bord {s} : sortie à {} m/s", fmt_point(*v)),

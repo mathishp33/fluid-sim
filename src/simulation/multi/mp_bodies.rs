@@ -965,7 +965,7 @@ impl super::multiphase::MultiphaseSim {
 
     /// Force visqueuse par unité de volume (∇·τ, N/m³) à la face u (i, j), 1 ≤ i < nx, ou v (i, j), 1 ≤ j < ny, pour les vitesses de
     /// face (wu, wv) et la viscosité `mu` par maille : mêmes formules que `add_forces` (tenseur symétrique complet, glissement libre
-    /// contre les parois et les solides).
+    /// contre les parois et les solides, sauf les parois adhérentes des bords du domaine).
     fn viscous_div(&self, wu: &[f64], wv: &[f64], mu: &[f64], u_face: bool, i: usize, j: usize) -> f64 {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
         let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
@@ -974,7 +974,7 @@ impl super::multiphase::MultiphaseSim {
         let tyy = |i: usize, j: usize| 2.0 * mu[j * nx + i] * (vi(i, j + 1) - vi(i, j)) / dx;
         let txy = |i: usize, j: usize| -> f64 {
             if i == 0 || j == 0 || i >= nx || j >= ny {
-                return 0.0;
+                return self.wall_node_txy(i, j, mu, wu, wv, None).unwrap_or(0.0);
             }
             let cs = [j.wrapping_sub(1) * nx + i - 1, (j - 1) * nx + i, j * nx + i - 1, j * nx + i];
             if cs.iter().any(|&c| self.is_solid(c)) {

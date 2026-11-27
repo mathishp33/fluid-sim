@@ -183,6 +183,20 @@ fn fr_node_avg(o: u32, i: u32, j: u32) -> f32 {
     }
     return s / max(cnt, 1.0);
 }
+// nœud (i, j) d'un bord du domaine (sans les coins) contre une paroi adhérente : les fluides y adhèrent aussi (miroir de wall_node_vel)
+fn fr_wall(i: u32, j: u32) -> bool {
+    if ((j == 0u || j == P.ny) && i >= 1u && i < P.nx) { return select(P.ns_b, P.ns_t, j == P.ny) != 0u; }
+    if ((i == 0u || i == P.nx) && j >= 1u && j < P.ny) { return select(P.ns_l, P.ns_r, i == P.nx) != 0u; }
+    return false;
+}
+// vitesse de la paroi au nœud, pour le second membre et la chaleur ; 0 dans l'opérateur A (linéaire), appliqué au tampon O_fr_p
+fn fr_uw(o: u32, i: u32, j: u32) -> f32 {
+    if (o == O_fr_p || !fr_wall(i, j)) { return 0.0; }
+    if (j == 0u) { return P.uw_b; }
+    if (j == P.ny) { return P.uw_t; }
+    if (i == 0u) { return P.uw_l; }
+    return P.uw_r;
+}
 fn fr_wu(o: u32, i: u32, j: u32) -> f32 { return S[o + uidx(i, j)]; }
 fn fr_wv(o: u32, i: u32, j: u32) -> f32 { return S[o + nfu() + vidx(i, j)]; }
 fn fr_mu_c(c: u32) -> f32 { return S[O_fr_mu + c] + S[O_fr_mv + c]; }
@@ -192,26 +206,28 @@ fn fr_tyy(o: u32, i: u32, j: u32) -> f32 { let c = cidx(i, j); return 2.0 * fr_m
 fn fr_gamma(o: u32, i: u32, j: u32, k: u32) -> f32 {
     let dx = P.dx;
     if (k == NK_IN) { return ((fr_wu(o, i, j) - fr_wu(o, i, j - 1u)) + (fr_wv(o, i, j) - fr_wv(o, i - 1u, j))) / dx; }
-    if (k == NK_FLOOR) { return 2.0 * fr_wu(o, i, j) / dx; }
-    if (k == NK_CEIL) { return -2.0 * fr_wu(o, i, j - 1u) / dx; }
-    if (k == NK_LEFT) { return 2.0 * fr_wv(o, i, j) / dx; }
-    if (k == NK_RIGHT) { return -2.0 * fr_wv(o, i - 1u, j) / dx; }
+    if (k == NK_FLOOR) { return 2.0 * (fr_wu(o, i, j) - fr_uw(o, i, j)) / dx; }
+    if (k == NK_CEIL) { return -2.0 * (fr_wu(o, i, j - 1u) - fr_uw(o, i, j)) / dx; }
+    if (k == NK_LEFT) { return 2.0 * (fr_wv(o, i, j) - fr_uw(o, i, j)) / dx; }
+    if (k == NK_RIGHT) { return -2.0 * (fr_wv(o, i - 1u, j) - fr_uw(o, i, j)) / dx; }
     return 0.0;
 }
-// contrainte de cisaillement au nœud : μ_g (parois comprises) + μ_v des fluides (nœuds intérieurs seulement, comme l'explicite)
+// contrainte de cisaillement au nœud : μ_g (parois comprises) + μ_v des fluides (nœuds intérieurs et parois adhérentes, comme
+// l'explicite)
 fn fr_txy(o: u32, i: u32, j: u32) -> f32 {
     let k = fr_kind(i, j);
     if (k == NK_NONE) { return 0.0; }
     var m = fr_node_avg(O_fr_mu, i, j);
-    if (k == NK_IN) { m += fr_node_avg(O_fr_mv, i, j); }
+    if (k == NK_IN || fr_wall(i, j)) { m += fr_node_avg(O_fr_mv, i, j); }
     if (m <= 0.0) { return 0.0; }
     return m * fr_gamma(o, i, j, k);
 }
-// contribution d'un nœud à la diagonale de la face qu'il cisaille : intérieur μ_g + μ_v, paroi `wall` 2 μ_g
+// contribution d'un nœud à la diagonale de la face qu'il cisaille : intérieur μ_g + μ_v, paroi `wall` 2 μ_g (+ 2 μ_v contre une paroi
+// adhérente)
 fn fr_nodec(i: u32, j: u32, wall: u32) -> f32 {
     let k = fr_kind(i, j);
     if (k == NK_IN) { return fr_node_avg(O_fr_mu, i, j) + fr_node_avg(O_fr_mv, i, j); }
-    if (k == wall) { return 2.0 * fr_node_avg(O_fr_mu, i, j); }
+    if (k == wall) { return 2.0 * (fr_node_avg(O_fr_mu, i, j) + select(0.0, fr_node_avg(O_fr_mv, i, j), fr_wall(i, j))); }
     return 0.0;
 }
 // face inconnue (intérieure, entre deux cellules fluides) ; masse volumique de la face

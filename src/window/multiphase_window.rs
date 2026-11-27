@@ -180,6 +180,8 @@ pub struct MultiphaseWindow {
 
     // bords modifiables en direct (gauche, droite, bas, haut)
     boundaries: [Boundary; 4],
+    /// murs du domaine adhérents (non-glissement) plutôt qu'en glissement libre
+    adhering_walls: bool,
 
     stats: MpStats,
     stats_age: usize,
@@ -265,6 +267,7 @@ impl MultiphaseWindow {
             tp_radius: 2,
             picking_destination: false,
             boundaries,
+            adhering_walls: false,
             stats: MpStats::default(),
             stats_age: 0,
             status,
@@ -319,16 +322,19 @@ impl MultiphaseWindow {
             .unwrap_or(self.sim.ambient_phase)
     }
 
-    /// Reporte les bords de l'interface dans le solveur (Wall / Outlet = ouvert à 1 atm / Inlet = paroi à vitesse imposée). Retourne true si quelque chose a changé.
+    /// Reporte les bords de l'interface dans le solveur (Wall / Outlet = ouvert à 1 atm / Inlet = paroi à vitesse imposée ; murs
+    /// adhérents si la case est cochée). Retourne true si quelque chose a changé.
     fn apply_boundaries(&mut self) -> bool {
-        let before = (self.sim.bc, self.sim.inlet);
+        let before = (self.sim.bc, self.sim.inlet, self.sim.no_slip);
         let phase = self.inlet_phase();
         for k in 0..4 {
             let b = self.boundaries[k];
+            self.sim.no_slip[k] = None;
             match b.boundary_type {
                 BoundaryType::Wall => {
                     self.sim.bc[k] = Bc::Wall;
                     self.sim.inlet[k] = None;
+                    self.sim.no_slip[k] = self.adhering_walls.then_some(0.0);
                 }
                 BoundaryType::Outlet => {
                     self.sim.bc[k] = Bc::Open { p: P_ATM };
@@ -340,7 +346,7 @@ impl MultiphaseWindow {
                 }
             }
         }
-        before != (self.sim.bc, self.sim.inlet)
+        before != (self.sim.bc, self.sim.inlet, self.sim.no_slip)
     }
 
     /// Recommence le scénario avec `self.settings.materials`.
@@ -829,6 +835,10 @@ impl MultiphaseWindow {
                     for k in 0..4 {
                         boundary_ui(ui, names[k], &mut self.boundaries[k], dx);
                     }
+                    ui.checkbox(&mut self.adhering_walls, "Murs adhérents (le fluide y colle)").on_hover_text(
+                        "Non-glissement : la viscosité freine le fluide le long des murs du domaine (profil de Poiseuille, couches limites) ; \
+                         sinon il y glisse librement. Les solides posés restent en glissement libre.",
+                    );
                     ui.weak("Inlet : vitesse imposée sur la face normale (fluide d'entrée choisi à l'écran de démarrage) ; Outlet : ouvert à 1 atm.");
                 });
 
@@ -1584,6 +1594,14 @@ mod tests {
         w.boundaries[1].boundary_type = BoundaryType::Outlet;
         frame(&ctx, &mut w, vec![], Modifiers::default());
         assert!(w.sim.inlet[0].is_some() && matches!(w.sim.bc[1], Bc::Open { .. }) && w.sim.bc[0] == Bc::Wall);
+        // murs adhérents : les seuls murs (ni l'entrée, ni la sortie) ; décochés, glissement libre
+        w.adhering_walls = true;
+        frame(&ctx, &mut w, vec![], Modifiers::default());
+        assert_eq!(w.sim.no_slip, [None, None, Some(0.0), w.sim.no_slip[3]]);
+        assert_eq!(w.sim.wall_slide(2), Some(0.0));
+        w.adhering_walls = false;
+        frame(&ctx, &mut w, vec![], Modifiers::default());
+        assert_eq!(w.sim.no_slip, [None; 4]);
         for _ in 0..20 {
             frame(&ctx, &mut w, vec![], Modifiers::default());
         }

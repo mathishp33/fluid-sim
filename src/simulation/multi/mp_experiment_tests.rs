@@ -2786,3 +2786,146 @@ fn a_sponge_leaves_water_at_rest_alone_and_absorbs_the_waves_that_reach_it() {
     eprintln!("vagues réfléchies à la sonde : écart-type {wall:.3} kg/m contre un mur, {sp:.3} avec l'éponge");
     assert!(sp < 0.5 * wall, "l'éponge réfléchit les vagues : {sp} contre {wall} pour un mur");
 }
+
+/// vitesses des faces u de la colonne x = i dx (rangées j = 0..ny), et des faces v de la rangée y = j dx (colonnes i = 0..nx)
+fn u_column(s: &MultiphaseSim, i: usize) -> Vec<f64> {
+    (0..s.ny).map(|j| s.u[s.uidx(i, j)]).collect()
+}
+fn v_row(s: &MultiphaseSim, j: usize) -> Vec<f64> {
+    (0..s.nx).map(|i| s.v[s.vidx(i, j)]).collect()
+}
+
+/// extremum d'une suite de valeurs régulièrement espacées, affiné par la parabole des trois valeurs qui l'entourent : (rang, valeur)
+fn parabolic_peak(v: &[f64], min: bool) -> (f64, f64) {
+    let k = (0..v.len()).min_by(|&a, &b| if min { v[a].total_cmp(&v[b]) } else { v[b].total_cmp(&v[a]) }).unwrap();
+    if k == 0 || k + 1 == v.len() {
+        return (k as f64, v[k]);
+    }
+    let (a, b, c) = (v[k - 1], v[k], v[k + 1]);
+    let den = a - 2.0 * b + c;
+    if den == 0.0 {
+        return (k as f64, b);
+    }
+    let d = 0.5 * (a - c) / den;
+    (k as f64 + d, b - 0.25 * (a - c) * d)
+}
+
+#[test]
+fn walls_can_be_made_adhering_or_moving_along_their_side() {
+    let p = proto("départ scénario \"cuve vide\"\nbord bas mur adhérent\nbord haut mur mobile (0.1, 0) m/s\nbord gauche paroi mobile (0, -0.2) m/s\nbord droite mur\n");
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(matches!(acts[0], Action::Boundary { side: 2, spec: BoundarySpec::NoSlip { v } } if *v == 0.0), "{:?}", acts[0]);
+    assert!(matches!(acts[1], Action::Boundary { side: 3, spec: BoundarySpec::NoSlip { v } } if *v == 0.1), "{:?}", acts[1]);
+    assert!(matches!(acts[2], Action::Boundary { side: 0, spec: BoundarySpec::NoSlip { v } } if *v == -0.2), "{:?}", acts[2]);
+    assert!(matches!(acts[3], Action::Boundary { side: 1, spec: BoundarySpec::Wall }), "{:?}", acts[3]);
+    // une paroi mobile glisse le long de son bord
+    let e = errors_in("départ scénario \"cuve vide\"\nbord haut mur mobile (0, 0.1) m/s\n", Path::new("."));
+    let e = e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+    assert!(e.contains("vitesse normale est nulle"), "{e}");
+    // posée, puis rendue au glissement libre par un autre bord ; un bord ouvert n'adhère pas
+    let r = run("départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm\nbord bas mur adhérent\nbord haut mur mobile (0.1, 0) m/s\nbord gauche mur mobile (0, 0.3) m/s\nsimuler 1 ms\nbord gauche ouvert\nsimuler 1 ms\n", None);
+    let log = r.log.join("\n");
+    assert!(log.contains("bord bas : mur adhérent") && log.contains("bord haut : mur mobile à 0.1 m/s"), "{log}");
+    assert_eq!(r.sim.no_slip, [None, None, Some(0.0), Some(0.1)]);
+    assert_eq!([r.sim.wall_slide(0), r.sim.wall_slide(2), r.sim.wall_slide(3)], [None, Some(0.0), Some(0.1)]);
+}
+
+#[test]
+fn a_moving_lid_drags_the_fluid_of_a_closed_channel_into_the_exact_profile() {
+    // canal fermé de 5 cm × 1 cm plein d'air, fond adhérent, couvercle qui glisse à U = 5 cm/s : loin des bouts, le débit est nul et
+    // u(y) = U (3η² − 2η), η = y / H (un contre-courant de U/3 au tiers de la hauteur) ; à 10 mailles dans la hauteur, à 0.7 % de U
+    // (0.15 % à 20 mailles)
+    let text = "départ scénario \"cuve vide\" grille 50 x 10 maille 1 mm
+gravité (0, 0)
+remplir partout avec \"air\" à 20 °C
+bord bas mur adhérent
+bord haut mur mobile (0.05, 0) m/s
+simuler 6 s
+";
+    let r = run(text, None);
+    let u = u_column(&r.sim, 25);
+    let mut worst = 0.0f64;
+    for (j, &uj) in u.iter().enumerate() {
+        let eta = (j as f64 + 0.5) / 10.0;
+        let want = 0.05 * (3.0 * eta * eta - 2.0 * eta);
+        eprintln!("η = {eta:.3} : u = {uj:+.5} m/s (exact {want:+.5})");
+        worst = worst.max((uj - want).abs() / 0.05);
+    }
+    assert!(worst < 0.01, "écart au profil exact : {worst} U");
+}
+
+#[test]
+fn air_blown_between_two_adhering_walls_takes_the_poiseuille_profile() {
+    // canal de 1 cm entre deux parois adhérentes, air entré à 5 cm/s à gauche (Re = 33), sorti à droite : à 3.5 cm de l'entrée, le
+    // profil est établi, parabolique — u = 6 U η (1 − η), 1.5 U au milieu — à 0.5 % de U ; la pression baisse de 12 μ U / H² par m
+    let text = "départ scénario \"cuve vide\" grille 120 x 20 maille 0.5 mm
+gravité (0, 0)
+remplir partout avec \"air\" à 20 °C
+bord bas mur adhérent
+bord haut mur adhérent
+bord gauche entrée (0.05, 0) m/s à 20 °C \"air\"
+bord droite sortie (0.05, 0) m/s
+simuler 2 s
+";
+    let r = run(text, None);
+    let u = u_column(&r.sim, 70);
+    let mut worst = 0.0f64;
+    for (j, &uj) in u.iter().enumerate() {
+        let eta = (j as f64 + 0.5) / 20.0;
+        worst = worst.max((uj - 0.05 * 6.0 * eta * (1.0 - eta)).abs() / 0.05);
+    }
+    let (_, top) = parabolic_peak(&u, false);
+    eprintln!("Poiseuille : vitesse au milieu {:.4} U (1.5 U), écart au profil {worst:.4} U", top / 0.05);
+    assert!(worst < 0.005, "écart au profil de Poiseuille : {worst} U");
+}
+
+/// cavité carrée de 2 cm pleine d'air, trois parois adhérentes, couvercle à 7.5 cm/s (Re = U L / ν = 100), 40 × 40 mailles, 3 s
+fn lid_driven_cavity(gpu: bool) -> Option<MultiphaseSim> {
+    let text = "départ scénario \"cuve vide\" grille 40 x 40 maille 0.5 mm
+gravité (0, 0)
+remplir partout avec \"air\" à 20 °C
+bord gauche mur adhérent
+bord droite mur adhérent
+bord bas mur adhérent
+bord haut mur mobile (0.075, 0) m/s
+simuler 3 s
+";
+    if gpu {
+        let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+        super::mp_gpu_tests::gpu_or_skip(&probe)?;
+    }
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(gpu)).unwrap();
+    assert_eq!(r.gpu.is_some(), gpu, "{}", r.log.join("\n"));
+    run_to_end(&mut r);
+    Some(r.sim)
+}
+
+#[test]
+fn a_lid_driven_cavity_turns_like_the_reference_solutions_at_re_100() {
+    // extrema des vitesses sur les axes de la cavité, rapportés à U : solutions fines u_min −0.2140, v_max 0.1796, v_min −0.2538
+    // (Ghia, Ghia et Shin 1982 : −0.2109, 0.1753, −0.2453). À 40 × 40 mailles, à 2.5 % près (mesuré 1.7 à 2.4 % ; 80 × 80 : 0.5 à
+    // 0.7 %, ordre 2), et à leur place ; le GPU comme le CPU
+    let (u_lid, n) = (0.075, 40.0);
+    let mut seen = vec![];
+    for gpu in [false, true] {
+        let Some(s) = lid_driven_cavity(gpu) else { break };
+        let what = if gpu { "GPU" } else { "CPU" };
+        // u sur l'axe vertical (faces de la colonne x = L/2, à y = (j + ½) dx), v sur l'axe horizontal (faces de la rangée y = L/2)
+        let (yu, umin) = parabolic_peak(&u_column(&s, 20), true);
+        let v = v_row(&s, 20);
+        let ((xa, vmax), (xb, vmin)) = (parabolic_peak(&v, false), parabolic_peak(&v, true));
+        let got = [umin / u_lid, vmax / u_lid, vmin / u_lid];
+        let at = [(yu + 0.5) / n, (xa + 0.5) / n, (xb + 0.5) / n];
+        eprintln!("{what} : u_min {:+.4} en y = {:.3}, v_max {:+.4} en x = {:.3}, v_min {:+.4} en x = {:.3}", got[0], at[0], got[1], at[1], got[2], at[2]);
+        for (k, (want, place)) in [(-0.2140, 0.458), (0.1796, 0.237), (-0.2538, 0.810)].into_iter().enumerate() {
+            assert!((got[k] / want - 1.0).abs() < 0.025, "{what} : extremum {k} {} au lieu de {want}", got[k]);
+            assert!((at[k] - place).abs() < 0.02, "{what} : extremum {k} en {} au lieu de {place}", at[k]);
+        }
+        seen.push(got);
+    }
+    if let [c, g] = &seen[..] {
+        for k in 0..3 {
+            assert!((g[k] / c[k] - 1.0).abs() < 2e-3, "extremum {k} : GPU {} CPU {}", g[k], c[k]);
+        }
+    }
+}

@@ -190,6 +190,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   éponge <zone> [temps 0.1 s] [vers (vx, vy) m/s] [uniforme]   (bord absorbant : la vitesse ramenée au repos, en rampe jusqu'à 1/τ au fond)
   téléporteur <zone> vers (x, y) [0.5 m/s] [rayon 2 cm]   (aspire dans la zone, rejette le même débit autour de (x, y))
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"] | sortie (vx, vy)   (vitesse vers l'extérieur)
+        | mur adhérent | mur mobile (vx, 0) m/s   (le fluide y colle ; une paroi mobile l'entraîne le long du bord)
   champ T|vx|vy|fraction \"eau\"|solide \"acier\"  fichier \"f.csv|f.png\" [origine haut|bas] [valeurs a b]
         | formule \"300 + 50*exp(-((x-0.2)^2+(y-0.1)^2)/0.02^2)\"     [dans <zone>] [à T]
   gravité (0, -9.81) · pas max 1 ms

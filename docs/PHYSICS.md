@@ -50,7 +50,8 @@ Chaque maille a une seule pression (équilibre mécanique) et, par groupe de pha
 | Viscosité (tenseur des contraintes) | τ = μ (∇u + ∇uᵀ), μ variable ; explicite sous μ dt < 0.2 ρ dx², implicite au-delà (`mp_friction.rs`) | traînée, couches limites ; le miel ne réduit plus le pas de temps |
 | Tension de surface, CSF (Brackbill, Kothe et Zemach 1992) | f_σ = σ κ ∇α, courbure κ par fonctions de hauteur | gouttes, bulles, ménisques ; saut de Laplace Δp = σ/R (vérifié à 0.1 %) |
 | Pression faiblement compressible implicite (Helmholtz) | −∇·(dt/ρ_f ∇δp) + (κ_eff/dt) δp = (V − 1)/dt − ∇·(Ũ − uⁿ), uⁿ⁺¹ = Ũ − dt/ρ_f ∇δp | projection qui rend la vitesse compatible avec la fermeture ; l'acoustique implicite ne limite pas dt par la vitesse du son |
-| Parois | glissement libre : vitesse normale nulle, pas de frottement tangentiel | bords du domaine et mailles solides |
+| Parois | glissement libre : vitesse normale nulle, pas de frottement tangentiel | mailles solides, bords du domaine (par défaut) |
+| Paroi adhérente ou mobile (bords du domaine) | non-glissement à la vitesse U de la paroi : τxy = 2 μ (u − U) / dx sur la rangée de faces qui la longe, à une demi-maille (viscosité explicite et implicite ; les grains y adhèrent à cette vitesse) | profils de Couette et de Poiseuille, couches limites, cavité entraînée (solutions de référence à 2 % près en 40 × 40) |
 | Bord ouvert, colonne compressible | p = p_o + ρ_a Φ (1 + ½ ρ′ Φ) + ⅛ ρ_a ρ′ (g dx)², Φ potentiel de pesanteur depuis le haut, ρ′ = dρ/dp | un côté ouvert suit l'hydrostatique de l'air extérieur, sans vent parasite (7.6e-8 m/s après 5 s) |
 | Bord ouvert, fluide qui entre | à une face où le fluide du dehors entre à v : p = p_bord − ½ ρ v² (sa pression totale est celle du dehors au repos, Bernoulli) | l'air aspiré par un bord ouvert ne s'emballe pas : un filet plus rapide ne reçoit pas plus d'énergie que ses voisins |
 

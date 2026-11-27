@@ -1929,6 +1929,16 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 o => return p.err(format!("bord « {o} » : gauche, droite, bas ou haut")),
             };
             let spec = match p.word("mur, ouvert ou entrée")?.as_str() {
+                // mur adhérent (non-glissement) ; mur mobile (vx, vy) : adhérent, qui glisse le long du bord à cette vitesse
+                "mur" | "paroi" if p.eat_w("adherent") || p.eat_w("adherente") => BoundarySpec::NoSlip { v: 0.0 },
+                "mur" | "paroi" if p.eat_w("mobile") => {
+                    let v = p.vector(Dim::Speed, "la vitesse de la paroi")?;
+                    let (along, normal) = if side < 2 { (v[1], v[0]) } else { (v[0], v[1]) };
+                    if normal != 0.0 {
+                        return p.err("une paroi mobile glisse le long de son bord : sa vitesse normale est nulle ((vx, 0) en bas ou en haut, (0, vy) à gauche ou à droite)");
+                    }
+                    BoundarySpec::NoSlip { v: along }
+                }
                 "mur" | "paroi" => BoundarySpec::Wall,
                 // sortie (vx, vy) : vitesse imposée vers l'extérieur ; « sortie » seule ou suivie d'une pression : bord ouvert
                 "sortie" if matches!(p.peek(), Some(Tok::LP)) => {

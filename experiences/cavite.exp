@@ -1,0 +1,19 @@
+# Cavité entraînée, l'essai de référence de la viscosité : une boîte carrée de 2 cm pleine d'air, trois parois adhérentes, le
+# couvercle qui glisse vers la droite à 7.5 cm/s (Re = U L / ν = 100). L'air tourne en un grand tourbillon, son centre un peu au-dessus
+# du milieu et vers la droite. Les sondes relèvent les vitesses aux extrema des profils sur les axes, rapportées ici à U : à 40 × 40
+# mailles, u = −0.210 U sur l'axe vertical (y = 0.46 L), v = +0.176 U et −0.247 U sur l'axe horizontal (x = 0.24 L et 0.81 L) ; les
+# solutions fines donnent −0.214, +0.180 et −0.254 (Ghia, Ghia et Shin 1982 : −0.211, +0.175 et −0.245), que l'on approche à
+# 0.5–0.7 % près avec 80 × 80 mailles (grille 80 x 80 maille 0.25 mm).
+#   fluid-sim experience experiences/cavite.exp
+
+départ scénario "Cuve vide" grille 40 x 40 maille 0.5 mm
+gravité (0, 0)
+remplir partout avec "air" à 20 °C
+bord gauche mur adhérent
+bord droite mur adhérent
+bord bas mur adhérent
+bord haut mur mobile (0.075, 0) m/s
+
+mesurer toutes les 0.1 s : vx en (0.01, 0.0092) comme "u sur l'axe vertical, y = 0.46 L", vy en (0.0047, 0.01) comme "v sur l'axe horizontal, x = 0.24 L", vy en (0.0162, 0.01) comme "v sur l'axe horizontal, x = 0.81 L"
+simuler 3 s
+sauver image "tourbillon" vorticité

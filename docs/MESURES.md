@@ -3,7 +3,7 @@
 Ce que vaut le simulateur, chiffres à l'appui : chaque ligne compare une grandeur calculée à une valeur de référence (solution
 exacte, corrélation, expérience publiée, bilan). Les chiffres viennent des essais de `cargo test --release` (solveur multiphasique
 CPU f64, sauf mention), dont le nom est donné quand il aide à les refaire ; le détail est dans MULTIPHASE.md, GRANULAIRE.md et
-SOLID.md. Mis à jour le 2026-11-26.
+SOLID.md. Mis à jour le 2026-11-27.
 
 Légende de la colonne « Écart » : **exact** = au chiffre imprimé ou à l'arrondi près ; un pourcentage = écart relatif à la référence ;
 « sous-résolu » = résultat connu pour dépendre de la maille (voir la colonne « Conditions »).
@@ -22,6 +22,14 @@ Légende de la colonne « Écart » : **exact** = au chiffre imprimé ou à l'ar
 | Pression de l'eau d'un barrage qui frappe la paroi | 1.010–1.132 bar | 1.1–1.4 bar (mesures de cette taille : 0.1–0.4 bar de surpression) | dans la plage | barrage 74 × 120, jusqu'à 0.8 s ; aucune vapeur (avant la correction de fermeture : jusqu'à 93 bar) |
 | Erreur de remplissage de l'eau pure (barrage) | ≤ 0.28 % | 0 | — | même calcul |
 | Masse d'eau d'un barrage, d'une éclaboussure | conservée | — | exact | |
+
+### Viscosité contre les parois (parois adhérentes et mobiles des bords)
+
+| Grandeur | Simulé | Référence | Écart | Conditions |
+|---|---|---|---|---|
+| Profil d'un canal fermé dont le couvercle glisse à U | U (3η² − 2η) à 0.7 % de U près (0.15 % à 20 mailles) | U (3η² − 2η), débit nul, η = y/H | 0.7 % de U | air, 10 mailles dans la hauteur ; de même pour un gaz très visqueux en viscosité implicite, pas 80 fois la borne explicite, CPU et GPU (`a_moving_wall_drags_a_very_viscous_fluid_…`) |
+| Profil de Poiseuille entre deux parois adhérentes | 1.496 U au milieu, tout le profil à 0.4 % de U | 6 U η (1 − η) : 1.5 U au milieu | 0.4 % de U | air entré à U = 5 cm/s, Re = 33, 20 mailles dans la hauteur, à 3.5 cm de l'entrée |
+| Cavité entraînée à Re = 100 : extrema des vitesses sur les axes | u_min −0.2102 U, v_max +0.1758 U, v_min −0.2477 U | solutions fines −0.2140, +0.1796, −0.2538 (Ghia, Ghia et Shin 1982 : −0.2109, +0.1753, −0.2453) | 1.8 à 2.4 % | 40 × 40 mailles, CPU et GPU au même chiffre ; 80 × 80 : −0.2130, +0.1787, −0.2520 (0.5 à 0.7 %, ordre 2) ; `experiences/cavite.exp` |
 
 ## 2. Chaleur et changements d'état
 

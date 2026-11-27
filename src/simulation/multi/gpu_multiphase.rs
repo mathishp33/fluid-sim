@@ -53,7 +53,7 @@ const D_FR_UNCONV: usize = 65;
 const SLOT_A: usize = 2048;
 const SLOT_A_SP: usize = 512;
 const SLOT_BYTES: u64 = 256;
-const PARAMS_WORDS: usize = 72;
+const PARAMS_WORDS: usize = 80;
 /// groupes de travail des copies d'instantané du prédicteur-correcteur (boucle à pas SNAP_STRIDE = 1024 × 64 dans k_pc_save / k_pc_restore)
 const PC_GROUPS: u32 = 1024;
 
@@ -1410,6 +1410,12 @@ impl MultiphaseGpu {
             };
             w[64 + s] = f(rho);
             w[68 + s] = f(drho);
+        }
+        // parois adhérentes (miroir de wall_slide)
+        for s in 0..4 {
+            let slide = sim.wall_slide(s);
+            w[72 + s] = slide.is_some() as u32;
+            w[76 + s] = f(slide.unwrap_or(0.0));
         }
         w
     }

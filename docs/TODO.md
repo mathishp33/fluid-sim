@@ -15,7 +15,7 @@ EXPERIENCES.md (protocoles).
 ### Bords du domaine
 - [M] Plus de types de bords : périodiques, sortie convective. Existent : bord ouvert à pression imposée (hydrostatique de
   l'ambiant, colonne compressible : le vent parasite des côtés ouverts est corrigé, 7.6e-8 m/s après 5 s au lieu de 4 mm/s), entrées
-  et sorties à vitesse imposée.
+  et sorties à vitesse imposée, parois adhérentes et mobiles.
 
 ### Solides mobiles (voir SOLID.md ; étapes 0 à 4 et chaleur faites)
 - [M] GPU : les scènes avec des corps se calculent sur le CPU. Porter fractions et ouvertures des faces, couplage monolithique
@@ -129,8 +129,9 @@ EXPERIENCES.md (protocoles).
   du tout ou rien des règles `quand` — bain-marie, couveuse, débit régulé.
 - [M] Clapet anti-retour en mailles : faces qui ne laissent passer l'écoulement que dans un sens (le clapet sur pivot existe, mais
   c'est un corps : CPU seulement, et cher). Dans la projection : fermer les faces où le flux s'inverserait, puis résoudre à nouveau.
-- [M] Paroi mobile : solide dont la surface glisse à vitesse imposée (tapis roulant, cylindre qui tourne en mailles) ; donnerait la
-  cavité entraînée par son couvercle, essai de référence de la viscosité (Ghia, Ghia et Shin 1982).
+- [M] Paroi mobile en mailles : solide dont la surface glisse à vitesse imposée (tapis roulant, cylindre qui tourne en mailles), et
+  non-glissement contre les obstacles en mailles solides, qui glissent encore librement (seuls les bords du domaine adhèrent :
+  `bord … mur adhérent | mobile`) — la traînée d'un obstacle fixe en mailles en dépend.
 - [M] Ventilateur à courbe Δp(Q) : saut de pression imposé à travers la zone, qui baisse quand le débit monte (Δp = Δp₀ (1 −
   Q/Q_max)), au lieu du débit fixé de la pompe : le débit s'ajuste aux pertes du circuit.
 - [M] Membrane sélective : faces ouvertes à une seule phase — évent qui laisse passer le gaz et retient le liquide, filtre qui
@@ -297,6 +298,10 @@ détail dans les documents de conception et l'historique git.
   repos par −σ (u − u_cible), implicite, σ en rampe depuis l'entrée de la zone jusqu'à 1/τ au fond ; l'eau au repos le reste, à
   1e-7 m/s près) : les vagues d'une bosse d'eau reviennent d'une éponge de 0.5 m avec un quart de la hauteur que renvoie un mur,
   un dixième sur 1 m ; exemple `experiences/plage.exp` (bassin à houle et sa plage) ; CPU et GPU, au pinceau dans les deux fenêtres.
+- Bords : parois adhérentes et mobiles `bord … mur adhérent | mur mobile (vx, vy)` (non-glissement à la vitesse de la paroi, en
+  viscosité explicite et implicite, CPU et GPU ; les grains y adhèrent aussi à sa vitesse) : canal fermé à couvercle mobile (profil
+  exact à 0.7 % de U), Poiseuille (0.4 %), cavité entraînée à Re = 100 (solutions de référence à 2 % près en 40 × 40, 0.6 % en
+  80 × 80) ; exemple `experiences/cavite.exp` ; case « Murs adhérents » de la fenêtre multiphasique.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

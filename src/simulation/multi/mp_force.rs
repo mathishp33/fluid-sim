@@ -2,7 +2,7 @@
 //! courbure par fonctions de hauteur). Toutes sont des ACCÉLÉRATIONS de face (m/s²) ; la pression utilise le même ρ_f
 //! que ces forces, donc l'hydrostatique est équilibrée exactement au niveau discret.
 
-use super::multiphase::MultiphaseSim;
+use super::multiphase::{Bc, MultiphaseSim};
 
 impl MultiphaseSim {
     /// Fraction volumique totale de liquide ℓ (marqueur de l'interface liquide/gaz)
@@ -94,6 +94,55 @@ impl MultiphaseSim {
         kap
     }
 
+    /// Vitesse tangentielle de la paroi adhérente du côté `side` (0 gauche, 1 droite, 2 bas, 3 haut) : un mur (`Bc::Wall`) sans
+    /// entrée, déclaré adhérent (`no_slip`) ; None : glissement libre (ou bord ouvert, entrée)
+    pub(crate) fn wall_slide(&self, side: usize) -> Option<f64> {
+        match (self.bc[side], &self.inlet[side], self.no_slip[side]) {
+            (Bc::Wall, None, Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Vitesse de la paroi adhérente au nœud (i, j) d'un bord du domaine (le long du bord, sans les coins) ; None ailleurs
+    pub(crate) fn wall_node_vel(&self, i: usize, j: usize) -> Option<f64> {
+        let (nx, ny) = (self.nx, self.ny);
+        if (j == 0 || j == ny) && i >= 1 && i < nx {
+            self.wall_slide(if j == 0 { 2 } else { 3 })
+        } else if (i == 0 || i == nx) && j >= 1 && j < ny {
+            self.wall_slide(if i == 0 { 0 } else { 1 })
+        } else {
+            None
+        }
+    }
+
+    /// Contrainte de cisaillement τxy au nœud (i, j) d'un bord du domaine contre une paroi adhérente : non-glissement à la vitesse U
+    /// de la paroi, la face voisine étant à une demi-maille — τxy = 2 μ (u − U) / dx en bas (u de la première rangée), 2 μ (U − u) / dx
+    /// en haut, 2 μ (v − U) / dx à gauche, 2 μ (U − v) / dx à droite (la vitesse normale d'une paroi est nulle tout du long : ∂v/∂x
+    /// = 0 en bas). μ moyenne des deux mailles du nœud, plafonnée comme à un nœud intérieur si `cap_dt`. None : pas une paroi
+    /// adhérente, ou une des deux mailles est solide (glissement libre, comme avant).
+    pub(crate) fn wall_node_txy(&self, i: usize, j: usize, mu: &[f64], u: &[f64], v: &[f64], cap_dt: Option<f64>) -> Option<f64> {
+        let (nx, ny, dx) = (self.nx, self.ny, self.dx);
+        let uw = self.wall_node_vel(i, j)?;
+        let (a, b, d) = if j == 0 || j == ny {
+            let jc = if j == 0 { 0 } else { ny - 1 };
+            let du = u[jc * (nx + 1) + i] - uw;
+            (self.idx(i - 1, jc), self.idx(i, jc), if j == 0 { du } else { -du })
+        } else {
+            let ic = if i == 0 { 0 } else { nx - 1 };
+            let dv = v[j * nx + ic] - uw;
+            (self.idx(ic, j - 1), self.idx(ic, j), if i == 0 { dv } else { -dv })
+        };
+        if self.is_solid(a) || self.is_solid(b) {
+            return None;
+        }
+        let m = 0.5 * (mu[a] + mu[b]);
+        let m = match cap_dt {
+            Some(dt) => m.min(self.explicit_node_mu_cap([a, b, a, b], dt)),
+            None => m,
+        };
+        Some(2.0 * m * d / dx)
+    }
+
     /// Ajoute dt × (gravité + viscosité + tension de surface) aux champs de face us, vs. Les champs ρ, μ, α sont ceux du début de pas.
     pub(crate) fn add_forces(&self, dt: f64, us: &mut [f64], vs: &mut [f64]) {
         let (nx, ny, dx) = (self.nx, self.ny, self.dx);
@@ -144,8 +193,8 @@ impl MultiphaseSim {
                 }
             }
         }
-        // viscosité : ∇·[μ(∇u + ∇uᵀ)] / ρ_f  (parois : glissement libre) ; au-delà de la borne explicite 0.2 ρ dx²/dt, le reste de μ est
-        // implicite (`apply_implicit_viscosity`)
+        // viscosité : ∇·[μ(∇u + ∇uᵀ)] / ρ_f  (parois : glissement libre, sauf les parois adhérentes des bords) ; au-delà de la borne
+        // explicite 0.2 ρ dx²/dt, le reste de μ est implicite (`apply_implicit_viscosity`)
         if self.viscous {
             let mue: Vec<f64> = (0..nx * ny).map(|c| self.mu_cell[c].min(self.explicit_mu_cap(c, dt))).collect();
             // corps en mouvement (mp_bodies.rs) : contraintes calculées sur la vitesse du MÉLANGE fluide + corps de chaque face,
@@ -177,6 +226,15 @@ impl MultiphaseSim {
                     }
                     let mu = (cs.iter().map(|&c| mue[c]).sum::<f64>() / 4.0).min(self.explicit_node_mu_cap(cs, dt));
                     txy[j * (nx + 1) + i] = mu * ((ui(i, j) - ui(i, j - 1)) / dx + (vi(i, j) - vi(i - 1, j)) / dx);
+                }
+            }
+            // parois adhérentes (bords du domaine) : frottement de la paroi sur la rangée de faces qui la longe
+            if self.no_slip.iter().any(|s| s.is_some()) {
+                let nodes = (0..=nx).flat_map(|i| [(i, 0), (i, ny)]).chain((1..ny).flat_map(|j| [(0, j), (nx, j)]));
+                for (i, j) in nodes {
+                    if let Some(t) = self.wall_node_txy(i, j, &mue, u, v, Some(dt)) {
+                        txy[j * (nx + 1) + i] = t;
+                    }
                 }
             }
             for j in 0..ny {

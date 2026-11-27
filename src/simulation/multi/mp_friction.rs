@@ -15,7 +15,9 @@
 //! Φ = τ : D rendue aux grains.
 //!
 //! Fluides : la part de μ au-delà de la borne explicite 0.2 ρ dx²/dt (`implicit_viscosity`) passe dans le même solveur — un miel ne
-//! réduit plus le pas de temps ; glissement libre aux parois, comme la viscosité explicite. Sans fluide si visqueux, rien ne change.
+//! réduit plus le pas de temps ; glissement libre aux parois, comme la viscosité explicite, sauf contre une paroi adhérente d'un bord
+//! du domaine (`no_slip` : non-glissement à la vitesse de la paroi, qui entraîne aussi les grains). Sans fluide si visqueux, rien ne
+//! change.
 //!
 //! Solveur : (ρ_f/dt)(u − u_f) = ∇·[μ(∇u + ∇uᵀ)], opérateur symétrique défini positif, gradient conjugué préconditionné (Jacobi). La
 //! vitesse u_f voit déjà le gradient de la pression du pas précédent (u_f = u* − dt ∇pⁿ/ρ_f, rendu ensuite) : le frottement équilibre la
@@ -335,6 +337,13 @@ impl MultiphaseSim {
         let kinds: Vec<NodeKind> = map_ranges(nn, MIN_HEAVY, |lo, hi| (lo..hi).map(|q| self.node_kind(q % (nx + 1), q / (nx + 1))).collect::<Vec<_>>()).concat();
         let cells: Vec<Vec<usize>> =
             map_ranges(nn, MIN_HEAVY, |lo, hi| (lo..hi).map(|q| self.node_cells(q % (nx + 1), q / (nx + 1))).collect::<Vec<_>>()).into_iter().flatten().collect();
+        // parois adhérentes des bords : vitesse de la paroi à leurs nœuds (fluides et grains y adhèrent à cette vitesse)
+        let walls: Vec<Option<f64>> = (0..nn)
+            .map(|q| {
+                let (i, j) = (q % (nx + 1), q / (nx + 1));
+                if matches!(kinds[q], NodeKind::Floor | NodeKind::Ceiling | NodeKind::Left | NodeKind::Right) { self.wall_node_vel(i, j) } else { None }
+            })
+            .collect();
         // inconnues : faces intérieures entre deux cellules fluides
         let mut ku = vec![false; nu];
         let mut rho_u = vec![0.0; nu];
@@ -405,12 +414,12 @@ impl MultiphaseSim {
                 }
             }
         }
-        let (total, xu, xv) = solve_viscous(nx, ny, dx, dt, &mg, &mi, &kinds, &cells, &ku, &kv, &rho_u, &rho_v, &uf, &vf, self.friction_max_iter);
+        let (total, xu, xv) = solve_viscous(nx, ny, dx, dt, &mg, &mi, &kinds, &cells, &walls, &ku, &kv, &rho_u, &rho_v, &uf, &vf, self.friction_max_iter);
         // chaleur de frottement Φ dt (Φ = τ : D, part des grains) rendue aux groupes granulaires de la cellule
         if friction {
             let wu: Vec<f64> = (0..nu).map(|f| uf[f] + xu[f]).collect();
             let wv: Vec<f64> = (0..nv).map(|f| vf[f] + xv[f]).collect();
-            let heat = friction_dissipation(nx, ny, dx, &mg, &kinds, &cells, &wu, &wv);
+            let heat = friction_dissipation(nx, ny, dx, &mg, &kinds, &cells, &walls, &wu, &wv);
             self.add_granular_heat(&heat, dt);
         }
         for f in 0..nu {
@@ -446,22 +455,27 @@ impl MultiphaseSim {
     }
 }
 
-/// contrainte de cisaillement au nœud q (genre `kind`) : μ_g avec non-glissement aux parois, μ_i (fluides) aux nœuds intérieurs
-fn node_txy(kind: NodeKind, mgn: f64, min: f64, wu: &[f64], wv: &[f64], nx: usize, i: usize, j: usize, dx: f64) -> f64 {
+/// contrainte de cisaillement au nœud q (genre `kind`) : μ_g avec non-glissement aux parois, μ_i (fluides) aux nœuds intérieurs et
+/// contre une paroi adhérente (μ_i nul aux autres parois) ; `uw` : vitesse de la paroi (0 pour une paroi immobile, et dans l'opérateur
+/// du gradient conjugué, linéaire : la vitesse de la paroi n'entre que dans le second membre)
+#[allow(clippy::too_many_arguments)]
+fn node_txy(kind: NodeKind, mgn: f64, min: f64, uw: f64, wu: &[f64], wv: &[f64], nx: usize, i: usize, j: usize, dx: f64) -> f64 {
     let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
     let vi = |i: usize, j: usize| wv[j * nx + i];
+    let m = mgn + min;
     match kind {
-        NodeKind::Interior => (mgn + min) * ((ui(i, j) - ui(i, j - 1)) + (vi(i, j) - vi(i - 1, j))) / dx,
-        NodeKind::Floor => mgn * 2.0 * ui(i, j) / dx,
-        NodeKind::Ceiling => -mgn * 2.0 * ui(i, j - 1) / dx,
-        NodeKind::Left => mgn * 2.0 * vi(i, j) / dx,
-        NodeKind::Right => -mgn * 2.0 * vi(i - 1, j) / dx,
+        NodeKind::Interior => m * ((ui(i, j) - ui(i, j - 1)) + (vi(i, j) - vi(i - 1, j))) / dx,
+        NodeKind::Floor => m * 2.0 * (ui(i, j) - uw) / dx,
+        NodeKind::Ceiling => -m * 2.0 * (ui(i, j - 1) - uw) / dx,
+        NodeKind::Left => m * 2.0 * (vi(i, j) - uw) / dx,
+        NodeKind::Right => -m * 2.0 * (vi(i - 1, j) - uw) / dx,
         NodeKind::None => 0.0,
     }
 }
 
-/// viscosités aux nœuds : (μ_g moyen des cellules non bloquées, μ_i moyen aux nœuds intérieurs)
-fn node_mu(kinds: &[NodeKind], cells: &[Vec<usize>], mg: &[f64], mi: &[f64]) -> (Vec<f64>, Vec<f64>) {
+/// viscosités aux nœuds : (μ_g moyen des cellules non bloquées, μ_i moyen aux nœuds intérieurs et contre les parois adhérentes,
+/// `walls`)
+fn node_mu(kinds: &[NodeKind], cells: &[Vec<usize>], walls: &[Option<f64>], mg: &[f64], mi: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let mut a = vec![0.0; kinds.len()];
     let mut b = vec![0.0; kinds.len()];
     for q in 0..kinds.len() {
@@ -470,7 +484,7 @@ fn node_mu(kinds: &[NodeKind], cells: &[Vec<usize>], mg: &[f64], mi: &[f64]) -> 
         }
         let k = cells[q].len() as f64;
         a[q] = cells[q].iter().map(|&c| mg[c]).sum::<f64>() / k;
-        if kinds[q] == NodeKind::Interior {
+        if kinds[q] == NodeKind::Interior || walls[q].is_some() {
             b[q] = cells[q].iter().map(|&c| mi[c]).sum::<f64>() / k;
         }
     }
@@ -480,8 +494,8 @@ fn node_mu(kinds: &[NodeKind], cells: &[Vec<usize>], mg: &[f64], mi: &[f64]) -> 
 /// Résout (ρ/dt) δ − F(δ) = F(u_f) (δ = 0 sur les faces fixes) par gradient conjugué préconditionné ; renvoie (itérations, δu, δv).
 #[allow(clippy::too_many_arguments)]
 fn solve_viscous(
-    nx: usize, ny: usize, dx: f64, dt: f64, mg: &[f64], mi: &[f64], kinds: &[NodeKind], cells: &[Vec<usize>], ku: &[bool], kv: &[bool],
-    rho_u: &[f64], rho_v: &[f64], uf: &[f64], vf: &[f64], max_it: usize,
+    nx: usize, ny: usize, dx: f64, dt: f64, mg: &[f64], mi: &[f64], kinds: &[NodeKind], cells: &[Vec<usize>], walls: &[Option<f64>], ku: &[bool],
+    kv: &[bool], rho_u: &[f64], rho_v: &[f64], uf: &[f64], vf: &[f64], max_it: usize,
 ) -> (usize, Vec<f64>, Vec<f64>) {
     // (parallèle par tranches, `mp_par` : chaque face / cellule / nœud calculé comme en séquentiel ; produits scalaires par blocs fixes)
     use super::mp_par::{dsum, for_ranges, for_rows, MIN_LIGHT};
@@ -489,12 +503,13 @@ fn solve_viscous(
     let (nu, nv) = ((nx + 1) * ny, nx * (ny + 1));
     let dx2 = dx * dx;
     let mu: Vec<f64> = mg.iter().zip(mi).map(|(a, b)| a + b).collect();
-    let (mgn, min) = node_mu(kinds, cells, mg, mi);
+    let (mgn, min) = node_mu(kinds, cells, walls, mg, mi);
     // contraintes (tampons réutilisés) : normales par cellule, de cisaillement par nœud
     let mut txx = vec![0.0; nx * ny];
     let mut tyy = vec![0.0; nx * ny];
     let mut txy = vec![0.0; (nx + 1) * (ny + 1)];
-    let force = |wu: &[f64], wv: &[f64], fu: &mut [f64], fv: &mut [f64], txx: &mut [f64], tyy: &mut [f64], txy: &mut [f64]| {
+    // F(w) ; `rhs` : second membre, la vitesse des parois adhérentes y entre (l'opérateur A, linéaire, ne la voit pas)
+    let force = |wu: &[f64], wv: &[f64], rhs: bool, fu: &mut [f64], fv: &mut [f64], txx: &mut [f64], tyy: &mut [f64], txy: &mut [f64]| {
         let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
         let vi = |i: usize, j: usize| wv[j * nx + i];
         // SAFETY (écritures de ce bloc) : chaque cellule, nœud ou face n'est écrit que par sa ligne
@@ -517,7 +532,8 @@ fn solve_viscous(
             for_rows(ny + 1, nx + 1, MIN_LIGHT, |j| {
                 for i in 0..=nx {
                     let q = j * (nx + 1) + i;
-                    let t = if mgn[q] > 0.0 || min[q] > 0.0 { node_txy(kinds[q], mgn[q], min[q], wu, wv, nx, i, j, dx) } else { 0.0 };
+                    let uw = if rhs { walls[q].unwrap_or(0.0) } else { 0.0 };
+                    let t = if mgn[q] > 0.0 || min[q] > 0.0 { node_txy(kinds[q], mgn[q], min[q], uw, wu, wv, nx, i, j, dx) } else { 0.0 };
                     unsafe { *tp.at(q) = t }
                 }
             });
@@ -551,7 +567,7 @@ fn solve_viscous(
     let nodec = |q: usize, wall: NodeKind| -> f64 {
         match kinds[q] {
             NodeKind::Interior => mgn[q] + min[q],
-            k if k == wall => 2.0 * mgn[q],
+            k if k == wall => 2.0 * (mgn[q] + min[q]),
             _ => 0.0,
         }
     };
@@ -576,9 +592,9 @@ fn solve_viscous(
         }
     }
     let (mut ru, mut rv) = (vec![0.0; nu], vec![0.0; nv]);
-    force(uf, vf, &mut ru, &mut rv, &mut txx, &mut tyy, &mut txy);
+    force(uf, vf, true, &mut ru, &mut rv, &mut txx, &mut tyy, &mut txy);
     let apply = |xu: &[f64], xv: &[f64], au: &mut [f64], av: &mut [f64], txx: &mut [f64], tyy: &mut [f64], txy: &mut [f64]| {
-        force(xu, xv, au, av, txx, tyy, txy);
+        force(xu, xv, false, au, av, txx, tyy, txy);
         let (ap, bp) = (SyncPtr(au.as_mut_ptr()), SyncPtr(av.as_mut_ptr()));
         // SAFETY : chaque face dans une seule tranche
         for_ranges(nu, MIN_LIGHT, |lo, hi| {
@@ -649,7 +665,10 @@ fn solve_viscous(
 /// dissipation du frottement Φ_c = τ : D (W/m³) par cellule pour la vitesse w : 2μ_g (Dxx² + Dyy²) dans la cellule, plus la part des
 /// nœuds voisins (μ_n γ², poids ½ sur une paroi) répartie au prorata de μ_g des cellules qui touchent le nœud
 #[allow(clippy::too_many_arguments)]
-fn friction_dissipation(nx: usize, ny: usize, dx: f64, mg: &[f64], kinds: &[NodeKind], cells: &[Vec<usize>], wu: &[f64], wv: &[f64]) -> Vec<f64> {
+#[allow(clippy::too_many_arguments)]
+fn friction_dissipation(
+    nx: usize, ny: usize, dx: f64, mg: &[f64], kinds: &[NodeKind], cells: &[Vec<usize>], walls: &[Option<f64>], wu: &[f64], wv: &[f64],
+) -> Vec<f64> {
     let ui = |i: usize, j: usize| wu[j * (nx + 1) + i];
     let vi = |i: usize, j: usize| wv[j * nx + i];
     let mut phi = vec![0.0; nx * ny];
@@ -663,14 +682,15 @@ fn friction_dissipation(nx: usize, ny: usize, dx: f64, mg: &[f64], kinds: &[Node
         }
     }
     let zero = vec![0.0; mg.len()];
-    let (mgn, _) = node_mu(kinds, cells, mg, &zero);
+    let (mgn, _) = node_mu(kinds, cells, walls, mg, &zero);
     for j in 0..=ny {
         for i in 0..=nx {
             let q = j * (nx + 1) + i;
             if mgn[q] <= 0.0 {
                 continue;
             }
-            let t = node_txy(kinds[q], mgn[q], 0.0, wu, wv, nx, i, j, dx);
+            // (contre une paroi mobile : le glissement par rapport à elle)
+            let t = node_txy(kinds[q], mgn[q], 0.0, walls[q].unwrap_or(0.0), wu, wv, nx, i, j, dx);
             // γ = τxy / μ ; énergie du nœud μ γ² (poids ½ sur une paroi)
             let gam = t / mgn[q];
             let wgt = if kinds[q] == NodeKind::Interior { 1.0 } else { 0.5 };
@@ -909,6 +929,56 @@ pub(crate) mod tests {
             s.dt_max = 1e-3;
             s
         }
+    }
+
+    /// Canal fermé de 5 cm × 1 cm (50 × 10 mailles) d'un gaz très visqueux (μ = 0.02 Pa·s, ν ≈ 0.017 m²/s) au repos, sans pesanteur ;
+    /// fond adhérent, couvercle qui glisse à 5 cm/s. Pas de 1 ms : 80 fois la borne explicite.
+    pub(crate) fn sliding_lid_channel(implicit: bool) -> MultiphaseSim {
+        let mut r = Registry::new();
+        let mut gas = Phase::air();
+        gas.mu_ref = 0.02;
+        gas.mu_law = crate::simulation::materials::PropertyLaw::Constant;
+        let k = r.add_phase(gas);
+        let mut s = MultiphaseSim::new(50, 10, 1e-3, r, k);
+        s.gravity = [0.0, 0.0];
+        s.surface_tension = false;
+        s.implicit_viscosity = implicit;
+        s.paint_phase(move |_, _| Some(k));
+        s.finalize_init(|_, _| 293.15);
+        s.no_slip[2] = Some(0.0);
+        s.no_slip[3] = Some(0.05);
+        s.dt_max = 1e-3;
+        s
+    }
+
+    /// plus grand écart, rapporté à la vitesse U du couvercle, entre la colonne de faces du milieu d'un canal fermé et son profil exact
+    /// U (3η² − 2η)
+    pub(crate) fn lid_profile_error(s: &MultiphaseSim, u_lid: f64) -> f64 {
+        let i = s.nx / 2;
+        (0..s.ny)
+            .map(|j| {
+                let eta = (j as f64 + 0.5) / s.ny as f64;
+                (s.u[s.uidx(i, j)] - u_lid * (3.0 * eta * eta - 2.0 * eta)).abs() / u_lid
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn a_moving_wall_drags_a_very_viscous_fluid_into_the_exact_profile_with_large_time_steps() {
+        // la vitesse de la paroi n'entre qu'au second membre du gradient conjugué : profil U (3η² − 2η) à 1 % près en 30 pas de 1 ms
+        // (5 H²/ν) ; en viscosité explicite, le même à petits pas
+        let run = |mut s: MultiphaseSim| {
+            while s.time < 0.03 && !s.diverged {
+                s.step();
+            }
+            assert!(!s.diverged);
+            (lid_profile_error(&s, 0.05), s.step_count)
+        };
+        let (ei, ni) = run(sliding_lid_channel(true));
+        let (ee, ne) = run(sliding_lid_channel(false));
+        eprintln!("implicite : écart {ei:.4} U en {ni} pas ; explicite : écart {ee:.4} U en {ne} pas");
+        assert!(ei < 0.01 && ee < 0.01, "écart au profil exact : implicite {ei} U, explicite {ee} U");
+        assert!(ni * 10 < ne, "la viscosité implicite doit permettre de plus grands pas : {ni} contre {ne}");
     }
 
     #[test]

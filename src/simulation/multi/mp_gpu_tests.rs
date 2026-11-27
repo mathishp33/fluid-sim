@@ -2040,3 +2040,15 @@ fn gpu_blown_bed_step_diag() {
         eprintln!(" ΔT rangée {j} : {}", row.join(" "));
     }
 }
+
+#[test]
+fn gpu_drags_a_very_viscous_fluid_along_a_moving_wall_like_the_cpu() {
+    // paroi adhérente et mobile en viscosité implicite (friction.wgsl : la vitesse de la paroi au second membre seulement) : le profil
+    // exact U (3η² − 2η) du canal fermé, comme le CPU (la viscosité explicite des parois : la cavité de mp_experiment_tests)
+    use super::mp_friction::tests::{lid_profile_error, sliding_lid_channel};
+    let mk = || sliding_lid_channel(true);
+    let Some((cpu, gs, _)) = compare("canal à couvercle mobile", &mk, 0.03) else { return };
+    let (ec, eg) = (lid_profile_error(&cpu, 0.05), lid_profile_error(&gs, 0.05));
+    eprintln!(" écart au profil exact : CPU {ec:.4} U, GPU {eg:.4} U ; pas CPU {} GPU {}", cpu.step_count, gs.step_count);
+    assert!(eg < 0.01, "GPU : écart {eg} U au profil exact");
+}

@@ -210,6 +210,10 @@ pub struct MultiphaseSim {
     pub thermal: Vec<MpThermal>,
     /// entrée de bord par côté (gauche, droite, bas, haut) ; n'agit que si le bord est fermé (`Bc::Wall`)
     pub inlet: [Option<MpInlet>; 4],
+    /// paroi ADHÉRENTE par côté (gauche, droite, bas, haut) : vitesse tangentielle de la paroi (m/s ; vx en bas et en haut, vy à
+    /// gauche et à droite ; 0 : immobile), à laquelle le fluide qui la touche est entraîné (non-glissement, viscosité) ; None :
+    /// glissement libre. N'agit que sur un bord fermé sans entrée (voir `wall_slide`)
+    pub no_slip: [Option<f64>; 4],
     /// chaleur injectée par les solides chauffants depuis le début (J par m de profondeur)
     pub energy_input: f64,
     pub(crate) pin: Vec<Option<PinInfo>>,
@@ -419,6 +423,7 @@ impl MultiphaseSim {
             special: vec![None; n],
             thermal: vec![MpThermal::Passive; n],
             inlet: [None; 4],
+            no_slip: [None; 4],
             energy_input: 0.0,
             pin: vec![None; n],
             pf_u: vec![f64::NAN; (nx + 1) * ny],
