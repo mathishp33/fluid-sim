@@ -1264,7 +1264,7 @@ simuler 0.15 s
     assert!(r.log.iter().any(|l| l.contains("ligne 4 : quand corps 1 y < 0.15 m — 1 fois")), "{}", r.log.join("\n"));
     for (bad, what) in [
         ("quand corps 1 y < 0.1 : simuler 1 s", "une seule action"),
-        ("quand corps 1 y < 0.1", "il faut « : »"),
+        ("quand corps 1 y < 0.1", "« quand » sans son « fin »"),
         ("quand stats < 3 : marque \"x\"", "relevé"),
         ("toutes les 1 s : quand corps 1 y < 0.1 : marque \"x\"", "règle « quand »"),
         ("quand corps 1 y < 0.1 : quand corps 1 y > 0.2 : pause", "autre règle"),
@@ -1359,7 +1359,9 @@ attendre 10 ms
     let marks = |r: &Runner, what: &str| -> Vec<f64> { r.log.iter().filter(|l| l.contains(&format!("repère « {what} »"))).map(|l| log_time(l)).collect() };
     let (tours, sorti, bas) = (marks(&r, "tour"), marks(&r, "sorti"), marks(&r, "bas"));
     eprintln!("tant que : tours à {tours:?}, sortie à {sorti:?}, « bas » à {bas:?}");
-    assert!(tours.len() == 9 && tours.iter().enumerate().all(|(k, &t)| (t - 0.02 * (k + 1) as f64).abs() < 1e-9), "{tours:?}\n{}", r.log.join("\n"));
+    // (trois tours notés, puis le corps se tait au journal, comme une répétition ; le compte des tours est à la sortie)
+    assert!(tours.len() == 3 && tours.iter().enumerate().all(|(k, &t)| (t - 0.02 * (k + 1) as f64).abs() < 1e-9), "{tours:?}\n{}", r.log.join("\n"));
+    assert!(r.log.iter().any(|l| l.contains("ligne 4 : tours suivants non notés au journal")), "{}", r.log.join("\n"));
     assert!(sorti.len() == 1 && (sorti[0] - 0.18).abs() < 1e-9, "{sorti:?}");
     let expect = (0.4 / 9.81f64).sqrt();
     assert!(bas.len() == 1 && bas[0] >= expect - 2e-4 && bas[0] < expect + 5e-3, "{bas:?} pour {expect}");
@@ -1400,7 +1402,7 @@ fin tant que
     // lecture : erreurs
     for (bad, line, what) in [
         ("tant que temps < 1 s\nmarque \"x\"\nfin", 2, "faire avancer le temps"),
-        ("fin", 2, "sans « tant que »"),
+        ("fin", 2, "sans bloc ouvert"),
         ("tant que temps < 1 s\nattendre 1 ms", 2, "sans son « fin »"),
         ("tant temps < 1 s\nattendre 1 ms\nfin", 2, "il faut « tant que"),
         ("toutes les 1 s : tant que temps < 1 s", 2, "une seule action"),
@@ -1421,6 +1423,119 @@ fin tant que
         let (t, n) = insert_initial_line(&format!("départ scénario \"cuve vide\"\nremplir partout avec \"air\"\n{first}\n"), "solide rect (0, 0) (0.1, 0.1) \"acier\"");
         assert!(n == 3 && t.lines().nth(2) == Some("solide rect (0, 0) (0.1, 0.1) \"acier\""), "{t}");
     }
+}
+
+#[test]
+fn if_else_and_repeat_blocks_choose_and_count_their_steps() {
+    // « répéter 4 fois » : à 10, 20, 30 et 40 ms, « si temps < 15 ms » (a), « sinon si temps < 35 ms » (b), « sinon » (c) ; un « si »
+    // faux sans « sinon » saute son bloc ; blocs imbriqués
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+répéter 4 fois
+    attendre 10 ms
+    si temps < 15 ms
+        marque \"a\"
+    sinon si temps < 35 ms
+        marque \"b\"
+    sinon
+        marque \"c\"
+    fin si
+    si temps > 1 s
+        marque \"jamais\"
+    fin
+fin répéter
+marque \"après\"
+";
+    // fin prévue : 4 tours de 10 ms
+    assert!((proto(text).planned_end(0.0) - 0.04).abs() < 1e-12, "{}", proto(text).planned_end(0.0));
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let marks: Vec<(String, f64)> = r
+        .log
+        .iter()
+        .filter_map(|l| l.find("repère « ").map(|i| (l[i + "repère « ".len()..l.rfind(" »").unwrap()].to_string(), log_time(l))))
+        .collect();
+    eprintln!("si / sinon : {marks:?}");
+    let names: Vec<&str> = marks.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a", "b", "b", "après"], "{}", r.log.join("\n"));
+    for ((_, t), want) in marks.iter().zip([0.01, 0.02, 0.03, 0.04]) {
+        assert!((t - want).abs() < 1e-9, "{marks:?}");
+    }
+    let log = r.log.join("\n");
+    // (le quatrième tour se tait au journal : « c » n'est pas noté, mais il a été fait — seul le compte des tours le dit)
+    assert!(log.contains("ligne 2 : tours suivants non notés") && log.contains("ligne 2 : répéter 4 fois — fini après 4 tours"), "{log}");
+    assert!(log.contains("ligne 4 : si temps < 0.015 s (0.01 s) — vrai") && log.contains("ligne 6 : sinon si temps < 0.035 s (0.02 s) — vrai"), "{log}");
+    assert!((r.sim.time - 0.04).abs() < 1e-9);
+    // lecture : erreurs
+    for (bad, line, what) in [
+        ("sinon", 2, "hors d'un « si »"),
+        ("si temps < 1 s\nattendre 1 ms\nsinon\nattendre 1 ms\nsinon si temps < 2 s\nfin", 6, "dernière branche"),
+        ("répéter 0 fois\nattendre 1 ms\nfin", 2, "entier positif"),
+        ("répéter 2\nattendre 1 ms\nfin", 2, "répéter <n> fois"),
+        ("si temps < 1 s\nattendre 1 ms", 2, "« si » sans son « fin »"),
+        ("répéter 2 fois\nattendre 1 ms", 2, "« répéter » sans son « fin »"),
+        ("quand temps > 1 s\nmarque \"x\"", 2, "« quand » sans son « fin »"),
+        ("fin", 2, "sans bloc ouvert"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e.len() == 1 && e[0].line == line && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+}
+
+#[test]
+fn a_when_block_runs_in_parallel_each_time_and_skips_while_still_running() {
+    // eau versée puis retirée toutes les 20 ms (trois fois) ; deux règles en bloc sur la masse d'eau : une suite courte (15 ms)
+    // reprend à chaque versement ; une longue (25 ms) tourne encore au deuxième : sautée, puis relancée au troisième, que la fin du
+    // protocole interrompt. Les attentes des suites tombent à l'heure pile, en parallèle du protocole
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+pas max 1 ms
+quand masse \"eau\" > 0.2
+    marque \"court\"
+    attendre 15 ms
+    marque \"court fini\"
+fin quand
+quand masse \"eau\" > 0.2
+    marque \"long\"
+    attendre 25 ms
+    marque \"long fini\"
+fin
+répéter 3 fois
+    remplir rect (0, 0) (0.02, 0.02) avec \"eau\"
+    attendre 10 ms
+    remplir rect (0, 0) (0.02, 0.02) avec \"air\"
+    attendre 10 ms
+fin
+";
+    // les conditions initiales sautent le corps des blocs : seul « pas max » (sans ce saut, la marque du premier bloc en serait)
+    let p = proto(text);
+    assert_eq!(p.initial_actions().0.len(), 1);
+    assert!((p.planned_end(0.0) - 0.06).abs() < 1e-12, "{}", p.planned_end(0.0));
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    let marks = |what: &str| -> Vec<f64> { r.log.iter().filter(|l| l.contains(&format!("repère « {what} »"))).map(|l| log_time(l)).collect() };
+    eprintln!("quand en bloc : court {:?} / {:?}, long {:?} / {:?}", marks("court"), marks("court fini"), marks("long"), marks("long fini"));
+    let near = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
+    assert!(near(&marks("court"), &[0.001, 0.021, 0.041]) && near(&marks("court fini"), &[0.016, 0.036, 0.056]), "{log}");
+    assert!(near(&marks("long"), &[0.001, 0.041]) && near(&marks("long fini"), &[0.026]), "{log}");
+    assert!(log.contains("ligne 3 : quand masse eau partout > 0.2 kg/m — 3 fois"), "{log}");
+    assert!(log.contains("ligne 8 : quand masse eau partout > 0.2 kg/m — 2 fois, 1 fois sautée"), "{log}");
+    assert!(log.contains("ligne 8 : suite de la règle « quand » arrêtée par la fin du protocole (à la ligne 11)"), "{log}");
+    assert!((r.sim.time - 0.06).abs() < 1e-9, "fin à {}", r.sim.time);
+    // un bloc dont la condition est vraie dès sa ligne démarre tout de suite ; ses lignes ne sont pas des conditions initiales
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+quand temps >= 0 s
+    remplir partout avec \"eau\"
+fin
+remplir rect (0, 0) (0.02, 0.02) avec \"eau\"
+simuler 1 ms
+";
+    let (s, _, _) = initial_state(&proto(text), Path::new(".")).unwrap();
+    let eau = s.reg.phases.iter().position(|p| p.name == "eau").unwrap();
+    let cells = s.mass[eau].iter().filter(|&&m| m > 0.0).count();
+    assert_eq!(cells, 4, "conditions initiales : seul le remplissage hors du bloc");
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert!(r.sim.mass[eau].iter().all(|&m| m > 0.0), "le bloc a rempli tout le domaine au départ");
 }
 
 #[test]

@@ -795,10 +795,15 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             push(proto, Action::Periodic { period, start, end, action: Box::new(action) }, ln);
         }
         "quand" => {
-            // quand <condition> : <action> — faite chaque fois que la condition devient vraie (relevée après chaque pas)
+            // quand <condition> : <action> — faite chaque fois que la condition devient vraie (relevée après chaque pas) ; sans « : »,
+            // un bloc jusqu'au « fin », déroulé en parallèle (attentes comprises)
             let (clauses, any) = condition(p)?;
-            let action = timed_action(p, ln, true)?;
-            push(proto, Action::When { clauses, any, action: Box::new(action) }, ln);
+            if p.done() {
+                proto.steps.push((Step::WhenBlock { clauses, any, end: usize::MAX }, ln));
+            } else {
+                let action = timed_action(p, ln, true)?;
+                push(proto, Action::When { clauses, any, action: Box::new(action) }, ln);
+            }
         }
         "a" => {
             // à <t> : <action> — faite une fois, à l'instant t pile, en parallèle du déroulement (geste enregistré par la fenêtre…)
@@ -912,12 +917,33 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             proto.steps.push((Step::While { clauses, any, limit, end: usize::MAX }, ln));
         }
         "fin" => {
-            // fin [tant que] : ferme la boucle ouverte la plus récente
+            // fin [tant que | répéter | si | quand] : ferme le bloc ouvert le plus récent
             if p.eat_w("tant") && !p.eat_w("que") {
                 return p.err("il faut « fin » ou « fin tant que »");
             }
+            let _ = p.eat_w("repeter") || p.eat_w("si") || p.eat_w("quand");
             p.end()?;
-            proto.steps.push((Step::EndWhile { start: usize::MAX }, ln));
+            proto.steps.push((Step::End { start: usize::MAX }, ln));
+        }
+        "repeter" => {
+            // répéter <n> fois … fin
+            let n = p.count("le nombre de tours")?;
+            if !p.eat_w("fois") {
+                return p.err(format!("il faut « répéter <n> fois »{}", p.here()));
+            }
+            p.end()?;
+            proto.steps.push((Step::Repeat { n, end: usize::MAX }, ln));
+        }
+        "si" => {
+            // si <condition> … [sinon si <condition> …] [sinon …] fin
+            let (clauses, any) = condition(p)?;
+            p.end()?;
+            proto.steps.push((Step::If { clauses, any, next: usize::MAX, end: usize::MAX }, ln));
+        }
+        "sinon" => {
+            let cond = if p.eat_w("si") { Some(condition(p)?) } else { None };
+            p.end()?;
+            proto.steps.push((Step::Else { cond, next: usize::MAX, end: usize::MAX }, ln));
         }
         "remplir" => {
             let zone = p.zone()?;
@@ -1442,7 +1468,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
-                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin)"
+                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin)"
             ))
         }
     }
@@ -1450,12 +1476,77 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
 }
 
 /// Lit un protocole (sans balayage : voir `parse_all`).
+/// nom d'un bloc pour les messages
+fn block_name(s: &Step) -> &'static str {
+    match s {
+        Step::While { .. } => "tant que",
+        Step::Repeat { .. } => "répéter",
+        Step::If { .. } => "si",
+        Step::WhenBlock { .. } => "quand",
+        _ => "bloc",
+    }
+}
+
+/// Liens des blocs pour l'étape `s` (ligne `ln`) qui vient d'être lue : une ouverture (tant que, répéter, si, quand) est empilée ;
+/// un « sinon » s'accroche au « si » ouvert ; un « fin » ferme le bloc le plus récent (sauts posés de part et d'autre)
+fn close_blocks(proto: &mut Protocol, open: &mut Vec<(usize, usize, usize)>, errs: &mut Vec<ScriptError>, s: usize, ln: usize) {
+    let set_next = |st: &mut Step, to: usize| {
+        if let Step::If { next, .. } | Step::Else { next, .. } = st {
+            *next = to;
+        }
+    };
+    match &proto.steps[s].0 {
+        Step::While { .. } | Step::Repeat { .. } | Step::If { .. } | Step::WhenBlock { .. } => open.push((s, ln, s)),
+        Step::Else { .. } => match open.last_mut() {
+            Some((usize::MAX, _, _)) => {}
+            Some((w, _, branch)) if matches!(proto.steps[*w].0, Step::If { .. }) => {
+                if matches!(proto.steps[*branch].0, Step::Else { cond: None, .. }) {
+                    errs.push(ScriptError { line: ln, msg: "une branche après « sinon » : le « sinon » sans condition est la dernière branche du « si »".into() });
+                }
+                set_next(&mut proto.steps[*branch].0, s);
+                *branch = s;
+            }
+            _ => errs.push(ScriptError { line: ln, msg: "« sinon » hors d'un « si »".into() }),
+        },
+        Step::End { .. } => match open.pop() {
+            Some((usize::MAX, _, _)) => {}
+            Some((w, wl, branch)) => {
+                if matches!(proto.steps[w].0, Step::While { .. }) {
+                    let advances = proto.steps[w + 1..s].iter().any(|(st, _)| matches!(st, Step::Simulate(_) | Step::Until(_) | Step::UntilCond { .. }));
+                    if !advances {
+                        errs.push(ScriptError { line: wl, msg: "le corps d'une boucle « tant que » doit faire avancer le temps (simuler, attendre)".into() });
+                    }
+                }
+                if let Step::While { end, .. } | Step::Repeat { end, .. } | Step::If { end, .. } | Step::WhenBlock { end, .. } = &mut proto.steps[w].0 {
+                    *end = s;
+                }
+                if matches!(proto.steps[w].0, Step::If { .. }) {
+                    // la dernière branche mène au « fin » ; chaque « sinon » du bloc en sort après sa branche
+                    set_next(&mut proto.steps[branch].0, s);
+                    for b in w + 1..s {
+                        if let Step::Else { end, .. } = &mut proto.steps[b].0 {
+                            if *end == usize::MAX {
+                                *end = s;
+                            }
+                        }
+                    }
+                }
+                if let Step::End { start } = &mut proto.steps[s].0 {
+                    *start = w;
+                }
+            }
+            None => errs.push(ScriptError { line: ln, msg: "« fin » sans bloc ouvert (tant que, répéter, si, quand)".into() }),
+        },
+        _ => {}
+    }
+}
+
 pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, Vec<ScriptError>> {
     let mut proto = Protocol { source: text.to_string(), variant, ..Default::default() };
     let mut errs = vec![];
-    // boucles « tant que » ouvertes : (indice de leur étape, ligne) ; usize::MAX pour une ligne « tant que » mal écrite (son « fin »
-    // la ferme sans autre erreur)
-    let mut open: Vec<(usize, usize)> = vec![];
+    // blocs ouverts (tant que, répéter, si, quand … fin) : (étape d'ouverture, ligne, dernière branche d'un « si ») ; usize::MAX pour
+    // une ligne d'ouverture mal écrite (son « fin » la ferme sans autre erreur)
+    let mut open: Vec<(usize, usize, usize)> = vec![];
     for (k, l) in text.lines().enumerate() {
         let ln = k + 1;
         let toks = match tokenize(l, ln) {
@@ -1471,37 +1562,22 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
         let mut p = P { t: &toks, i: 0, ln };
         let n0 = proto.steps.len();
         if let Err(e) = parse_line(&mut p, &mut proto) {
-            if matches!(toks.first(), Some(Tok::W(w, _)) if w == "tant") {
-                open.push((usize::MAX, ln));
+            let opens = match toks.first() {
+                Some(Tok::W(w, _)) => matches!(w.as_str(), "tant" | "repeter" | "si") || (w == "quand" && !toks.contains(&Tok::Colon)),
+                _ => false,
+            };
+            if opens {
+                open.push((usize::MAX, ln, usize::MAX));
             }
             errs.push(e);
         }
         for s in n0..proto.steps.len() {
-            match proto.steps[s].0 {
-                Step::While { .. } => open.push((s, ln)),
-                Step::EndWhile { .. } => match open.pop() {
-                    Some((usize::MAX, _)) => {}
-                    Some((w, wl)) => {
-                        let advances = proto.steps[w + 1..s].iter().any(|(st, _)| matches!(st, Step::Simulate(_) | Step::Until(_) | Step::UntilCond { .. }));
-                        if !advances {
-                            errs.push(ScriptError { line: wl, msg: "le corps d'une boucle « tant que » doit faire avancer le temps (simuler, attendre)".into() });
-                        }
-                        if let Step::While { end, .. } = &mut proto.steps[w].0 {
-                            *end = s;
-                        }
-                        if let Step::EndWhile { start } = &mut proto.steps[s].0 {
-                            *start = w;
-                        }
-                    }
-                    None => errs.push(ScriptError { line: ln, msg: "« fin » sans « tant que » ouvert".into() }),
-                },
-                _ => {}
-            }
+            close_blocks(&mut proto, &mut open, &mut errs, s, ln);
         }
     }
-    for (w, wl) in open {
+    for (w, wl, _) in open {
         if w != usize::MAX {
-            errs.push(ScriptError { line: wl, msg: "« tant que » sans son « fin »".into() });
+            errs.push(ScriptError { line: wl, msg: format!("« {} » sans son « fin »", block_name(&proto.steps[w].0)) });
         }
     }
     if proto.start.is_none() && errs.is_empty() {
@@ -1603,7 +1679,7 @@ pub fn insert_initial_line(text: &str, line: &str) -> (String, usize) {
         .iter()
         .position(|l| {
             let first: String = strip_comment(l).trim_start().chars().take_while(|c| c.is_alphabetic()).collect();
-            matches!(norm(&first).as_str(), "simuler" | "avancer" | "attendre" | "tant")
+            matches!(norm(&first).as_str(), "simuler" | "avancer" | "attendre" | "tant" | "repeter" | "si")
         })
         .unwrap_or(lines.len());
     // pas de ligne vide en trop à la fin

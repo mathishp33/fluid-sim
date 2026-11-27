@@ -11,8 +11,8 @@ EXPERIENCES.md (protocoles).
 ## 1. Prioritaire
 
 ### Organisation et interface
-- [M] Protocoles : `si <condition> … sinon … fin`, `répéter n fois … fin`, règle `quand` en bloc (plusieurs lignes, avec des
-  attentes, déroulées en parallèle du protocole).
+- [M] Protocoles : parenthèses dans les conditions (« et » et « ou » mêlés) ; variables (compteurs, valeurs relevées reprises
+  dans les seuils ou les actions).
 
 ### Bords du domaine
 - [M] Plus de types de bords : périodiques, sortie convective. Existent : bord ouvert à pression imposée (hydrostatique de
@@ -264,6 +264,9 @@ détail dans les documents de conception et l'historique git.
   qui tourne sans que le temps avance arrête l'expérience), `attendre <durée> | jusqu'à <t> | [que] <condition> [au plus d]`,
   relevé `temps` ; une règle ou une répétition écrite dans une boucle n'est posée qu'une fois ; exemple `experiences/bachees.exp`
   (vidange par bâchées).
+- Protocoles : `répéter n fois … fin`, `si <condition> … sinon si … sinon … fin`, règles `quand <condition> … fin` en bloc (ses
+  lignes, attentes comprises, se déroulent en parallèle du protocole chaque fois que la condition devient vraie ; une suite à la
+  fois par règle) ; exemple `experiences/chasse.exp` (chasse d'eau automatique) ; journal muet au-delà du troisième tour.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

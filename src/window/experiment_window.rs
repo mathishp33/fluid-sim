@@ -191,6 +191,8 @@ TEMPS, MESURES, SORTIES
   simuler jusqu'à ce que max T dans partout < 400 K [ou corps 1 y < 5 cm] [au plus 10 s]   (relevé comme une mesure ; < <= > >= ; et | ou)
   attendre 0.5 s · attendre jusqu'à 2 s · attendre que T en (0.1, 0.1) > 350 K [au plus 5 s]   (comme « simuler »)
   tant que <condition> [au plus 10 s]   puis ses lignes, puis   fin   (boucle : condition relevée à chaque tour ; relevé « temps »)
+  répéter 3 fois  …  fin    ·    si <condition>  …  sinon si <condition>  …  sinon  …  fin   (blocs, imbriquables)
+  quand <condition>  …  fin   (règle en bloc : ses lignes, attentes comprises, se déroulent en parallèle du protocole)
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
   quand p en (0.15, 0.1) > 104 kPa [et | ou …] : <action>   (règle : faite chaque fois que la condition devient vraie ; aussi « pause »)
@@ -766,7 +768,7 @@ impl ExperimentWindow {
             }
         } else if let Some(p) = &self.parsed {
             let acts = p.steps.iter().filter(|(s, _)| matches!(s, Step::Do(_))).count();
-            let ci = p.first_advance();
+            let ci = p.initial_actions().0.len();
             ui.weak(format!(
                 "{} conditions initiales, {} actions ensuite, {} mesure(s){}, fin prévue à t = {} s",
                 ci,

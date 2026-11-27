@@ -632,8 +632,18 @@ pub enum Step {
     /// boucle « tant que <condition> [au plus d] » : la condition est relevée à chaque tour ; vraie, les étapes du corps sont faites,
     /// jusqu'au « fin » (étape `end`) qui ramène au test ; fausse (ou la durée `limit` écoulée depuis l'entrée), on passe après `end`
     While { clauses: Vec<Clause>, any: bool, limit: Option<f64>, end: usize },
-    /// « fin » d'une boucle : retour à son test (étape `start`)
-    EndWhile { start: usize },
+    /// boucle « répéter n fois » : son corps, jusqu'au « fin » (étape `end`), est fait n fois
+    Repeat { n: usize, end: usize },
+    /// « si <condition> » : vraie, la branche qui suit ; fausse, saut au premier « sinon » (étape `next`) ou au « fin » (`end`)
+    If { clauses: Vec<Clause>, any: bool, next: usize, end: usize },
+    /// « sinon » ou « sinon si <condition> » : atteint en suivant la branche d'avant, on passe après le « fin » (`end`) ; atteint par
+    /// le saut d'une condition fausse, on entre dans sa branche (si sa propre condition est vraie ; sinon, saut à `next`)
+    Else { cond: Option<(Vec<Clause>, bool)>, next: usize, end: usize },
+    /// règle « quand <condition> » en bloc : chaque fois que la condition devient vraie, les étapes jusqu'au « fin » (`end`) se
+    /// déroulent en parallèle du protocole, attentes comprises ; le déroulement principal passe par-dessus
+    WhenBlock { clauses: Vec<Clause>, any: bool, end: usize },
+    /// « fin » d'un bloc (étape `start`) : retour au test d'une boucle ; sortie d'un « si » ; fin du corps d'une règle en bloc
+    End { start: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -666,27 +676,67 @@ pub struct Protocol {
 impl Protocol {
     /// durée simulée prévue (fin du dernier « simuler »), pour la barre de progression
     pub fn planned_end(&self, t0: f64) -> f64 {
+        self.span(0, self.steps.len(), t0)
+    }
+    /// fin prévue des étapes [from, to) commencées à t0 : une boucle bornée pour sa durée permise, une boucle sans borne pour un
+    /// tour, « répéter n fois » pour n tours, un « si » pour sa plus longue branche ; le corps d'une règle en bloc ne compte pas (il
+    /// se déroule en parallèle)
+    fn span(&self, from: usize, to: usize, t0: f64) -> f64 {
         let mut t = t0;
-        let mut k = 0;
-        while k < self.steps.len() {
+        let mut k = from;
+        while k < to {
             match &self.steps[k].0 {
                 Step::Simulate(d) => t += d,
                 Step::Until(u) => t = t.max(*u),
                 Step::UntilCond { limit, .. } => t += limit.unwrap_or(0.0),
-                // boucle bornée : sa durée permise (son corps est sauté) ; sinon son corps compté une fois
                 Step::While { limit: Some(d), end, .. } => {
                     t += d;
                     k = *end;
                 }
-                Step::Do(_) | Step::While { .. } | Step::EndWhile { .. } => {}
+                Step::While { end, .. } => {
+                    t = self.span(k + 1, *end, t);
+                    k = *end;
+                }
+                Step::Repeat { n, end } => {
+                    t += *n as f64 * self.span(k + 1, *end, 0.0);
+                    k = *end;
+                }
+                Step::If { next, end, .. } => {
+                    let mut longest = self.span(k + 1, *next, t);
+                    let mut b = *next;
+                    while b < *end {
+                        let Step::Else { next: nb, .. } = &self.steps[b].0 else { break };
+                        longest = longest.max(self.span(b + 1, *nb, t));
+                        b = *nb;
+                    }
+                    t = longest;
+                    k = *end;
+                }
+                Step::WhenBlock { end, .. } => k = *end,
+                Step::Do(_) | Step::Else { .. } | Step::End { .. } => {}
             }
             k += 1;
         }
         t
     }
-    /// indice de la première étape qui fait avancer le temps (les actions avant elle sont les conditions initiales)
+    /// conditions initiales : les actions d'avant la première étape qui fait avancer le temps ou qui décide (boucle, « si »), le
+    /// corps des règles « quand » en bloc sauté ; et l'indice de cette étape
+    pub fn initial_actions(&self) -> (Vec<usize>, usize) {
+        let mut v = vec![];
+        let mut k = 0;
+        while k < self.steps.len() {
+            match &self.steps[k].0 {
+                Step::Do(_) => v.push(k),
+                Step::WhenBlock { end, .. } => k = *end,
+                _ => break,
+            }
+            k += 1;
+        }
+        (v, k)
+    }
+    /// indice de la première étape qui fait avancer le temps ou qui décide (les actions avant elle sont les conditions initiales)
     pub fn first_advance(&self) -> usize {
-        self.steps.iter().position(|(s, _)| !matches!(s, Step::Do(_))).unwrap_or(self.steps.len())
+        self.initial_actions().1
     }
 }
 
@@ -1083,8 +1133,8 @@ fn effect(sim: &mut MultiphaseSim, zone: &Zone, e: MpEffect) -> Result<usize, St
 /// montre en mode « Conditions initiales »). Les erreurs portent leur ligne.
 pub fn initial_state(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Option<MaterialLibrary>, Option<usize>), String> {
     let (mut sim, lib, sc) = build_start(proto, base)?;
-    for (s, line) in &proto.steps[..proto.first_advance()] {
-        if let Step::Do(a) = s {
+    for k in proto.initial_actions().0 {
+        if let (Step::Do(a), line) = &proto.steps[k] {
             if a.is_instant_edit() {
                 apply_action(&mut sim, a, base).map_err(|e| format!("ligne {line} : {e}"))?;
             }
@@ -1510,7 +1560,7 @@ struct Periodic {
     count: usize,
 }
 
-/// boucle « tant que » : instant d'entrée, tours faits, tours de suite sans que le temps avance, instant du dernier test
+/// boucle (« tant que », « répéter ») : instant d'entrée, tours faits, tours de suite sans que le temps avance, instant du dernier test
 #[derive(Default)]
 struct LoopState {
     since: f64,
@@ -1519,12 +1569,36 @@ struct LoopState {
     last: f64,
 }
 
-/// règle « quand » en cours : condition, action, condition vraie au dernier relevé, nombre de fois où l'action a été faite
+/// suite d'étapes en cours : le déroulement principal, ou le corps d'une règle « quand » en bloc, déroulé en parallèle
+#[derive(Default)]
+struct Seq {
+    /// prochaine étape ; la suite est finie à `end` (le « fin » de son bloc ; pour le déroulement principal, après la dernière)
+    pc: usize,
+    end: usize,
+    /// attente : jusqu'à cet instant (borne d'une attente de condition), jusqu'à cette condition
+    target: Option<f64>,
+    cond: Option<Cond>,
+    /// boucles (par indice de leur étape)
+    loops: std::collections::HashMap<usize, LoopState>,
+    /// étape atteinte par un saut : le « fin » d'une boucle vers son test, une condition fausse vers son « sinon »
+    jumped: Option<usize>,
+    /// corps des boucles au-delà de leur troisième tour (indices de leur « fin ») : journal muet
+    mute: Vec<usize>,
+    /// règle qui l'a lancée ; journal muet (au-delà de la troisième fois de cette règle)
+    rule: Option<usize>,
+    quiet: bool,
+}
+
+/// règle « quand » en cours : condition ; action d'une ligne, ou corps d'un bloc (étapes `start`..`end`) ; condition vraie au dernier
+/// relevé ; nombre de fois ; suite de son bloc en cours ; fois sautées (la suite d'avant tournait encore)
 struct WhenRule {
     cond: Cond,
-    action: Action,
+    action: Option<Action>,
+    body: Option<(usize, usize)>,
     on: bool,
     count: usize,
+    running: bool,
+    skipped: usize,
 }
 
 struct Timed {
@@ -1547,17 +1621,13 @@ pub struct Runner {
     pub out_dir: Option<PathBuf>,
     pub library: Option<MaterialLibrary>,
     pub scenario: Option<usize>,
-    pc: usize,
-    target: Option<f64>,
-    /// condition d'arrêt en cours (`simuler jusqu'à ce que …`)
-    cond: Option<Cond>,
+    /// déroulement principal (étape, attente, boucles) ; suites des règles « quand » en bloc, en parallèle
+    main: Seq,
+    threads: Vec<Seq>,
     timed: Vec<Timed>,
     periodic: Vec<Periodic>,
     /// règles « quand … : … »
     when: Vec<WhenRule>,
-    /// boucles « tant que » (par indice de leur étape) ; `loop_back` : le « fin » de cette boucle vient d'être passé (sinon on y entre)
-    loops: std::collections::HashMap<usize, LoopState>,
-    loop_back: Option<usize>,
     /// journal muet (répétitions au-delà de la troisième)
     quiet: bool,
     probes: Vec<Probe>,
@@ -1614,14 +1684,11 @@ impl Runner {
             out_dir,
             library,
             scenario,
-            pc: 0,
-            target: None,
-            cond: None,
+            main: Seq::default(),
+            threads: vec![],
             timed: vec![],
             periodic: vec![],
             when: vec![],
-            loops: std::collections::HashMap::new(),
-            loop_back: None,
             quiet: false,
             probes: vec![],
             stats: false,
@@ -1636,6 +1703,7 @@ impl Runner {
             wall: Instant::now(),
             proto,
         };
+        r.main.end = r.proto.steps.len();
         r.watch_flux_lines()?;
         r.compile_measures()?;
         r.log_header();
@@ -1666,7 +1734,12 @@ impl Runner {
         }
         for (s, _) in &self.proto.steps {
             let clauses = match s {
-                Step::UntilCond { clauses, .. } | Step::While { clauses, .. } | Step::Do(Action::When { clauses, .. }) => clauses,
+                Step::UntilCond { clauses, .. }
+                | Step::While { clauses, .. }
+                | Step::If { clauses, .. }
+                | Step::Else { cond: Some((clauses, _)), .. }
+                | Step::WhenBlock { clauses, .. }
+                | Step::Do(Action::When { clauses, .. }) => clauses,
                 _ => continue,
             };
             for c in clauses {
@@ -1836,64 +1909,112 @@ impl Runner {
         let mut first = true;
         while self.state == RunState::Running && (first || t0.elapsed() < budget) {
             first = false;
-            if let Some(target) = self.target {
+            if let Some(target) = self.main.target {
                 self.sim_step(target);
                 continue;
             }
-            if self.pc >= self.proto.steps.len() {
+            if self.main.pc >= self.main.end {
                 self.finish();
                 break;
             }
-            let (step, line) = self.proto.steps[self.pc].clone();
+            let mut seq = std::mem::take(&mut self.main);
+            self.exec(&mut seq, true);
+            self.main = seq;
+        }
+        &self.state
+    }
+
+    /// Fait l'étape suivante de la suite `seq` (des actions consécutives d'un coup) : le déroulement principal (`main`) ou la suite
+    /// d'une règle en bloc. Une attente pose `seq.target` (et `seq.cond`) : la suite reprend quand elle est finie.
+    fn exec(&mut self, seq: &mut Seq, main: bool) {
+        let outer = self.quiet;
+        self.quiet = outer || seq.quiet || !seq.mute.is_empty();
+        let (step, line) = self.proto.steps[seq.pc].clone();
+        if main {
             self.line = line;
-            match step {
-                Step::Do(_) => self.run_actions(),
-                Step::While { clauses, any, limit, end } => self.loop_test(line, &clauses, any, limit, end),
-                Step::EndWhile { start } => {
-                    // fin du corps : retour au test de la boucle
-                    self.loop_back = Some(start);
-                    self.pc = start;
-                }
-                Step::Simulate(d) => {
-                    self.start_sampling();
-                    self.target = Some(self.sim.time + d);
-                    self.pc += 1;
-                }
-                Step::Until(t) => {
-                    self.start_sampling();
-                    if t > self.sim.time {
-                        self.target = Some(t);
+        }
+        match step {
+            Step::Do(_) => self.run_actions(seq, main),
+            Step::While { clauses, any, limit, end } => self.loop_test(seq, line, &clauses, any, limit, end, outer),
+            Step::Repeat { n, end } => self.repeat_test(seq, line, n, end, outer),
+            Step::If { clauses, any, next, .. } => {
+                if let Some((holds, text)) = self.eval_cond(line, &clauses, any) {
+                    self.note(format!("ligne {line} : si {text} — {}", if holds { "vrai" } else { "faux" }));
+                    if holds {
+                        seq.pc += 1;
                     } else {
-                        self.note(format!("ligne {line} : « simuler jusqu'à {} s » déjà atteint", fmt_num(t)));
+                        seq.jumped = Some(next);
+                        seq.pc = next;
                     }
-                    self.pc += 1;
                 }
-                Step::UntilCond { clauses, any, limit } => {
-                    self.start_sampling();
-                    self.pc += 1;
-                    let mut parts = vec![];
-                    for cl in &clauses {
-                        match self.make_probe(&cl.measure) {
-                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
-                            Ok(None) => {
-                                self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
-                                return &self.state;
-                            }
-                            Err(e) => {
-                                self.fail(format!("ligne {line} : {e}"));
-                                return &self.state;
+            }
+            Step::Else { cond, next, end } => {
+                if seq.jumped == Some(seq.pc) {
+                    // (saut d'une condition fausse : cette branche, si sa propre condition le veut)
+                    seq.jumped = None;
+                    match cond {
+                        None => seq.pc += 1,
+                        Some((clauses, any)) => {
+                            if let Some((holds, text)) = self.eval_cond(line, &clauses, any) {
+                                self.note(format!("ligne {line} : sinon si {text} — {}", if holds { "vrai" } else { "faux" }));
+                                if holds {
+                                    seq.pc += 1;
+                                } else {
+                                    seq.jumped = Some(next);
+                                    seq.pc = next;
+                                }
                             }
                         }
                     }
-                    self.sync_host();
+                } else {
+                    // branche d'avant finie : après le « fin »
+                    seq.pc = end + 1;
+                }
+            }
+            Step::End { start } => {
+                if matches!(self.proto.steps[start].0, Step::While { .. } | Step::Repeat { .. }) {
+                    seq.jumped = Some(start);
+                    seq.pc = start;
+                } else {
+                    seq.jumped = None;
+                    seq.pc += 1;
+                }
+            }
+            Step::WhenBlock { clauses, any, end } => {
+                // la règle est posée (une fois par ligne) ; son corps se déroule en parallèle, quand sa condition devient vraie
+                let start = seq.pc;
+                seq.pc = end + 1;
+                if !(line > 0 && self.registered(line)) {
+                    let _ = self.arm_rule(line, &clauses, any, None, Some((start, end)));
+                }
+            }
+            Step::Simulate(d) => {
+                if main {
+                    self.start_sampling();
+                }
+                seq.target = Some(self.sim.time + d);
+                seq.pc += 1;
+            }
+            Step::Until(t) => {
+                if main {
+                    self.start_sampling();
+                }
+                if t > self.sim.time {
+                    seq.target = Some(t);
+                } else {
+                    self.note(format!("ligne {line} : « simuler jusqu'à {} s » déjà atteint", fmt_num(t)));
+                }
+                seq.pc += 1;
+            }
+            Step::UntilCond { clauses, any, limit } => {
+                if main {
+                    self.start_sampling();
+                }
+                seq.pc += 1;
+                if let Some(mut c) = self.make_cond(line, &clauses, any) {
                     // (pas de tendance avant deux relevés : un pas à la fois, sinon le GPU ferait d'emblée une série de 8 pas)
-                    let mut c = Cond { clauses: parts, any, line, near: true };
+                    c.near = true;
                     let xs = c.values(&self.sim);
-                    let t = self.sim.time;
-                    for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
-                        cl.last = Some((t, x));
-                        cl.far = (!cl.cmp.holds(x, cl.value)).then_some((t, x));
-                    }
                     if c.holds(&xs) {
                         self.note(format!("ligne {line} : {} déjà vrai ({})", c.text(), c.values_text(&xs)));
                     } else {
@@ -1902,13 +2023,47 @@ impl Runner {
                             None => "sans limite de durée".to_string(),
                         };
                         self.note(format!("ligne {line} : simuler jusqu'à ce que {} ({what}) — {} au départ", c.text(), c.values_text(&xs)));
-                        self.target = Some(limit.map_or(f64::INFINITY, |d| self.sim.time + d));
-                        self.cond = Some(c);
+                        seq.target = Some(limit.map_or(f64::INFINITY, |d| self.sim.time + d));
+                        seq.cond = Some(c);
                     }
                 }
             }
         }
-        &self.state
+        self.quiet = outer;
+    }
+
+    /// Condition prête à être suivie (sondes, premiers relevés gardés) ; None : l'expérience a échoué (relevé impossible)
+    fn make_cond(&mut self, line: usize, clauses: &[Clause], any: bool) -> Option<Cond> {
+        let mut parts = vec![];
+        for cl in clauses {
+            match self.make_probe(&cl.measure) {
+                Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
+                Ok(None) => {
+                    self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
+                    return None;
+                }
+                Err(e) => {
+                    self.fail(format!("ligne {line} : {e}"));
+                    return None;
+                }
+            }
+        }
+        self.sync_host();
+        let mut c = Cond { clauses: parts, any, line, near: false };
+        let xs = c.values(&self.sim);
+        let t = self.sim.time;
+        for (cl, &x) in c.clauses.iter_mut().zip(&xs) {
+            cl.last = Some((t, x));
+            cl.far = (!cl.cmp.holds(x, cl.value)).then_some((t, x));
+        }
+        Some(c)
+    }
+
+    /// relève une condition (boucle, « si ») : (vraie ?, « relevé op seuil (valeurs) ») ; None : l'expérience a échoué
+    fn eval_cond(&mut self, line: usize, clauses: &[Clause], any: bool) -> Option<(bool, String)> {
+        let c = self.make_cond(line, clauses, any)?;
+        let xs = c.values(&self.sim);
+        Some((c.holds(&xs), format!("{} ({})", c.text(), c.values_text(&xs))))
     }
 
     /// Reprend après une pause (ligne « pause » ou pause de la fenêtre).
@@ -1952,15 +2107,17 @@ impl Runner {
         }
     }
 
-    /// Exécute les actions consécutives à partir de `pc` (une seule relecture / un seul envoi GPU pour le groupe).
-    fn run_actions(&mut self) {
+    /// Exécute les actions consécutives de la suite `seq` (une seule relecture / un seul envoi GPU pour le groupe).
+    fn run_actions(&mut self, seq: &mut Seq, main: bool) {
         self.sync_host();
         let (mut edited, mut heat) = (false, false);
-        while self.pc < self.proto.steps.len() {
-            let (step, line) = self.proto.steps[self.pc].clone();
+        while seq.pc < seq.end {
+            let (step, line) = self.proto.steps[seq.pc].clone();
             let Step::Do(a) = step else { break };
-            self.line = line;
-            self.pc += 1;
+            if main {
+                self.line = line;
+            }
+            seq.pc += 1;
             match self.do_action(&a, line) {
                 Ok((e, h)) => {
                     edited |= e;
@@ -2003,11 +2160,14 @@ impl Runner {
         if edited || heat {
             // l'état a changé (vanne, chauffage…) : les tendances relevées avant ne disent plus rien, les conditions en cours sont
             // relevées pas à pas jusqu'aux suivantes (sans quoi le GPU vidait une cuve pendant une série de pas)
-            if let Some(c) = &mut self.cond {
+            if let Some(c) = &mut self.main.cond {
                 c.near = true;
             }
             for w in &mut self.when {
                 w.cond.near = true;
+            }
+            for c in self.threads.iter_mut().filter_map(|s| s.cond.as_mut()) {
+                c.near = true;
             }
         }
         if heat {
@@ -2027,26 +2187,17 @@ impl Runner {
         self.when.iter().any(|w| w.cond.line == line) || self.periodic.iter().any(|p| p.line == line)
     }
 
-    /// Test d'une boucle « tant que » (étape `pc`) : vraie, on entre dans son corps ; fausse, ou sa durée permise écoulée depuis
-    /// l'entrée, on passe après son « fin » (étape `end`). Le journal note les trois premiers tours et la sortie. Une boucle qui
-    /// tourne sans que le temps avance (corps dont les attentes sont déjà atteintes) arrête l'expérience.
-    fn loop_test(&mut self, line: usize, clauses: &[Clause], any: bool, limit: Option<f64>, end: usize) {
-        let k = self.pc;
-        let back = self.loop_back.take() == Some(k);
-        let mut parts = vec![];
-        for cl in clauses {
-            match self.make_probe(&cl.measure) {
-                Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
-                Ok(None) => return self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »")),
-                Err(e) => return self.fail(format!("ligne {line} : {e}")),
-            }
-        }
-        self.sync_host();
-        let cond = Cond { clauses: parts, any, line, near: false };
-        let xs = cond.values(&self.sim);
+    /// Test d'une boucle « tant que » (étape `seq.pc`) : vraie, on entre dans son corps ; fausse, ou sa durée permise écoulée depuis
+    /// l'entrée, on passe après son « fin » (étape `end`). Une boucle qui tourne sans que le temps avance (corps dont les attentes
+    /// sont déjà atteintes) arrête l'expérience. `outer` : journal muet hors de la suite.
+    #[allow(clippy::too_many_arguments)]
+    fn loop_test(&mut self, seq: &mut Seq, line: usize, clauses: &[Clause], any: bool, limit: Option<f64>, end: usize, outer: bool) {
+        let k = seq.pc;
+        let back = seq.jumped.take() == Some(k);
+        let Some((holds, text)) = self.eval_cond(line, clauses, any) else { return };
         let now = self.sim.time;
         let eps = 1e-12 * (1.0 + now.abs());
-        let st = self.loops.entry(k).or_default();
+        let st = seq.loops.entry(k).or_default();
         if back {
             st.idle = if now <= st.last + eps { st.idle + 1 } else { 0 };
             st.last = now;
@@ -2060,33 +2211,134 @@ impl Runner {
             ));
         }
         let over = limit.is_some_and(|d| now >= since + d - eps);
-        let holds = cond.holds(&xs);
-        let text = format!("{} ({})", cond.text(), cond.values_text(&xs));
         if holds && !over {
-            let st = self.loops.get_mut(&k).unwrap();
-            st.turns += 1;
-            let n = st.turns;
-            if n <= 3 {
-                self.note(format!("ligne {line} : tant que {text} — tour {n}"));
-            } else if n == 4 {
-                self.note(format!("ligne {line} : tours suivants non notés au journal"));
-            }
-            self.pc += 1;
+            self.enter_turn(seq, k, line, end, &format!("tant que {text}"));
         } else {
-            let n = self.loops.get(&k).map_or(0, |s| s.turns);
             let why = if holds { format!(" (au bout des {} s permises)", fmt_num(limit.unwrap_or(0.0))) } else { String::new() };
-            let tours = match n {
-                0 => "aucun tour".to_string(),
-                1 => "fini après 1 tour".to_string(),
-                n => format!("fini après {n} tours"),
-            };
-            self.note(format!("ligne {line} : tant que {text} — {tours}{why}"));
-            self.pc = end + 1;
+            self.leave_loop(seq, k, line, end, &format!("tant que {text}"), &why, outer);
         }
     }
 
-    /// Règles « quand » après un pas : l'action d'une règle est faite si sa condition, fausse au relevé précédent, est vraie (le
-    /// journal note les trois premières fois). Une pause arrête la tournée (les règles suivantes sont relevées au pas suivant).
+    /// Test d'une boucle « répéter n fois » (étape `seq.pc`, « fin » à `end`)
+    fn repeat_test(&mut self, seq: &mut Seq, line: usize, n: usize, end: usize, outer: bool) {
+        let k = seq.pc;
+        let back = seq.jumped.take() == Some(k);
+        let now = self.sim.time;
+        let st = seq.loops.entry(k).or_default();
+        if !back {
+            *st = LoopState { since: now, turns: 0, idle: 0, last: now };
+        }
+        let what = format!("répéter {n} fois");
+        if st.turns < n {
+            self.enter_turn(seq, k, line, end, &what);
+        } else {
+            self.leave_loop(seq, k, line, end, &what, "", outer);
+        }
+    }
+
+    /// tour suivant de la boucle de l'étape k (« fin » à `end`) : le journal note les trois premiers, puis son corps se tait
+    fn enter_turn(&mut self, seq: &mut Seq, k: usize, line: usize, end: usize, what: &str) {
+        let st = seq.loops.get_mut(&k).unwrap();
+        st.turns += 1;
+        let n = st.turns;
+        if n <= 3 {
+            self.note(format!("ligne {line} : {what} — tour {n}"));
+        } else if n == 4 {
+            self.note(format!("ligne {line} : tours suivants non notés au journal"));
+            seq.mute.push(end);
+        }
+        seq.pc += 1;
+    }
+
+    /// sortie de la boucle de l'étape k : le journal (rouvert) note ses tours ; on passe après son « fin »
+    #[allow(clippy::too_many_arguments)]
+    fn leave_loop(&mut self, seq: &mut Seq, k: usize, line: usize, end: usize, what: &str, why: &str, outer: bool) {
+        seq.mute.retain(|&m| m > end);
+        self.quiet = outer || seq.quiet || !seq.mute.is_empty();
+        let tours = match seq.loops.get(&k).map_or(0, |s| s.turns) {
+            0 => "aucun tour".to_string(),
+            1 => "fini après 1 tour".to_string(),
+            n => format!("fini après {n} tours"),
+        };
+        self.note(format!("ligne {line} : {what} — {tours}{why}"));
+        seq.pc = end + 1;
+    }
+
+    /// Pose une règle « quand » : action d'une ligne, ou corps d'un bloc (étapes `start`..`end`) ; faite tout de suite si sa
+    /// condition est déjà vraie
+    fn arm_rule(&mut self, line: usize, clauses: &[Clause], any: bool, action: Option<&Action>, body: Option<(usize, usize)>) -> Result<(bool, bool), ()> {
+        let Some(mut cond) = self.make_cond(line, clauses, any) else { return Err(()) };
+        let xs = cond.values(&self.sim);
+        let on = cond.holds(&xs);
+        // (pas de tendance avant deux relevés : un pas à la fois tant que la règle attend sa condition)
+        cond.near = !on;
+        let what = match (action, body) {
+            (Some(a), _) => describe(a),
+            (None, Some((a, b))) => {
+                let (l0, l1) = (self.proto.steps[a].1, self.proto.steps[b].1);
+                format!("bloc des lignes {} à {}", l0 + 1, l1.saturating_sub(1).max(l0 + 1))
+            }
+            _ => String::new(),
+        };
+        let now_text = if on { " : déjà vrai, faite maintenant" } else { "" };
+        self.note(format!("ligne {line} : quand {} : {what} — {} au départ{now_text}", cond.text(), cond.values_text(&xs)));
+        let k = self.when.len();
+        self.when.push(WhenRule { cond, action: action.cloned(), body, on, count: 0, running: false, skipped: 0 });
+        if on { self.fire_rule(k) } else { Ok((false, false)) }
+    }
+
+    /// Fait la règle k (sa condition vient de devenir vraie) : son action, ou le lancement de la suite de son bloc (sautée si celle
+    /// d'avant tourne encore)
+    fn fire_rule(&mut self, k: usize) -> Result<(bool, bool), ()> {
+        let line = self.when[k].cond.line;
+        if self.when[k].running {
+            self.when[k].skipped += 1;
+            if self.when[k].skipped == 1 {
+                self.note(format!("ligne {line} : condition vraie, mais la suite d'avant n'est pas finie : cette fois est sautée (les suivantes aussi, sans note)"));
+            }
+            return Ok((false, false));
+        }
+        self.when[k].count += 1;
+        let count = self.when[k].count;
+        match (self.when[k].action.clone(), self.when[k].body) {
+            (Some(a), _) => self.do_action(&a, line),
+            (None, Some((start, end))) => {
+                self.when[k].running = true;
+                let seq = Seq { pc: start + 1, end, rule: Some(k), quiet: self.quiet || count > 3, ..Default::default() };
+                if let Some(s) = self.run_thread(seq) {
+                    self.threads.push(s);
+                }
+                if matches!(self.state, RunState::Failed(_)) { Err(()) } else { Ok((false, false)) }
+            }
+            _ => Ok((false, false)),
+        }
+    }
+
+    /// Déroule la suite `seq` d'une règle en bloc jusqu'à sa prochaine attente (rendue, pour la reprendre) ou jusqu'à sa fin (None)
+    fn run_thread(&mut self, mut seq: Seq) -> Option<Seq> {
+        let mut n = 0usize;
+        while self.state == RunState::Running && seq.target.is_none() && seq.pc < seq.end {
+            n += 1;
+            if n > 100_000 {
+                let line = seq.rule.map_or(0, |r| self.when[r].cond.line);
+                self.fail(format!("ligne {line} : la suite de la règle « quand » tourne sans fin sans que le temps avance"));
+                break;
+            }
+            self.exec(&mut seq, false);
+        }
+        let done = seq.target.is_none() && seq.pc >= seq.end;
+        if done || matches!(self.state, RunState::Failed(_)) {
+            if let Some(r) = seq.rule {
+                self.when[r].running = false;
+            }
+            None
+        } else {
+            Some(seq)
+        }
+    }
+
+    /// Règles « quand » après un pas : une règle est faite si sa condition, fausse au relevé précédent, est vraie (le journal note les
+    /// trois premières fois). Une pause arrête la tournée (les règles suivantes sont relevées au pas suivant).
     fn check_when(&mut self) {
         self.sync_host();
         let (t, dt) = (self.sim.time, self.sim.last_dt);
@@ -2106,19 +2358,18 @@ impl Runner {
             if !fire {
                 continue;
             }
-            let (action, line, count) = {
-                let w = &mut self.when[k];
-                w.count += 1;
-                (w.action.clone(), w.cond.line, w.count)
-            };
-            if count <= 3 {
-                let text = self.when[k].cond.values_text(&xs);
-                self.note(format!("ligne {line} : condition vraie ({text})"));
-            } else if count == 4 {
-                self.note(format!("ligne {line} : fois suivantes non notées au journal"));
+            let line = self.when[k].cond.line;
+            let count = self.when[k].count + 1;
+            if !self.when[k].running {
+                if count <= 3 {
+                    let text = self.when[k].cond.values_text(&xs);
+                    self.note(format!("ligne {line} : condition vraie ({text})"));
+                } else if count == 4 {
+                    self.note(format!("ligne {line} : fois suivantes non notées au journal"));
+                }
             }
             self.quiet = count > 3;
-            let r = self.do_action(&action, line);
+            let r = self.fire_rule(k);
             self.quiet = false;
             match r {
                 Ok((e, h)) => {
@@ -2132,6 +2383,79 @@ impl Runner {
             }
         }
         self.finish_edits(edited, heat);
+    }
+
+    /// Suites parallèles dont l'attente est finie à l'instant `now` (instant atteint, durée permise d'une condition écoulée, ou
+    /// reprise après une pause) : déroulées jusqu'à leur attente suivante
+    fn run_due_threads(&mut self, now: f64, eps: f64) {
+        if !self.threads.iter().any(|s| s.target.map_or(true, |t| t <= now + eps)) {
+            return;
+        }
+        self.sync_host();
+        let mut k = 0;
+        while k < self.threads.len() {
+            if !self.threads[k].target.map_or(true, |t| t <= now + eps) {
+                k += 1;
+                continue;
+            }
+            let mut seq = self.threads.remove(k);
+            seq.target = None;
+            if let Some(c) = seq.cond.take() {
+                let xs = c.values(&self.sim);
+                self.note(format!("ligne {} : {} non atteint au bout du temps permis ({})", c.line, c.text(), c.values_text(&xs)));
+            }
+            if let Some(s) = self.run_thread(seq) {
+                self.threads.insert(k, s);
+                k += 1;
+            }
+            if self.state != RunState::Running {
+                return;
+            }
+        }
+    }
+
+    /// Suites parallèles qui attendent une condition, après un pas : celles dont la condition est vraie reprennent
+    fn check_threads(&mut self) {
+        if !self.threads.iter().any(|s| s.cond.is_some()) {
+            return;
+        }
+        self.sync_host();
+        let (t, dt) = (self.sim.time, self.sim.last_dt);
+        let mut k = 0;
+        while k < self.threads.len() {
+            let (xs, holds) = match &self.threads[k].cond {
+                Some(c) => {
+                    let xs = c.values(&self.sim);
+                    let h = c.holds(&xs);
+                    (xs, h)
+                }
+                None => {
+                    k += 1;
+                    continue;
+                }
+            };
+            if !holds {
+                if let Some(c) = self.threads[k].cond.as_mut() {
+                    c.track(t, dt, &xs);
+                }
+                k += 1;
+                continue;
+            }
+            let mut seq = self.threads.remove(k);
+            let c = seq.cond.take().unwrap();
+            seq.target = None;
+            let q = self.quiet;
+            self.quiet = seq.quiet;
+            self.note(format!("ligne {} : {} atteint ({})", c.line, c.text(), c.values_text(&xs)));
+            self.quiet = q;
+            if let Some(s) = self.run_thread(seq) {
+                self.threads.insert(k, s);
+                k += 1;
+            }
+            if self.state != RunState::Running {
+                return;
+            }
+        }
     }
 
     /// Actions répétées dues à l'instant `now` (à `eps` près), dans l'ordre de leurs échéances : (état modifié, chauffages changés).
@@ -2207,39 +2531,9 @@ impl Runner {
                     heat |= h;
                 }
                 Action::When { clauses, any, action } => {
-                    let mut parts = vec![];
-                    for cl in clauses {
-                        match self.make_probe(&cl.measure) {
-                            Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
-                            Ok(None) => {
-                                self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »"));
-                                return Err(());
-                            }
-                            Err(e) => {
-                                self.fail(format!("ligne {line} : {e}"));
-                                return Err(());
-                            }
-                        }
-                    }
-                    self.sync_host();
-                    let mut cond = Cond { clauses: parts, any: *any, line, near: false };
-                    let xs = cond.values(&self.sim);
-                    let t = self.sim.time;
-                    for (cl, &x) in cond.clauses.iter_mut().zip(&xs) {
-                        cl.last = Some((t, x));
-                        cl.far = (!cl.cmp.holds(x, cl.value)).then_some((t, x));
-                    }
-                    let on = cond.holds(&xs);
-                    // (pas de tendance avant deux relevés : un pas à la fois tant que la règle attend sa condition)
-                    cond.near = !on;
-                    let now_text = if on { " : déjà vrai, faite maintenant" } else { "" };
-                    self.note(format!("ligne {line} : quand {} : {} — {} au départ{now_text}", cond.text(), describe(action), cond.values_text(&xs)));
-                    self.when.push(WhenRule { cond, action: (**action).clone(), on, count: on as usize });
-                    if on {
-                        let (e, h) = self.do_action(action, line)?;
-                        edited |= e;
-                        heat |= h;
-                    }
+                    let (e, h) = self.arm_rule(line, clauses, *any, Some(action), None)?;
+                    edited |= e;
+                    heat |= h;
                 }
                 Action::Mark(t) => self.note(format!("ligne {line} : repère « {t} »")),
                 Action::SaveState(name) => self.save_state(name, line),
@@ -2426,9 +2720,14 @@ impl Runner {
                 return;
             }
         }
+        // suites parallèles (règles en bloc) dont l'attente est finie, à l'heure pile
+        self.run_due_threads(now, eps);
+        if self.state != RunState::Running {
+            return;
+        }
         if now >= target - eps {
-            self.target = None;
-            if let Some(c) = self.cond.take() {
+            self.main.target = None;
+            if let Some(c) = self.main.cond.take() {
                 self.sync_host();
                 let xs = c.values(&self.sim);
                 self.note(format!("ligne {} : {} non atteint au bout du temps permis ({})", c.line, c.text(), c.values_text(&xs)));
@@ -2440,6 +2739,7 @@ impl Runner {
             .iter()
             .map(|t| t.end)
             .chain(self.periodic.iter().filter(|p| p.next <= p.end).map(|p| p.next))
+            .chain(self.threads.iter().filter_map(|s| s.target))
             .fold(target, f64::min);
         let remaining = next - now;
         let dt_max0 = self.sim.dt_max;
@@ -2453,7 +2753,9 @@ impl Runner {
         match &mut self.gpu {
             Some(g) => {
                 // (condition d'arrêt près de son seuil : un pas à la fois, pour s'arrêter au bon pas)
-                let near = self.cond.as_ref().is_some_and(|c| c.near) || self.when.iter().any(|w| w.cond.near);
+                let near = self.main.cond.as_ref().is_some_and(|c| c.near)
+                    || self.when.iter().any(|w| w.cond.near)
+                    || self.threads.iter().any(|s| s.cond.as_ref().is_some_and(|c| c.near));
                 let k = if cap.is_infinite() && !near { ((remaining / pred) * 0.5).floor().clamp(1.0, 8.0) as usize } else { 1 };
                 if k > 1 {
                     // série de k pas : bornés pour que la série s'arrête avant l'échéance
@@ -2474,17 +2776,22 @@ impl Runner {
             self.fail(format!("divergence numérique à t = {:.6} s (même à dt/1024, le pas donne un état invalide)", self.sim.time));
             return;
         }
-        if self.cond.is_some() {
+        if self.main.cond.is_some() {
             self.sync_host();
             let (t, dt) = (self.sim.time, self.sim.last_dt);
-            let xs = self.cond.as_ref().unwrap().values(&self.sim);
-            if self.cond.as_ref().unwrap().holds(&xs) {
-                let c = self.cond.take().unwrap();
+            let xs = self.main.cond.as_ref().unwrap().values(&self.sim);
+            if self.main.cond.as_ref().unwrap().holds(&xs) {
+                let c = self.main.cond.take().unwrap();
                 self.note(format!("ligne {} : {} atteint ({})", c.line, c.text(), c.values_text(&xs)));
-                self.target = None;
+                self.main.target = None;
             } else {
-                self.cond.as_mut().unwrap().track(t, dt, &xs);
+                self.main.cond.as_mut().unwrap().track(t, dt, &xs);
             }
+        }
+        // suites parallèles qui attendent une condition
+        self.check_threads();
+        if self.state != RunState::Running {
+            return;
         }
         // règles « quand » : relevées après chaque pas, l'action est faite quand la condition devient vraie
         if !self.when.is_empty() {
@@ -2593,9 +2900,17 @@ impl Runner {
     }
 
     fn finish(&mut self) {
+        for s in std::mem::take(&mut self.threads) {
+            if let Some(r) = s.rule {
+                let at = self.proto.steps.get(s.pc).map_or(0, |st| st.1);
+                let msg = format!("ligne {} : suite de la règle « quand » arrêtée par la fin du protocole (à la ligne {at})", self.when[r].cond.line);
+                self.note(msg);
+            }
+        }
         for k in 0..self.when.len() {
             let w = &self.when[k];
-            let msg = format!("ligne {} : quand {} — {} fois", w.cond.line, w.cond.text(), w.count);
+            let skipped = if w.skipped > 0 { format!(", {} fois sautée (suite d'avant en cours)", w.skipped) } else { String::new() };
+            let msg = format!("ligne {} : quand {} — {} fois{skipped}", w.cond.line, w.cond.text(), w.count);
             self.note(msg);
         }
         for k in 0..self.periodic.len() {
