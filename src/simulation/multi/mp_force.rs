@@ -104,8 +104,9 @@ impl MultiphaseSim {
         for f in vs.iter_mut() {
             *f += dt * self.gravity[1];
         }
-        // accélérateurs (cellules spéciales)
+        // accélérateurs et couches éponges (cellules spéciales)
         self.add_accelerators(dt, us, vs);
+        self.add_sponges(dt, us, vs);
         // tension de surface (CSF équilibré) : a = σ κ ∇ℓ / ρ_f
         if self.surface_tension {
             let l = self.liquid_marker();

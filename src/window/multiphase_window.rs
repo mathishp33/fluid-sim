@@ -77,10 +77,11 @@ enum CellKind {
     Grille,
     Valve,
     Pump,
+    Sponge,
 }
 
 impl CellKind {
-    const ALL: [CellKind; 8] = [
+    const ALL: [CellKind; 9] = [
         CellKind::Wall,
         CellKind::Sink,
         CellKind::Emitter,
@@ -89,6 +90,7 @@ impl CellKind {
         CellKind::Grille,
         CellKind::Valve,
         CellKind::Pump,
+        CellKind::Sponge,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -100,6 +102,7 @@ impl CellKind {
             CellKind::Grille => "Grille (arrête les grains)",
             CellKind::Valve => "Vanne fermée (fluide gardé)",
             CellKind::Pump => "Pompe / compresseur",
+            CellKind::Sponge => "Éponge (bord absorbant)",
         }
     }
 }
@@ -167,6 +170,8 @@ pub struct MultiphaseWindow {
     /// pompe : vitesse imposée sur ses faces (m/s)
     pump_vx: f64,
     pump_vy: f64,
+    /// éponge : taux d'amortissement (1/s)
+    sponge_rate: f64,
     tp_dest: Option<usize>,
     tp_speed: f64,
     /// rayon (mailles) de la zone de destination des téléporteurs posés
@@ -254,6 +259,7 @@ impl MultiphaseWindow {
             acc_ay: 0.0,
             pump_vx: 0.5,
             pump_vy: 0.0,
+            sponge_rate: 10.0,
             tp_dest: None,
             tp_speed: 0.5,
             tp_radius: 2,
@@ -899,6 +905,10 @@ impl MultiphaseWindow {
                 ui.add(egui::Slider::new(&mut self.acc_ax, -50.0..=50.0).text("Accélération X (m/s²)"));
                 ui.add(egui::Slider::new(&mut self.acc_ay, -50.0..=50.0).text("Accélération Y (m/s²)"));
             }
+            CellKind::Sponge => {
+                ui.add(egui::Slider::new(&mut self.sponge_rate, 0.1..=1000.0).logarithmic(true).text("Amortissement (1/s)"));
+                ui.weak("Ramène la vitesse du fluide au repos (force −σ u) : les vagues et les ondes qui y entrent s'y amortissent. Le pinceau pose un taux uniforme, dont le bord réfléchit un peu ; le protocole (« éponge ») pose une rampe.");
+            }
             CellKind::Grille => {
                 ui.add(egui::Slider::new(&mut self.grille_hole_mm, 0.5..=50.0).logarithmic(true).text("Trous (mm)"));
                 ui.add(egui::Slider::new(&mut self.grille_open, 0.1..=0.9).text("Fraction ouverte"));
@@ -1221,6 +1231,7 @@ impl MultiphaseWindow {
             CellKind::Teleporter => self.tp_dest.map(|d| (MpTool::Effect(MpEffect::Teleporter { dest: d, speed: self.tp_speed, radius: self.tp_radius }), MpThermal::Passive)),
             CellKind::Valve => Some((MpTool::Effect(MpEffect::Valve), MpThermal::Passive)),
             CellKind::Pump => Some((MpTool::Effect(MpEffect::Pump { vx: self.pump_vx, vy: self.pump_vy }), MpThermal::Passive)),
+            CellKind::Sponge => Some((MpTool::Effect(MpEffect::Sponge { rate: self.sponge_rate, ux: 0.0, uy: 0.0 }), MpThermal::Passive)),
         }
     }
 
@@ -1524,7 +1535,7 @@ mod tests {
 
         // chaque type de cellule posable
         w.paused = true;
-        for kind in [CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Valve, CellKind::Pump, CellKind::Wall] {
+        for kind in [CellKind::Sink, CellKind::Emitter, CellKind::Accelerator, CellKind::Valve, CellKind::Pump, CellKind::Sponge, CellKind::Wall] {
             w.cell_kind = kind;
             if kind == CellKind::Wall {
                 w.thermal_mode = ThermalMode::Heater;
@@ -1534,6 +1545,7 @@ mod tests {
                 CellKind::Wall => assert!(w.sim.solid.iter().any(|&s| s >= 0), "solide non posé"),
                 CellKind::Valve => assert!(w.sim.special.iter().any(|s| *s == Some(MpEffect::Valve)), "vanne non posée"),
                 CellKind::Pump => assert!(w.sim.special.iter().any(|s| *s == Some(MpEffect::Pump { vx: 0.5, vy: 0.0 })), "pompe non posée"),
+                CellKind::Sponge => assert!(w.sim.special.iter().any(|s| *s == Some(MpEffect::Sponge { rate: 10.0, ux: 0.0, uy: 0.0 })), "éponge non posée"),
                 _ => assert!(w.sim.special_count() > 0, "{} non posé", kind.name()),
             }
             if kind == CellKind::Wall {

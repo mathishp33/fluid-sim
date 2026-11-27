@@ -1840,6 +1840,26 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             p.end()?;
             push(proto, Action::Pump { zone, v }, ln);
         }
+        "eponge" => {
+            // éponge <zone> [temps τ] [vers (vx, vy)] [uniforme] : couche éponge (bord absorbant), taux 1/τ au fond (τ : 0.1 s par défaut)
+            let zone = p.zone()?;
+            let (mut tau, mut target, mut uniform) = (0.1, [0.0, 0.0], false);
+            while !p.done() {
+                let w = p.word("une option (temps, vers, uniforme)")?;
+                match w.as_str() {
+                    "temps" => {
+                        tau = p.quantity(Dim::Time, "le temps d'amortissement")?;
+                        if !(tau > 0.0) {
+                            return p.err("le temps d'amortissement d'une éponge est positif");
+                        }
+                    }
+                    "vers" => target = p.vector(Dim::Speed, "la vitesse vers laquelle l'éponge ramène l'écoulement")?,
+                    "uniforme" => uniform = true,
+                    o => return p.err(format!("option « {o} » inconnue après « éponge » : temps <τ>, vers (vx, vy), uniforme")),
+                }
+            }
+            push(proto, Action::Sponge { zone, tau, target, uniform }, ln);
+        }
         "teleporteur" => {
             // téléporteur <zone> vers (x, y) [v m/s] [rayon r] : aspire à v (0.5 m/s par défaut), rejette le même débit autour de (x, y)
             let zone = p.zone()?;
@@ -2057,7 +2077,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         o => {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
-                 allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
+                 allumer, puits, émetteur, grille, vanne, pompe, éponge, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
                  calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit, \
                  vilebrequin, mécanisme, roue, pièce, zone \"nom\" = …, inclure, paramètre)"
             ))

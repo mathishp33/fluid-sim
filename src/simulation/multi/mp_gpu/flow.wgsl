@@ -193,7 +193,8 @@ fn k_force_init(@builtin(global_invocation_id) g: vec3<u32>) {
     if (f < nfu()) { S[O_Fx + f] = dtv() * P.gx; }
     if (f < nfv()) { S[O_Fy + f] = dtv() * P.gy; }
 }
-// accélérateurs : moyenne des cellules accélératrices adjacentes à la face
+// accélérateurs : moyenne des cellules accélératrices adjacentes à la face ; couches éponges : −σ (u − u_cible), implicite, σ moyenne
+// des deux mailles (0 hors de l'éponge), u la vitesse du début du pas (miroir de add_sponges)
 @compute @workgroup_size(64)
 fn k_accel(@builtin(global_invocation_id) g: vec3<u32>) {
     let f = g.x;
@@ -206,6 +207,8 @@ fn k_accel(@builtin(global_invocation_id) g: vec3<u32>) {
                 if (S[O_acc_on + a] > 0.5) { s += S[O_acc_x + a]; cnt += 1.0; }
                 if (S[O_acc_on + b] > 0.5) { s += S[O_acc_x + b]; cnt += 1.0; }
                 if (cnt > 0.0) { S[O_Fx + f] += dtv() * s / cnt; }
+                let sg = 0.5 * (S[O_sp_r + a] + S[O_sp_r + b]);
+                if (sg > 0.0) { S[O_Fx + f] -= dtv() * (sg * S[O_U + f] - 0.5 * (S[O_sp_x + a] + S[O_sp_x + b])) / (1.0 + sg * dtv()); }
             }
         }
     }
@@ -218,6 +221,8 @@ fn k_accel(@builtin(global_invocation_id) g: vec3<u32>) {
                 if (S[O_acc_on + a] > 0.5) { s += S[O_acc_y + a]; cnt += 1.0; }
                 if (S[O_acc_on + b] > 0.5) { s += S[O_acc_y + b]; cnt += 1.0; }
                 if (cnt > 0.0) { S[O_Fy + f] += dtv() * s / cnt; }
+                let sg = 0.5 * (S[O_sp_r + a] + S[O_sp_r + b]);
+                if (sg > 0.0) { S[O_Fy + f] -= dtv() * (sg * S[O_V + f] - 0.5 * (S[O_sp_y + a] + S[O_sp_y + b])) / (1.0 + sg * dtv()); }
             }
         }
     }

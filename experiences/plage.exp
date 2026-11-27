@@ -1,0 +1,17 @@
+# Plage numérique : le batteur à came de « came.exp » (le composant « composants/excentrique.exp ») lève une houle régulière dans
+# un bassin de 1.5 m et 10 cm d'eau (période 0.5 s, longueur d'onde 37 cm) ; au bout du bassin, une couche éponge de 60 cm, la
+# « plage » (1.6 longueur d'onde, temps d'amortissement 0.1 s au fond), la ramène au repos au lieu de la renvoyer. Les sondes
+# relèvent le niveau tous les 9 cm, un quart de longueur d'onde : la houle y passe avec la même hauteur, 26 à 29 mm (réflexion de
+# l'ordre de 5 %). Sans la plage (un # devant la ligne « éponge »), les vagues réfléchies au fond reviennent vers 3 s et s'ajoutent
+# à la houle : une onde stationnaire, de 22 à 39 mm d'une sonde à l'autre entre 5 et 6 s, qui grandit encore (le bassin résonne).
+#   fluid-sim experience experiences/plage.exp
+#
+# Une sonde est la part d'eau d'une colonne de 20 cm de haut (0.5 : 10 cm d'eau).
+
+départ scénario "Cuve vide" grille 300 x 50 maille 5 mm
+remplir rect (0, 0) (1.5, 0.1) avec "eau" à 20 °C
+inclure "composants/excentrique.exp" avec NOM = "batteur", X = 0.03, Y = 0.2, BAS = 0.005, MOUVEMENT = rotation 120 tr/min
+éponge rect (0.9, 0) (1.5, 0.25) temps 0.1 s
+
+mesurer toutes les 10 ms : moyenne fraction "eau" dans rect (0.3, 0) (0.305, 0.2) comme "niveau à 30 cm", moyenne fraction "eau" dans rect (0.39, 0) (0.395, 0.2) comme "niveau à 39 cm", moyenne fraction "eau" dans rect (0.48, 0) (0.485, 0.2) comme "niveau à 48 cm", moyenne fraction "eau" dans rect (0.57, 0) (0.575, 0.2) comme "niveau à 57 cm", moyenne fraction "eau" dans rect (0.66, 0) (0.665, 0.2) comme "niveau à 66 cm"
+simuler 6 s

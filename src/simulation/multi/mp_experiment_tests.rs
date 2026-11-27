@@ -2658,3 +2658,131 @@ simuler 1 s
     let e = run_until_failure(&mut r).expect("le pas effondré aurait dû arrêter l'expérience");
     assert!(e.contains("le pas de temps s'effondre") && e.contains("une vitesse s'emballe"), "{e}");
 }
+
+#[test]
+fn a_sponge_layer_reads_its_options_and_ramps_its_rate_up_from_its_entrance() {
+    use super::mp_cells::MpEffect;
+    let p = proto("départ scénario \"cuve vide\"\néponge partout\néponge rect (0.1, 0) (0.2, 0.1) temps 50 ms vers (0.1, 0) m/s uniforme\n");
+    let acts: Vec<&Action> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a) = s { Some(a) } else { None }).collect();
+    assert!(matches!(acts[0], Action::Sponge { tau, target, uniform: false, .. } if *tau == 0.1 && *target == [0.0, 0.0]), "{:?}", acts[0]);
+    assert!(
+        matches!(acts[1], Action::Sponge { tau, target, uniform: true, .. } if (*tau - 0.05).abs() < 1e-15 && *target == [0.1, 0.0]),
+        "{:?}",
+        acts[1]
+    );
+    for (bad, want) in [("éponge partout temps 0 s", "positif"), ("éponge partout épaisse", "inconnue après « éponge »")] {
+        let e = errors_in(&format!("départ scénario \"cuve vide\"\n{bad}\n"), Path::new("."));
+        let e = e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(e.contains(want), "{bad} : {e}");
+    }
+    // bande de 10 mailles le long du bord droit : l'entrée est sa colonne de gauche, le taux monte en ((d + 1) / 10)² jusqu'à 1/τ
+    // contre le bord ; un solide dans la zone est laissé, ses voisines ne sont pas une entrée
+    let text = "départ scénario \"cuve vide\" grille 40 x 20 maille 1 cm
+solide rect (0.39, 0.1) (0.4, 0.11) \"acier\"
+éponge rect (0.3, 0) (0.4, 0.2) temps 0.1 s
+simuler 1 ms
+";
+    let r = run(text, None);
+    let log = r.log.join("\n");
+    assert!(log.contains("éponge rect (0.3, 0) (0.4, 0.2) temps 0.1 s — 199 mailles"), "{log}");
+    let sim = &r.sim;
+    let rate = |i: usize, j: usize| match sim.special[sim.idx(i, j)] {
+        Some(MpEffect::Sponge { rate, ux, uy }) if ux == 0.0 && uy == 0.0 => rate,
+        e => panic!("maille ({i}, {j}) : {e:?}"),
+    };
+    for j in [0, 9, 10, 11, 19] {
+        for k in (0..10).filter(|&k| (k, j) != (9, 10)) {
+            let x = (k + 1) as f64 / 10.0;
+            assert!((rate(30 + k, j) - 10.0 * x * x).abs() < 1e-12, "({}, {j}) : {} pour {}", 30 + k, rate(30 + k, j), 10.0 * x * x);
+        }
+    }
+    assert!(sim.is_solid(sim.idx(39, 10)) && sim.special[sim.idx(39, 10)].is_none() && sim.special[sim.idx(29, 5)].is_none());
+    // zone sans entrée (tout le fluide) : uniforme
+    let (sim, _, _) = initial_state(&proto("départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm\néponge partout temps 0.5 s\n"), Path::new(".")).unwrap();
+    assert!(sim.special.iter().all(|e| *e == Some(MpEffect::Sponge { rate: 2.0, ux: 0.0, uy: 0.0 })));
+}
+
+/// tourbillon de Taylor–Green dans une boîte d'eau fermée, sans gravité, avec ou sans une éponge uniforme : (temps, vitesse max)
+fn sponge_vortex(sponge: &str, gpu: bool) -> Option<Vec<(f64, f64)>> {
+    let text = format!(
+        "départ scénario \"cuve vide\" grille 20 x 20 maille 5 mm
+gravité (0, 0)
+bord haut mur
+remplir partout avec \"eau\" à 20 °C
+champ vx formule \"0.01*sin(pi*x/0.1)*cos(pi*y/0.1)\"
+champ vy formule \"-0.01*cos(pi*x/0.1)*sin(pi*y/0.1)\"
+{sponge}
+pas max 1 ms
+mesurer toutes les 20 ms : max vitesse dans partout comme \"v\"
+simuler 0.2 s
+"
+    );
+    if gpu {
+        let probe = build_scenario(MpScenario::DamBreak, 40, 30, 0.01, 9.81);
+        super::mp_gpu_tests::gpu_or_skip(&probe)?;
+    }
+    let mut r = Runner::new(proto(&text), Path::new("."), None, Some(gpu)).unwrap();
+    assert_eq!(r.gpu.is_some(), gpu, "{}", r.log.join("\n"));
+    run_to_end(&mut r);
+    let k = column(&r, "v (m/s)");
+    Some(r.rows.iter().map(|row| (row[0], row[k])).collect())
+}
+
+#[test]
+fn a_uniform_sponge_damps_the_flow_as_exp_minus_t_over_tau() {
+    // l'éponge (τ = 0.1 s) amortit toutes les vitesses d'un même facteur exp(−t/τ) — rapporté au même tourbillon sans éponge, que le
+    // schéma amortit un peu de lui-même ; le pas de 1 ms (implicite) donne 1 % de plus au bout de 0.2 s
+    for gpu in [false, true] {
+        let (Some(free), Some(damped)) = (sponge_vortex("", gpu), sponge_vortex("éponge partout temps 0.1 s", gpu)) else {
+            return;
+        };
+        let what = if gpu { "GPU" } else { "CPU" };
+        assert_eq!(free.len(), damped.len());
+        for (f, d) in free.iter().zip(&damped).skip(1) {
+            let got = (d.1 / damped[0].1) / (f.1 / free[0].1);
+            let want = (-f.0 / 0.1).exp();
+            eprintln!("{what} : t = {:.2} s, rapport {got:.4} pour exp(−t/τ) = {want:.4}", f.0);
+            assert!((got / want - 1.0).abs() < 0.03, "{what} : t = {} s, vitesse ramenée à {got} au lieu de {want}", f.0);
+        }
+    }
+}
+
+/// bassin de 1.2 m, 10 cm d'eau : (temps, eau au-dessus de 10 cm entre 0.3 et 0.4 m) après une bosse d'eau lâchée contre le bord gauche
+fn sponge_basin(sponge: &str, hump: bool) -> Vec<(f64, f64, f64)> {
+    let text = format!(
+        "départ scénario \"Cuve vide\" grille 120 x 25 maille 1 cm
+remplir rect (0, 0) (1.2, 0.1) avec \"eau\" à 20 °C
+{}
+{sponge}
+mesurer toutes les 20 ms : masse \"eau\" dans rect (0.3, 0.1) (0.4, 0.25) comme \"sonde\", max vitesse dans partout comme \"v\"
+simuler {}
+",
+        if hump { "remplir rect (0, 0.1) (0.15, 0.13) avec \"eau\" à 20 °C" } else { "" },
+        if hump { "3 s" } else { "0.5 s" }
+    );
+    let r = run(&text, None);
+    let (k, v) = (column(&r, "sonde (kg/m)"), column(&r, "v (m/s)"));
+    r.rows.iter().map(|row| (row[0], row[k], row[v])).collect()
+}
+
+#[test]
+fn a_sponge_leaves_water_at_rest_alone_and_absorbs_the_waves_that_reach_it() {
+    let sponge = "éponge rect (0.7, 0) (1.2, 0.25) temps 0.1 s";
+    // au repos : l'éponge n'amortit que la vitesse, l'équilibre hydrostatique reste tel quel — à quelques 1e-8 m/s près (1e-11 sans
+    // éponge ; ce reste croît un peu avec le taux, 3e-9 m/s à τ = 1 s, 5e-8 à 0.01 s, et ne grandit pas avec le temps)
+    let (still, still_sp) = (sponge_basin("", false), sponge_basin(sponge, false));
+    let vmax = |r: &[(f64, f64, f64)]| r.iter().map(|x| x.2).fold(0.0, f64::max);
+    eprintln!("eau au repos : vitesse max {:.3e} m/s sans éponge, {:.3e} avec", vmax(&still), vmax(&still_sp));
+    assert!(vmax(&still_sp) < 1e-6 && vmax(&still) < 1e-6, "eau au repos : {} m/s avec l'éponge, {} sans", vmax(&still_sp), vmax(&still));
+    // une bosse d'eau lâchée au bord gauche : ses vagues courent vers la droite ; contre un mur elles reviennent, dans l'éponge
+    // (0.5 m, la moitié de la longueur d'onde des plus longues) elles s'amortissent — l'eau qui oscille à la sonde après leur
+    // retour (de 1.5 à 3 s) : écart-type 0.36 kg/m avec un mur, 0.13 avec l'éponge (0.06 dans un bassin trois fois plus long)
+    let spread = |r: &[(f64, f64, f64)]| {
+        let s: Vec<f64> = r.iter().filter(|x| x.0 >= 1.5).map(|x| x.1).collect();
+        let m = s.iter().sum::<f64>() / s.len() as f64;
+        (s.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / s.len() as f64).sqrt()
+    };
+    let (wall, sp) = (spread(&sponge_basin("", true)), spread(&sponge_basin(sponge, true)));
+    eprintln!("vagues réfléchies à la sonde : écart-type {wall:.3} kg/m contre un mur, {sp:.3} avec l'éponge");
+    assert!(sp < 0.5 * wall, "l'éponge réfléchit les vagues : {sp} contre {wall} pour un mur");
+}

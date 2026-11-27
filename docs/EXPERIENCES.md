@@ -127,6 +127,7 @@ d'expérience.
 | `grille <zone> [trous d] [ouverte f]` | grille qui arrête les grains (trous de 1 cm, 60 % ouverte par défaut) |
 | `téléporteur <zone> vers (x, y) [v] [rayon r]` | les mailles de la zone aspirent à v (0.5 m/s par défaut) ; le fluide absorbé (composition, température) ressort avec le même débit volumique sur le disque de rayon r (0 par défaut : la seule maille) autour de (x, y). Plusieurs téléporteurs vers la même destination mélangent leurs fluides. La destination est dans le domaine, hors des solides et des autres cellules spéciales (une zone qui la couvre la laisse libre). CPU et GPU |
 | `pompe <zone> (vx, vy)` (ou `compresseur …`) | pompe à débit volumique fixé : la vitesse vx est imposée sur les faces verticales des mailles fluides de la zone, vy sur leurs faces horizontales ; la zone est un conduit fermé sur ses côtés, que le fluide traverse à ce débit quoi qu'il arrive — en aval fermé, un gaz se comprime (compresseur). `pompe <zone> (0, 0)` la retire. CPU et GPU |
+| `éponge <zone> [temps τ] [vers (vx, vy)] [uniforme]` | COUCHE ÉPONGE (bord absorbant) : dans les mailles fluides de la zone, la vitesse est ramenée vers le repos (ou vers (vx, vy), pour un courant) par une force −σ (u − u_cible), implicite (stable à tout pas). Le taux σ monte en rampe, ((d + 1) / (d_max + 1))² / τ, depuis l'entrée de la zone (ses mailles voisines du fluide hors de la zone, d = 0) jusqu'au fond (τ = 0.1 s par défaut) ; `uniforme` : 1/τ partout, de même pour une zone sans entrée (qui couvre tout le fluide). Les vagues et les ondes de pression qui y entrent s'y amortissent au lieu de se réfléchir sur le bord : posée contre un mur ou un bord ouvert, c'est une plage numérique (bac à houle, explosion à l'air libre). Elle n'agit que sur la vitesse : l'eau au repos le reste (à 1e-7 m/s près). Réglage : τ d'un cinquième à un dixième de la période des ondes, une zone d'au moins une longueur d'onde — les vagues d'une bosse d'eau lâchée dans un bassin de 10 cm d'eau reviennent d'une éponge de 0.5 m avec un quart de la hauteur que renvoie un mur, d'une éponge de 1 m avec un dixième ; une éponge uniforme (un saut de taux) en renvoie plus. Elle freine aussi un écoulement moyen (perte de charge ρ σ u par mètre de zone) : `vers (vx, vy)` pour le laisser passer. Exemple : `experiences/plage.exp` (bassin à houle à came et sa plage). CPU et GPU |
 | `vanne <zone> [fermée \| ouverte [f \| n %]]` | vanne à guillotine (fermée par défaut) : le long du plus grand côté de la zone, la part ouverte (fraction f de 0 à 1, ou n %) de ses rangées, depuis la gauche ou le bas, laisse passer l'écoulement ; les autres mailles ont leurs faces fermées et gardent leur fluide. À répéter pour l'ouvrir ou la fermer en cours d'expérience, par exemple `toutes les 0.2 s : vanne … ouverte` et `toutes les 0.2 s à partir de 0.1 s : vanne … fermée`. CPU et GPU |
 | `bord gauche\|droite\|bas\|haut mur` | paroi |
 | `bord … ouvert [p]` | ouvert à la pression p (1 atm par défaut) au point le plus haut du bord ; le fluide du dehors qui y entre a pour pression totale celle du dehors (p − ½ ρ v² à la face) |
@@ -308,7 +309,7 @@ Composants fournis (`experiences/composants/` ; leurs paramètres et leurs noms 
 | `soupape.exp` | soupape de sécurité à deux seuils, sur une lumière et un capteur donnés | `soupape.exp` |
 | `paliers.exp` | une suite d'actions : chauffe par paliers de consigne croissante, compteur de paliers en variable | `rampe.exp` |
 | `roue_a_aubes.exp` | roue à aubes sur son arbre, menée ou libre (volant, frein) ; ses colonnes | `moulin.exp` (libre, sous un jet), `agitateur.exp` (menée, balayage de la vitesse) |
-| `excentrique.exp` | came excentrique et poussoir (deux pièces en formules) ; ses colonnes | `came.exp` (batteur à houle) |
+| `excentrique.exp` | came excentrique et poussoir (deux pièces en formules) ; ses colonnes | `came.exp` (batteur à houle), `plage.exp` (bassin à houle et sa plage) |
 
 ## 4. La fenêtre d'expérience
 
@@ -321,7 +322,8 @@ Composants fournis (`experiences/composants/` ; leurs paramètres et leurs noms 
 - **Onglet « Conditions initiales »**, comme les pinceaux de la fenêtre multiphasique :
   - remplir, solide (passif, isotherme, chauffant), corps rigide (disque au clic, rectangle tiré : ligne `corps`), température,
     effacer, allumer, et toutes les cellules spéciales : puits, émetteur, grille, vanne (ouverture réglable), pompe, accélérateur
-    (ligne `accélérer`, qui agit dès le départ), téléporteur (destination choisie d'un clic sur l'image) ;
+    (ligne `accélérer`, qui agit dès le départ), téléporteur (destination choisie d'un clic sur l'image), éponge (temps
+    d'amortissement au fond ; ligne `éponge`, avec sa rampe) ;
   - le corps est fixe, à mouvement imposé (vitesse, rotation, oscillation de période donnée) ou libre (vitesse et rotation de
     départ, masse volumique propre, rebond, frottement, axes bloqués), éventuellement sur un pivot au milieu d'un côté de sa boîte
     (sur un pivot, seule la rotation compte), à sa température propre ou à celle du fluide ;

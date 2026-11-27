@@ -11,7 +11,8 @@
 //! créée / détruite est inscrite dans `boundary_flux` : le bilan M_k(t) − M_k(0) = flux_k reste exact. Dans la matrice de pression
 //! elles sont des conditions de Dirichlet (δp = 0) : elles ne perturbent pas le champ de pression voisin.
 //!
-//! Accélérateur : accélération de volume ajoutée aux faces (comme la gravité). Solide thermique : `ThermalCell`.
+//! Accélérateur : accélération de volume ajoutée aux faces (comme la gravité). Couche éponge : force de volume −σ (u − u_cible) sur
+//! les faces, qui ramène l'écoulement au repos (bord absorbant). Solide thermique : `ThermalCell`.
 
 use std::collections::HashMap;
 
@@ -42,10 +43,16 @@ pub enum MpEffect {
     /// verticales, vy sur les horizontales — d'où un débit volumique fixé à travers la zone, fermée sur ses côtés ; en aval fermé, la
     /// pression monte. Son fluide reste et la traverse.
     Pump { vx: f64, vy: f64 },
+    /// couche éponge (bord absorbant) : ramène la vitesse du fluide vers (ux, uy) m/s — le repos, le plus souvent — au taux `rate`
+    /// (1/s) : force de volume −rate (u − u_cible), implicite (stable à tout pas). Elle n'agit que sur la vitesse : un fluide au repos,
+    /// à l'équilibre hydrostatique, ne la sent pas. Une vague ou une onde de pression qui y entre s'y amortit au lieu de se
+    /// réfléchir sur le bord ; le protocole pose une rampe (taux faible à l'entrée de la zone, 1/τ au fond), un saut de taux
+    /// réfléchissant lui-même les ondes.
+    Sponge { rate: f64, ux: f64, uy: f64 },
 }
 
 impl MpEffect {
-    pub const KINDS: [&'static str; 7] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille", "Vanne", "Pompe"];
+    pub const KINDS: [&'static str; 8] = ["Puits", "Émetteur", "Accélérateur", "Téléporteur", "Grille", "Vanne", "Pompe", "Éponge"];
     pub fn kind_name(&self) -> &'static str {
         match self {
             MpEffect::Sink { .. } => "Puits",
@@ -55,6 +62,7 @@ impl MpEffect {
             MpEffect::Grille { .. } => "Grille",
             MpEffect::Valve => "Vanne",
             MpEffect::Pump { .. } => "Pompe",
+            MpEffect::Sponge { .. } => "Éponge",
         }
     }
 }
@@ -521,6 +529,49 @@ impl MultiphaseSim {
                 }
                 if cnt > 0.0 && !self.is_solid(self.idx(i, j - 1)) && !self.is_solid(self.idx(i, j)) {
                     vs[j * nx + i] += dt * sum / cnt;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- couches éponges
+    /// Ajoute aux faces d'une couche éponge dt × (−σ (u − u_cible)), implicite : −σ dt (u − u_cible) / (1 + σ dt), avec u la vitesse
+    /// du début du pas (`self.u`, `self.v`) — seule, la vitesse devient (u + σ dt u_cible) / (1 + σ dt), stable à tout pas ; au repos,
+    /// rien ne change (l'équilibre hydrostatique non plus : la gravité n'est pas amortie). Une face prend la moyenne de ses deux
+    /// mailles, 0 pour une maille hors de l'éponge (le taux monte d'une demi-maille à l'entrée de la zone).
+    pub(crate) fn add_sponges(&self, dt: f64, us: &mut [f64], vs: &mut [f64]) {
+        if !self.special.iter().any(|s| matches!(s, Some(MpEffect::Sponge { .. }))) {
+            return;
+        }
+        let (nx, ny) = (self.nx, self.ny);
+        // (σ, σ ux, σ uy) de la maille
+        let sp = |c: usize| -> [f64; 3] {
+            match self.special[c] {
+                Some(MpEffect::Sponge { rate, ux, uy }) if !self.is_solid(c) => [rate, rate * ux, rate * uy],
+                _ => [0.0; 3],
+            }
+        };
+        let damp = |u: f64, a: [f64; 3], b: [f64; 3], k: usize| -> f64 {
+            let s = 0.5 * (a[0] + b[0]);
+            -dt * (s * u - 0.5 * (a[k] + b[k])) / (1.0 + s * dt)
+        };
+        for j in 0..ny {
+            for i in 1..nx {
+                let (a, b) = (self.idx(i - 1, j), self.idx(i, j));
+                let (sa, sb) = (sp(a), sp(b));
+                if sa[0] + sb[0] > 0.0 && !self.is_solid(a) && !self.is_solid(b) {
+                    let f = j * (nx + 1) + i;
+                    us[f] += damp(self.u[f], sa, sb, 1);
+                }
+            }
+        }
+        for j in 1..ny {
+            for i in 0..nx {
+                let (a, b) = (self.idx(i, j - 1), self.idx(i, j));
+                let (sa, sb) = (sp(a), sp(b));
+                if sa[0] + sb[0] > 0.0 && !self.is_solid(a) && !self.is_solid(b) {
+                    let f = j * nx + i;
+                    vs[f] += damp(self.v[f], sa, sb, 2);
                 }
             }
         }

@@ -18,7 +18,7 @@ Constantes : R = 8.314 J/(mol·K) ; σ_SB = 5.670374e-8 W/(m²·K⁴) ; g = 9.81
 | Loi | Forme | À quoi elle sert |
 |---|---|---|
 | Masse de chaque phase | ∂m_k/∂t + ∇·(m_k u) = sources (changement d'état, réactions, cellules spéciales) | transport de chaque fluide et des grains ; les masses sont les variables conservées, à l'arrondi près |
-| Quantité de mouvement du mélange (Navier–Stokes compressible) | ρ (∂u/∂t + u·∇u) = −∇p + ∇·[μ (∇u + ∇uᵀ)] + ρ g + f_σ + accélérateurs | une seule vitesse par maille pour toutes les phases qui s'y trouvent |
+| Quantité de mouvement du mélange (Navier–Stokes compressible) | ρ (∂u/∂t + u·∇u) = −∇p + ∇·[μ (∇u + ∇uᵀ)] + ρ g + f_σ + accélérateurs − ρ σ (u − u_cible) (éponges) | une seule vitesse par maille pour toutes les phases qui s'y trouvent |
 | Énergie interne, par groupe de phases | ∂e_g/∂t + ∇·(e_g u) = ∇·(k ∇T) − p ∇·u + échanges + sources | une température par groupe miscible (air, eau, huile… ont chacun la leur) |
 | Fermeture volumique | Σ_k m_k / ρ_k(p, T_k) + α_corps = 1 dans chaque maille | c'est elle qui fixe la pression : le fluide remplit exactement la maille (`mp_pressure.rs`) |
 | Fractions volumiques | α_k = (m_k/ρ_k) / Σ_j (m_j/ρ_j) | dérivées des masses, jamais transportées seules |
@@ -133,6 +133,7 @@ Chaque maille a une seule pression (équilibre mécanique) et, par groupe de pha
 | Grille | faces fermées au mélange, le fluide passe par percolation (Ergun, trous de taille d) | sole d'un foyer, tamis |
 | Vanne | faces fermées sur la part fermée, le fluide reste | vanne à guillotine, réglable de 0 à 100 % |
 | Pompe (compresseur) | vitesse imposée sur les faces de la zone : débit volumique fixé | pompe, compresseur (en aval fermé, la pression monte) |
+| Couche éponge | force de volume −σ (u − u_cible) aux faces (σ moyenne des deux mailles, 0 hors de l'éponge), implicite : −σ dt (u_n − u_cible) / (1 + σ dt) avec u_n la vitesse du début du pas — seule, la vitesse devient (u_n + σ dt u_cible) / (1 + σ dt) ; la pesanteur n'est pas amortie, l'équilibre hydrostatique reste. Taux en rampe quadratique depuis l'entrée de la zone | bord absorbant : plage d'un bac à houle, ondes de pression d'une explosion à l'air libre (vitesses amorties en exp(−σ t) à 1 % près, CPU et GPU) |
 
 ## 10. Méthodes mathématiques et numériques
 

@@ -121,9 +121,10 @@ EXPERIENCES.md (protocoles).
 
 ### Cellules spéciales
 - [M] Existent : puits, émetteur, accélérateur, téléporteur, grille, vanne à guillotine (fermée, ouverte, ouverture en fraction ou
-  en %), pompe / compresseur ; toutes posables par protocole et au pinceau dans la fenêtre d'expérience (vanne et pompe aussi dans
-  la fenêtre multiphasique). Une porte sur charnière se fait avec un corps libre sur pivot (clapet, SOLID.md) ; une soupape de
-  sécurité ou un thermostat tout ou rien, avec deux règles `quand` aux seuils écartés (`experiences/soupape.exp`). À ajouter :
+  en %), pompe / compresseur, couche éponge ; toutes posables par protocole et au pinceau dans la fenêtre d'expérience (vanne,
+  pompe et éponge aussi dans la fenêtre multiphasique). Une porte sur charnière se fait avec un corps libre sur pivot (clapet,
+  SOLID.md) ; une soupape de sécurité ou un thermostat tout ou rien, avec deux règles `quand` aux seuils écartés
+  (`experiences/soupape.exp`). À ajouter :
 - [M] Régulateur proportionnel (PI) : puissance de chauffe ou ouverture de vanne qui suit l'écart d'une sonde à sa consigne, au lieu
   du tout ou rien des règles `quand` — bain-marie, couveuse, débit régulé.
 - [M] Clapet anti-retour en mailles : faces qui ne laissent passer l'écoulement que dans un sens (le clapet sur pivot existe, mais
@@ -134,8 +135,6 @@ EXPERIENCES.md (protocoles).
   Q/Q_max)), au lieu du débit fixé de la pompe : le débit s'ajuste aux pertes du circuit.
 - [M] Membrane sélective : faces ouvertes à une seule phase — évent qui laisse passer le gaz et retient le liquide, filtre qui
   retient une poudre.
-- [M] Couche éponge (bord absorbant) : mailles qui ramènent doucement la vitesse au repos, pour que vagues et ondes de pression ne
-  se réfléchissent pas sur les bords (bac à vagues, explosion à l'air libre).
 - [M] Chauffe-fluide à puissance imposée (W/m³ dans le fluide : résistance plongée, effet Joule, micro-ondes) : « chauffer » vise
   une température ; une puissance connue sert aux essais de convection à flux imposé (Rayleigh–Bénard).
 - [M] Trémie : émetteur de grains à débit massique et à fraction choisie (sablier, charbon qui alimente un feu) ; l'émetteur
@@ -294,6 +293,10 @@ détail dans les documents de conception et l'historique git.
   "…" angle "…"` (crémaillère, came, pendule) ; un vilebrequin est un mécanisme (ses roues tournent avec lui) ; relevés `mécanisme
   "X" …` ; exemples `engrenages.exp`, `moulin.exp` et `agitateur.exp` (composant `roue_a_aubes.exp`), `came.exp` (composant
   `excentrique.exp`) ; pendule en formules à 2e-5 près de sa période.
+- Cellules spéciales : couche éponge `éponge <zone> [temps τ] [vers (vx, vy)] [uniforme]` (bord absorbant : vitesse ramenée vers le
+  repos par −σ (u − u_cible), implicite, σ en rampe depuis l'entrée de la zone jusqu'à 1/τ au fond ; l'eau au repos le reste, à
+  1e-7 m/s près) : les vagues d'une bosse d'eau reviennent d'une éponge de 0.5 m avec un quart de la hauteur que renvoie un mur,
+  un dixième sur 1 m ; exemple `experiences/plage.exp` (bassin à houle et sa plage) ; CPU et GPU, au pinceau dans les deux fenêtres.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

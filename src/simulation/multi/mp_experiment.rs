@@ -634,6 +634,9 @@ pub enum Action {
     Valve { zone: Zone, open: f64 },
     /// pompe (compresseur) : vitesse `v` imposée sur les faces des mailles fluides de la zone
     Pump { zone: Zone, v: [f64; 2] },
+    /// couche éponge (bord absorbant) sur les mailles fluides de la zone : la vitesse y est ramenée vers `target` au taux 1/`tau` au
+    /// fond de la zone, en rampe depuis son entrée (voir `sponge_rates`) ou partout (`uniform`)
+    Sponge { zone: Zone, tau: f64, target: [f64; 2], uniform: bool },
     /// téléporteur : les mailles de la zone aspirent à `speed` m/s ; le fluide absorbé (composition, température) ressort avec le même
     /// débit volumique sur le disque de rayon `radius` (m, arrondi en mailles ; 0 : la seule maille) autour de `dest`
     Teleporter { zone: Zone, dest: [f64; 2], speed: f64, radius: f64 },
@@ -704,6 +707,7 @@ impl Action {
             | Action::Grille { zone, .. }
             | Action::Valve { zone, .. }
             | Action::Pump { zone, .. }
+            | Action::Sponge { zone, .. }
             | Action::Teleporter { zone, .. }
             | Action::Field { zone, .. } => Some(zone),
             Action::Periodic { action, .. } | Action::When { action, .. } => action.zone(),
@@ -1425,6 +1429,20 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             sim.refresh();
             Ok(n)
         }
+        Action::Sponge { zone, tau, target, uniform } => {
+            // mailles fluides sans autre effet ; une éponge déjà posée est remplacée
+            let cs: Vec<usize> = cells(sim, zone)
+                .into_iter()
+                .map(|(i, j)| sim.idx(i, j))
+                .filter(|&c| !sim.is_solid(c) && matches!(sim.special[c], None | Some(MpEffect::Sponge { .. })))
+                .collect();
+            let rates = sponge_rates(sim, &cs, 1.0 / tau, *uniform);
+            for (&c, rate) in cs.iter().zip(rates) {
+                sim.special[c] = Some(MpEffect::Sponge { rate, ux: target[0], uy: target[1] });
+            }
+            sim.refresh();
+            Ok(cs.len())
+        }
         Action::Teleporter { zone, dest, speed, radius } => {
             let (lx, ly) = (sim.nx as f64 * sim.dx, sim.ny as f64 * sim.dx);
             if !(dest[0] >= 0.0 && dest[0] < lx && dest[1] >= 0.0 && dest[1] < ly) {
@@ -1582,6 +1600,50 @@ fn add_wheel(sim: &mut MultiphaseSim, s: &WheelSpec) -> Result<usize, String> {
 
 fn no_mechanism(name: &str) -> String {
     format!("aucun mécanisme ne s'appelle « {name} » : il faut d'abord sa ligne « mécanisme \"{name}\" » (ou « vilebrequin … nom \"{name}\" »)")
+}
+
+/// Taux d'amortissement (1/s) des mailles `cs` d'une couche éponge : `s_max` au fond, en rampe quadratique depuis l'entrée de la
+/// zone — ses mailles voisines d'une maille fluide hors de la zone, d'où la distance d (en mailles) de chacune, par un parcours en
+/// largeur dans la zone : σ = s_max ((d + 1) / (d_max + 1))². Une vague qui y entre s'amortit peu à peu au lieu de rebondir sur un
+/// saut de taux. Uniforme sur demande, ou si la zone n'a pas d'entrée (elle couvre tout le fluide, ou n'est bordée que de solides et
+/// des bords du domaine).
+pub(crate) fn sponge_rates(sim: &MultiphaseSim, cs: &[usize], s_max: f64, uniform: bool) -> Vec<f64> {
+    let (nx, ny) = (sim.nx, sim.ny);
+    let mut inz = vec![false; nx * ny];
+    for &c in cs {
+        inz[c] = true;
+    }
+    let nbrs = |c: usize| {
+        let (i, j) = (c % nx, c / nx);
+        [(i > 0).then(|| c - 1), (i + 1 < nx).then(|| c + 1), (j > 0).then(|| c - nx), (j + 1 < ny).then(|| c + nx)].into_iter().flatten()
+    };
+    let mut d = vec![usize::MAX; nx * ny];
+    let mut queue = std::collections::VecDeque::new();
+    for &c in cs {
+        if nbrs(c).any(|m| !inz[m] && !sim.is_solid(m)) {
+            d[c] = 0;
+            queue.push_back(c);
+        }
+    }
+    if uniform || queue.is_empty() {
+        return vec![s_max; cs.len()];
+    }
+    while let Some(c) = queue.pop_front() {
+        for m in nbrs(c) {
+            if inz[m] && d[m] == usize::MAX {
+                d[m] = d[c] + 1;
+                queue.push_back(m);
+            }
+        }
+    }
+    // (une part de la zone séparée de l'entrée par un solide : le taux du fond)
+    let dmax = cs.iter().map(|&c| d[c]).filter(|&x| x != usize::MAX).max().unwrap_or(0);
+    cs.iter()
+        .map(|&c| {
+            let x = (d[c].min(dmax) as f64 + 1.0) / (dmax as f64 + 1.0);
+            s_max * x * x
+        })
+        .collect()
 }
 
 fn effect(sim: &mut MultiphaseSim, zone: &Zone, e: MpEffect) -> Result<usize, String> {
@@ -3758,6 +3820,13 @@ fn describe(a: &Action) -> String {
         Action::Emitter { zone, fluid, .. } => format!("émetteur de « {fluid} » {}", zone.label()),
         Action::Grille { zone, .. } => format!("grille {}", zone.label()),
         Action::Pump { zone, v } => format!("pompe {} à {} m/s", zone.label(), fmt_point(*v)),
+        Action::Sponge { zone, tau, target, uniform } => format!(
+            "éponge {} temps {} s{}{}",
+            zone.label(),
+            fmt_num(*tau),
+            if *target == [0.0, 0.0] { String::new() } else { format!(" vers {} m/s", fmt_point(*target)) },
+            if *uniform { ", uniforme" } else { "" }
+        ),
         Action::Teleporter { zone, dest, speed, radius } => {
             format!("téléporteur {} vers {} ({} m/s, rayon {} m)", zone.label(), fmt_point(*dest), fmt_num(*speed), fmt_num(*radius))
         }

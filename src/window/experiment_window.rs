@@ -48,10 +48,11 @@ enum CiTool {
     Pump,
     Accelerator,
     Teleporter,
+    Sponge,
 }
 
 impl CiTool {
-    const ALL: [CiTool; 13] = [
+    const ALL: [CiTool; 14] = [
         CiTool::Fill,
         CiTool::Solid,
         CiTool::Body,
@@ -65,6 +66,7 @@ impl CiTool {
         CiTool::Pump,
         CiTool::Accelerator,
         CiTool::Teleporter,
+        CiTool::Sponge,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -81,6 +83,7 @@ impl CiTool {
             CiTool::Pump => "Pompe / compresseur (débit imposé)",
             CiTool::Accelerator => "Accélérateur (force de volume)",
             CiTool::Teleporter => "Téléporteur (aspire ici, rejette ailleurs)",
+            CiTool::Sponge => "Éponge (bord absorbant : vagues et ondes amorties)",
         }
     }
 }
@@ -184,6 +187,7 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
   pompe <zone> (0.5, 0) m/s   (débit volumique fixé à travers la zone ; en aval fermé, compresseur ; (0, 0) la retire)
+  éponge <zone> [temps 0.1 s] [vers (vx, vy) m/s] [uniforme]   (bord absorbant : la vitesse ramenée au repos, en rampe jusqu'à 1/τ au fond)
   téléporteur <zone> vers (x, y) [0.5 m/s] [rayon 2 cm]   (aspire dans la zone, rejette le même débit autour de (x, y))
   bord gauche|droite|bas|haut  mur | ouvert [p] | entrée (vx, vy) [à T] [\"fluide\"] | sortie (vx, vy)   (vitesse vers l'extérieur)
   champ T|vx|vy|fraction \"eau\"|solide \"acier\"  fichier \"f.csv|f.png\" [origine haut|bas] [valeurs a b]
@@ -280,6 +284,8 @@ pub struct ExperimentWindow {
     valve_open: f64,
     pump_v: [f64; 2],
     acc_a: [f64; 2],
+    /// éponge : temps d'amortissement au fond de la zone (s)
+    sponge_tau: f64,
     /// téléporteur : destination (m, choisie d'un clic sur l'image quand `tp_picking`), aspiration (m/s), rayon de la destination
     /// (mailles)
     tp_dest: Option<[f64; 2]>,
@@ -378,6 +384,7 @@ impl ExperimentWindow {
             valve_open: 0.0,
             pump_v: [0.5, 0.0],
             acc_a: [0.0, 20.0],
+            sponge_tau: 0.1,
             tp_dest: None,
             tp_picking: false,
             tp_speed: 0.5,
@@ -759,6 +766,7 @@ impl ExperimentWindow {
                     ("accélérer", "accélérer rect (0, 0) (0.1, 0.05) de (5, 0) m/s² pendant 0.5 s"),
                     ("vitesse", "vitesse rect (0, 0) (0.1, 0.05) (1, 0) m/s"),
                     ("bord", "bord haut ouvert"),
+                    ("éponge", "éponge rect (0.8, 0) (1, 0.3) temps 0.1 s"),
                     ("sauver état", "sauver état \"etat\""),
                     ("sauver image", "sauver image \"image\" température"),
                     ("images", "images toutes les 50 ms phases"),
@@ -959,6 +967,10 @@ impl ExperimentWindow {
                 ui.add(egui::Slider::new(&mut self.pump_v[1], -5.0..=5.0).text("Vitesse y (m/s)"));
                 ui.weak("Débit volumique imposé à travers la zone, fermée sur ses côtés ; en aval fermé, la pression monte (compresseur). (0, 0) retire la pompe.");
             }
+            CiTool::Sponge => {
+                ui.add(egui::Slider::new(&mut self.sponge_tau, 0.001..=10.0).logarithmic(true).text("Temps d'amortissement au fond (s)"));
+                ui.weak("Ramène l'écoulement au repos : les vagues et les ondes de pression qui y entrent s'y amortissent au lieu de se réfléchir sur le bord. Le taux monte en rampe depuis l'entrée de la zone jusqu'à 1/τ au fond ; un fluide au repos ne la sent pas. Pour des vagues : τ d'un cinquième de leur période environ, une zone d'au moins une longueur d'onde.");
+            }
             CiTool::Accelerator => {
                 ui.add(egui::Slider::new(&mut self.acc_a[0], -50.0..=50.0).text("Accélération x (m/s²)"));
                 ui.add(egui::Slider::new(&mut self.acc_a[1], -50.0..=50.0).text("Accélération y (m/s²)"));
@@ -1137,6 +1149,11 @@ impl ExperimentWindow {
             },
             CiTool::Pump => format!("pompe {z} {} m/s", fmt_point(Self::rounded(self.pump_v))),
             CiTool::Accelerator => format!("accélérer {z} de {} m/s²", fmt_point(Self::rounded(self.acc_a))),
+            CiTool::Sponge => {
+                // (trois chiffres significatifs)
+                let m = 10f64.powf(self.sponge_tau.log10().floor() - 2.0);
+                format!("éponge {z} temps {} s", fmt_num((self.sponge_tau / m).round() * m))
+            }
             CiTool::Teleporter => match self.tp_dest {
                 Some(d) => {
                     let dx = self.shown().map_or(0.01, |s| s.dx);
@@ -1836,8 +1853,17 @@ mod tests {
         assert_eq!(w.text.lines().count(), lines);
         paint(&mut w, CiTool::Teleporter, (30, 2), (31, 3));
         assert!(w.text.contains("téléporteur rect (0.3, 0.02) (0.32, 0.04) vers (0.305, 0.205) 0.5 m/s rayon 0.02 m"), "{}", w.text);
+        // éponge : 2 × 2 mailles, toutes à l'entrée de la zone (entourées de fluide) : le taux du fond, 1/τ
+        w.sponge_tau = 0.1;
+        paint(&mut w, CiTool::Sponge, (34, 2), (35, 3));
+        assert!(w.text.contains("éponge rect (0.34, 0.02) (0.36, 0.04) temps 0.1 s"), "{}", w.text);
+        let s = w.preview.as_ref().unwrap();
+        assert!(matches!(s.special[s.idx(34, 2)], Some(MpEffect::Sponge { rate, .. }) if (rate - 10.0).abs() < 1e-12), "{:?}", s.special[s.idx(34, 2)]);
         assert!(w.errors.is_empty(), "{:?}\n{}", w.errors, w.text);
-        assert_eq!([count(&w, "Puits"), count(&w, "Émetteur"), count(&w, "Grille"), count(&w, "Vanne"), count(&w, "Pompe")], [4, 4, 4, 2, 4]);
+        assert_eq!(
+            [count(&w, "Puits"), count(&w, "Émetteur"), count(&w, "Grille"), count(&w, "Vanne"), count(&w, "Pompe"), count(&w, "Éponge")],
+            [4, 4, 4, 2, 4, 4]
+        );
         let s = w.preview.as_ref().unwrap();
         let dst = s.idx(30, 20);
         let tp: Vec<MpEffect> = s.special.iter().filter_map(|e| *e).filter(|e| e.kind_name() == "Téléporteur").collect();

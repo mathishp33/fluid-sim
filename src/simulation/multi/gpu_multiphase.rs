@@ -268,6 +268,7 @@ pub struct MultiphaseGpu {
     pub adapter_name: String,
     // état statique (recalculé à chaque envoi)
     has_extras: bool,
+    /// accélérateurs ou couches éponges (`k_accel`)
     has_accel: bool,
     has_thermal: bool,
     ntp: usize,
@@ -334,7 +335,8 @@ impl MultiphaseGpu {
         sl.add("pfu", nfu);
         sl.add("pfv_on", nfv);
         sl.add("pfv", nfv);
-        for name in ["acc_on", "acc_x", "acc_y", "th_kind", "th_val", "heat_t", "ovl"] {
+        // (éponges : σ, σ ux, σ uy de la maille)
+        for name in ["acc_on", "acc_x", "acc_y", "sp_r", "sp_x", "sp_y", "th_kind", "th_val", "heat_t", "ovl"] {
             sl.add(name, n);
         }
         // faces suivies par les mesures de débit (`watch_faces`) : emplacement + 1, 0 pour aucune
@@ -946,6 +948,7 @@ impl MultiphaseGpu {
         let (o_solid, o_pk, o_pp, o_pt, o_ptp) = (o("solid"), o("pin_kind"), o("pin_phase"), o("pin_temp"), o("pin_tp"));
         let (o_acc_on, o_ax, o_ay, o_thk, o_thv, o_ht, o_ovl) = (o("acc_on"), o("acc_x"), o("acc_y"), o("th_kind"), o("th_val"), o("heat_t"), o("ovl"));
         let (o_grd, o_gre) = (o("grl_d"), o("grl_e"));
+        let (o_spr, o_spx, o_spy) = (o("sp_r"), o("sp_x"), o("sp_y"));
         self.has_accel = false;
         self.has_thermal = false;
         let mut ovl = vec![0u32; n];
@@ -971,6 +974,12 @@ impl MultiphaseGpu {
                     s[o_acc_on + c] = 1.0;
                     s[o_ax + c] = ax as f32;
                     s[o_ay + c] = ay as f32;
+                    self.has_accel = true;
+                }
+                if let Some(MpEffect::Sponge { rate, ux, uy }) = sim.special[c] {
+                    s[o_spr + c] = rate as f32;
+                    s[o_spx + c] = (rate * ux) as f32;
+                    s[o_spy + c] = (rate * uy) as f32;
                     self.has_accel = true;
                 }
             } else {
@@ -999,6 +1008,7 @@ impl MultiphaseGpu {
                 Some(MpEffect::Grille { .. }) => ovl[c] = col(0x9a, 0x9a, 0xa0) + 1,
                 Some(MpEffect::Valve) => ovl[c] = col(0xd0, 0x80, 0x30) + 1,
                 Some(MpEffect::Pump { .. }) => ovl[c] = col(0xff, 0xc0, 0x00) + 1,
+                Some(MpEffect::Sponge { .. }) => ovl[c] = col(0x30, 0xa0, 0x90) + 1,
                 Some(MpEffect::Teleporter { dest, radius, .. }) => {
                     ovl[c] = col(0, 0, 0xff) + 1;
                     if dest < n {
