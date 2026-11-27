@@ -189,11 +189,13 @@ TEMPS, MESURES, SORTIES
   simuler 1 s · simuler jusqu'à 3 s · pause · marque \"texte\" · sauver état \"nom\" · sauver image \"nom\" [température | vitesse | …]
   images toutes les 50 ms [phases | température | vitesse | …]   (série d'images PNG dans images-<affichage>/)
   simuler jusqu'à ce que max T dans partout < 400 K [ou corps 1 y < 5 cm] [au plus 10 s]   (relevé comme une mesure ; < <= > >= ; et | ou)
+  attendre 0.5 s · attendre jusqu'à 2 s · attendre que T en (0.1, 0.1) > 350 K [au plus 5 s]   (comme « simuler »)
+  tant que <condition> [au plus 10 s]   puis ses lignes, puis   fin   (boucle : condition relevée à chaque tour ; relevé « temps »)
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
   quand p en (0.15, 0.1) > 104 kPa [et | ou …] : <action>   (règle : faite chaque fois que la condition devient vraie ; aussi « pause »)
   mesurer toutes les 10 ms : stats, T en (x, y), moyenne|max|min|somme <grandeur> dans <zone>, masse \"eau\" [dans <zone>] [comme \"nom\"]
-     grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur
+     grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur ; temps (temps simulé, pour les conditions)
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
      corps 1 fx|fy|couple contact|loi|total   (force des contacts, de la loi en formule, ou bilan avec le poids : M a d'un corps libre)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
@@ -1595,7 +1597,7 @@ impl ExperimentWindow {
                     self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230))
                 }
                 Measure::Flux { a, b, .. } => self.draw_zone(painter, rect, &Zone::Trait { pts: vec![*a, *b], r: 0.0 }, Color32::from_rgb(60, 220, 230)),
-                Measure::Stats | Measure::Body { .. } => {}
+                Measure::Stats | Measure::Body { .. } | Measure::Time { .. } => {}
             }
         }
     }

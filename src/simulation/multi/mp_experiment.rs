@@ -247,6 +247,8 @@ pub enum Measure {
     /// débit volumique (m²/s) ou massique (`mass`, kg/(m·s)) d'un fluide pur, ou de tous, à travers le segment horizontal ou vertical
     /// (a, b), le long des faces des mailles ; positif vers +x (segment vertical) ou +y (horizontal)
     Flux { fluid: Option<String>, mass: bool, a: [f64; 2], b: [f64; 2], label: Option<String> },
+    /// temps simulé (s), surtout pour les conditions (`tant que temps < 2 s`, `quand temps > 1 s et …`)
+    Time { label: Option<String> },
 }
 
 /// Force mesurée sur un corps : celle du fluide (pression et frottement), des contacts, d'une loi en formule, ou leur somme avec
@@ -627,6 +629,11 @@ pub enum Step {
     /// avance jusqu'à ce que les comparaisons `clauses` soient toutes vraies (`any` : l'une d'elles), vérifiées après chaque pas (ou
     /// chaque série de pas du GPU), au plus pendant `limit` secondes si elle est donnée
     UntilCond { clauses: Vec<Clause>, any: bool, limit: Option<f64> },
+    /// boucle « tant que <condition> [au plus d] » : la condition est relevée à chaque tour ; vraie, les étapes du corps sont faites,
+    /// jusqu'au « fin » (étape `end`) qui ramène au test ; fausse (ou la durée `limit` écoulée depuis l'entrée), on passe après `end`
+    While { clauses: Vec<Clause>, any: bool, limit: Option<f64>, end: usize },
+    /// « fin » d'une boucle : retour à son test (étape `start`)
+    EndWhile { start: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -660,13 +667,20 @@ impl Protocol {
     /// durée simulée prévue (fin du dernier « simuler »), pour la barre de progression
     pub fn planned_end(&self, t0: f64) -> f64 {
         let mut t = t0;
-        for (s, _) in &self.steps {
-            match s {
+        let mut k = 0;
+        while k < self.steps.len() {
+            match &self.steps[k].0 {
                 Step::Simulate(d) => t += d,
                 Step::Until(u) => t = t.max(*u),
                 Step::UntilCond { limit, .. } => t += limit.unwrap_or(0.0),
-                Step::Do(_) => {}
+                // boucle bornée : sa durée permise (son corps est sauté) ; sinon son corps compté une fois
+                Step::While { limit: Some(d), end, .. } => {
+                    t += d;
+                    k = *end;
+                }
+                Step::Do(_) | Step::While { .. } | Step::EndWhile { .. } => {}
             }
+            k += 1;
         }
         t
     }
@@ -1086,6 +1100,7 @@ enum ProbeKind {
     /// valeur interpolée en un point ; `cells` : la maille qui le contient
     Point(QtyR, [f64; 2]),
     Mass(usize),
+    Time,
     Body(usize, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
@@ -1415,6 +1430,7 @@ impl Probe {
         match self.kind {
             ProbeKind::Flux { .. } => unreachable!(),
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
+            ProbeKind::Time => sim.time,
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Point(q, p) => point_value(sim, q, p, self.cells[0], self.fluid_only),
@@ -1494,6 +1510,15 @@ struct Periodic {
     count: usize,
 }
 
+/// boucle « tant que » : instant d'entrée, tours faits, tours de suite sans que le temps avance, instant du dernier test
+#[derive(Default)]
+struct LoopState {
+    since: f64,
+    turns: usize,
+    idle: usize,
+    last: f64,
+}
+
 /// règle « quand » en cours : condition, action, condition vraie au dernier relevé, nombre de fois où l'action a été faite
 struct WhenRule {
     cond: Cond,
@@ -1530,6 +1555,9 @@ pub struct Runner {
     periodic: Vec<Periodic>,
     /// règles « quand … : … »
     when: Vec<WhenRule>,
+    /// boucles « tant que » (par indice de leur étape) ; `loop_back` : le « fin » de cette boucle vient d'être passé (sinon on y entre)
+    loops: std::collections::HashMap<usize, LoopState>,
+    loop_back: Option<usize>,
     /// journal muet (répétitions au-delà de la troisième)
     quiet: bool,
     probes: Vec<Probe>,
@@ -1592,6 +1620,8 @@ impl Runner {
             timed: vec![],
             periodic: vec![],
             when: vec![],
+            loops: std::collections::HashMap::new(),
+            loop_back: None,
             quiet: false,
             probes: vec![],
             stats: false,
@@ -1636,7 +1666,7 @@ impl Runner {
         }
         for (s, _) in &self.proto.steps {
             let clauses = match s {
-                Step::UntilCond { clauses, .. } | Step::Do(Action::When { clauses, .. }) => clauses,
+                Step::UntilCond { clauses, .. } | Step::While { clauses, .. } | Step::Do(Action::When { clauses, .. }) => clauses,
                 _ => continue,
             };
             for c in clauses {
@@ -1719,6 +1749,9 @@ impl Runner {
         let (nx, ny, dx) = (self.sim.nx, self.sim.ny, self.sim.dx);
         Ok(Some(match m {
             Measure::Stats => return Ok(None),
+            Measure::Time { label } => {
+                (Probe { kind: ProbeKind::Time, cells: vec![], fluid_only: false }, label.clone().unwrap_or_else(|| "temps".into()), "s".to_string())
+            }
             Measure::Probe { q, reduce, zone, label } => {
                 let qr = match q {
                     Quantity::T => QtyR::T,
@@ -1815,6 +1848,12 @@ impl Runner {
             self.line = line;
             match step {
                 Step::Do(_) => self.run_actions(),
+                Step::While { clauses, any, limit, end } => self.loop_test(line, &clauses, any, limit, end),
+                Step::EndWhile { start } => {
+                    // fin du corps : retour au test de la boucle
+                    self.loop_back = Some(start);
+                    self.pc = start;
+                }
                 Step::Simulate(d) => {
                     self.start_sampling();
                     self.target = Some(self.sim.time + d);
@@ -1983,6 +2022,69 @@ impl Runner {
         }
     }
 
+    /// une règle « quand » ou une répétition de cette ligne du protocole est déjà en place (ligne repassée dans une boucle)
+    fn registered(&self, line: usize) -> bool {
+        self.when.iter().any(|w| w.cond.line == line) || self.periodic.iter().any(|p| p.line == line)
+    }
+
+    /// Test d'une boucle « tant que » (étape `pc`) : vraie, on entre dans son corps ; fausse, ou sa durée permise écoulée depuis
+    /// l'entrée, on passe après son « fin » (étape `end`). Le journal note les trois premiers tours et la sortie. Une boucle qui
+    /// tourne sans que le temps avance (corps dont les attentes sont déjà atteintes) arrête l'expérience.
+    fn loop_test(&mut self, line: usize, clauses: &[Clause], any: bool, limit: Option<f64>, end: usize) {
+        let k = self.pc;
+        let back = self.loop_back.take() == Some(k);
+        let mut parts = vec![];
+        for cl in clauses {
+            match self.make_probe(&cl.measure) {
+                Ok(Some((probe, name, unit))) => parts.push(CondClause { probe, cmp: cl.cmp, value: cl.value, name, unit, last: None, far: None }),
+                Ok(None) => return self.fail(format!("ligne {line} : une condition porte sur un relevé, pas sur « stats »")),
+                Err(e) => return self.fail(format!("ligne {line} : {e}")),
+            }
+        }
+        self.sync_host();
+        let cond = Cond { clauses: parts, any, line, near: false };
+        let xs = cond.values(&self.sim);
+        let now = self.sim.time;
+        let eps = 1e-12 * (1.0 + now.abs());
+        let st = self.loops.entry(k).or_default();
+        if back {
+            st.idle = if now <= st.last + eps { st.idle + 1 } else { 0 };
+            st.last = now;
+        } else {
+            *st = LoopState { since: now, turns: 0, idle: 0, last: now };
+        }
+        let (since, idle) = (st.since, st.idle);
+        if idle > 1000 {
+            return self.fail(format!(
+                "ligne {line} : la boucle « tant que » tourne sans que le temps avance (ses attentes sont déjà atteintes) : il faut qu'elle simule ou attende à chaque tour"
+            ));
+        }
+        let over = limit.is_some_and(|d| now >= since + d - eps);
+        let holds = cond.holds(&xs);
+        let text = format!("{} ({})", cond.text(), cond.values_text(&xs));
+        if holds && !over {
+            let st = self.loops.get_mut(&k).unwrap();
+            st.turns += 1;
+            let n = st.turns;
+            if n <= 3 {
+                self.note(format!("ligne {line} : tant que {text} — tour {n}"));
+            } else if n == 4 {
+                self.note(format!("ligne {line} : tours suivants non notés au journal"));
+            }
+            self.pc += 1;
+        } else {
+            let n = self.loops.get(&k).map_or(0, |s| s.turns);
+            let why = if holds { format!(" (au bout des {} s permises)", fmt_num(limit.unwrap_or(0.0))) } else { String::new() };
+            let tours = match n {
+                0 => "aucun tour".to_string(),
+                1 => "fini après 1 tour".to_string(),
+                n => format!("fini après {n} tours"),
+            };
+            self.note(format!("ligne {line} : tant que {text} — {tours}{why}"));
+            self.pc = end + 1;
+        }
+    }
+
     /// Règles « quand » après un pas : l'action d'une règle est faite si sa condition, fausse au relevé précédent, est vraie (le
     /// journal note les trois premières fois). Une pause arrête la tournée (les règles suivantes sont relevées au pas suivant).
     fn check_when(&mut self) {
@@ -2076,6 +2178,7 @@ impl Runner {
                     self.note(format!("ligne {line} : pause"));
                     self.state = RunState::Paused(format!("pause du protocole (ligne {line})"));
                 }
+                Action::Periodic { .. } | Action::When { .. } if line > 0 && self.registered(line) => {}
                 Action::Periodic { period, start, end, action } => {
                     // (période infinie : action datée « à t : … », faite une fois)
                     let once = period.is_infinite();

@@ -11,6 +11,8 @@ EXPERIENCES.md (protocoles).
 ## 1. Prioritaire
 
 ### Organisation et interface
+- [M] Protocoles : `si <condition> … sinon … fin`, `répéter n fois … fin`, règle `quand` en bloc (plusieurs lignes, avec des
+  attentes, déroulées en parallèle du protocole).
 
 ### Bords du domaine
 - [M] Plus de types de bords : périodiques, sortie convective. Existent : bord ouvert à pression imposée (hydrostatique de
@@ -258,6 +260,10 @@ détail dans les documents de conception et l'historique git.
   aussi `pause`) : soupape de sécurité (`experiences/soupape.exp` : pression tenue entre 102.2 et 104.1 kPa, au lieu de monter de
   49 kPa/s), thermostat tout ou rien. CPU et GPU au même pas : le GPU relève pas à pas près d'un seuil (tendance prise aussi depuis
   le relevé le plus éloigné, qu'une sonde qui oscille ne trompe pas) et après chaque action ; les conditions d'arrêt en profitent.
+- Protocoles : boucles `tant que <condition> [au plus d]` … `fin` (imbriquées ; le corps doit faire avancer le temps, une boucle
+  qui tourne sans que le temps avance arrête l'expérience), `attendre <durée> | jusqu'à <t> | [que] <condition> [au plus d]`,
+  relevé `temps` ; une règle ou une répétition écrite dans une boucle n'est posée qu'une fois ; exemple `experiences/bachees.exp`
+  (vidange par bâchées).
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

@@ -1,0 +1,24 @@
+# Vidange par bâchées : un réservoir d'eau se vide dans le bassin du dessous par une vanne de 2 cm, ouverte 0.2 s puis fermée
+# 0.3 s, tant qu'il y reste plus de 4 kg (par mètre de profondeur ; il en contient 19 au départ). Boucle « tant que … fin »,
+# attentes « attendre », bornée à 4 s par « au plus ».
+#   fluid-sim experience experiences/bachees.exp
+
+départ scénario "Cuve vide" grille 40 x 40 maille 1 cm
+
+# réservoir d'acier ouvert en haut, vanne fermée dans son fond, rempli d'eau sur 12 cm
+solide rect (0.11, 0.21) (0.29, 0.37) "acier"
+effacer rect (0.12, 0.22) (0.28, 0.37)
+effacer rect (0.19, 0.21) (0.21, 0.22)
+vanne rect (0.19, 0.21) (0.21, 0.22) fermée
+remplir rect (0.12, 0.22) (0.28, 0.34) avec "eau" à 20 °C
+
+mesurer toutes les 20 ms : masse "eau" dans rect (0.12, 0.22) (0.28, 0.37) comme "réservoir", masse "eau" dans rect (0, 0) (0.4, 0.21) comme "bassin"
+
+tant que masse "eau" dans rect (0.12, 0.22) (0.28, 0.37) > 4 au plus 4 s
+    vanne rect (0.19, 0.21) (0.21, 0.22) ouverte
+    attendre 0.2 s
+    vanne rect (0.19, 0.21) (0.21, 0.22) fermée
+    attendre 0.3 s
+fin
+marque "réservoir presque vide"
+attendre 0.5 s

@@ -390,6 +390,7 @@ impl<'a> P<'a> {
             Measure::Probe { reduce: Reduce::Sum, .. } | Measure::Mass { .. } | Measure::SolidForce { .. } | Measure::Flux { .. } | Measure::Stats => {
                 Dim::Plain
             }
+            Measure::Time { .. } => Dim::Time,
             Measure::Probe { q, .. } => match q {
                 Quantity::T => Dim::Temp,
                 Quantity::P => Dim::Pressure,
@@ -544,6 +545,7 @@ impl<'a> P<'a> {
         };
         let mut m = match (w.as_str(), reduce) {
             ("stats" | "statistiques", _) => Measure::Stats,
+            ("temps", _) => Measure::Time { label: None },
             ("masse", _) => {
                 let fluid = self.string("le fluide")?;
                 let zone = if self.eat_w("dans") { self.zone()? } else { Zone::Partout };
@@ -631,7 +633,8 @@ impl<'a> P<'a> {
                 | Measure::Mass { label, .. }
                 | Measure::Body { label, .. }
                 | Measure::SolidForce { label, .. }
-                | Measure::Flux { label, .. } => *label = Some(l),
+                | Measure::Flux { label, .. }
+                | Measure::Time { label } => *label = Some(l),
                 Measure::Stats => return self.err("« comme » ne s'applique pas à « stats »"),
             }
         }
@@ -669,6 +672,21 @@ fn condition(p: &mut P) -> R<(Vec<Clause>, bool)> {
         any = Some(link);
     }
     Ok((clauses, any.unwrap_or(false)))
+}
+
+/// [au plus <durée>] après une condition
+fn opt_limit(p: &mut P) -> R<Option<f64>> {
+    if !p.eat_w("au") {
+        return Ok(None);
+    }
+    if !p.eat_w("plus") {
+        return p.err(format!("il faut « au plus <durée> »{}", p.here()));
+    }
+    let d = p.quantity(Dim::Time, "la durée maximale")?;
+    if !(d > 0.0) {
+        return p.err("la durée maximale doit être positive");
+    }
+    Ok(Some(d))
 }
 
 /// action après « : » d'une action datée, répétée ou d'une règle « quand » (`pause_ok` : une pause est permise, pour « quand »)
@@ -852,19 +870,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                     return p.err(format!("il faut « jusqu'à ce que <relevé> < <valeur> »{}", p.here()));
                 }
                 let (clauses, any) = condition(p)?;
-                let limit = if p.eat_w("au") {
-                    if !p.eat_w("plus") {
-                        return p.err(format!("il faut « au plus <durée> »{}", p.here()));
-                    }
-                    let d = p.quantity(Dim::Time, "la durée maximale")?;
-                    if !(d > 0.0) {
-                        return p.err("la durée maximale doit être positive");
-                    }
-                    Some(d)
-                } else {
-                    None
-                };
-                Step::UntilCond { clauses, any, limit }
+                Step::UntilCond { clauses, any, limit: opt_limit(p)? }
             } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
             } else {
@@ -876,6 +882,42 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             };
             p.end()?;
             proto.steps.push((step, ln));
+        }
+        "attendre" => {
+            // attendre <durée> | jusqu'à <instant> | [que | jusqu'à ce que] <condition> [au plus <durée>] — comme « simuler »
+            let step = if matches!(p.peek(), Some(Tok::N(_))) {
+                let d = p.quantity(Dim::Time, "la durée à attendre")?;
+                if !(d >= 0.0) {
+                    return p.err("la durée doit être positive");
+                }
+                Step::Simulate(d)
+            } else if (p.eat_w("jusqua") || p.eat_w("jusque")) && !p.eat_w("ce") {
+                Step::Until(p.quantity(Dim::Time, "l'instant à atteindre")?)
+            } else {
+                p.eat_w("que");
+                let (clauses, any) = condition(p)?;
+                Step::UntilCond { clauses, any, limit: opt_limit(p)? }
+            };
+            p.end()?;
+            proto.steps.push((step, ln));
+        }
+        "tant" => {
+            // tant que <condition> [au plus <durée>] … fin — boucle (les liens entre « tant que » et « fin » sont posés par `parse`)
+            if !p.eat_w("que") {
+                return p.err(format!("il faut « tant que <condition> »{}", p.here()));
+            }
+            let (clauses, any) = condition(p)?;
+            let limit = opt_limit(p)?;
+            p.end()?;
+            proto.steps.push((Step::While { clauses, any, limit, end: usize::MAX }, ln));
+        }
+        "fin" => {
+            // fin [tant que] : ferme la boucle ouverte la plus récente
+            if p.eat_w("tant") && !p.eat_w("que") {
+                return p.err("il faut « fin » ou « fin tant que »");
+            }
+            p.end()?;
+            proto.steps.push((Step::EndWhile { start: usize::MAX }, ln));
         }
         "remplir" => {
             let zone = p.zone()?;
@@ -1400,7 +1442,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
-                 calcul, matériaux, balayage, toutes les, à, quand)"
+                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin)"
             ))
         }
     }
@@ -1411,6 +1453,9 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
 pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, Vec<ScriptError>> {
     let mut proto = Protocol { source: text.to_string(), variant, ..Default::default() };
     let mut errs = vec![];
+    // boucles « tant que » ouvertes : (indice de leur étape, ligne) ; usize::MAX pour une ligne « tant que » mal écrite (son « fin »
+    // la ferme sans autre erreur)
+    let mut open: Vec<(usize, usize)> = vec![];
     for (k, l) in text.lines().enumerate() {
         let ln = k + 1;
         let toks = match tokenize(l, ln) {
@@ -1424,8 +1469,39 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
             continue;
         }
         let mut p = P { t: &toks, i: 0, ln };
+        let n0 = proto.steps.len();
         if let Err(e) = parse_line(&mut p, &mut proto) {
+            if matches!(toks.first(), Some(Tok::W(w, _)) if w == "tant") {
+                open.push((usize::MAX, ln));
+            }
             errs.push(e);
+        }
+        for s in n0..proto.steps.len() {
+            match proto.steps[s].0 {
+                Step::While { .. } => open.push((s, ln)),
+                Step::EndWhile { .. } => match open.pop() {
+                    Some((usize::MAX, _)) => {}
+                    Some((w, wl)) => {
+                        let advances = proto.steps[w + 1..s].iter().any(|(st, _)| matches!(st, Step::Simulate(_) | Step::Until(_) | Step::UntilCond { .. }));
+                        if !advances {
+                            errs.push(ScriptError { line: wl, msg: "le corps d'une boucle « tant que » doit faire avancer le temps (simuler, attendre)".into() });
+                        }
+                        if let Step::While { end, .. } = &mut proto.steps[w].0 {
+                            *end = s;
+                        }
+                        if let Step::EndWhile { start } = &mut proto.steps[s].0 {
+                            *start = w;
+                        }
+                    }
+                    None => errs.push(ScriptError { line: ln, msg: "« fin » sans « tant que » ouvert".into() }),
+                },
+                _ => {}
+            }
+        }
+    }
+    for (w, wl) in open {
+        if w != usize::MAX {
+            errs.push(ScriptError { line: wl, msg: "« tant que » sans son « fin »".into() });
         }
     }
     if proto.start.is_none() && errs.is_empty() {
@@ -1527,7 +1603,7 @@ pub fn insert_initial_line(text: &str, line: &str) -> (String, usize) {
         .iter()
         .position(|l| {
             let first: String = strip_comment(l).trim_start().chars().take_while(|c| c.is_alphabetic()).collect();
-            matches!(norm(&first).as_str(), "simuler" | "avancer")
+            matches!(norm(&first).as_str(), "simuler" | "avancer" | "attendre" | "tant")
         })
         .unwrap_or(lines.len());
     // pas de ligne vide en trop à la fin

@@ -1325,6 +1325,104 @@ fn when_rules_make_a_safety_valve_that_holds_the_pressure_of_a_pumped_vessel() {
     assert!(pmax_g < 104.5e3 && pmin_g > 101.5e3, "GPU : pression entre {pmin_g} et {pmax_g} Pa");
 }
 
+/// déroule un protocole jusqu'au bout, ou jusqu'à son échec (sans paniquer) : le message d'échec
+fn run_until_failure(r: &mut Runner) -> Option<String> {
+    loop {
+        match r.advance(Duration::from_secs(3600)).clone() {
+            RunState::Running => {}
+            RunState::Paused(_) => r.resume(),
+            RunState::Finished => return None,
+            RunState::Failed(e) => return Some(e),
+        }
+    }
+}
+
+#[test]
+fn a_while_loop_repeats_its_body_and_wait_waits_for_a_time_or_a_condition() {
+    // disque lâché à 25 cm : « tant que y > 10 cm » attend 20 ms par tour — y(0.16 s) = 12.4 cm, y(0.18 s) = 9.1 cm : 9 tours,
+    // sortie à 0.18 s pile ; puis « attendre » une condition (y < 5 cm à t = √(0.4 m / g) ≈ 0.2019 s), un instant, une durée
+    let text = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+corps disque (0.15, 0.25) rayon 1 cm \"acier\" libre
+mesurer toutes les 0.1 s : temps comme \"horloge\", corps 1 y
+tant que corps 1 y > 10 cm
+    attendre 20 ms
+    marque \"tour\"
+fin
+marque \"sorti\"
+attendre que corps 1 y < 5 cm
+marque \"bas\"
+attendre jusqu'à 0.3 s
+attendre 10 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let marks = |r: &Runner, what: &str| -> Vec<f64> { r.log.iter().filter(|l| l.contains(&format!("repère « {what} »"))).map(|l| log_time(l)).collect() };
+    let (tours, sorti, bas) = (marks(&r, "tour"), marks(&r, "sorti"), marks(&r, "bas"));
+    eprintln!("tant que : tours à {tours:?}, sortie à {sorti:?}, « bas » à {bas:?}");
+    assert!(tours.len() == 9 && tours.iter().enumerate().all(|(k, &t)| (t - 0.02 * (k + 1) as f64).abs() < 1e-9), "{tours:?}\n{}", r.log.join("\n"));
+    assert!(sorti.len() == 1 && (sorti[0] - 0.18).abs() < 1e-9, "{sorti:?}");
+    let expect = (0.4 / 9.81f64).sqrt();
+    assert!(bas.len() == 1 && bas[0] >= expect - 2e-4 && bas[0] < expect + 5e-3, "{bas:?} pour {expect}");
+    assert!((r.sim.time - 0.31).abs() < 1e-9, "fin à {}", r.sim.time);
+    assert!(r.log.iter().any(|l| l.contains("ligne 4 : tant que corps 1 y > 0.1 m") && l.contains("fini après 9 tours")), "{}", r.log.join("\n"));
+    // le relevé « temps » redonne l'instant du relevé
+    let c = r.columns.iter().position(|c| c == "horloge (s)").unwrap();
+    assert!(r.rows.len() >= 3 && r.rows.iter().all(|row| row[c] == row[0]), "{:?}", r.rows);
+
+    // boucles imbriquées, « au plus » ; une règle écrite dans une boucle n'est posée qu'une fois
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+tant que temps < 0.1 s
+    quand temps > 0.02 s : marque \"règle\"
+    tant que temps < 0.05 s
+        attendre 10 ms
+    fin
+    attendre 20 ms
+fin
+tant que temps > 0 au plus 50 ms
+    attendre 20 ms
+fin tant que
+";
+    // fin prévue (barre de progression) : corps d'une boucle sans borne compté une fois (10 + 20 ms), boucle bornée pour sa durée
+    // permise (50 ms)
+    assert!((proto(text).planned_end(0.0) - 0.08).abs() < 1e-12, "{}", proto(text).planned_end(0.0));
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    let count = |pat: &[&str]| r.log.iter().filter(|l| pat.iter().all(|p| l.contains(p))).count();
+    assert!((r.sim.time - 0.17).abs() < 1e-9, "fin à {}\n{log}", r.sim.time);
+    assert_eq!(count(&["ligne 2 : tant que temps < 0.1 s", "fini après 3 tours"]), 1, "{log}");
+    assert_eq!(count(&["ligne 4 : tant que temps < 0.05 s", "fini après 5 tours"]), 1, "{log}");
+    assert_eq!(count(&["ligne 4 : tant que temps < 0.05 s", "aucun tour"]), 2, "{log}");
+    assert_eq!(count(&["ligne 9 : tant que temps > 0 s", "fini après 3 tours", "au bout des 0.05 s permises"]), 1, "{log}");
+    assert_eq!(count(&["ligne 3 : quand temps > 0.02 s"]), 2, "règle posée une fois (plus son bilan) :\n{log}");
+    assert_eq!(marks(&r, "règle").len(), 1, "{log}");
+
+    // lecture : erreurs
+    for (bad, line, what) in [
+        ("tant que temps < 1 s\nmarque \"x\"\nfin", 2, "faire avancer le temps"),
+        ("fin", 2, "sans « tant que »"),
+        ("tant que temps < 1 s\nattendre 1 ms", 2, "sans son « fin »"),
+        ("tant temps < 1 s\nattendre 1 ms\nfin", 2, "il faut « tant que"),
+        ("toutes les 1 s : tant que temps < 1 s", 2, "une seule action"),
+        ("quand temps > 1 s : attendre 1 ms", 2, "une seule action"),
+        ("attendre", 2, "mesure"),
+        ("attendre que temps < 1 s au plus 0 s", 2, "positive"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e.len() == 1 && e[0].line == line && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // une boucle dont les attentes sont déjà atteintes arrête l'expérience au lieu de tourner sans fin
+    let p = proto("départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm\ntant que temps < 1 s\n    attendre jusqu'à 0.02 s\nfin\n");
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    let e = run_until_failure(&mut r).expect("la boucle aurait dû arrêter l'expérience");
+    assert!(e.contains("sans que le temps avance") && (r.sim.time - 0.02).abs() < 1e-9, "{e}");
+    // un geste de la fenêtre s'inscrit avant la première ligne qui fait avancer le temps : simuler, attendre ou tant que
+    for first in ["tant que temps < 1 s\n    attendre 0.1 s\nfin", "attendre 0.1 s", "simuler 0.1 s"] {
+        let (t, n) = insert_initial_line(&format!("départ scénario \"cuve vide\"\nremplir partout avec \"air\"\n{first}\n"), "solide rect (0, 0) (0.1, 0.1) \"acier\"");
+        assert!(n == 3 && t.lines().nth(2) == Some("solide rect (0, 0) (0.1, 0.1) \"acier\""), "{t}");
+    }
+}
+
 #[test]
 fn the_fluid_force_on_solid_cells_is_archimedes_and_the_hydrostatic_thrust() {
     // bloc de mailles solides entouré d'eau au repos : poussée d'Archimède ρ g A vers le haut, rien de côté ; muret qui retient

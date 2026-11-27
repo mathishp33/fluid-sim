@@ -173,6 +173,8 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 | `simuler d` | avance de la durée d |
 | `simuler jusqu'à t` | avance jusqu'au temps simulé t |
 | `simuler jusqu'à ce que <relevé> < \| <= \| > \| >= <seuil> [et \| ou …] [au plus d]` | avance jusqu'à ce que le relevé franchisse le seuil (≤ et ≥ s'écrivent aussi) : le relevé s'écrit comme une mesure (`T en (x, y)`, `max T dans <zone>`, `masse "eau" dans <zone>`, `corps 1 y`…), le seuil dans son unité (`400 K`, `20 °C`, `2 bar`, `30` pour un angle en degrés). Plusieurs comparaisons se relient par `et` (toutes vraies) ou par `ou` (l'une d'elles), sans mélanger les deux (pas de parenthèses) : `simuler jusqu'à ce que max T dans partout > 400 K ou corps 1 y < 5 cm`. Vérifié après chaque pas (sur le GPU, après chaque série de pas, puis pas à pas près du seuil) ; le journal note l'instant et les valeurs. `au plus d` borne la durée (sinon, aucune limite) |
+| `attendre d` · `attendre jusqu'à t` · `attendre [que \| jusqu'à ce que] <condition> [au plus d]` | comme `simuler d`, `simuler jusqu'à t` et `simuler jusqu'à ce que <condition> [au plus d]`, en plus lisible dans une boucle : `attendre 0.2 s`, `attendre que T en (0.1, 0.1) > 350 K` |
+| `tant que <condition> [au plus d]` … `fin` | BOUCLE : la condition (écrite comme pour `simuler jusqu'à ce que`) est relevée à chaque tour ; vraie, les lignes jusqu'au `fin` sont faites, puis on revient au test ; fausse, ou la durée d écoulée depuis l'entrée dans la boucle, on continue après le `fin`. Les boucles s'imbriquent (chaque `fin`, ou `fin tant que`, ferme la plus récente). Le corps doit faire avancer le temps (`simuler`, `attendre`) ; une boucle qui tourne sans que le temps avance (attentes déjà atteintes) arrête l'expérience. Une règle `quand` ou une répétition écrite dans le corps n'est posée qu'une fois. Le journal note les trois premiers tours et la sortie. Exemple : `experiences/bachees.exp` (vidange par bâchées : vanne ouverte 0.2 s, fermée 0.3 s, tant que le réservoir n'est pas vide) |
 | `toutes les T [à partir de t0] [jusqu'à t1] : <action>` (ou `chaque T …`) | action RÉPÉTÉE en parallèle du déroulement : toute action d'une ligne (remplir, chauffer … pendant d, accélérer, bord …, solide, effacer, corps, marque, sauver état…), faite à t0 (sinon à l'instant où la ligne est atteinte), puis toutes les T, jusqu'à t1 (sinon jusqu'à la fin), chaque fois à l'heure pile (le pas s'arrête sur ses échéances). Une vanne : `toutes les 0.2 s : bord bas sortie (0, -0.05)` et `toutes les 0.2 s à partir de 0.1 s : bord bas mur`. Le journal note les trois premières fois, puis le nombre de fois à la fin. Pas de répétition d'une répétition, ni de `simuler`, `mesurer` ou `pause` |
 | `à t : <action>` | action DATÉE : faite une fois, à l'instant t pile, en parallèle du déroulement (comme une répétition qui ne se répète pas) ; c'est ainsi que la fenêtre inscrit les gestes faits pendant une expérience. Un instant déjà passé quand la ligne est atteinte : faite tout de suite, et notée au journal |
 | `quand <relevé> < \| <= \| > \| >= <seuil> [et \| ou …] : <action>` | RÈGLE, en parallèle du déroulement dès que sa ligne est atteinte : l'action (une action d'une ligne, comme pour `toutes les`, ou `pause`) est faite chaque fois que la condition DEVIENT vraie, relevée après chaque pas (relevés et seuils s'écrivent comme pour `simuler jusqu'à ce que`) ; tout de suite si elle l'est déjà quand la ligne est atteinte. Deux règles aux seuils écartés font une hystérésis — soupape de sécurité : `quand p en (x, y) > 104 kPa : vanne … ouverte` et `quand p en (x, y) < 102 kPa : vanne … fermée` (`experiences/soupape.exp`) ; thermostat tout ou rien : `quand T en (x, y) < 340 K : chauffer … à 360 K pendant 0.5 s`. Le journal note les trois premières fois, puis le nombre de fois à la fin. CPU et GPU, au même pas : le GPU relève pas à pas près d'un seuil et après chaque action |
@@ -198,6 +200,7 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
   - `moyenne | max | min | somme <grandeur> dans <zone>` : la somme est une intégrale (× dx², par mètre de profondeur) ;
     les grandeurs du fluide ignorent les mailles solides, T les compte ;
   - `masse "fluide" [dans <zone>]` : en kg par mètre de profondeur ;
+  - `temps` : le temps simulé (s), surtout pour les conditions (`tant que temps < 2 s`, `quand temps > 1 s et …`) ;
   - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple | température` : position (m), angle (°), vitesse (m/s, °/s) du
     n-ième corps posé, force du fluide sur lui (pression et frottement, N/m ; couple autour de son centre de masse, N) à la dernière
     projection, ou sa température (K). `fx`, `fy` et `couple` peuvent être suivis de `contact` (bords, solides et autres corps,
@@ -315,9 +318,9 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 
 ## 7. Limites et suites
 
-- Pas de boucles d'étapes (« répéter 3 fois … »), hormis le balayage : les répétitions (`toutes les T : <action>`) portent sur
-  une action, en parallèle du déroulement. Une condition d'arrêt (`simuler jusqu'à ce que …`) relie ses comparaisons par « et » ou
-  par « ou », pas les deux à la fois : il n'y a pas de parenthèses.
+- Les boucles d'étapes sont des `tant que <condition> … fin` ; pas encore de `répéter n fois`, de `si … sinon … fin`, ni de règle
+  `quand` en bloc (plusieurs lignes, avec des attentes). Les répétitions (`toutes les T : <action>`) et les règles portent sur une
+  action. Une condition relie ses comparaisons par « et » ou par « ou », pas les deux à la fois : il n'y a pas de parenthèses.
 - Une ligne de débit est horizontale ou verticale (elle suit les faces des mailles) ; un débit à travers une ligne oblique se
   mesure en ligne brisée, par plusieurs mesures.
 - La commande `corps` pose des corps fixes, à mouvement imposé ou libres. Exemples : `experiences/piston.exp`,
