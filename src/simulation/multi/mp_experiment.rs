@@ -256,6 +256,8 @@ pub enum Measure {
     Time { label: Option<String> },
     /// variable du protocole (indice dans `Protocol::vars`)
     Var { var: usize, label: Option<String> },
+    /// grandeur d'un vilebrequin (indice à partir de 0, dans l'ordre de pose)
+    Crank { index: usize, q: CrankQty, label: Option<String> },
 }
 
 /// Force mesurée sur un corps : celle du fluide (pression et frottement), des contacts, d'une loi en formule, ou leur somme avec
@@ -277,6 +279,74 @@ impl ForcePart {
             ForcePart::Total => " total",
         }
     }
+}
+
+/// Grandeur mesurée sur un vilebrequin : angle depuis le point mort haut (°, 0 à 360), tours depuis le départ, rotation (°/s), couple
+/// des forces du fluide et des poids ramené au vilebrequin (N, par mètre de profondeur), puissance qu'il lui donne (W/m)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CrankQty {
+    Angle,
+    Turns,
+    Rotation,
+    Torque,
+    Power,
+}
+
+impl CrankQty {
+    fn name(self) -> &'static str {
+        match self {
+            CrankQty::Angle => "angle",
+            CrankQty::Turns => "tours",
+            CrankQty::Rotation => "rotation",
+            CrankQty::Torque => "couple",
+            CrankQty::Power => "puissance",
+        }
+    }
+    fn unit(self) -> &'static str {
+        match self {
+            CrankQty::Angle => "°",
+            CrankQty::Turns => "tr",
+            CrankQty::Rotation => "°/s",
+            CrankQty::Torque => "N",
+            CrankQty::Power => "W/m",
+        }
+    }
+    fn value(self, sim: &MultiphaseSim, k: usize) -> f64 {
+        let Some(c) = sim.cranks.get(k) else { return f64::NAN };
+        match self {
+            CrankQty::Angle => c.angle_deg(),
+            CrankQty::Turns => c.theta / std::f64::consts::TAU,
+            CrankQty::Rotation => c.omega.to_degrees(),
+            CrankQty::Torque => c.torque,
+            CrankQty::Power => c.torque * c.omega,
+        }
+    }
+}
+
+/// vilebrequin, bielle et piston, et peut-être leur cylindre : `vilebrequin (x, y) rayon r bielle l …`
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrankSpec {
+    pub pivot: [f64; 2],
+    pub r: f64,
+    pub l: f64,
+    /// direction de l'axe du cylindre depuis l'axe du vilebrequin (°)
+    pub axis_deg: f64,
+    /// alésage (largeur du piston ; 2r par défaut) et hauteur du piston (r par défaut), m
+    pub bore: Option<f64>,
+    pub piston_h: Option<f64>,
+    /// angle de départ depuis le point mort haut (°)
+    pub angle_deg: f64,
+    /// cylindre à poser : (longueur de la chambre au point mort haut, épaisseur des parois), m
+    pub cylinder: Option<(Option<f64>, Option<f64>)>,
+    pub material: String,
+    /// libre (moteur) ; sinon mené à `omega`
+    pub free: bool,
+    /// rotation imposée, ou de départ (rad/s)
+    pub omega: f64,
+    /// inertie du volant (kg·m par mètre de profondeur) et couple appliqué (formule en t, angle, tours, rotation ; N)
+    pub inertia: f64,
+    pub load: Option<String>,
+    pub temp: Option<f64>,
 }
 
 /// Grandeur mesurée sur un corps rigide.
@@ -551,6 +621,8 @@ pub enum Action {
     Periodic { period: f64, start: Option<f64>, end: Option<f64>, action: Box<Action> },
     /// variable du protocole (indice dans `Protocol::vars`) : `soit n = <valeur>`
     Let { var: usize, value: LetValue },
+    /// vilebrequin, bielle, piston (et cylindre)
+    Crank(CrankSpec),
     /// action aux valeurs calculées (`{…}`, formules `calcs` dans l'ordre) : ses mots `toks` sont relus avec les valeurs de l'instant
     /// chaque fois qu'elle est faite ; `check` : la même lue avec ces valeurs à 1 (noms vérifiés au départ)
     Deferred { toks: Vec<super::mp_script::Tok>, calcs: Vec<Calc>, check: Box<Action> },
@@ -981,7 +1053,10 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
             Action::Emitter { fluid: f, .. } => fluid(f, *line, true, &mut errs),
             Action::Boundary { spec: BoundarySpec::Inlet { fluid: Some(f), .. }, .. } => fluid(f, *line, true, &mut errs),
             Action::Field { qty: FieldQty::Fraction(f), .. } => fluid(f, *line, false, &mut errs),
-            Action::Solid { material, .. } | Action::Body { material, .. } | Action::Field { qty: FieldQty::Solid(material), .. } => {
+            Action::Solid { material, .. }
+            | Action::Body { material, .. }
+            | Action::Crank(CrankSpec { material, .. })
+            | Action::Field { qty: FieldQty::Solid(material), .. } => {
                 if let Err(e) = find_solid(sim, material) {
                     errs.push((*line, e));
                 }
@@ -1079,6 +1154,7 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             apply_tool_with(sim, MpTool::ClearCell, &cs, &tool_opts(t_amb, MpThermal::Passive));
             Ok(cs.len())
         }
+        Action::Crank(spec) => add_crank(sim, spec, base),
         Action::Body { shape, material, angle, motion, temp } => {
             let s = find_solid(sim, material)?;
             let b = shape.body(s, *angle, temp.unwrap_or(t_amb), motion)?;
@@ -1247,6 +1323,61 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
     }
 }
 
+/// Pose un vilebrequin (`vilebrequin …`) : son cylindre s'il en faut un (parois solides le long de l'axe, culasse ; alésage d'un nombre
+/// entier de mailles, l'axe du vilebrequin recalé au milieu, pour que le piston y glisse sans fuite), puis la manivelle, la bielle et
+/// le piston
+fn add_crank(sim: &mut MultiphaseSim, spec: &CrankSpec, base: &Path) -> Result<usize, String> {
+    let mat = find_solid(sim, &spec.material)?;
+    let dx = sim.dx;
+    let axis = spec.axis_deg.to_radians();
+    let mut bore = spec.bore.unwrap_or(2.0 * spec.r);
+    let piston_h = spec.piston_h.unwrap_or(spec.r);
+    let mut pivot = spec.pivot;
+    if let Some((chamber, wall)) = spec.cylinder {
+        let q = (spec.axis_deg / 90.0).round();
+        if (spec.axis_deg - 90.0 * q).abs() > 1e-9 {
+            return Err("un cylindre suit la grille : son axe fait 0, 90, 180 ou 270°".into());
+        }
+        let cells = (bore / dx).round().max(1.0);
+        bore = cells * dx;
+        // (coordonnée en travers de l'axe : x pour un axe vertical)
+        let across = if (q as i64).rem_euclid(2) == 1 { 0 } else { 1 };
+        pivot[across] = if (cells as i64) % 2 == 0 { (pivot[across] / dx).round() * dx } else { ((pivot[across] / dx).floor() + 0.5) * dx };
+        let (c, e) = (chamber.unwrap_or(0.5 * spec.r), wall.unwrap_or(dx));
+        if !(c > 0.0 && e > 0.0) {
+            return Err("la chambre et la paroi du cylindre doivent être positives".into());
+        }
+        let (dir, nor) = ([axis.cos().round(), axis.sin().round()], [-axis.sin().round(), axis.cos().round()]);
+        let world = |along: f64, side: f64| [pivot[0] + along * dir[0] + side * nor[0], pivot[1] + along * dir[1] + side * nor[1]];
+        let (lo, hi, half) = (spec.l - spec.r, spec.l + spec.r + piston_h + c, bore / 2.0);
+        for (a0, a1, b0, b1) in [(lo, hi + e, -half - e, -half), (lo, hi + e, half, half + e), (hi, hi + e, -half - e, half + e)] {
+            let (p, q) = (world(a0, b0), world(a1, b1));
+            let zone = Zone::Rect { a: [p[0].min(q[0]), p[1].min(q[1])], b: [p[0].max(q[0]), p[1].max(q[1])] };
+            apply_action(sim, &Action::Solid { zone, material: spec.material.clone(), thermal: ThermalSpec::Passive, temp: spec.temp }, base)?;
+        }
+    }
+    let ck = super::mp_mechanism::Crank {
+        pivot,
+        r: spec.r,
+        l: spec.l,
+        axis,
+        piston_h,
+        rod_len: 0.0,
+        bodies: [0; 3],
+        theta: spec.angle_deg.to_radians(),
+        omega: spec.omega,
+        driven: (!spec.free).then_some(spec.omega),
+        inertia: spec.inertia,
+        load: spec.load.clone(),
+        torque: 0.0,
+        applied: 0.0,
+    };
+    let w = (spec.r / 3.0).max(dx);
+    let t = spec.temp.unwrap_or(sim.t_ambient);
+    sim.add_crank(ck, bore, w, mat, t)?;
+    Ok(3)
+}
+
 fn effect(sim: &mut MultiphaseSim, zone: &Zone, e: MpEffect) -> Result<usize, String> {
     let cs = zone.cells(sim.nx, sim.ny, sim.dx);
     apply_tool_with(sim, MpTool::Effect(e), &cs, &tool_opts(sim.t_ambient, MpThermal::Passive));
@@ -1276,6 +1407,7 @@ enum ProbeKind {
     Mass(usize),
     Time,
     Var(usize),
+    Crank(usize, CrankQty),
     Body(usize, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
@@ -1618,6 +1750,7 @@ impl Probe {
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
             ProbeKind::Time => sim.time,
             ProbeKind::Var(k) => vals.get(k + 1).copied().unwrap_or(f64::NAN),
+            ProbeKind::Crank(k, q) => q.value(sim, k),
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
             ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Point(q, p) => point_value(sim, q, p, self.cells[0], self.fluid_only),
@@ -1967,6 +2100,10 @@ impl Runner {
             Measure::Stats => return Ok(None),
             Measure::Time { label } => {
                 (Probe { kind: ProbeKind::Time, cells: vec![], fluid_only: false }, label.clone().unwrap_or_else(|| "temps".into()), "s".to_string())
+            }
+            Measure::Crank { index, q, label } => {
+                let name = label.clone().unwrap_or_else(|| format!("vilebrequin {} {}", index + 1, q.name()));
+                (Probe { kind: ProbeKind::Crank(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
             }
             Measure::Var { var, label } => {
                 let name = label.clone().unwrap_or_else(|| self.proto.vars.get(*var).cloned().unwrap_or_default());
@@ -3316,6 +3453,11 @@ fn describe(a: &Action) -> String {
         Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
         Action::Deferred { .. } => "action aux valeurs calculées".into(),
+        Action::Crank(c) => {
+            let how = if c.free { "libre".to_string() } else { format!("mené à {} tr/min", fmt_num(c.omega * 60.0 / std::f64::consts::TAU)) };
+            let cyl = if c.cylinder.is_some() { ", dans son cylindre" } else { "" };
+            format!("vilebrequin {} rayon {} m, bielle {} m, « {} »{cyl} — {how}", fmt_point(c.pivot), fmt_num(c.r), fmt_num(c.l), c.material)
+        }
         Action::Let { value, .. } => match value {
             LetValue::Num(v) => format!("variable = {}", fmt_num(*v)),
             LetValue::Calc(c) => format!("variable = « {} »", c.text),

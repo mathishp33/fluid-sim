@@ -1682,6 +1682,142 @@ attendre jusqu'à 3.5 ms
     assert!(e.contains("« 1/z »") && e.contains("il faut un nombre"), "{e}");
 }
 
+/// énergie cinétique (J/m) des pièces du vilebrequin k et de son volant
+fn crank_energy(s: &MultiphaseSim, k: usize) -> f64 {
+    let ck = &s.cranks[k];
+    let mut e = 0.5 * ck.inertia * ck.omega * ck.omega;
+    for &i in &ck.bodies {
+        let b = &s.bodies[i];
+        let rho = b.density(s.reg.solids[b.material].rho);
+        e += 0.5 * rho * b.shape.area() * (b.vel[0].powi(2) + b.vel[1].powi(2)) + 0.5 * rho * b.shape.polar_moment() * b.omega.powi(2);
+    }
+    e
+}
+
+fn column(r: &Runner, name: &str) -> usize {
+    r.columns.iter().position(|c| c == name).unwrap_or_else(|| panic!("colonne « {name} » absente : {:?}", r.columns))
+}
+
+#[test]
+fn a_driven_crank_moves_its_rod_and_piston_along_the_slider_crank_law() {
+    // vilebrequin mené à 300 tr/min (1800 °/s) : l'axe du piston à s(θ) = r cos θ + √(l² − r² sin² θ) au-dessus de l'axe du
+    // vilebrequin, le centre du piston une demi-hauteur plus haut ; à 0.1 s, point mort bas (θ = 180°)
+    let text = "départ scénario \"cuve vide\" grille 30 x 40 maille 1 cm
+vilebrequin (0.15, 0.08) rayon 2 cm bielle 6 cm \"acier\" rotation 300 tr/min
+mesurer toutes les 10 ms : vilebrequin 1 angle, vilebrequin 1 tours, corps 3 y comme \"piston\"
+simuler 0.1 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (rr, l, h) = (0.02, 0.06, 0.02);
+    let s = |th: f64| rr * th.cos() + (l * l - (rr * th.sin()).powi(2)).sqrt();
+    let (ca, ct, cp) = (column(&r, "vilebrequin 1 angle (°)"), column(&r, "vilebrequin 1 tours (tr)"), column(&r, "piston (m)"));
+    for row in &r.rows {
+        let th = 1800f64.to_radians() * row[0];
+        assert!((row[cp] - (0.08 + s(th) + h / 2.0)).abs() < 1e-9, "t = {} : piston à {} pour {}", row[0], row[cp], 0.08 + s(th) + h / 2.0);
+        assert!((row[ca] - th.to_degrees().rem_euclid(360.0)).abs() < 1e-6, "{row:?}");
+    }
+    let last = r.rows.last().unwrap();
+    assert!((last[0] - 0.1).abs() < 1e-9 && (last[ct] - 0.5).abs() < 1e-9 && (last[cp] - 0.13).abs() < 1e-9, "{last:?}");
+    // la bielle relie l'axe de manivelle à l'axe du piston ; les trois pièces sont menées
+    let ck = &r.sim.cranks[0];
+    let (a, b) = ck.pins(ck.theta);
+    assert!(((b[0] - a[0]).hypot(b[1] - a[1]) - l).abs() < 1e-12);
+    assert!(r.sim.bodies.len() == 3 && r.sim.bodies.iter().all(|b| b.motion == super::mp_bodies::Motion::Driven));
+    // lecture : erreurs
+    for (bad, what) in [
+        ("vilebrequin (0.1, 0.1) rayon 2 cm bielle 2 cm", "plus longue"),
+        ("vilebrequin (0.1, 0.1) rayon 2 cm", "bielle"),
+        ("vilebrequin (0.1, 0.1) rayon 2 cm bielle 6 cm inertie 0.1", "libre"),
+        ("vilebrequin (0.1, 0.1) rayon 2 cm bielle 6 cm libre couple \"-0.1*vitesse\"", "couple"),
+        ("vilebrequin (0.1, 0.1) rayon 2 cm bielle 6 cm volant", "option"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    let p = proto("départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm\nvilebrequin (0.15, 0.1) rayon 2 cm bielle 6 cm axe 45 cylindre\nsimuler 1 ms\n");
+    let e = initial_state(&p, Path::new(".")).err().unwrap();
+    assert!(e.contains("0, 90, 180 ou 270"), "{e}");
+}
+
+#[test]
+fn a_free_crank_keeps_its_kinetic_energy_and_its_speed_follows_its_inertia() {
+    // vilebrequin libre lancé à 300 tr/min, sans pesanteur ni cylindre : ½ M(θ) ω² se conserve (l'air ne freine presque pas) ;
+    // la vitesse varie au cours du tour, M(θ) avec elle (plus vite aux points morts, où le piston est arrêté)
+    let text = "départ scénario \"cuve vide\" grille 30 x 40 maille 1 cm
+gravité (0, 0)
+vilebrequin (0.15, 0.08) rayon 2 cm bielle 6 cm \"acier\" libre rotation 300 tr/min inertie 0.002
+mesurer toutes les 2 ms : vilebrequin 1 rotation, vilebrequin 1 angle
+simuler 0.2 s
+";
+    let p = proto(text);
+    let (s0, _, _) = initial_state(&p, Path::new(".")).unwrap();
+    let e0 = crank_energy(&s0, 0);
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let e1 = crank_energy(&r.sim, 0);
+    let c = column(&r, "vilebrequin 1 rotation (°/s)");
+    let (wmin, wmax) = r.rows.iter().map(|row| row[c]).fold((f64::MAX, f64::MIN), |(a, b), w| (a.min(w), b.max(w)));
+    eprintln!("vilebrequin libre : énergie {e0:.5} → {e1:.5} J/m, rotation entre {wmin:.0} et {wmax:.0} °/s, {:.3} tour", r.sim.cranks[0].theta / std::f64::consts::TAU);
+    assert!((e1 / e0 - 1.0).abs() < 1e-2, "énergie {e0} → {e1}");
+    assert!(wmax / wmin > 1.1 && r.sim.cranks[0].theta > 1.5 * std::f64::consts::PI, "rotation {wmin} … {wmax}");
+}
+
+#[test]
+fn a_piston_compresses_the_gas_of_its_cylinder_without_leaking() {
+    // du point mort bas au point mort haut à 600 tr/min (0.05 s), le volume de la chambre est divisé par ε = (c + 2r)/c = 5 : sans
+    // fuite autour du piston, la masse d'air reste, et p monte vers ε^γ ≈ 9.5 fois (adiabatique ; un peu moins, la chaleur passant
+    // dans les parois d'acier)
+    let text = "départ scénario \"cuve vide\" grille 30 x 40 maille 5 mm
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm \"acier\" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 180 rotation 600 tr/min
+mesurer toutes les 2 ms : p en (0.075, 0.145) comme \"chambre\", masse \"air\" dans rect (0.055, 0.1) (0.095, 0.15) comme \"air haut\", masse \"air\" dans rect (0.055, 0.14) (0.095, 0.15) comme \"air PMH\"
+simuler 0.05 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (cp, cm, ct) = (column(&r, "chambre (Pa)"), column(&r, "air haut (kg/m)"), column(&r, "air PMH (kg/m)"));
+    let (first, last) = (&r.rows[0], r.rows.last().unwrap());
+    let ratio = last[cp] / first[cp];
+    let lost = 1.0 - last[ct] / first[cm];
+    let t_gas = r.sim.temp[r.sim.idx(15, 28)];
+    eprintln!("compression : p {:.0} → {:.0} Pa (× {ratio:.2} ; adiabatique × 9.52), air {:.3e} → {:.3e} kg/m ({:.2} % perdu), T = {t_gas:.0} K", first[cp], last[cp], first[cm], last[ct], 100.0 * lost);
+    assert!(ratio > 7.5 && ratio < 9.7, "rapport de pression {ratio}");
+    assert!(lost.abs() < 1e-2, "fuite : {:.2} % de l'air", 100.0 * lost);
+}
+
+#[test]
+fn compressed_air_drives_a_free_crank_and_its_work_becomes_kinetic_energy() {
+    // moteur à air comprimé : vilebrequin libre à l'arrêt 20° après le point mort haut ; un compresseur dans la culasse pousse l'air
+    // du dehors dans la chambre, la pression monte et pousse le piston, le vilebrequin accélère. L'énergie cinétique gagnée vaut le
+    // travail de la force du fluide sur le piston ∫ F dy, et celui de la pression de la chambre ∫ (p − p_atm) A |dy| (relevée en un
+    // point)
+    let text = "départ scénario \"cuve vide\" grille 30 x 40 maille 5 mm
+gravité (0, 0)
+pas max 0.2 ms
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm \"acier\" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 20 libre inertie 0.002
+effacer rect (0.07, 0.15) (0.08, 0.155)
+pompe rect (0.07, 0.15) (0.08, 0.155) (0, -4) m/s
+mesurer toutes les 0.2 ms : p en (0.075, 0.145) comme \"chambre\", corps 3 y comme \"piston\", corps 3 fy comme \"force\", vilebrequin 1 angle
+simuler 15 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (cp, cy, cf, ca) = (column(&r, "chambre (Pa)"), column(&r, "piston (m)"), column(&r, "force (N/m)"), column(&r, "vilebrequin 1 angle (°)"));
+    let (mut wf, mut wp) = (0.0, 0.0);
+    // (pas de force au premier relevé : aucune projection encore)
+    for w in r.rows.windows(2).filter(|w| w[0][cf].is_finite()) {
+        let dy = w[1][cy] - w[0][cy];
+        wf += 0.5 * (w[0][cf] + w[1][cf]) * dy;
+        wp += 0.5 * (w[0][cp] + w[1][cp] - 2.0 * 101325.0) * 0.04 * (-dy);
+    }
+    let ke = crank_energy(&r.sim, 0);
+    let last = r.rows.last().unwrap();
+    eprintln!("moteur : angle 20 → {:.1}°, énergie cinétique {ke:.3} J/m ; travail de la force {wf:.3}, de la pression {wp:.3} J/m", last[ca]);
+    assert!(last[ca] > 40.0 && ke > 0.1, "le vilebrequin n'a pas tourné : {last:?}");
+    assert!((wf / ke - 1.0).abs() < 0.03, "travail de la force {wf} pour {ke}");
+    assert!((wp / ke - 1.0).abs() < 0.1, "travail de la pression {wp} pour {ke}");
+}
+
 #[test]
 fn the_fluid_force_on_solid_cells_is_archimedes_and_the_hydrostatic_thrust() {
     // bloc de mailles solides entouré d'eau au repos : poussée d'Archimède ρ g A vers le haut, rien de côté ; muret qui retient

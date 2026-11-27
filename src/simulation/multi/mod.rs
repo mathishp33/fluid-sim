@@ -29,6 +29,7 @@ pub mod mp_tests;
 pub mod mp_view;
 pub mod mp_state;
 pub mod mp_bodies;
+pub mod mp_mechanism;
 pub mod mp_contacts;
 pub mod mp_body_heat;
 pub mod mp_experiment;

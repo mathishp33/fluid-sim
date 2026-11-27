@@ -63,6 +63,8 @@ pub struct MultiphaseSim {
     /// corps rigides (solides mobiles, voir mp_bodies.rs et SOLID.md) — étape 0 : géométrie et fermeture seulement, pas encore couplés
     /// à l'écoulement ; aucun scénario n'en pose
     pub bodies: Vec<super::mp_bodies::RigidBody>,
+    /// mécanismes bielle-manivelle (mp_mechanism.rs) : ils mènent trois corps chacun
+    pub cranks: Vec<super::mp_mechanism::Crank>,
     /// fraction de chaque maille occupée par les corps (0 sans corps), comptée dans la fermeture Σ m/ρ + α_corps = 1
     pub body_frac: Vec<f64>,
     /// vitesse normale du corps aux faces u et v bordées par une maille couverte (corps en mouvement ; vides sinon)
@@ -359,6 +361,7 @@ impl MultiphaseSim {
             body_applied: vec![],
             push_src: vec![],
             contact_springs: vec![],
+            cranks: vec![],
             rho_mix: vec![1.0; n],
             mu_cell: vec![0.0; n],
             k_cell: vec![0.0; n],

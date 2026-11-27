@@ -172,6 +172,8 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
         — ou libre, poussé par l'écoulement : libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse (vx, vy)] [masse volumique 600 kg/m³]
           [rebond 0.5] [frottement 0.3] [force formule \"-100*(x - x0)\" \"0\"] [couple formule \"…\"]   (contacts contre les bords, les solides, les corps)
         — tout corps : à 80 °C   (température de départ ; il échange ensuite sa chaleur avec le fluide)
+  vilebrequin (x, y) rayon 2 cm bielle 6 cm \"acier\" [axe 90] [alésage 4 cm] [piston 1 cm] [cylindre] [chambre 1 cm] [angle 0]
+        rotation 600 tr/min (mené) | libre [rotation …] [inertie 0.005] [couple \"-0.001*rotation\"]   (manivelle, bielle, piston)
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
@@ -203,6 +205,7 @@ TEMPS, MESURES, SORTIES
      grandeurs : T, p, vx, vy, vitesse, rho, fraction \"fluide\", chaleur ; temps (temps simulé, pour les conditions)
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
      corps 1 fx|fy|couple contact|loi|total   (force des contacts, de la loi en formule, ou bilan avec le poids : M a d'un corps libre)
+     vilebrequin 1 angle|tours|rotation|couple|puissance   (angle depuis le point mort haut, de 0 à 360°)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
      débit [massique] [\"eau\"] à travers ligne (x, y1) (x, y2)   (ligne verticale ou horizontale ; m²/s ou kg/(m·s), vers +x ou +y)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
@@ -1602,7 +1605,7 @@ impl ExperimentWindow {
                     self.draw_zone(painter, rect, zone, Color32::from_rgb(60, 220, 230))
                 }
                 Measure::Flux { a, b, .. } => self.draw_zone(painter, rect, &Zone::Trait { pts: vec![*a, *b], r: 0.0 }, Color32::from_rgb(60, 220, 230)),
-                Measure::Stats | Measure::Body { .. } | Measure::Time { .. } | Measure::Var { .. } => {}
+                Measure::Stats | Measure::Body { .. } | Measure::Time { .. } | Measure::Var { .. } | Measure::Crank { .. } => {}
             }
         }
     }

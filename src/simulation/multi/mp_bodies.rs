@@ -177,6 +177,9 @@ pub enum Motion {
     Imposed { v: [f64; 2], omega: f64, osc_v: [f64; 2], osc_omega: f64, period: f64 },
     /// Mouvement imposé par des formules (protocoles) : le corps pousse le fluide comme ci-dessus.
     Law(Box<MotionLaw>),
+    /// Mené par un mécanisme (vilebrequin, mp_mechanism.rs) : pose et vitesses posées par lui à chaque pas ; le corps pousse le
+    /// fluide comme un corps à mouvement imposé.
+    Driven,
 }
 
 /// Variables des formules de mouvement et de force : temps (s), centre du corps (m), sa vitesse (m/s), son accélération sur le
@@ -366,7 +369,7 @@ impl RigidBody {
     pub fn constrained_velocity(&self, m: f64, i: f64, p: [f64; 2], l: f64) -> ([f64; 2], f64) {
         match self.motion {
             Motion::Fixed => ([0.0, 0.0], 0.0),
-            Motion::Imposed { .. } | Motion::Law(_) => (self.vel, self.omega),
+            Motion::Imposed { .. } | Motion::Law(_) | Motion::Driven => (self.vel, self.omega),
             Motion::Free => match self.pivot {
                 Some(q) => {
                     let r = sub(self.pos, q);
@@ -407,7 +410,7 @@ impl RigidBody {
 
     /// corps dont le mouvement est imposé ?
     pub fn is_imposed(&self) -> bool {
-        matches!(self.motion, Motion::Imposed { .. } | Motion::Law(_))
+        matches!(self.motion, Motion::Imposed { .. } | Motion::Law(_) | Motion::Driven)
     }
 
     /// variables des formules de mouvement à l'instant t, pour l'état (pos, vel, acc, angle, omega)
@@ -450,7 +453,7 @@ impl RigidBody {
     pub fn rates(&self, t: f64) -> ([f64; 2], f64) {
         match &self.motion {
             Motion::Fixed => ([0.0, 0.0], 0.0),
-            Motion::Free => (self.vel, self.omega),
+            Motion::Free | Motion::Driven => (self.vel, self.omega),
             Motion::Law(l) => {
                 let (lin, w) = Self::law_rates(l, t, self.pos, self.vel, self.acc, self.angle, self.omega);
                 match self.pivot {
@@ -1096,6 +1099,10 @@ impl super::multiphase::MultiphaseSim {
     /// contacts, avec rebond et frottement, sont l'étape 4).
     pub(crate) fn move_bodies(&mut self, t0: f64, t1: f64) {
         let old = self.body_frac.clone();
+        // pièces des mécanismes : posées par eux (corps menés)
+        if !self.cranks.is_empty() {
+            self.advance_cranks(t0, t1);
+        }
         let (lx, ly) = (self.nx as f64 * self.dx, self.ny as f64 * self.dx);
         for k in 0..self.bodies.len() {
             if self.bodies[k].is_free() {
@@ -1547,6 +1554,7 @@ impl super::multiphase::MultiphaseSim {
         }
         let old = self.body_frac.clone();
         self.bodies.clear();
+        self.cranks.clear();
         self.body_frac.iter_mut().for_each(|a| *a = 0.0);
         self.displace_fluid(&old);
     }

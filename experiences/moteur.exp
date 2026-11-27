@@ -1,0 +1,27 @@
+# Moteur à air comprimé, un cylindre : vilebrequin libre avec volant et frein visqueux, bielle, piston dans son cylindre. Une lumière
+# de 1 cm dans la culasse est menée par l'angle du vilebrequin (règles « quand … fin ») : de 5 à 150° après le point mort haut, un
+# compresseur y pousse l'air du dehors à 8 m/s (admission : la pression de la chambre pousse le piston) ; de 150 à 355°, elle est
+# ouverte (échappement) ; puis fermée jusqu'au tour suivant. Le compresseur donne un débit fixé : le moteur prend de la vitesse
+# tant que le piston ne le dépasse pas, puis se stabilise quand le frein absorbe ce que l'air lui donne.
+#   fluid-sim experience experiences/moteur.exp
+
+départ scénario "Cuve vide" grille 30 x 40 maille 5 mm
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm "acier" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 10 libre inertie 0.005 couple "-0.0002*rotation"
+
+# la lumière de la culasse, fermée au départ
+effacer rect (0.07, 0.15) (0.08, 0.155)
+vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+
+quand vilebrequin 1 angle > 5 et vilebrequin 1 angle < 150
+    vanne rect (0.07, 0.15) (0.08, 0.155) ouverte
+    pompe rect (0.07, 0.15) (0.08, 0.155) (0, -8) m/s
+fin
+quand vilebrequin 1 angle > 150 et vilebrequin 1 angle < 355
+    pompe rect (0.07, 0.15) (0.08, 0.155) (0, 0) m/s
+fin
+quand vilebrequin 1 angle > 355
+    vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+fin
+
+mesurer toutes les 5 ms : vilebrequin 1 rotation, vilebrequin 1 tours, vilebrequin 1 puissance, p en (0.075, 0.145) comme "chambre"
+simuler 1 s

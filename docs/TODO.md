@@ -271,6 +271,10 @@ détail dans les documents de conception et l'historique git.
 - Protocoles : valeurs calculées `{formule}` (en t et en variables) à la place d'un nombre — dans les actions (relues chaque fois
   qu'elles sont faites, aussi dans une règle ou une répétition), les durées, le nombre de tours de `répéter`, les seuils, `soit` et
   les repères ; exemple `experiences/rampe.exp` (chauffe par paliers calculés).
+- Corps : système bielle-manivelle `vilebrequin (x, y) rayon r bielle l …` (manivelle, bielle et piston menés par l'angle du
+  vilebrequin, cylindre en option ; mené à vitesse imposée, ou libre sous les forces du fluide, les poids, un volant et un couple
+  appliqué), mesures `vilebrequin n angle | tours | rotation | couple | puissance` ; exemple `experiences/moteur.exp` (moteur à
+  air comprimé).
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

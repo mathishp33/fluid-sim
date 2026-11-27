@@ -5,8 +5,8 @@
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, FieldQty, FieldSource, LetValue, Logic, Measure, Protocol, Quantity, Reduce, Start,
-    Step, ThermalSpec, Threshold, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, CrankQty, CrankSpec, FieldQty, FieldSource, LetValue, Logic, Measure, Protocol,
+    Quantity, Reduce, Start, Step, ThermalSpec, Threshold, Zone,
 };
 use super::mp_view::T_IGNITION;
 
@@ -454,6 +454,11 @@ impl<'a> P<'a> {
             }
             Measure::Time { .. } => Dim::Time,
             Measure::Var { .. } => Dim::Plain,
+            Measure::Crank { q, .. } => match q {
+                CrankQty::Angle => Dim::Angle,
+                CrankQty::Rotation => Dim::AngSpeed,
+                CrankQty::Turns | CrankQty::Torque | CrankQty::Power => Dim::Plain,
+            },
             Measure::Probe { q, .. } => match q {
                 Quantity::T => Dim::Temp,
                 Quantity::P => Dim::Pressure,
@@ -640,6 +645,18 @@ impl<'a> P<'a> {
                 }
                 Measure::Flux { fluid, mass, a, b, label: None }
             }
+            ("vilebrequin", _) => {
+                let n = self.count("le numéro du vilebrequin (1 pour le premier posé)")?;
+                let q = match self.word("la grandeur du vilebrequin (angle, tours, rotation, couple, puissance)")?.as_str() {
+                    "angle" => CrankQty::Angle,
+                    "tours" | "tour" => CrankQty::Turns,
+                    "rotation" => CrankQty::Rotation,
+                    "couple" => CrankQty::Torque,
+                    "puissance" => CrankQty::Power,
+                    o => return self.err(format!("grandeur « {o} » d'un vilebrequin : angle, tours, rotation, couple, puissance")),
+                };
+                Measure::Crank { index: n - 1, q, label: None }
+            }
             ("corps", _) => {
                 let n = self.count("le numéro du corps (1 pour le premier posé)")?;
                 let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple [contact | loi | total], température)")?;
@@ -700,7 +717,8 @@ impl<'a> P<'a> {
                 | Measure::SolidForce { label, .. }
                 | Measure::Flux { label, .. }
                 | Measure::Time { label }
-                | Measure::Var { label, .. } => *label = Some(l),
+                | Measure::Var { label, .. }
+                | Measure::Crank { label, .. } => *label = Some(l),
                 Measure::Stats => return self.err("« comme » ne s'applique pas à « stats »"),
             }
         }
@@ -1180,6 +1198,87 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let zone = p.zone()?;
             p.end()?;
             push(proto, Action::Clear { zone }, ln);
+        }
+        "vilebrequin" => {
+            // vilebrequin (x, y) rayon r bielle l ["matériau"] [axe a] [angle a0] [alésage d] [piston h] [cylindre] [chambre c] [paroi e]
+            //   [rotation ω] [libre] [inertie I] [couple "formule"] [à T]
+            let pivot = p.point()?;
+            if !p.eat_w("rayon") {
+                return p.err(format!("il faut « rayon r », le rayon de manivelle (la moitié de la course){}", p.here()));
+            }
+            let r = p.quantity(Dim::Length, "le rayon de manivelle")?;
+            if !p.eat_w("bielle") {
+                return p.err(format!("il faut « bielle l », la longueur de la bielle entre ses axes{}", p.here()));
+            }
+            let l = p.quantity(Dim::Length, "la longueur de la bielle")?;
+            let material = if matches!(p.peek(), Some(Tok::S(_))) { p.string("le matériau")? } else { "acier".to_string() };
+            let mut spec = CrankSpec {
+                pivot,
+                r,
+                l,
+                axis_deg: 90.0,
+                bore: None,
+                piston_h: None,
+                angle_deg: 0.0,
+                cylinder: None,
+                material,
+                free: false,
+                omega: 0.0,
+                inertia: 0.0,
+                load: None,
+                temp: None,
+            };
+            let deg = |p: &mut P, what: &str| -> R<f64> {
+                let v = p.number(what)?;
+                let (v, unit) = p.opt_unit(Dim::Angle, v)?;
+                Ok(if unit { v.to_degrees() } else { v })
+            };
+            while !p.done() {
+                match p.word("une option (axe, angle, alésage, piston, cylindre, chambre, paroi, rotation, libre, inertie, couple, à T)")?.as_str() {
+                    "axe" => spec.axis_deg = deg(p, "la direction de l'axe du cylindre")?,
+                    "angle" => spec.angle_deg = deg(p, "l'angle de départ depuis le point mort haut")?,
+                    "alesage" => spec.bore = Some(p.quantity(Dim::Length, "l'alésage")?),
+                    "piston" => spec.piston_h = Some(p.quantity(Dim::Length, "la hauteur du piston")?),
+                    "cylindre" => spec.cylinder = Some(spec.cylinder.unwrap_or((None, None))),
+                    "chambre" => {
+                        let c = p.quantity(Dim::Length, "la longueur de la chambre au point mort haut")?;
+                        spec.cylinder = Some((Some(c), spec.cylinder.and_then(|x| x.1)));
+                    }
+                    "paroi" => {
+                        let e = p.quantity(Dim::Length, "l'épaisseur des parois du cylindre")?;
+                        spec.cylinder = Some((spec.cylinder.and_then(|x| x.0), Some(e)));
+                    }
+                    "rotation" => {
+                        let v = p.number("la vitesse de rotation")?;
+                        let (v, unit) = p.opt_unit(Dim::AngSpeed, v)?;
+                        spec.omega = if unit { v } else { v.to_radians() };
+                    }
+                    "libre" => spec.free = true,
+                    "inertie" => {
+                        spec.inertia = p.number("l'inertie du volant (kg·m par mètre de profondeur)")?;
+                        if !(spec.inertia >= 0.0) {
+                            return p.err("l'inertie du volant est positive");
+                        }
+                    }
+                    "couple" => {
+                        p.eat_w("formule");
+                        let f = p.string("la formule du couple appliqué (N)")?;
+                        if let Err(e) = super::mp_fields::Formula::parse_vars(&f, &super::mp_mechanism::CRANK_VARS) {
+                            return p.err(format!("couple « {f} » : {e} (variables : t, angle, tours, rotation)"));
+                        }
+                        spec.load = Some(f);
+                    }
+                    "a" => spec.temp = Some(p.quantity(Dim::Temp, "la température des pièces")?),
+                    o => return p.err(format!("option « {o} » inconnue après « vilebrequin »")),
+                }
+            }
+            if !spec.free && (spec.inertia > 0.0 || spec.load.is_some()) {
+                return p.err("inertie et couple : pour un vilebrequin « libre » (un vilebrequin mené tourne à sa rotation)");
+            }
+            if !(spec.r > 0.0 && spec.l > 1.05 * spec.r) {
+                return p.err("la bielle doit être plus longue que le rayon de manivelle (au moins 1.05 fois)");
+            }
+            push(proto, Action::Crank(spec), ln);
         }
         "corps" => {
             let shape = match p.word("la forme du corps (disque, rect, polygone)")?.as_str() {
@@ -1671,7 +1770,8 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
-                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit)"
+                 calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit, \
+                 vilebrequin)"
             ))
         }
     }

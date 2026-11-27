@@ -515,6 +515,23 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   (≈ 0.5 mm) est plus fine que la maille (2 mm), et les ouvertures prudentes des faces freinent l'eau chauffée au contact du corps.
   La conduction, elle, est exacte (même échange qu'une paroi solide).
 
+**Mécanismes : bielle-manivelle (fait le 2026-11-27).**
+- `mp_mechanism.rs` : un vilebrequin (manivelle autour d'un axe fixe), une bielle et un piston qui glisse le long de l'axe de son
+  cylindre. Les trois pièces sont des corps MENÉS (`Motion::Driven`, état complet en version 18) : leur pose découle exactement de
+  l'angle θ du vilebrequin (axe du piston à s(θ) = r cos θ + √(l² − r² sin² θ)) ; le fluide les voit comme des corps à mouvement
+  imposé, et la force qu'il exerce sur chacune est relevée à chaque projection.
+- Mené à vitesse imposée (compresseur), ou libre (moteur) : M(θ) θ̈ + ½ M′(θ) θ̇² = Q (Lagrange, un degré de liberté), M(θ) =
+  I_volant + Σ (m |dG/dθ|² + I (dφ/dθ)²), Q = Σ (F · dG/dθ + Γ dφ/dθ) + couple appliqué (formule), les forces du fluide gardées sur
+  le pas (couplage décalé, sûr pour un gaz) ; point milieu en sous-pas d'au plus 0.005 rad.
+- Cylindre (option) : parois et culasse en mailles solides, alésage d'un nombre entier de mailles et axe recalé au milieu : le
+  piston couvre des rangées entières, sans passage autour de lui.
+- Validations (mp_experiment_tests.rs) : cinématique exacte (1e-9 m) ; vilebrequin libre lancé à 300 tr/min, énergie conservée à
+  0.24 % sur 0.8 tour ; compression du point mort bas au point mort haut (ε = 5) à 600 tr/min : p × 9.36 pour 9.52 adiabatique,
+  aucune fuite ; moteur à air comprimé : énergie cinétique gagnée = travail de la force du fluide et de la pression à 1.2 % près.
+  Exemple : `experiences/moteur.exp` (lumière de culasse menée par l'angle : admission, échappement ; ≈ 1300 tr/min).
+- Limites : une seule bielle par vilebrequin, cylindre suivant la grille ; pas de liaisons générales entre corps libres
+  (engrenages, plusieurs cylindres sur un vilebrequin).
+
 ## 9. Choix (validés le 2026-11-24)
 
 - Corps rigides seulement, en 2D, formes convexes (disque, rectangle, polygone).
