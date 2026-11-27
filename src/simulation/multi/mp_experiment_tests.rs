@@ -1819,6 +1819,54 @@ simuler 15 ms
 }
 
 #[test]
+fn filling_a_cell_under_a_body_leaves_the_body_its_place() {
+    // disque fixe posé, puis « remplir partout avec eau » : chaque maille reçoit le fluide de la place que le corps lui laisse
+    // (Σ m/ρ = 1 − α_corps) ; avant, une maille à demi couverte était remplie en entier (pic de pression au pas suivant)
+    let text = "départ scénario \"cuve vide\" grille 20 x 20 maille 1 cm
+corps disque (0.1, 0.1) rayon 3 cm \"acier\"
+remplir partout avec \"eau\" à 20 °C
+simuler 1 ms
+";
+    let (s, _, _) = initial_state(&proto(text), Path::new(".")).unwrap();
+    let mut worst = 0.0f64;
+    let mut partial = 0;
+    for c in 0..s.nx * s.ny {
+        let a = s.body_frac[c];
+        if a > 0.0 && a < 1.0 {
+            partial += 1;
+        }
+        let vol: f64 = (0..s.reg.phases.len()).map(|k| s.mass[k][c] / s.reg.phases[k].rho(s.p[c], s.temp[c])).sum();
+        worst = worst.max((vol - (1.0 - a.min(1.0 - super::mp_bodies::FLUID_TRACE))).abs());
+    }
+    assert!(partial > 10 && worst < 1e-9, "{partial} mailles à demi couvertes, écart au volume laissé {worst}");
+}
+
+#[test]
+fn a_spark_in_the_compressed_charge_drives_the_crank() {
+    // temps moteur : mélange hydrogène–air dans le cylindre, vilebrequin libre lancé au point mort bas, compression (≈ 9 atm),
+    // étincelle à 355° (un noyau de 4 mm : `allumer` remplace sa charge par des gaz brûlés, un gros noyau la gaspille) ; la
+    // combustion fait monter la pression bien au-dessus de la compression, et la détente relance le vilebrequin
+    let text = "départ scénario \"Explosion confinée (hydrogène–air)\" grille 30 x 40 maille 5 mm
+remplir partout avec \"air sec (O2 + N2)\" à 20 °C
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm \"acier\" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 180 libre rotation 600 tr/min inertie 0.5
+remplir rect (0.055, 0.1) (0.095, 0.15) avec \"hydrogène–air stœchiométrique\" à 20 °C
+quand vilebrequin 1 angle > 355 : allumer disque (0.075, 0.145) rayon 4 mm
+mesurer toutes les 1 ms : p en (0.075, 0.145) comme \"chambre\", vilebrequin 1 rotation, vilebrequin 1 angle
+attendre que vilebrequin 1 angle > 60 et vilebrequin 1 angle < 180 au plus 0.15 s
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let (cp, cw, ca) = (column(&r, "chambre (Pa)"), column(&r, "vilebrequin 1 rotation (°/s)"), column(&r, "vilebrequin 1 angle (°)"));
+    let spark = r.rows.iter().position(|row| row[ca] > 355.0 && row[ca] < 359.9).unwrap_or_else(|| panic!("pas d'allumage\n{}", r.log.join("\n")));
+    let (p_spark, w_spark) = (r.rows[spark][cp], r.rows[spark][cw]);
+    let p_max = r.rows[spark..].iter().map(|row| row[cp]).fold(0.0, f64::max);
+    let w_end = r.rows.last().unwrap()[cw];
+    eprintln!("temps moteur : p {p_spark:.0} Pa à l'étincelle, {p_max:.0} Pa au plus ; rotation {w_spark:.0} → {w_end:.0} °/s");
+    assert!(p_max > 2.5 * p_spark, "la charge n'a pas brûlé : p {p_spark} → {p_max}");
+    assert!(w_end > 1.2 * w_spark, "la détente n'a pas relancé le vilebrequin : {w_spark} → {w_end}");
+}
+
+#[test]
 fn the_fluid_force_on_solid_cells_is_archimedes_and_the_hydrostatic_thrust() {
     // bloc de mailles solides entouré d'eau au repos : poussée d'Archimède ρ g A vers le haut, rien de côté ; muret qui retient
     // 10 cm d'eau : poussée horizontale ½ (ρ_eau − ρ_air) g H² (la pression de l'air agit des deux côtés)

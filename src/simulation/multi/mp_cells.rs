@@ -140,11 +140,16 @@ impl MultiphaseSim {
         self.thermal[c] = MpThermal::Passive;
     }
 
-    /// Remplit la cellule d'une phase pure à (p courant, T) ; les faces ne sont pas modifiées.
+    /// part de la cellule laissée au fluide par les corps rigides (1 − α_corps, au moins la trace `FLUID_TRACE`, comme à leur pose)
+    pub(crate) fn fluid_room(&self, c: usize) -> f64 {
+        1.0 - self.body_frac.get(c).copied().unwrap_or(0.0).min(1.0 - super::mp_bodies::FLUID_TRACE)
+    }
+
+    /// Remplit la cellule d'une phase pure à (p courant, T), dans la place que lui laissent les corps ; les faces ne sont pas modifiées.
     pub fn fill_pure(&mut self, c: usize, k: usize, t: f64) {
-        let p = self.p[c];
+        let (p, room) = (self.p[c], self.fluid_room(c));
         for j in 0..self.reg.phases.len() {
-            self.mass[j][c] = if j == k { self.reg.phases[j].rho(p, t) } else { 0.0 };
+            self.mass[j][c] = if j == k { room * self.reg.phases[j].rho(p, t) } else { 0.0 };
         }
         self.set_cell_temperature(c, t);
     }
@@ -155,11 +160,12 @@ impl MultiphaseSim {
         self.fill_mixture(c, &a, t);
     }
 
-    /// Remplit la cellule d'un mélange (fractions volumiques `alpha`, somme 1) à (p courant, T).
+    /// Remplit la cellule d'un mélange (fractions volumiques `alpha`, somme 1) à (p courant, T), dans la place que lui laissent les corps
+    /// (un remplissage qui ignorait un piston à demi dans la maille la remplissait trop : pic de pression)
     pub fn fill_mixture(&mut self, c: usize, alpha: &[f64], t: f64) {
-        let p = self.p[c];
+        let (p, room) = (self.p[c], self.fluid_room(c));
         for j in 0..self.reg.phases.len() {
-            self.mass[j][c] = alpha[j] * self.reg.phases[j].rho(p, t);
+            self.mass[j][c] = room * alpha[j] * self.reg.phases[j].rho(p, t);
         }
         self.set_cell_temperature(c, t);
     }

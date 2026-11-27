@@ -75,6 +75,11 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-26.
   colonne compressible au second ordre, p = po + ρ_a Φ (1 + ½ ρ' Φ), plus le décalage de la demi-maille du haut de l'intérieur
   (⅛ ρ_a ρ' (g dx)²), sur le CPU et le GPU : 7.6e-8 m/s après 5 s, au niveau des arrondis.
 
+### Corps et mécanismes (2026-11-27)
+- **Remplir une maille à demi couverte par un corps** (`remplir`, `allumer`, champs, pinceaux, cellules épinglées) la remplissait en
+  entier, comme si le corps n'y était pas : Σ m/ρ dépassait 1 − α_corps, d'où un pic de pression au pas suivant (la charge fraîche
+  d'un cylindre, posée contre le piston) → le remplissage prend la place que les corps laissent (`fill_pure`, `fill_mixture`).
+
 ### Solides mobiles (2026-11-24 → 26)
 - **Raideur de contact qui suivait le pas** → le ressort ne rendait pas à la détente l'énergie de la compression (rebond à 0.29 pour
   e = 0.8) → ressort figé pendant le contact, puis un ressort par contact réglé sur la vitesse d'approche (367bbc6).

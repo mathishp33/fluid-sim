@@ -658,10 +658,11 @@ pub fn all_tools(reg: &Registry) -> Vec<MpTool> {
 
 /// Remplit la cellule c d'une seule phase pure à (p, T) en gardant la cohérence masse/énergie. Les faces voisines ne sont pas modifiées.
 fn set_pure(sim: &mut MultiphaseSim, c: usize, k: usize, t: f64) {
-    let p = sim.p[c];
+    // (dans la place que les corps laissent à la maille)
+    let (p, room) = (sim.p[c], sim.fluid_room(c));
     sim.solid[c] = -1;
     for j in 0..sim.reg.phases.len() {
-        sim.mass[j][c] = if j == k { sim.reg.phases[j].rho(p, t) } else { 0.0 };
+        sim.mass[j][c] = if j == k { room * sim.reg.phases[j].rho(p, t) } else { 0.0 };
     }
     sim.set_cell_temperature(c, t);
 }

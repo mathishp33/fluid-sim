@@ -275,6 +275,10 @@ détail dans les documents de conception et l'historique git.
   vilebrequin, cylindre en option ; mené à vitesse imposée, ou libre sous les forces du fluide, les poids, un volant et un couple
   appliqué), mesures `vilebrequin n angle | tours | rotation | couple | puissance` ; exemple `experiences/moteur.exp` (moteur à
   air comprimé).
+- Moteur à explosion : `experiences/moteur_explosion.exp`, cycle à deux temps idéalisé (échappement par une lumière, balayage au
+  point mort bas, étincelle à 355° dans le mélange hydrogène–air comprimé ≈ 9 atm ; combustion jusqu'à ≈ 44 atm, 3000 K ; ≈ 615
+  tr/min tenus par un frein de banc d'essai) ;
+  un remplissage dans une maille à demi couverte par un corps laisse au corps sa place.
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir
