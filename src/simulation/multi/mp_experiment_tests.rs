@@ -9,7 +9,7 @@ use super::mp_experiment::{
     Zone,
 };
 use super::mp_fields::{read_csv, Formula};
-use super::mp_script::{insert_initial_line, parse, parse_all, zone_text};
+use super::mp_script::{insert_initial_line, parse, parse_all, parse_all_in, zone_text};
 use super::mp_view::{brush_cells, build_scenario, MpScenario};
 use super::multiphase::{Bc, MultiphaseSim};
 
@@ -481,7 +481,7 @@ fn the_example_protocols_read_and_start() {
             continue;
         }
         let text = std::fs::read_to_string(&p).unwrap();
-        let protos = parse_all(&text).unwrap_or_else(|e| panic!("{} : {}", p.display(), e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")));
+        let protos = parse_all_in(&text, &dir).unwrap_or_else(|e| panic!("{} : {}", p.display(), e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")));
         for pr in protos {
             let mut r = Runner::new(pr, &dir, None, Some(false)).unwrap_or_else(|e| panic!("{} : {e}", p.display()));
             for _ in 0..3 {
@@ -541,7 +541,7 @@ fn a_simulation_can_run_until_a_reading_crosses_a_threshold() {
         s => panic!("{s:?}"),
     }
     match one(1) {
-        (Clause { measure: Measure::Body { index: 0, q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value: super::mp_experiment::Threshold::Num(value) }, None) => {
+        (Clause { measure: Measure::Body { who: super::mp_experiment::Who::Rank(0), q: BodyQty::Angle, .. }, cmp: Cmp::Ge, value: super::mp_experiment::Threshold::Num(value) }, None) => {
             assert!((value - 0.5f64.to_degrees()).abs() < 1e-9, "angle en degrés comme la mesure : {value}")
         }
         s => panic!("{s:?}"),
@@ -1156,7 +1156,7 @@ fn a_condition_can_combine_comparisons_with_and_or() {
     match &p.steps[0].0 {
         Step::UntilCond { clauses, logic: super::mp_experiment::Logic::Any(_), limit: Some(l) } if clauses.len() == 3 && *l == 2.0 => {
             assert!(matches!(clauses[0], Clause { measure: Measure::Probe { q: Quantity::T, reduce: Reduce::Max, .. }, cmp: Cmp::Gt, value: super::mp_experiment::Threshold::Num(value) } if value == 400.0));
-            assert!(matches!(clauses[1], Clause { measure: Measure::Body { index: 0, q: BodyQty::Y, .. }, cmp: Cmp::Lt, value: super::mp_experiment::Threshold::Num(value) } if (value - 0.05).abs() < 1e-12));
+            assert!(matches!(clauses[1], Clause { measure: Measure::Body { who: super::mp_experiment::Who::Rank(0), q: BodyQty::Y, .. }, cmp: Cmp::Lt, value: super::mp_experiment::Threshold::Num(value) } if (value - 0.05).abs() < 1e-12));
             assert!(matches!(clauses[2], Clause { measure: Measure::Body { q: BodyQty::Angle, .. }, cmp: Cmp::Gt, value: super::mp_experiment::Threshold::Num(value) } if (value - 1.5f64.to_degrees()).abs() < 1e-9));
         }
         s => panic!("{s:?}"),
@@ -2077,4 +2077,353 @@ simuler 0.1 s
     assert_eq!((rd.info().width, rd.info().height), (640, 480));
     assert!(r.log.iter().any(|l| l.contains("6 images (vitesse) toutes les 0.02 s dans images-vitesse/")), "{}", r.log.join("\n"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------- composants
+
+/// protocole lu depuis le dossier `dir` (ses composants y sont cherchés)
+fn proto_in(text: &str, dir: &Path) -> super::mp_experiment::Protocol {
+    match parse_all_in(text, dir) {
+        Ok(mut v) => v.remove(0),
+        Err(e) => panic!("{}", e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")),
+    }
+}
+
+fn errors_in(text: &str, dir: &Path) -> Vec<super::mp_script::ScriptError> {
+    parse_all_in(text, dir).err().unwrap_or_else(|| panic!("le protocole devait être refusé :\n{text}"))
+}
+
+fn steps_only(p: &super::mp_experiment::Protocol) -> Vec<Step> {
+    p.steps.iter().map(|(s, _)| s.clone()).collect()
+}
+
+#[test]
+fn a_component_is_included_with_its_parameters_and_its_lines_say_where_they_come_from() {
+    let dir = tmp_dir("composants");
+    std::fs::create_dir_all(dir.join("comp")).unwrap();
+    // un bac d'eau au fond, posé deux fois : ses zones et sa colonne nommées d'après NOM
+    std::fs::write(
+        dir.join("comp/bac.exp"),
+        "# bac d'eau au fond
+paramètre NOM = \"bac\"
+paramètre X = 0.02          # bord gauche
+paramètre L = 4 cm
+paramètre FLUIDE = \"eau\"
+paramètre FIN = $(X + L)
+zone \"$NOM.fond\" = rect ($X, 0) ($FIN, 0.02)
+remplir zone \"$NOM.fond\" avec $FLUIDE à 20 °C
+mesurer : masse $FLUIDE dans zone \"$NOM.fond\" comme \"$NOM\"
+quand temps > 1 ms : marque \"$NOM plein\"
+",
+    )
+    .unwrap();
+    let text = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm
+inclure \"comp/bac.exp\" avec NOM = \"a\"
+inclure \"comp/bac.exp\" avec NOM = \"b\", X = 6 cm, L = $(0.01 * 3)
+mesurer toutes les 1 ms : masse \"eau\" dans zone \"a.fond\" comme \"a encore\"
+simuler 2 ms
+";
+    let p = proto_in(text, &dir);
+    let fills: Vec<(&Zone, usize)> =
+        p.steps.iter().filter_map(|(s, l)| if let Step::Do(Action::Fill { zone, .. }) = s { Some((zone, *l)) } else { None }).collect();
+    assert_eq!(fills.len(), 2);
+    assert_eq!(*fills[0].0, Zone::Rect { a: [0.02, 0.0], b: [0.06, 0.02] });
+    assert_eq!(*fills[1].0, Zone::Rect { a: [0.06, 0.0], b: [0.09, 0.02] }, "FIN = X + L, L calculé dans le protocole");
+    // lignes d'un composant : numérotées après le texte (5 lignes), situées dans leur fichier et à la ligne de leur « inclure »
+    assert!(fills[0].1 > 5 && fills[1].1 > fills[0].1);
+    assert_eq!(p.includes.place(fills[0].1), "ligne 2 (« comp/bac.exp » ligne 8)");
+    assert_eq!(p.includes.place(fills[1].1), "ligne 3 (« comp/bac.exp » ligne 8)");
+    assert_eq!(p.includes.place(4), "ligne 4");
+    // la copie du protocole se relit seule, aux mêmes étapes
+    assert!(p.source.contains("# ─── composant « comp/bac.exp » avec NOM = \"b\", X = 6 cm, L = 0.03"), "{}", p.source);
+    assert!(p.source.contains("# paramètre FIN = 0.09"), "{}", p.source);
+    assert!(!p.source.contains('$') && !p.source.lines().any(|l| l.starts_with("inclure")), "{}", p.source);
+    assert_eq!(steps_only(&proto(&p.source)), steps_only(&p));
+    // déroulé : les deux bacs pesés, le journal situe les règles des composants
+    let mut r = Runner::new(p, &dir, None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let first = &r.rows[0];
+    let (a, b, a2) = (first[column(&r, "a (kg/m)")], first[column(&r, "b (kg/m)")], first[column(&r, "a encore (kg/m)")]);
+    assert!(a > 0.7 && a < 0.9, "{a}");
+    assert_eq!(a.to_bits(), a2.to_bits());
+    assert!((b / a - 0.75).abs() < 1e-9, "{b} {a}");
+    assert!(r.log.iter().any(|l| l.contains("ligne 3 (« comp/bac.exp » ligne 10) : quand temps")), "{}", r.log.join("\n"));
+    assert!(r.log.iter().any(|l| l.contains("b plein")), "{}", r.log.join("\n"));
+
+    // erreurs : à la ligne de l'« inclure », situées dans le composant
+    let start = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm\n";
+    let e = errors_in(&format!("{start}inclure \"comp/bac.exp\" avec NOMM = \"x\"\n"), &dir);
+    assert_eq!(e[0].line, 2);
+    assert!(e[0].msg.contains("n'a pas de paramètre « NOMM » (paramètres : NOM, X, L, FLUIDE, FIN)"), "{}", e[0].msg);
+    let e = errors_in(&format!("{start}inclure \"comp/absent.exp\"\n"), &dir);
+    assert!(e[0].line == 2 && e[0].msg.contains("composant « comp/absent.exp »"), "{e:?}");
+    std::fs::write(dir.join("comp/faux.exp"), "paramètre N = 1\nremplir rect (0, 0) (0.1, 0.1) avec \"eau\" à $N K\nvoler\n").unwrap();
+    let e = errors_in(&format!("{start}\ninclure \"comp/faux.exp\"\n"), &dir);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].line == 3 && e[0].msg.starts_with("« comp/faux.exp » ligne 3 : commande « voler » inconnue"), "{e:?}");
+    // inclusions imbriquées : chemin relatif au composant, chaîne des inclusions dans le message
+    std::fs::write(dir.join("comp/double.exp"), "inclure \"bac.exp\" avec NOM = \"d\"\ninclure \"faux.exp\"\n").unwrap();
+    let e = errors_in(&format!("{start}inclure \"comp/double.exp\"\n"), &dir);
+    assert!(e[0].line == 2 && e[0].msg.starts_with("« comp/double.exp » ligne 2 → « faux.exp » ligne 3 : commande « voler »"), "{e:?}");
+    // valeur inconnue, paramètre sans valeur, inclusion circulaire, balayage dans un composant
+    let e = errors_in(&format!("{start}remplir rect (0, 0) ($Y, 0.01) avec \"eau\"\n"), &dir);
+    assert!(e[0].line == 2 && e[0].msg.contains("valeur « $Y » inconnue"), "{e:?}");
+    std::fs::write(dir.join("comp/requis.exp"), "paramètre Z\nremplir rect (0, 0) ($Z, 0.01) avec \"eau\"\n").unwrap();
+    let e = errors_in(&format!("{start}inclure \"comp/requis.exp\"\n"), &dir);
+    assert!(e[0].msg.contains("paramètre « Z » sans valeur : il faut « avec Z = … »"), "{e:?}");
+    assert!(proto_in(&format!("{start}inclure \"comp/requis.exp\" avec Z = 3 cm\n"), &dir).steps.len() == 1);
+    std::fs::write(dir.join("comp/boucle.exp"), "inclure \"boucle.exp\"\n").unwrap();
+    let e = errors_in(&format!("{start}inclure \"comp/boucle.exp\"\n"), &dir);
+    assert!(e[0].msg.contains("inclusion circulaire"), "{e:?}");
+    std::fs::write(dir.join("comp/balaye.exp"), "balayage T = 1, 2\n").unwrap();
+    let e = errors_in(&format!("{start}inclure \"comp/balaye.exp\"\n"), &dir);
+    assert!(e[0].msg.contains("« balayage » : dans le protocole seulement"), "{e:?}");
+    // un bloc s'ouvre et se ferme dans le même fichier
+    std::fs::write(dir.join("comp/ouvre.exp"), "si temps > 0 s\nmarque \"x\"\n").unwrap();
+    let e = errors_in(&format!("{start}inclure \"comp/ouvre.exp\"\nfin\n"), &dir);
+    assert!(e.iter().any(|e| e.line == 3 && e.msg.contains("ferme un bloc ouvert dans un autre fichier")), "{e:?}");
+    // des colonnes sans période
+    let e = errors_in(&format!("{start}mesurer : temps\nsimuler 1 ms\n"), &dir);
+    assert!(e[0].line == 2 && e[0].msg.contains("sans période"), "{e:?}");
+    // un paramètre du protocole lui-même, et le balayage qui le remplace
+    let ps = parse_all_in(&format!("{start}paramètre T0 = 300 K\nbalayage T0 = 310 K, 320 K\nremplir partout avec \"eau\" à $(T0 + 5)\n"), &dir).unwrap();
+    let temps: Vec<Option<f64>> = ps.iter().map(|p| match &p.steps[0].0 { Step::Do(Action::Fill { temp, .. }) => *temp, _ => None }).collect();
+    assert_eq!(temps, vec![Some(315.0), Some(325.0)]);
+    let p = proto(&format!("{start}paramètre T0 = 300 K\nremplir partout avec \"eau\" à $(T0 + 5)\n"));
+    assert!(matches!(p.steps[0].0, Step::Do(Action::Fill { temp: Some(t), .. }) if t == 305.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_named_zone_stands_for_its_zone_or_its_point() {
+    let text = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm
+zone \"bas\" = rect (0, 0) (0.12, 3 cm)
+zone \"capteur\" = point (0.06, 0.01)
+zone \"bas bis\" = zone \"Bas\"
+remplir zone \"bas\" avec \"eau\" à 20 °C
+chauffer disque zone \"capteur\" rayon 1 cm à 30 °C pendant 1 ms
+mesurer toutes les 1 ms : T en zone \"capteur\" comme \"T\", moyenne T dans zone \"bas bis\"
+simuler 1 ms
+";
+    let p = proto(text);
+    assert!(matches!(&p.steps[0].0, Step::Do(Action::Fill { zone: Zone::Rect { a, b }, .. }) if *a == [0.0, 0.0] && *b == [0.12, 0.03]));
+    assert!(matches!(&p.steps[1].0, Step::Do(Action::Heat { zone: Zone::Disque { c, r }, .. }) if *c == [0.06, 0.01] && *r == 0.01));
+    assert!(matches!(&p.measures[0].0, Measure::Probe { zone: Zone::Point(c), reduce: Reduce::At, .. } if *c == [0.06, 0.01]));
+    assert!(matches!(&p.measures[1].0, Measure::Probe { zone: Zone::Rect { b, .. }, reduce: Reduce::Mean, .. } if *b == [0.12, 0.03]));
+    let start = "départ scénario \"cuve vide\" grille 12 x 12 maille 1 cm\n";
+    let bad = |rest: &str| parse(&format!("{start}zone \"bas\" = rect (0, 0) (0.12, 0.03)\n{rest}"), None).unwrap_err();
+    let e = bad("remplir zone \"haut\" avec \"eau\"\n");
+    assert!(e[0].line == 3 && e[0].msg.contains("zone « haut » inconnue") && e[0].msg.contains("(zones nommées : bas)"), "{e:?}");
+    let e = bad("zone \"BAS\" = point (0, 0)\n");
+    assert!(e[0].msg.contains("zone « BAS » déjà nommée (ligne 2)"), "{e:?}");
+    let e = bad("zone \"t\" = rect ({t}, 0) (1, 1)\n");
+    assert!(e[0].msg.contains("fixée à la lecture"), "{e:?}");
+    let e = bad("zone \"d\" = disque (0, 0)\n");
+    assert!(e[0].line == 3 && e[0].msg.contains("rayon"), "{e:?}");
+}
+
+#[test]
+fn named_bodies_and_cranks_are_found_by_their_name() {
+    let text = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+corps disque (0.05, 0.2) rayon 1 cm \"acier\" libre nom \"bille\"
+corps disque (0.15, 0.2) rayon 1 cm \"acier\" nom \"Borne\"
+vilebrequin (0.1, 0.05) rayon 1 cm bielle 4 cm rotation 600 tr/min nom \"a\"
+vilebrequin (0.22, 0.05) rayon 1 cm bielle 4 cm rotation 300 tr/min angle 90 nom \"b\"
+mesurer toutes les 2 ms : corps \"bille\" y, corps \"borne\" y, corps 1 y, vilebrequin \"b\" angle, vilebrequin 2 angle, corps \"b.piston\" y, corps 8 y
+simuler 10 ms
+";
+    let r = run(text, None);
+    assert_eq!(r.sim.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), [
+        "bille", "Borne", "a.manivelle", "a.bielle", "a.piston", "b.manivelle", "b.bielle", "b.piston"
+    ]);
+    assert_eq!(r.sim.cranks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    let last = r.rows.last().unwrap();
+    let col = |n: &str| last[column(&r, n)];
+    assert!(col("corps bille y (m)") < 0.2, "la bille tombe");
+    assert_eq!(col("corps borne y (m)"), 0.2);
+    assert_eq!(col("corps bille y (m)").to_bits(), col("corps 1 y (m)").to_bits());
+    assert_eq!(col("vilebrequin b angle (°)").to_bits(), col("vilebrequin 2 angle (°)").to_bits());
+    assert!((col("vilebrequin b angle (°)") - 108.0).abs() < 1e-6, "90° + 1800 °/s × 10 ms");
+    assert_eq!(col("corps b.piston y (m)").to_bits(), col("corps 8 y (m)").to_bits());
+    // un nom que rien ne pose : refusé à la lecture, avec les noms posés
+    let e = parse(&text.replace("corps \"bille\" y,", "corps \"bile\" y,"), None).unwrap_err();
+    assert!(e[0].line == 6 && e[0].msg.contains("aucun corps ne s'appelle « bile »") && e[0].msg.contains("noms posés : bille, Borne, a.manivelle, a.bielle"), "{e:?}");
+    let e = parse(&text.replace("vilebrequin \"b\" angle", "vilebrequin \"c\" angle"), None).unwrap_err();
+    assert!(e[0].msg.contains("aucun vilebrequin ne s'appelle « c »"), "{e:?}");
+    // deux objets du même nom : refusés à la pose
+    let twice = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+corps disque (0.05, 0.2) rayon 1 cm \"acier\" nom \"x\"
+corps disque (0.15, 0.2) rayon 1 cm \"acier\" nom \"X\"
+";
+    let e = initial_state(&proto(twice), Path::new(".")).err().unwrap();
+    assert!(e.starts_with("ligne 3 : un corps s'appelle déjà « X »"), "{e}");
+    let twice = "départ scénario \"cuve vide\" grille 30 x 30 maille 1 cm
+vilebrequin (0.1, 0.05) rayon 1 cm bielle 4 cm nom \"m\"
+vilebrequin (0.22, 0.05) rayon 1 cm bielle 4 cm nom \"m\"
+";
+    let e = initial_state(&proto(twice), Path::new(".")).err().unwrap();
+    assert!(e.contains("un vilebrequin s'appelle déjà « m »"), "{e}");
+}
+
+/// texte d'un exemple d'avant ses composants, et l'exemple d'aujourd'hui : mêmes relevés, au bit près, sur un début d'expérience
+fn same_rows(old: &str, file: &str, short: &[(&str, &str)]) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("experiences");
+    let new = std::fs::read_to_string(dir.join(file)).unwrap();
+    let (mut old, mut new) = (old.to_string(), new);
+    for (a, b) in short {
+        assert!(old.contains(a) && new.contains(a), "{file} : « {a} »");
+        old = old.replace(a, b);
+        new = new.replace(a, b);
+    }
+    let mut ro = Runner::new(proto(&old), &dir, None, Some(false)).unwrap();
+    run_to_end(&mut ro);
+    let mut rn = Runner::new(proto_in(&new, &dir), &dir, None, Some(false)).unwrap();
+    run_to_end(&mut rn);
+    assert_eq!(ro.columns.len(), rn.columns.len(), "{file} : {:?} / {:?}", ro.columns, rn.columns);
+    assert!(ro.rows.len() >= 3, "{file} : {} relevés", ro.rows.len());
+    assert_eq!(ro.rows.len(), rn.rows.len(), "{file}");
+    for (a, b) in ro.rows.iter().zip(&rn.rows) {
+        let bits = |r: &Vec<f64>| r.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(a), bits(b), "{file} : {a:?} / {b:?}");
+    }
+}
+
+#[test]
+fn the_examples_built_from_components_give_the_same_experiments_as_before() {
+    same_rows(
+        "départ scénario \"Explosion confinée (hydrogène–air)\" grille 30 x 40 maille 5 mm
+remplir partout avec \"air sec (O2 + N2)\" à 20 °C
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm \"acier\" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 180 libre rotation 600 tr/min inertie 0.5 couple \"-0.5*max(rotation - 3600, 0)\"
+effacer rect (0.07, 0.15) (0.08, 0.155)
+vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+remplir rect (0.055, 0.1) (0.095, 0.15) avec \"hydrogène–air stœchiométrique\" à 20 °C
+quand vilebrequin 1 angle > 140 et vilebrequin 1 angle < 180 : vanne rect (0.07, 0.15) (0.08, 0.155) ouverte
+quand vilebrequin 1 angle > 180 et vilebrequin 1 angle < 270
+    remplir rect (0.055, 0.1) (0.095, 0.15) avec \"hydrogène–air stœchiométrique\" à 20 °C
+    vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+fin
+quand vilebrequin 1 angle > 355 : allumer disque (0.075, 0.145) rayon 4 mm
+mesurer toutes les 2 ms : vilebrequin 1 rotation, vilebrequin 1 tours, vilebrequin 1 puissance, p en (0.075, 0.145) comme \"chambre\", max T dans rect (0.055, 0.1) (0.095, 0.15) comme \"T chambre\"
+simuler 1 s
+",
+        "moteur_explosion.exp",
+        &[("simuler 1 s", "simuler 6 ms")],
+    );
+    same_rows(
+        "départ scénario \"Cuve vide\" grille 30 x 40 maille 5 mm
+vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm \"acier\" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 10 libre inertie 0.005 couple \"-0.0002*rotation\"
+effacer rect (0.07, 0.15) (0.08, 0.155)
+vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+quand vilebrequin 1 angle > 5 et vilebrequin 1 angle < 150
+    vanne rect (0.07, 0.15) (0.08, 0.155) ouverte
+    pompe rect (0.07, 0.15) (0.08, 0.155) (0, -8) m/s
+fin
+quand vilebrequin 1 angle > 150 et vilebrequin 1 angle < 355
+    pompe rect (0.07, 0.15) (0.08, 0.155) (0, 0) m/s
+fin
+quand vilebrequin 1 angle > 355
+    vanne rect (0.07, 0.15) (0.08, 0.155) fermée
+fin
+mesurer toutes les 5 ms : vilebrequin 1 rotation, vilebrequin 1 tours, vilebrequin 1 puissance, p en (0.075, 0.145) comme \"chambre\"
+simuler 1 s
+",
+        "moteur.exp",
+        &[("simuler 1 s", "simuler 15 ms")],
+    );
+    same_rows(
+        "départ scénario \"Cuve vide\" grille 40 x 40 maille 1 cm
+solide rect (0.11, 0.21) (0.29, 0.37) \"acier\"
+effacer rect (0.12, 0.22) (0.28, 0.37)
+effacer rect (0.19, 0.21) (0.21, 0.22)
+vanne rect (0.19, 0.21) (0.21, 0.22) fermée
+remplir rect (0.12, 0.22) (0.28, 0.34) avec \"eau\" à 20 °C
+mesurer toutes les 20 ms : masse \"eau\" dans rect (0.12, 0.22) (0.28, 0.37) comme \"réservoir\", masse \"eau\" dans rect (0, 0) (0.4, 0.21) comme \"bassin\"
+tant que masse \"eau\" dans rect (0.12, 0.22) (0.28, 0.37) > 4 au plus 4 s
+    vanne rect (0.19, 0.21) (0.21, 0.22) ouverte
+    attendre 0.2 s
+    vanne rect (0.19, 0.21) (0.21, 0.22) fermée
+    attendre 0.3 s
+fin
+marque \"réservoir presque vide\"
+attendre 0.5 s
+",
+        "bachees.exp",
+        &[("au plus 4 s", "au plus 0.25 s"), ("attendre 0.5 s", "attendre 0.02 s")],
+    );
+    same_rows(
+        "départ scénario \"Cuve vide\" grille 40 x 40 maille 1 cm
+solide rect (0.11, 0.21) (0.29, 0.37) \"acier\"
+effacer rect (0.12, 0.22) (0.28, 0.37)
+effacer rect (0.18, 0.21) (0.22, 0.22)
+vanne rect (0.18, 0.21) (0.22, 0.22) fermée
+émetteur rect (0.13, 0.35) (0.15, 0.36) \"eau\" (0, -0.3) m/s à 20 °C
+mesurer toutes les 20 ms : masse \"eau\" dans rect (0.12, 0.22) (0.28, 0.37) comme \"réservoir\", masse \"eau\" dans rect (0, 0) (0.4, 0.21) comme \"bassin\"
+quand masse \"eau\" dans rect (0.12, 0.22) (0.28, 0.37) > 10
+    marque \"chasse\"
+    vanne rect (0.18, 0.21) (0.22, 0.22) ouverte
+    attendre que masse \"eau\" dans rect (0.12, 0.22) (0.28, 0.37) < 3 au plus 2 s
+    vanne rect (0.18, 0.21) (0.22, 0.22) fermée
+fin
+simuler 8 s
+",
+        "chasse.exp",
+        &[("simuler 8 s", "simuler 0.1 s")],
+    );
+    same_rows(
+        "départ scénario \"Cuve vide\" grille 30 x 24 maille 1 cm
+bord haut ouvert
+pas max 2 ms
+solide rect (0.05, 0.02) (0.25, 0.2) \"acier\"
+effacer rect (0.06, 0.03) (0.24, 0.19)
+effacer rect (0.05, 0.1) (0.06, 0.12)
+pompe rect (0.05, 0.1) (0.06, 0.12) (0.5, 0) m/s
+effacer rect (0.14, 0.19) (0.16, 0.2)
+vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+quand p en (0.15, 0.1) > 104 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) ouverte
+quand p en (0.15, 0.1) < 102 kPa : vanne rect (0.14, 0.19) (0.16, 0.2) fermée
+mesurer toutes les 2 ms : p en (0.15, 0.1) comme \"pression dans la cuve\"
+simuler 1 s
+",
+        "soupape.exp",
+        &[("simuler 1 s", "simuler 0.12 s")],
+    );
+    same_rows(
+        "départ scénario \"Cuve vide\" grille 30 x 30 maille 1 cm
+soit k = 0
+mesurer toutes les 20 ms : T en (0.15, 0.08) comme \"air au-dessus\", k comme \"palier\"
+répéter 5 fois
+    soit k = {k + 1}
+    chauffer rect (0.1, 0.01) (0.2, 0.03) à {300 + 20*k} K pendant 0.5 s
+    attendre 0.5 s
+fin
+marque \"dernière consigne : {300 + 20*k} K\"
+",
+        "rampe.exp",
+        &[("0.5 s", "0.04 s")],
+    );
+}
+
+#[test]
+fn one_engine_component_placed_twice_runs_two_engines_on_their_own_rules() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("experiences");
+    let text = std::fs::read_to_string(dir.join("deux_moteurs.exp")).unwrap().replace("simuler 1 s", "simuler 4 ms");
+    let p = proto_in(&text, &dir);
+    // les règles de chaque moteur ne nomment que son vilebrequin ; « droite » s'allume plus tôt
+    let rules: Vec<String> = p.steps.iter().filter_map(|(s, _)| if let Step::Do(a @ Action::When { .. }) = s { Some(format!("{a:?}")) } else { None }).collect();
+    assert_eq!(rules.len(), 4, "{rules:?}");
+    assert!(rules[..2].iter().all(|r| r.contains("Name(\"gauche\")") && !r.contains("droite")), "{rules:?}");
+    assert!(rules[2..].iter().all(|r| r.contains("Name(\"droite\")") && !r.contains("gauche")), "{rules:?}");
+    assert!(rules[3].contains("Num(330.0)") && rules[1].contains("Num(355.0)"), "{rules:?}");
+    let mut r = Runner::new(p, &dir, None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert_eq!(r.sim.cranks.len(), 2);
+    assert_eq!((r.sim.cranks[0].name.as_str(), r.sim.cranks[1].name.as_str()), ("gauche", "droite"));
+    assert!((r.sim.cranks[1].pivot[0] - 0.225).abs() < 1e-12, "{:?}", r.sim.cranks[1].pivot);
+    let last = r.rows.last().unwrap();
+    for side in ["gauche", "droite"] {
+        let w = last[column(&r, &format!("{side} rotation (°/s)"))];
+        assert!(w > 3000.0 && w < 4000.0, "{side} : {w} °/s");
+        assert!(last[column(&r, &format!("{side} chambre (Pa)"))] > 1e5);
+    }
 }

@@ -1,0 +1,19 @@
+# Composant : chauffe par paliers (expérience « rampe.exp ») — une suite d'actions plutôt qu'un montage : la zone ZONE est chauffée
+# PALIERS fois pendant DUREE, la consigne montant de PAS à chaque palier (DEPART + PAS au premier), chaque palier suivi d'une
+# attente de DUREE. Elle se déroule là où elle est incluse ; le protocole reprend ensuite. Le compteur de paliers est la variable
+# COMPTEUR (un nom de variable, sans guillemets : relevé, colonne de mesure, repère « {k} »), définie à la ligne de l'« inclure ».
+#   inclure "composants/paliers.exp" avec ZONE = rect (0.1, 0.01) (0.2, 0.03), PALIERS = 5, PAS = 20 K, COMPTEUR = k
+
+paramètre ZONE = rect (0.1, 0.01) (0.2, 0.03)
+paramètre PALIERS = 5
+paramètre DEPART = 300 K
+paramètre PAS = 20 K
+paramètre DUREE = 0.5 s
+paramètre COMPTEUR = k
+
+soit $COMPTEUR = 0
+répéter $PALIERS fois
+    soit $COMPTEUR = {$COMPTEUR + 1}
+    chauffer $ZONE à {$(DEPART) + $(PAS)*$COMPTEUR} K pendant $DUREE
+    attendre $DUREE
+fin

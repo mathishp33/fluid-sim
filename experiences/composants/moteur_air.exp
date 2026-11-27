@@ -1,0 +1,32 @@
+# Composant : moteur à air comprimé à un cylindre (expérience « moteur.exp »). Le cylindre de « cylindre.exp », avec un frein
+# visqueux (FROTTEMENT newtons par °/s), et une lumière de culasse menée par l'angle du vilebrequin :
+#   de 5 à FIN_ADMISSION degrés après le point mort haut, un compresseur y pousse l'air du dehors à ADMISSION (l'admission : la
+#   pression de la chambre pousse le piston) ; de FIN_ADMISSION à 355°, elle reste ouverte (échappement) ; puis fermée.
+#   inclure "composants/moteur_air.exp" avec NOM = "moteur", ADMISSION = 10 m/s
+#
+# Pièces et zones nommées d'après NOM, comme dans « cylindre.exp ». Colonnes de mesure « NOM rotation » (°/s), « NOM tours »,
+# « NOM puissance » (W par mètre de profondeur) et « NOM chambre » (pression sous la culasse), à la période de l'expérience.
+
+paramètre NOM = "moteur"
+paramètre X = 0.075
+paramètre Y = 0.05
+paramètre ANGLE = 10
+paramètre INERTIE = 0.005
+paramètre FROTTEMENT = 0.0002         # frein visqueux (N par °/s)
+paramètre ADMISSION = 8 m/s           # vitesse de l'air poussé dans la lumière
+paramètre FIN_ADMISSION = 150         # (°)
+
+inclure "cylindre.exp" avec NOM = $NOM, X = $X, Y = $Y, ANGLE = $ANGLE, INERTIE = $INERTIE, COUPLE = "-$(FROTTEMENT)*rotation"
+
+quand vilebrequin $NOM angle > 5 et vilebrequin $NOM angle < $FIN_ADMISSION
+    vanne zone "$NOM.lumière" ouverte
+    pompe zone "$NOM.lumière" (0, -$(ADMISSION)) m/s
+fin
+quand vilebrequin $NOM angle > $FIN_ADMISSION et vilebrequin $NOM angle < 355
+    pompe zone "$NOM.lumière" (0, 0) m/s
+fin
+quand vilebrequin $NOM angle > 355
+    vanne zone "$NOM.lumière" fermée
+fin
+
+mesurer : vilebrequin $NOM rotation comme "$NOM rotation", vilebrequin $NOM tours comme "$NOM tours", vilebrequin $NOM puissance comme "$NOM puissance", p en zone "$NOM.culasse" comme "$NOM chambre"

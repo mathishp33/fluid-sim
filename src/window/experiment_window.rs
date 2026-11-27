@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, ColorImage, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
 
 use crate::simulation::multi::mp_experiment::{apply_action, fmt_num, fmt_point, initial_state, results_dir, Action, Measure, Protocol, RunState, Runner, Step, Zone};
-use crate::simulation::multi::mp_script::{insert_initial_line, parse_all, zone_text};
+use crate::simulation::multi::mp_script::{insert_initial_line, parse_all, parse_all_in, zone_text};
 use crate::simulation::multi::mp_view::{cell_info, compute_stats, render_rgba, MpDisplay, MpScenario, MpStats, RenderOpts};
 use crate::simulation::multi::multiphase::MultiphaseSim;
 use crate::window::WindowAction;
@@ -161,6 +161,7 @@ DÉPART (première ligne)
 
 ZONES
   partout · disque (x, y) rayon r · rect (x1, y1) (x2, y2) · point (x, y) · trait (x1, y1) (x2, y2) … rayon r
+  zone \"cuve\" = rect (0.1, 0) (0.3, 0.2)   puis   zone \"cuve\" à la place d'une zone (d'un point : zone \"capteur\" = point (x, y))
 
 CONDITIONS INITIALES ET ACTIONS (instantanées)
   remplir <zone> avec \"eau\" [à 20 °C]           température <zone> 350 K
@@ -171,9 +172,10 @@ CONDITIONS INITIALES ET ACTIONS (instantanées)
         ou en formules (t, x, y, vx, vy, ax, ay, angle, rotation, x0, y0) : position | vitesse | accélération formule \"…\" \"…\" · angle | rotation formule \"…\"
         — ou libre, poussé par l'écoulement : libre [bloqué x | y | rotation] [pivot (x, y)] [vitesse (vx, vy)] [masse volumique 600 kg/m³]
           [rebond 0.5] [frottement 0.3] [force formule \"-100*(x - x0)\" \"0\"] [couple formule \"…\"]   (contacts contre les bords, les solides, les corps)
-        — tout corps : à 80 °C   (température de départ ; il échange ensuite sa chaleur avec le fluide)
+        — tout corps : à 80 °C   (température de départ ; il échange ensuite sa chaleur avec le fluide) · nom \"bille\"   (relevés corps \"bille\" y)
   vilebrequin (x, y) rayon 2 cm bielle 6 cm \"acier\" [axe 90] [alésage 4 cm] [piston 1 cm] [cylindre] [chambre 1 cm] [angle 0]
         rotation 600 tr/min (mené) | libre [rotation …] [inertie 0.005] [couple \"-0.001*rotation\"]   (manivelle, bielle, piston)
+        [nom \"gauche\"]   (relevés vilebrequin \"gauche\" angle ; pièces corps \"gauche.manivelle\" | \"gauche.bielle\" | \"gauche.piston\")
   effacer <zone>     allumer <zone> [à 2200 K]    vitesse <zone> (vx, vy) m/s
   puits <zone> [0.2 m/s]   émetteur <zone> \"eau\" (0, 1) m/s [à T]   grille <zone> [trous 1 cm] [ouverte 0.6]
   vanne <zone> fermée | ouverte [0.4 | 40 %]   (vanne à guillotine : la part ouverte depuis la gauche ou le bas du plus grand côté)
@@ -206,9 +208,17 @@ TEMPS, MESURES, SORTIES
      corps 1 x|y|angle|vx|vy|rotation|fx|fy|couple|température   (position, vitesse, force du fluide, température du 1er corps posé)
      corps 1 fx|fy|couple contact|loi|total   (force des contacts, de la loi en formule, ou bilan avec le poids : M a d'un corps libre)
      vilebrequin 1 angle|tours|rotation|couple|puissance   (angle depuis le point mort haut, de 0 à 360°)
+     corps \"bille\" y · vilebrequin \"gauche\" angle   (par leur nom)
+  mesurer : <mesures>   (colonnes à la période d'une autre ligne : celles d'un composant) · mesurer toutes les 10 ms   (la période seule)
      force x|y sur <zone>   (force du fluide sur les mailles solides de la zone, N/m)
      débit [massique] [\"eau\"] à travers ligne (x, y1) (x, y2)   (ligne verticale ou horizontale ; m²/s ou kg/(m·s), vers +x ou +y)
   balayage T0 = 300 K, 350 K, 400 K               ($T0 dans le texte : une expérience par valeur)
+
+COMPOSANTS (fichiers .exp réutilisables, cherchés depuis le dossier du fichier qui les inclut ; « Vérifier » les relit)
+  inclure \"composants/moteur_2t.exp\" [avec NOM = \"gauche\", X = 0.075, AVANCE = 330]   (le composant, développé à sa place)
+  paramètre X = 0.075 · paramètre NOM   (valeur par défaut ; sans valeur : à donner par « avec »)
+  $X   (la valeur telle qu'écrite : 5 cm, \"acier\", rect (…) (…)) · $(X + ALESAGE/2)   (formule, paramètres en SI)
+  dans un composant posé deux fois : zone \"$NOM.sortie\" = … · nom $NOM · soit n_$NOM = 0 · comme \"$NOM rotation\"
 
 Résultats : résultats/<nom du protocole>/ à côté du protocole (mesures.csv, journal.txt, états .mps, copie du protocole).
 Ligne de commande : fluid-sim experience protocole.exp [--gpu] [--sortie dossier]";
@@ -434,7 +444,7 @@ impl ExperimentWindow {
     fn rebuild_preview(&mut self) {
         self.preview_src = self.text.clone();
         self.errors.clear();
-        let protos = match parse_all(&self.text) {
+        let protos = match parse_all_in(&self.text, &self.base_dir()) {
             Ok(p) => p,
             Err(errs) => {
                 self.errors = errs.iter().map(|e| e.to_string()).collect();
@@ -446,7 +456,7 @@ impl ExperimentWindow {
         match initial_state(&p, &self.base_dir()) {
             Ok((sim, _, _)) => {
                 let errs = crate::simulation::multi::mp_experiment::check_names(&p, &sim);
-                self.errors = errs.iter().map(|(l, e)| format!("ligne {l} : {e}")).collect();
+                self.errors = errs.iter().map(|(l, e)| format!("{} : {e}", p.includes.place(*l))).collect();
                 self.stats = compute_stats(&sim);
                 self.preview = Some(sim);
             }
@@ -512,7 +522,7 @@ impl ExperimentWindow {
         if self.running() {
             return;
         }
-        let protos = match parse_all(&self.text) {
+        let protos = match parse_all_in(&self.text, &self.base_dir()) {
             Ok(p) => p,
             Err(errs) => {
                 self.errors = errs.iter().map(|e| e.to_string()).collect();
@@ -751,6 +761,8 @@ impl ExperimentWindow {
                     ("marque", "marque \"repère\""),
                     ("pause", "pause"),
                     ("balayage", "balayage T0 = 300 K, 350 K, 400 K"),
+                    ("zone nommée", "zone \"cuve\" = rect (0.1, 0) (0.3, 0.2)"),
+                    ("inclure", "inclure \"composants/reservoir.exp\" avec NOM = \"cuve\""),
                 ] {
                     if ui.button(label).clicked() {
                         ui.close_menu();
@@ -1256,8 +1268,12 @@ impl ExperimentWindow {
                         };
                         ui.label(format!("État : {state}"));
                         ui.add(egui::ProgressBar::new(r.progress() as f32).text(format!("t = {:.4} s / {} s", r.sim.time, fmt_num(r.t_end))));
-                        let line = self.text.lines().nth(r.line.saturating_sub(1)).unwrap_or("").trim();
-                        ui.label(format!("Ligne {} : {line}", r.line));
+                        // (ligne d'un composant : la ligne de son « inclure », et la sienne dans le composant)
+                        let line = match r.proto.includes.get(r.line) {
+                            Some(o) => o.text.trim().to_string(),
+                            None => self.text.lines().nth(r.line.saturating_sub(1)).unwrap_or("").trim().to_string(),
+                        };
+                        ui.label(format!("L{} : {line}", &r.proto.includes.place(r.line)[1..]));
                         ui.weak(format!("{} pas · dt {:.2e} s · {}", r.sim.steps_done(), r.sim.last_dt, if r.gpu.is_some() { "GPU f32" } else { "CPU f64" }));
                     }
                 }

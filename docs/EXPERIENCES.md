@@ -24,7 +24,9 @@ le mettre au point, ou en **ligne de commande**, sans affichage, pour enchaîner
 - `protocole.exp` : la copie exacte du protocole exécuté.
 
 Exemples : `experiences/barrage.exp`, `experiences/chauffage.exp` (balayage de trois températures), `experiences/champs.exp`
-(conditions initiales par formules).
+(conditions initiales par formules). Des montages réutilisables — un cylindre de moteur, deux moteurs, un réservoir, une soupape,
+une chauffe par paliers — sont des **composants** (`experiences/composants/`), qu'une expérience inclut avec ses valeurs : voir
+« Composants » (§ 3).
 
 ## 1. Ce qui est garanti
 
@@ -83,6 +85,12 @@ Les fichiers sont lus par rapport au dossier du protocole.
 
 Une maille fait partie de la zone si son centre y est. Une zone trop petite pour contenir un centre prend la maille de son centre.
 
+**Zones nommées** : `zone "cuve" = rect (0.12, 0.22) (0.28, 0.37)` nomme une zone ; `zone "cuve"` la remplace ensuite partout où
+une zone s'écrit (`remplir zone "cuve" avec "eau"`, `vanne zone "sortie" ouverte`, `masse "eau" dans zone "cuve"`, conditions et
+règles comprises). Une zone nommée qui est un point sert aussi là où s'écrit un point : `zone "capteur" = point (0.15, 0.1)`, puis
+`p en zone "capteur"` ou `allumer disque zone "capteur" rayon 4 mm`. Le nom (sans casse ni accents obligatoires) est défini une
+fois, avant ses usages ; la zone est fixée à la lecture (`$(…)` pour la calculer, pas `{…}`).
+
 ### Conditions initiales et actions instantanées
 
 Toutes les commandes de ce tableau peuvent servir de conditions initiales (avant le premier `simuler`), ou d'actions en cours
@@ -106,7 +114,8 @@ d'expérience.
 | … `masse volumique ρ` | masse volumique propre du corps, en kg/m³ sans unité (ou `g/cm³`), à la place de celle du matériau : bouchon de liège, bloc de bois, corps de la densité de l'eau |
 | … `à T` | température du corps au départ (sinon celle du fluide ambiant) : il échange ensuite sa chaleur avec le fluide qui le borde (une température par corps, SOLID.md § 6.4) |
 | … `rebond e`, … `frottement μ` | contacts d'un corps libre contre les bords du domaine, les solides et les autres corps : coefficient de restitution e entre 0 (choc mou) et 1 (rebond parfait), 0.5 par défaut ; coefficient de frottement de Coulomb μ, 0.3 par défaut ; entre deux corps, la moyenne de leurs deux valeurs |
-| `vilebrequin (x, y) rayon r bielle l ["matériau"] [options]` | SYSTÈME BIELLE-MANIVELLE : vilebrequin (manivelle autour de l'axe (x, y), de rayon r : la course vaut 2r), bielle de longueur l entre ses axes, piston qui glisse le long de l'axe du cylindre (`axe a`, direction en degrés depuis l'axe du vilebrequin, 90 par défaut : vers le haut). Trois corps menés (numérotés à la suite des autres : manivelle, bielle, piston), dont la pose suit exactement l'angle du vilebrequin (0 au point mort haut, `angle a0` au départ). Options : `alésage d` (largeur du piston, 2r par défaut), `piston h` (sa hauteur, r par défaut), `cylindre` (parois et culasse en mailles solides du même matériau, axe à 0, 90, 180 ou 270° ; alésage arrondi à un nombre entier de mailles, l'axe recalé au milieu : le piston y glisse sans fuite), `chambre c` (longueur de la chambre au point mort haut, r/2 par défaut : rapport volumétrique (c + 2r)/c), `paroi e` (épaisseur, une maille par défaut), `à T`. Mené à `rotation ω` (compresseur, pompe ; 0 par défaut : immobile), ou `libre` (moteur) : l'angle suit l'équation du mécanisme sous les forces du fluide, les poids, `inertie I` (volant, kg·m par mètre de profondeur) et `couple "formule"` (N, en t, angle, tours, rotation : frein `"-0.001*rotation"`, charge, démarreur) ; `rotation ω` est alors sa vitesse de départ. Exemples : `experiences/moteur.exp` (moteur à air comprimé, lumière de culasse menée par l'angle), `experiences/moteur_explosion.exp` (moteur à explosion à deux temps idéalisé : échappement par la lumière, balayage au point mort bas par `remplir` du mélange hydrogène–air, étincelle `allumer` à 355° ; un volant de l'ordre de 0.5 kg·m par mètre : en 2D, la chambre a un mètre de profondeur, sa compression coûte des centaines de joules) |
+| … `nom "X"` | nom du corps : ses relevés s'écrivent `corps "X" y` (voir « Composants ») ; deux corps ne portent pas le même nom |
+| `vilebrequin (x, y) rayon r bielle l ["matériau"] [options]` | SYSTÈME BIELLE-MANIVELLE : vilebrequin (manivelle autour de l'axe (x, y), de rayon r : la course vaut 2r), bielle de longueur l entre ses axes, piston qui glisse le long de l'axe du cylindre (`axe a`, direction en degrés depuis l'axe du vilebrequin, 90 par défaut : vers le haut). Trois corps menés (numérotés à la suite des autres : manivelle, bielle, piston), dont la pose suit exactement l'angle du vilebrequin (0 au point mort haut, `angle a0` au départ). Options : `alésage d` (largeur du piston, 2r par défaut), `piston h` (sa hauteur, r par défaut), `cylindre` (parois et culasse en mailles solides du même matériau, axe à 0, 90, 180 ou 270° ; alésage arrondi à un nombre entier de mailles, l'axe recalé au milieu : le piston y glisse sans fuite), `chambre c` (longueur de la chambre au point mort haut, r/2 par défaut : rapport volumétrique (c + 2r)/c), `paroi e` (épaisseur, une maille par défaut), `à T`. Mené à `rotation ω` (compresseur, pompe ; 0 par défaut : immobile), ou `libre` (moteur) : l'angle suit l'équation du mécanisme sous les forces du fluide, les poids, `inertie I` (volant, kg·m par mètre de profondeur) et `couple "formule"` (N, en t, angle, tours, rotation : frein `"-0.001*rotation"`, charge, démarreur) ; `rotation ω` est alors sa vitesse de départ. `nom "X"` nomme le vilebrequin (relevés `vilebrequin "X" …`) et ses pièces (« X.manivelle », « X.bielle », « X.piston » : `corps "X.piston" fy`). Exemples : `experiences/moteur.exp` (moteur à air comprimé, lumière de culasse menée par l'angle), `experiences/moteur_explosion.exp` (moteur à explosion à deux temps idéalisé : échappement par la lumière, balayage au point mort bas par `remplir` du mélange hydrogène–air, étincelle `allumer` à 355° ; un volant de l'ordre de 0.5 kg·m par mètre : en 2D, la chambre a un mètre de profondeur, sa compression coûte des centaines de joules) |
 | `effacer <zone>` | retire solides et cellules spéciales (fluide ambiant) |
 | `allumer <zone> [à T]` | noyau de gaz brûlés (2200 K par défaut) : il REMPLACE le mélange de la zone, sans en dégager la chaleur ; c'est la flamme partie du noyau qui brûle le reste. Une petite zone (quelques mailles) allume ; une grande gaspille la charge (dans le cylindre de `experiences/moteur_explosion.exp`, 4 mm de rayon : 28 atm ; 9 mm : 21 atm) |
 | `vitesse <zone> (vx, vy)` | impose la vitesse des faces intérieures de la zone ; la projection du pas suivant la rend admissible |
@@ -196,7 +205,9 @@ champ T formule "293.15 + 60*exp(-((x - 0.2)^2 + (y - 0.06)^2)/0.03^2)"
 mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0.1, 0.05), masse "eau" dans disque (0.3, 0.1) rayon 5 cm comme "eau du bassin"
 ```
 
-- **Une seule période par protocole.** Plusieurs lignes `mesurer` ajoutent des colonnes.
+- **Une seule période par protocole.** Plusieurs lignes `mesurer` ajoutent des colonnes. `mesurer : <mesures>`, sans période,
+  ajoute des colonnes relevées à la période d'une autre ligne (c'est ainsi qu'un composant ajoute les siennes) ;
+  `mesurer toutes les 2 ms` seul fixe la période.
 - **Grandeurs** : `T`, `p`, `vx`, `vy`, `vitesse`, `rho`, `fraction "fluide pur"`, `chaleur` (puissance chimique, W/m³).
 - **Relevés** :
   - `<grandeur> en (x, y)` : valeur au point, interpolée entre les quatre centres de mailles voisins (bilinéaire ; les composantes
@@ -209,13 +220,14 @@ mesurer toutes les 10 ms : stats, T en (0.2, 0.1), moyenne p dans rect (0, 0) (0
   - `temps` : le temps simulé (s), surtout pour les conditions (`tant que temps < 2 s`, `quand temps > 1 s et …`) ;
   - `<variable>` : la valeur d'une variable (`soit`), sans unité ;
   - `corps n x | y | angle | vx | vy | rotation | fx | fy | couple | température` : position (m), angle (°), vitesse (m/s, °/s) du
-    n-ième corps posé, force du fluide sur lui (pression et frottement, N/m ; couple autour de son centre de masse, N) à la dernière
-    projection, ou sa température (K). `fx`, `fy` et `couple` peuvent être suivis de `contact` (bords, solides et autres corps,
+    n-ième corps posé (`corps "bille" y` : celui qui porte ce nom), force du fluide sur lui (pression et frottement, N/m ; couple
+    autour de son centre de masse, N) à la dernière projection, ou sa température (K). `fx`, `fy` et `couple` peuvent être suivis de `contact` (bords, solides et autres corps,
     rebond et frottement compris), `loi` (force ou couple en formule d'un corps libre) ou `total` (fluide + contacts + loi + poids :
     M a pour un corps libre sans pivot ni axe bloqué ; pour un corps fixe ou mené, l'opposé de ce que son support doit fournir) ;
-  - `vilebrequin n angle | tours | rotation | couple | puissance` : angle du n-ième vilebrequin depuis le point mort haut (°, de 0 à
-    360 : `quand vilebrequin 1 angle > 180 : …` mène une soupape à chaque tour), tours depuis le départ, rotation (°/s), couple des
-    forces du fluide et des poids ramené au vilebrequin (N), puissance qu'il lui donne (W/m) ;
+  - `vilebrequin n angle | tours | rotation | couple | puissance` (ou `vilebrequin "gauche" …`, par son nom) : angle du n-ième
+    vilebrequin depuis le point mort haut (°, de 0 à 360 : `quand vilebrequin 1 angle > 180 : …` mène une soupape à chaque tour),
+    tours depuis le départ, rotation (°/s), couple des forces du fluide et des poids ramené au vilebrequin (N), puissance qu'il lui
+    donne (W/m) ;
   - `force x | y sur <zone>` : force du fluide sur les mailles SOLIDES de la zone (N par mètre de profondeur), celles qui y sont au
     moment du relevé : la pression de chaque maille fluide voisine, ramenée par l'hydrostatique au centre de la face commune. Les
     parois glissent : pas de frottement. Une face contre le bord du domaine ne reçoit rien (un solide posé sur le fond y est plaqué
@@ -243,6 +255,54 @@ chauffer rect (0.1, 0) (0.2, 0.01) à $T pendant 3 s
 - Le protocole est rejoué pour chaque valeur, `$T` remplacé dans le texte. Chaque variante a son dossier de résultats
   (`résultats/chauffage/T=330_K/`…).
 - Il y a un seul balayage par protocole. Si les valeurs contiennent des virgules, séparez-les par `;`.
+
+### Composants
+
+Un **composant** est un fichier `.exp` qui pose un montage — un cylindre de moteur, un réservoir, une soupape, une suite d'actions
+— et qu'une expérience inclut, autant de fois qu'elle veut, chaque fois avec ses valeurs :
+
+```
+inclure "composants/moteur_2t.exp" avec NOM = "gauche", X = 0.075
+inclure "composants/moteur_2t.exp" avec NOM = "droite", X = 0.225, AVANCE = 330
+```
+
+- **Paramètres** : le composant déclare les siens avec leur valeur par défaut, `paramètre X = 0.075`, `paramètre NOM = "moteur"`
+  (sans valeur, `paramètre NOM` : l'« inclure » doit la donner). `avec NOM = valeur, …` les remplace ; un nom que le composant ne
+  déclare pas est une erreur. Un paramètre peut se calculer à partir des précédents (`paramètre HAUT = $(Y + RAYON + BIELLE)`).
+- **Valeurs** : `$X` est remplacé par la valeur telle qu'écrite (`5 cm`, `"acier"`, et aussi une zone `rect (0, 0) (0.1, 0.1)` ou
+  un point `(0.15, 0.1)`), sans ses guillemets entre guillemets (`"$NOM.piston"`). `$(expression)` est remplacé par la valeur d'une
+  formule (+ − × / ^, parenthèses, fonctions des formules) où les paramètres valent leur valeur SI (`5 cm` : 0.05 ; angles et
+  vitesses de rotation en degrés, comme leurs relevés) et les nombres s'écrivent en SI : `rect ($(X - ALESAGE/2), 0.1) …`,
+  `couple "-$(FREIN)*rotation"`. Tout est remplacé à la lecture, avant le reste ; les valeurs calculées pendant l'expérience
+  restent les `{…}`.
+- **Le protocole aussi** a ses paramètres (`paramètre T0 = 300 K`, puis `$T0`, `$(T0 + 20)`), et un `balayage T0 = …` en remplace
+  la valeur : une variante par valeur, qu'un `avec T0 = $T0` passe aux composants. Le balayage reste dans le protocole.
+- **Fichiers** : cherchés depuis le dossier du fichier qui les inclut (`composants/…` depuis le protocole, `cylindre.exp` depuis un
+  composant de `composants/`). Un composant peut en inclure d'autres (16 niveaux au plus ; pas d'inclusion circulaire).
+- **Noms** : un composant posé deux fois ne doit pas nommer deux fois la même chose ; ses objets prennent son `NOM` :
+  - zones nommées `zone "$NOM.chambre" = …`, dont l'expérience se sert ensuite (`vanne zone "réservoir.sortie" ouverte`) ;
+  - corps et vilebrequins nommés : option `nom "X"` de `corps` et de `vilebrequin`, relevés `corps "X" y`, `vilebrequin "X" angle`
+    (pièces d'un vilebrequin « X » : `corps "X.piston" fy`). Un nom que rien ne pose est une erreur de lecture (sauf au départ
+    d'un état enregistré, qui apporte ses propres corps) ; un nom posé deux fois, une erreur à la pose ;
+  - variables (`soit compte_$NOM = 0`) et colonnes (`comme "$NOM rotation"`). Ses colonnes s'ajoutent par `mesurer : …`, à la
+    période de l'expérience (`mesurer toutes les 2 ms`).
+- **Lignes** : une erreur dans un composant est signalée à la ligne de son « inclure », avec sa place dans le composant
+  (`ligne 9 : « composants/moteur_2t.exp » ligne 31 : …`) ; le journal situe de même ses règles et ses actions, et la fenêtre montre
+  la ligne du composant en cours (« Vérifier » relit aussi les composants). Un bloc (`si`, `tant que`, `quand` … `fin`) s'ouvre et
+  se ferme dans le même fichier.
+- **Copie** : `protocole.exp`, dans le dossier des résultats, est le protocole développé — paramètres remplacés, composants à leur
+  place entre deux commentaires — qui se relance seul.
+
+Composants fournis (`experiences/composants/` ; leurs paramètres et leurs noms sont décrits dans leur en-tête) :
+
+| Composant | Ce qu'il pose | Utilisé par |
+|---|---|---|
+| `cylindre.exp` | vilebrequin libre et volant, bielle, piston, cylindre, lumière de culasse fermée ; zones « NOM.chambre », « NOM.lumière », « NOM.culasse » | `moteur_2t.exp`, `moteur_air.exp` |
+| `moteur_2t.exp` | moteur à explosion à deux temps : le cylindre, sa charge, échappement, balayage, étincelle à AVANCE degrés, frein de banc ; ses colonnes | `moteur_explosion.exp`, `deux_moteurs.exp` (deux moteurs, deux avances), `avance.exp` (balayage de l'avance) |
+| `moteur_air.exp` | moteur à air comprimé : le cylindre, la lumière menée par l'angle ; ses colonnes | `moteur.exp` |
+| `reservoir.exp` | réservoir ouvert, sortie au fond fermée par une vanne ; zones « NOM.intérieur », « NOM.sortie » ; la masse de son fluide | `chasse.exp`, `bachees.exp` |
+| `soupape.exp` | soupape de sécurité à deux seuils, sur une lumière et un capteur donnés | `soupape.exp` |
+| `paliers.exp` | une suite d'actions : chauffe par paliers de consigne croissante, compteur de paliers en variable | `rampe.exp` |
 
 ## 4. La fenêtre d'expérience
 
@@ -298,7 +358,8 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
 | Fichier | Rôle |
 |---|---|
 | `simulation/multi/mp_experiment.rs` | modèle du protocole, zones, application des actions, déroulement (`Runner`), mesures, sorties, `run_cli` |
-| `simulation/multi/mp_script.rs` | lecture du texte (unités, erreurs avec leur ligne), balayage, écriture des zones (`zone_text`), insertion des lignes de conditions initiales |
+| `simulation/multi/mp_compose.rs` | composants : paramètres, `$NOM` et `$(…)`, inclusions développées, lignes numérotées d'après leur fichier (`Includes`) |
+| `simulation/multi/mp_script.rs` | lecture du texte (unités, erreurs avec leur ligne), balayage, zones nommées, objets nommés (vérifiés en fin de lecture), écriture des zones (`zone_text`), insertion des lignes de conditions initiales |
 | `simulation/multi/mp_fields.rs` | champs de valeurs : CSV, PNG (crate `png`), formules, étalement sur la zone |
 | `window/experiment_window.rs` | la fenêtre egui |
 
@@ -323,11 +384,18 @@ allées au bout. `--sortie` change la racine des résultats ; `--fils` fixe le n
   - chauffage tenu puis relâché ;
   - sorties ; reprise depuis un état enregistré au bit près ;
   - ligne de commande avec balayage ; protocoles d'exemple ;
+  - composants : paramètres et valeurs calculées, erreurs situées (inclusions imbriquées ou circulaires, paramètre inconnu ou
+    manquant, bloc à cheval sur deux fichiers), copie qui se relit seule ; zones et objets nommés ; les exemples refaits en
+    composants redonnent les mêmes relevés qu'avant, au bit près ; un moteur posé deux fois tourne sur ses propres règles ;
   - GPU, mêmes échéances et résultats proches ;
   - fenêtre : trait de pinceau, ligne et aperçu identiques, rectangle et champ, expérience menée au bout avec une pause.
 
 ## 7. Limites et suites
 
+- Composants : le texte est développé avant la lecture (des modèles, pas des objets isolés). Un composant ne voit que ses
+  paramètres, mais ses zones nommées, ses variables, ses règles et ses colonnes s'ajoutent à celles du protocole : d'où les noms
+  préfixés par `$NOM`. Les fichiers qu'il nomme (état, matériaux, champs) se cherchent depuis le dossier du protocole. Dans `$(…)`,
+  les nombres s'écrivent en SI, sans unité.
 - Blocs : `tant que`, `répéter n fois`, `si … sinon si … sinon` et les règles `quand` en bloc, fermés par `fin` (qui s'écrit aussi
   `fin tant que`, `fin répéter`, `fin si`, `fin quand`). Les répétitions (`toutes les T : <action>`) et les actions datées portent
   sur une action. Les valeurs calculées `{…}` vont dans les actions, les durées, les nombres de tours, les seuils, les

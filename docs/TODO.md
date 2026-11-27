@@ -279,6 +279,13 @@ détail dans les documents de conception et l'historique git.
   point mort bas, étincelle à 355° dans le mélange hydrogène–air comprimé ≈ 9 atm ; combustion jusqu'à ≈ 44 atm, 3000 K ; ≈ 615
   tr/min tenus par un frein de banc d'essai) ;
   un remplissage dans une maille à demi couverte par un corps laisse au corps sa place.
+- Protocoles : composants réutilisables — `inclure "fichier.exp" avec NOM = valeur, …` (inclusions imbriquées), `paramètre NOM =
+  valeur`, valeurs `$NOM` et `$(expression)` remplacées à la lecture (aussi dans le protocole, et par un balayage) ; erreurs et
+  journal situés dans le composant ; copie développée dans les résultats ; zones nommées `zone "nom" = …` ; corps et vilebrequins
+  nommés (`nom "X"`, relevés `corps "X" y`, `vilebrequin "X" angle`) ; `mesurer : …` sans période. Composants
+  `experiences/composants/` (cylindre, moteur à deux temps, moteur à air, réservoir, soupape, chauffe par paliers) : les exemples
+  refaits avec eux (mêmes relevés au bit près), un moteur posé deux fois (`deux_moteurs.exp`), un balayage passé à un composant
+  (`avance.exp`).
 
 ### Expériences et interface
 - Fenêtre d'expérience, protocoles reproductibles `.exp`, ligne de commande `fluid-sim experience` (2026-11-24, voir

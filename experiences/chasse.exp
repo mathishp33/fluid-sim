@@ -2,23 +2,23 @@
 # bloc « quand … fin » ouvre la vanne du fond (4 cm), attend que le réservoir soit presque vide (moins de 3 kg), puis la referme,
 # et recommence à chaque remplissage (4 chasses en 8 s), en parallèle du protocole, qui ne fait que simuler.
 #   fluid-sim experience experiences/chasse.exp
+#
+# Le réservoir est un composant, « composants/reservoir.exp » (le même que dans « bachees.exp », avec une sortie plus large) ; le
+# protocole le désigne par ses zones nommées « réservoir.intérieur » et « réservoir.sortie ».
 
 départ scénario "Cuve vide" grille 40 x 40 maille 1 cm
 
 # réservoir d'acier ouvert en haut, vanne fermée dans son fond, robinet au-dessus
-solide rect (0.11, 0.21) (0.29, 0.37) "acier"
-effacer rect (0.12, 0.22) (0.28, 0.37)
-effacer rect (0.18, 0.21) (0.22, 0.22)
-vanne rect (0.18, 0.21) (0.22, 0.22) fermée
+inclure "composants/reservoir.exp" avec SORTIE = 4 cm
 émetteur rect (0.13, 0.35) (0.15, 0.36) "eau" (0, -0.3) m/s à 20 °C
 
-mesurer toutes les 20 ms : masse "eau" dans rect (0.12, 0.22) (0.28, 0.37) comme "réservoir", masse "eau" dans rect (0, 0) (0.4, 0.21) comme "bassin"
+mesurer toutes les 20 ms : masse "eau" dans rect (0, 0) (0.4, 0.21) comme "bassin"
 
-quand masse "eau" dans rect (0.12, 0.22) (0.28, 0.37) > 10
+quand masse "eau" dans zone "réservoir.intérieur" > 10
     marque "chasse"
-    vanne rect (0.18, 0.21) (0.22, 0.22) ouverte
-    attendre que masse "eau" dans rect (0.12, 0.22) (0.28, 0.37) < 3 au plus 2 s
-    vanne rect (0.18, 0.21) (0.22, 0.22) fermée
+    vanne zone "réservoir.sortie" ouverte
+    attendre que masse "eau" dans zone "réservoir.intérieur" < 3 au plus 2 s
+    vanne zone "réservoir.sortie" fermée
 fin
 
 simuler 8 s

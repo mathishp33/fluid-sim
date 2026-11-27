@@ -245,8 +245,8 @@ pub enum Measure {
     Probe { q: Quantity, reduce: Reduce, zone: Zone, label: Option<String> },
     /// masse d'un fluide pur dans une zone (kg par mètre de profondeur)
     Mass { fluid: String, zone: Zone, label: Option<String> },
-    /// position, vitesse ou force du fluide sur un corps rigide (indice à partir de 0, dans l'ordre de pose)
-    Body { index: usize, q: BodyQty, label: Option<String> },
+    /// position, vitesse ou force du fluide sur un corps rigide (par son rang dans l'ordre de pose, ou par son nom)
+    Body { who: Who, q: BodyQty, label: Option<String> },
     /// force du fluide (composante x : 0, y : 1) sur les mailles solides de la zone, par mètre de profondeur
     SolidForce { axis: usize, zone: Zone, label: Option<String> },
     /// débit volumique (m²/s) ou massique (`mass`, kg/(m·s)) d'un fluide pur, ou de tous, à travers le segment horizontal ou vertical
@@ -256,8 +256,36 @@ pub enum Measure {
     Time { label: Option<String> },
     /// variable du protocole (indice dans `Protocol::vars`)
     Var { var: usize, label: Option<String> },
-    /// grandeur d'un vilebrequin (indice à partir de 0, dans l'ordre de pose)
-    Crank { index: usize, q: CrankQty, label: Option<String> },
+    /// grandeur d'un vilebrequin (par son rang dans l'ordre de pose, ou par son nom)
+    Crank { who: Who, q: CrankQty, label: Option<String> },
+}
+
+/// Corps ou vilebrequin d'un relevé : son rang dans l'ordre de pose (à partir de 0 ; « corps 2 » est le rang 1) ou son nom (option
+/// `nom "X"` de sa ligne) — un composant désigne ainsi ses pièces sans savoir combien d'autres ont été posées avant lui.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Who {
+    Rank(usize),
+    Name(String),
+}
+
+impl Who {
+    /// dans le nom d'une colonne : « 2 » ou « gauche »
+    pub fn label(&self) -> String {
+        match self {
+            Who::Rank(k) => format!("{}", k + 1),
+            Who::Name(n) => n.clone(),
+        }
+    }
+    /// indice parmi les objets posés (leurs noms, dans l'ordre de pose) ; usize::MAX s'il n'y est pas (relevé vide)
+    pub fn find<'a>(&self, mut names: impl Iterator<Item = &'a str>) -> usize {
+        match self {
+            Who::Rank(k) => *k,
+            Who::Name(n) => {
+                let n = norm(n);
+                names.position(|m| norm(m) == n).unwrap_or(usize::MAX)
+            }
+        }
+    }
 }
 
 /// Force mesurée sur un corps : celle du fluide (pression et frottement), des contacts, d'une loi en formule, ou leur somme avec
@@ -347,6 +375,8 @@ pub struct CrankSpec {
     pub inertia: f64,
     pub load: Option<String>,
     pub temp: Option<f64>,
+    /// nom (`nom "X"`) : relevés `vilebrequin "X" …`, pièces « X.manivelle », « X.bielle », « X.piston »
+    pub name: Option<String>,
 }
 
 /// Grandeur mesurée sur un corps rigide.
@@ -585,7 +615,8 @@ pub enum Action {
     Fill { zone: Zone, fluid: String, temp: Option<f64> },
     /// corps rigide, fixe ou à mouvement imposé (solides mobiles : voir SOLID.md)
     /// `temp` : température du corps au départ (sinon celle du fluide ambiant)
-    Body { shape: BodySpec, material: String, angle: f64, motion: BodyMotion, temp: Option<f64> },
+    /// `name` : nom du corps (`nom "X"`), pour ses relevés `corps "X" …`
+    Body { shape: BodySpec, material: String, angle: f64, motion: BodyMotion, temp: Option<f64>, name: Option<String> },
     SetTemp { zone: Zone, temp: f64 },
     Solid { zone: Zone, material: String, thermal: ThermalSpec, temp: Option<f64> },
     Clear { zone: Zone },
@@ -850,12 +881,80 @@ pub struct Protocol {
     pub images: Vec<(f64, super::mp_view::MpDisplay, usize)>,
     pub measures: Vec<(Measure, usize)>,
     pub steps: Vec<(Step, usize)>,
-    /// texte du protocole (après substitution du balayage)
+    /// texte du protocole : paramètres et balayage remplacés, composants développés (copié dans le dossier des résultats, il se
+    /// relance seul)
     pub source: String,
     /// (nom, valeur) de la variante d'un balayage
     pub variant: Option<(String, String)>,
     /// variables (`soit n = …`), dans l'ordre de leur première affectation ; leurs formules les nomment avec t (temps simulé)
     pub vars: Vec<String>,
+    /// lignes venues des composants (`inclure`), numérotées à la suite du texte
+    pub includes: Includes,
+}
+
+/// Lignes lues dans les composants (`inclure "fichier" avec …`) : numérotées à la suite des lignes du texte du protocole, pour que
+/// les étapes, les erreurs et le journal disent d'où elles viennent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Includes {
+    /// numéro de la première (le nombre de lignes du texte, plus un)
+    pub first: usize,
+    pub lines: Vec<IncludedLine>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncludedLine {
+    /// ligne du texte du protocole : l'« inclure » d'où elle vient
+    pub line: usize,
+    /// fichier du composant (tel qu'écrit dans son « inclure ») et ligne dans ce fichier ; `via` : les inclusions qui y mènent
+    /// (« « composants/moteur.exp » ligne 5 → », vide pour un composant inclus par le protocole)
+    pub file: String,
+    pub at: usize,
+    pub via: String,
+    /// texte de la ligne, paramètres remplacés
+    pub text: String,
+}
+
+impl Includes {
+    pub fn get(&self, l: usize) -> Option<&IncludedLine> {
+        if self.lines.is_empty() || l < self.first {
+            return None;
+        }
+        self.lines.get(l - self.first)
+    }
+    /// « ligne 12 », ou pour une ligne d'un composant « ligne 12 (« composants/moteur.exp » ligne 30) »
+    pub fn place(&self, l: usize) -> String {
+        match self.get(l) {
+            Some(o) => format!("ligne {} ({}« {} » ligne {})", o.line, o.via, o.file, o.at),
+            None => format!("ligne {l}"),
+        }
+    }
+    /// message (ou chacune de ses lignes) qui commence par « ligne N » : situé dans son composant si la ligne N en vient
+    pub fn relabel(&self, msg: &str) -> String {
+        if self.lines.is_empty() {
+            return msg.to_string();
+        }
+        let one = |l: &str| -> String {
+            if let Some(rest) = l.strip_prefix("ligne ") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<usize>() {
+                    if self.get(n).is_some() {
+                        return format!("{}{}", self.place(n), &rest[digits.len()..]);
+                    }
+                }
+            }
+            l.to_string()
+        };
+        msg.split('\n').map(one).collect::<Vec<_>>().join("\n")
+    }
+    /// lignes d'un bloc entre son ouverture (ligne l0) et son « fin » (ligne l1), dans leur fichier
+    pub fn block(&self, l0: usize, l1: usize) -> String {
+        match (self.get(l0), self.get(l1)) {
+            (Some(a), Some(b)) if a.file == b.file && a.via == b.via => {
+                format!("bloc des lignes {} à {} de « {} »", a.at + 1, b.at.saturating_sub(1).max(a.at + 1), a.file)
+            }
+            _ => format!("bloc des lignes {} à {}", l0 + 1, l1.saturating_sub(1).max(l0 + 1)),
+        }
+    }
 }
 
 impl Protocol {
@@ -1071,6 +1170,10 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
 
 /// Construit l'état de départ du protocole : (simulation, bibliothèque de matériaux, scénario).
 pub fn build_start(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Option<MaterialLibrary>, Option<usize>), String> {
+    build_start_at(proto, base).map_err(|e| proto.includes.relabel(&e))
+}
+
+fn build_start_at(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Option<MaterialLibrary>, Option<usize>), String> {
     let (start, line) = proto.start.as_ref().ok_or_else(|| "le protocole doit commencer par une ligne « départ … »".to_string())?;
     let lib = match &proto.materials {
         Some(f) => {
@@ -1155,9 +1258,10 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
             Ok(cs.len())
         }
         Action::Crank(spec) => add_crank(sim, spec, base),
-        Action::Body { shape, material, angle, motion, temp } => {
+        Action::Body { shape, material, angle, motion, temp, name } => {
             let s = find_solid(sim, material)?;
-            let b = shape.body(s, *angle, temp.unwrap_or(t_amb), motion)?;
+            let mut b = shape.body(s, *angle, temp.unwrap_or(t_amb), motion)?;
+            b.name = name.clone().unwrap_or_default();
             sim.add_body(b)?;
             Ok(sim.body_frac.iter().filter(|&&a| a > 0.0).count())
         }
@@ -1371,6 +1475,7 @@ fn add_crank(sim: &mut MultiphaseSim, spec: &CrankSpec, base: &Path) -> Result<u
         load: spec.load.clone(),
         torque: 0.0,
         applied: 0.0,
+        name: spec.name.clone().unwrap_or_default(),
     };
     let w = (spec.r / 3.0).max(dx);
     let t = spec.temp.unwrap_or(sim.t_ambient);
@@ -1391,7 +1496,7 @@ pub fn initial_state(proto: &Protocol, base: &Path) -> Result<(MultiphaseSim, Op
     for k in proto.initial_actions().0 {
         if let (Step::Do(a), line) = &proto.steps[k] {
             if a.is_instant_edit() {
-                apply_action(&mut sim, a, base).map_err(|e| format!("ligne {line} : {e}"))?;
+                apply_action(&mut sim, a, base).map_err(|e| format!("{} : {e}", proto.includes.place(*line)))?;
             }
         }
     }
@@ -1407,8 +1512,8 @@ enum ProbeKind {
     Mass(usize),
     Time,
     Var(usize),
-    Crank(usize, CrankQty),
-    Body(usize, BodyQty),
+    Crank(Who, CrankQty),
+    Body(Who, BodyQty),
     /// force du fluide sur les mailles solides parmi `cells`, composante 0 (x) ou 1 (y)
     SolidForce(usize),
     /// débit à travers des faces : fluide pur (sinon tous), massique, faces de u (ligne verticale) ou de v ; par face, son indice et
@@ -1715,6 +1820,11 @@ fn lerp_index(s: f64, n: usize) -> (usize, usize, f64) {
 impl Probe {
     /// valeur pour l'état `sim` ; `vals` : (t, variables du protocole…)
     fn value(&self, sim: &MultiphaseSim, vals: &[f64]) -> f64 {
+        match &self.kind {
+            ProbeKind::Crank(who, q) => return q.value(sim, who.find(sim.cranks.iter().map(|c| c.name.as_str()))),
+            ProbeKind::Body(who, q) => return q.value(sim, who.find(sim.bodies.iter().map(|b| b.name.as_str()))),
+            _ => {}
+        }
         if let ProbeKind::Flux { phase, mass, vertical, faces, slots, last } = &self.kind {
             // débit moyen depuis le relevé précédent : ce qu'a compté le transport ; au premier relevé, l'estimation instantanée
             let np = sim.reg.phases.len();
@@ -1750,9 +1860,8 @@ impl Probe {
             ProbeKind::Mass(k) => self.cells.iter().map(|&c| sim.mass[k][c]).sum::<f64>() * a2,
             ProbeKind::Time => sim.time,
             ProbeKind::Var(k) => vals.get(k + 1).copied().unwrap_or(f64::NAN),
-            ProbeKind::Crank(k, q) => q.value(sim, k),
+            ProbeKind::Crank(..) | ProbeKind::Body(..) => unreachable!(),
             ProbeKind::SolidForce(axis) => solid_force(sim, &self.cells)[axis],
-            ProbeKind::Body(k, q) => q.value(sim, k),
             ProbeKind::Point(q, p) => point_value(sim, q, p, self.cells[0], self.fluid_only),
             ProbeKind::Q(q, red) => {
                 let vals = self.cells.iter().filter(|&&c| !(self.fluid_only && sim.is_solid(c))).map(|&c| qty_value(sim, q, c));
@@ -1947,8 +2056,21 @@ impl Runner {
     ) -> Result<Runner, String> {
         let errs = check_names(&proto, &sim);
         if !errs.is_empty() {
-            return Err(errs.iter().map(|(l, e)| format!("ligne {l} : {e}")).collect::<Vec<_>>().join("\n"));
+            return Err(errs.iter().map(|(l, e)| format!("{} : {e}", proto.includes.place(*l))).collect::<Vec<_>>().join("\n"));
         }
+        let includes = proto.includes.clone();
+        Self::open(proto, base, out_dir, gpu, sim, library, scenario).map_err(|e| includes.relabel(&e))
+    }
+
+    fn open(
+        proto: Protocol,
+        base: &Path,
+        out_dir: Option<PathBuf>,
+        gpu: Option<bool>,
+        sim: MultiphaseSim,
+        library: Option<MaterialLibrary>,
+        scenario: Option<usize>,
+    ) -> Result<Runner, String> {
         let mut r = Runner {
             t_end: proto.planned_end(sim.time),
             t_start: sim.time,
@@ -2072,6 +2194,7 @@ impl Runner {
         if self.quiet {
             return;
         }
+        let msg = self.proto.includes.relabel(&msg);
         self.log.push(format!("[t = {:.6} s] {msg}", self.sim.time));
     }
 
@@ -2101,9 +2224,9 @@ impl Runner {
             Measure::Time { label } => {
                 (Probe { kind: ProbeKind::Time, cells: vec![], fluid_only: false }, label.clone().unwrap_or_else(|| "temps".into()), "s".to_string())
             }
-            Measure::Crank { index, q, label } => {
-                let name = label.clone().unwrap_or_else(|| format!("vilebrequin {} {}", index + 1, q.name()));
-                (Probe { kind: ProbeKind::Crank(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
+            Measure::Crank { who, q, label } => {
+                let name = label.clone().unwrap_or_else(|| format!("vilebrequin {} {}", who.label(), q.name()));
+                (Probe { kind: ProbeKind::Crank(who.clone(), *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
             }
             Measure::Var { var, label } => {
                 let name = label.clone().unwrap_or_else(|| self.proto.vars.get(*var).cloned().unwrap_or_default());
@@ -2144,13 +2267,13 @@ impl Runner {
                 let name = label.clone().unwrap_or_else(|| format!("masse {fluid} {}", zone.label()));
                 (Probe { kind: ProbeKind::Mass(k), cells, fluid_only: true }, name, "kg/m".to_string())
             }
-            Measure::Body { index, q, label } => {
+            Measure::Body { who, q, label } => {
                 let sfx = match q {
                     BodyQty::Fx(p) | BodyQty::Fy(p) | BodyQty::Torque(p) => p.suffix(),
                     _ => "",
                 };
-                let name = label.clone().unwrap_or_else(|| format!("corps {} {}{sfx}", index + 1, q.name()));
-                (Probe { kind: ProbeKind::Body(*index, *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
+                let name = label.clone().unwrap_or_else(|| format!("corps {} {}{sfx}", who.label(), q.name()));
+                (Probe { kind: ProbeKind::Body(who.clone(), *q), cells: vec![], fluid_only: false }, name, q.unit().to_string())
             }
             Measure::SolidForce { axis, zone, label } => {
                 // toutes les mailles de la zone : les solides sont retenus au relevé (posés avant ou pendant l'expérience)
@@ -2611,7 +2734,7 @@ impl Runner {
             (Some(a), _) => describe(a),
             (None, Some((a, b))) => {
                 let (l0, l1) = (self.proto.steps[a].1, self.proto.steps[b].1);
-                format!("bloc des lignes {} à {}", l0 + 1, l1.saturating_sub(1).max(l0 + 1))
+                self.proto.includes.block(l0, l1)
             }
             _ => String::new(),
         };
@@ -3044,6 +3167,7 @@ impl Runner {
     }
 
     fn fail(&mut self, msg: String) {
+        let msg = self.proto.includes.relabel(&msg);
         self.quiet = false;
         self.note(format!("ERREUR : {msg}"));
         self.state = RunState::Failed(msg);
@@ -3382,7 +3506,7 @@ fn describe(a: &Action) -> String {
         Action::SetTemp { zone, temp } => format!("température {} à {} K", zone.label(), fmt_num(*temp)),
         Action::Solid { zone, material, .. } => format!("solide « {material} » {}", zone.label()),
         Action::Clear { zone } => format!("effacer {}", zone.label()),
-        Action::Body { shape, material, angle, motion, temp } => {
+        Action::Body { shape, material, angle, motion, temp, name } => {
             let f = match shape {
                 BodySpec::Disc { c, r } => format!("disque {} rayon {}", fmt_point(*c), fmt_num(*r)),
                 BodySpec::Rect { a, b } => format!("rect {} {}", fmt_point(*a), fmt_point(*b)),
@@ -3395,6 +3519,10 @@ fn describe(a: &Action) -> String {
             };
             let a = match temp {
                 Some(t) => format!("{a}, à {} K", fmt_num(*t)),
+                None => a,
+            };
+            let a = match name {
+                Some(n) => format!("{a}, nommé « {n} »"),
                 None => a,
             };
             if motion.free {
@@ -3563,7 +3691,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let protos = match super::mp_script::parse_all(&text) {
+    let protos = match super::mp_script::parse_all_in(&text, file.parent().unwrap_or(Path::new(""))) {
         Ok(p) => p,
         Err(errs) => {
             for e in errs {

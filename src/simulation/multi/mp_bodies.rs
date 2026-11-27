@@ -266,6 +266,9 @@ pub struct RigidBody {
     /// contacts (mp_contacts.rs) : coefficient de restitution normal et coefficient de frottement de Coulomb
     pub restitution: f64,
     pub friction: f64,
+    /// nom donné par le protocole (`corps … nom "X"`), vide sinon ; les pièces d'un vilebrequin nommé « X » s'appellent « X.manivelle »,
+    /// « X.bielle » et « X.piston »
+    pub name: String,
 }
 
 /// coefficient de restitution d'un corps, sauf mention
@@ -292,6 +295,7 @@ impl RigidBody {
             rho: None,
             restitution: DEFAULT_RESTITUTION,
             friction: DEFAULT_FRICTION,
+            name: String::new(),
         }
     }
 
@@ -1497,6 +1501,12 @@ impl super::multiphase::MultiphaseSim {
     /// maille, masses et énergies sont ramenées à la place restante 1 − α_corps (composition et température gardées ; une trace
     /// FLUID_TRACE reste dans les mailles entièrement couvertes). Le fluide chassé disparaît, comme quand on peint un solide.
     /// Retourne l'indice du corps.
+    /// corps nommé `name` (sans casse ni accents) ; None pour un nom vide
+    pub fn body_named(&self, name: &str) -> Option<usize> {
+        let n = super::mp_experiment::norm(name);
+        (!n.is_empty()).then(|| self.bodies.iter().position(|b| super::mp_experiment::norm(&b.name) == n)).flatten()
+    }
+
     pub fn add_body(&mut self, b: RigidBody) -> Result<usize, String> {
         if b.material >= self.reg.solids.len() {
             return Err(format!("matériau n° {} inconnu ({} solides)", b.material, self.reg.solids.len()));
@@ -1513,6 +1523,9 @@ impl super::multiphase::MultiphaseSim {
             if !(r > 0.0 && r.is_finite()) {
                 return Err(format!("masse volumique {r} kg/m³ : il faut un nombre positif"));
             }
+        }
+        if self.body_named(&b.name).is_some() {
+            return Err(format!("un corps s'appelle déjà « {} » (un composant posé deux fois : donnez-lui un autre nom)", b.name));
         }
         let mut b = b;
         if b.is_imposed() {

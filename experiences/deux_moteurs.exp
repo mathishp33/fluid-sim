@@ -1,0 +1,15 @@
+# Deux moteurs à explosion sur le même banc : le composant « composants/moteur_2t.exp » posé deux fois, chaque moteur nommé
+# (« gauche », « droite ») pour que ses règles et ses mesures ne désignent que ses pièces. Ils ne diffèrent que par l'avance à
+# l'allumage : étincelle à 355° pour « gauche » (comme « moteur_explosion.exp »), à 330° pour « droite ». « gauche » tient
+# ≈ 620 tr/min, son frein absorbant ≈ 3.6 kW par mètre de profondeur ; « droite » ralentit et se tient vers 570 tr/min, sous le seuil
+# du frein : allumée trop tôt, sa charge brûle pendant la compression, contre le piston qui monte (pointe ≈ 3500 K, contre 3000 K
+# à gauche). Colonnes « gauche … » et « droite … » côte à côte dans mesures.csv.
+#   fluid-sim experience experiences/deux_moteurs.exp
+
+départ scénario "Explosion confinée (hydrogène–air)" grille 60 x 40 maille 5 mm
+remplir partout avec "air sec (O2 + N2)" à 20 °C
+inclure "composants/moteur_2t.exp" avec NOM = "gauche", X = 0.075
+inclure "composants/moteur_2t.exp" avec NOM = "droite", X = 0.225, AVANCE = 330
+
+mesurer toutes les 2 ms
+simuler 1 s

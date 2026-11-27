@@ -44,7 +44,13 @@ pub struct Crank {
     /// au dernier pas : couple ramené au vilebrequin des forces du fluide et des poids (N), couple appliqué (N)
     pub torque: f64,
     pub applied: f64,
+    /// nom donné par le protocole (`vilebrequin … nom "X"`), vide sinon ; ses pièces s'appellent « X.manivelle », « X.bielle »,
+    /// « X.piston »
+    pub name: String,
 }
+
+/// pièces d'un vilebrequin, dans l'ordre de `Crank::bodies` (noms « X.manivelle »… d'un vilebrequin nommé « X »)
+pub const CRANK_PARTS: [&str; 3] = ["manivelle", "bielle", "piston"];
 
 impl Crank {
     /// axes de la manivelle (A) et du piston (B) pour l'angle θ
@@ -134,6 +140,17 @@ impl MultiphaseSim {
         // (bielle inclinée d'au plus β = asin(r/l) : raccourcie pour que son coin ne morde pas sur le piston)
         let beta = (ck.r / ck.l).asin();
         ck.rod_len = (ck.l - 0.5 * w * beta.tan() - 0.05 * w).max(0.5 * ck.l);
+        if !ck.name.trim().is_empty() {
+            let n = super::mp_experiment::norm(&ck.name);
+            if self.cranks.iter().any(|c| super::mp_experiment::norm(&c.name) == n) {
+                return Err(format!("un vilebrequin s'appelle déjà « {} » (un composant posé deux fois : donnez-lui un autre nom)", ck.name));
+            }
+            for part in CRANK_PARTS {
+                if self.body_named(&format!("{}.{part}", ck.name)).is_some() {
+                    return Err(format!("un corps s'appelle déjà « {}.{part} »", ck.name));
+                }
+            }
+        }
         let n = self.bodies.len();
         ck.bodies = [n, n + 1, n + 2];
         let shapes = [Shape::Rect { w: ck.r + w, h: w }, Shape::Rect { w: ck.rod_len, h: w }, Shape::Rect { w: bore, h: ck.piston_h }];
@@ -142,6 +159,9 @@ impl MultiphaseSim {
             let mut b = RigidBody::new(shapes[k].clone(), material, poses[k].0, temp);
             b.angle = poses[k].1;
             b.motion = Motion::Driven;
+            if !ck.name.trim().is_empty() {
+                b.name = format!("{}.{}", ck.name, CRANK_PARTS[k]);
+            }
             self.add_body(b)?;
         }
         ck.place(&mut self.bodies);

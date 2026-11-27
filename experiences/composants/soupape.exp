@@ -1,0 +1,16 @@
+# Composant : soupape de sécurité (expérience « soupape.exp ») — une lumière percée dans une paroi, fermée par une vanne, qui s'ouvre
+# quand la pression relevée en CAPTEUR dépasse OUVERTURE et se referme sous FERMETURE. Deux règles « quand » aux seuils écartés :
+# une hystérésis, sans laquelle la soupape battrait à chaque pas.
+#   inclure "composants/soupape.exp" avec LUMIERE = rect (0.14, 0.19) (0.16, 0.2), CAPTEUR = (0.15, 0.1), OUVERTURE = 2 atm
+#
+# LUMIERE est une zone, CAPTEUR un point (x, y) : ils s'écrivent comme dans une ligne du protocole.
+
+paramètre LUMIERE = rect (0.14, 0.19) (0.16, 0.2)
+paramètre CAPTEUR = (0.15, 0.1)
+paramètre OUVERTURE = 104 kPa
+paramètre FERMETURE = 102 kPa
+
+effacer $LUMIERE
+vanne $LUMIERE fermée
+quand p en $CAPTEUR > $OUVERTURE : vanne $LUMIERE ouverte
+quand p en $CAPTEUR < $FERMETURE : vanne $LUMIERE fermée

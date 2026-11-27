@@ -1,0 +1,39 @@
+# Composant : moteur à explosion à un cylindre, cycle à deux temps idéalisé (expérience « moteur_explosion.exp »). Le cylindre de
+# « cylindre.exp », une première charge de mélange frais, et les règles du cycle, menées par l'angle du vilebrequin :
+#   de ECHAPPEMENT à BALAYAGE degrés après le point mort haut, la lumière de la culasse est ouverte (échappement des gaz brûlés) ;
+#   de BALAYAGE à 270°, la chambre est remplie de mélange frais (balayage) et la lumière se ferme ; le piston comprime la charge ;
+#   à AVANCE degrés, une étincelle (un petit noyau de gaz brûlés) l'allume.
+# Un frein de banc d'essai absorbe la puissance : FREIN newtons par °/s au-dessus de REGIME °/s (couple nul en dessous).
+#   inclure "composants/moteur_2t.exp" avec NOM = "droite", X = 0.225, AVANCE = 330
+#
+# Pièces et zones nommées d'après NOM, comme dans « cylindre.exp ». Colonnes de mesure « NOM rotation » (°/s), « NOM tours »,
+# « NOM puissance » (W par mètre de profondeur), « NOM chambre » (pression sous la culasse), « NOM T chambre » (température la plus
+# haute de la chambre), relevées à la période de l'expérience (« mesurer toutes les <durée> »).
+
+paramètre NOM = "moteur"
+paramètre X = 0.075
+paramètre Y = 0.05
+paramètre ANGLE = 180                 # départ au point mort bas, chambre pleine
+paramètre ROTATION = 600 tr/min
+paramètre INERTIE = 0.5
+paramètre REGIME = 3600               # (°/s) le frein ne freine qu'au-dessus
+paramètre FREIN = 0.5                 # (N par °/s au-dessus du régime)
+paramètre AVANCE = 355                # étincelle (°)
+paramètre ECHAPPEMENT = 140           # ouverture de la lumière (°)
+paramètre BALAYAGE = 180              # balayage de la chambre (°), jusqu'à 270°
+paramètre MELANGE = "hydrogène–air stœchiométrique"
+
+inclure "cylindre.exp" avec NOM = $NOM, X = $X, Y = $Y, ANGLE = $ANGLE, ROTATION = $ROTATION, INERTIE = $INERTIE, COUPLE = "-$(FREIN)*max(rotation - $(REGIME), 0)"
+
+# première charge
+remplir zone "$NOM.chambre" avec $MELANGE à 20 °C
+
+# échappement, balayage, allumage
+quand vilebrequin $NOM angle > $ECHAPPEMENT et vilebrequin $NOM angle < $BALAYAGE : vanne zone "$NOM.lumière" ouverte
+quand vilebrequin $NOM angle > $BALAYAGE et vilebrequin $NOM angle < 270
+    remplir zone "$NOM.chambre" avec $MELANGE à 20 °C
+    vanne zone "$NOM.lumière" fermée
+fin
+quand vilebrequin $NOM angle > $AVANCE : allumer disque zone "$NOM.culasse" rayon 4 mm
+
+mesurer : vilebrequin $NOM rotation comme "$NOM rotation", vilebrequin $NOM tours comme "$NOM tours", vilebrequin $NOM puissance comme "$NOM puissance", p en zone "$NOM.culasse" comme "$NOM chambre", max T dans zone "$NOM.chambre" comme "$NOM T chambre"

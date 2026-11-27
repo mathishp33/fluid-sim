@@ -1,0 +1,40 @@
+# Composant : cylindre de moteur — vilebrequin libre avec son volant, bielle, piston, cylindre droit (axe vers le haut) et lumière
+# de culasse fermée par une vanne. Il ne fait rien tourner : les règles d'un moteur (admission, échappement, allumage) sont celles du
+# composant qui l'inclut (« moteur_2t.exp », « moteur_air.exp »).
+#   inclure "cylindre.exp" avec NOM = "gauche", X = 0.075, ANGLE = 180, COUPLE = "-0.0002*rotation"
+#
+# Pièces et zones, nommées d'après NOM :
+#   vilebrequin "NOM" ; corps "NOM.manivelle", "NOM.bielle", "NOM.piston"
+#   zone "NOM.chambre" : volume balayé par le piston, et la chambre au-dessus ; zone "NOM.lumière" : la lumière, dans la culasse ;
+#   zone "NOM.culasse" : un point au milieu de la chambre au point mort haut (capteur de pression, bougie)
+# L'alésage est pris en mailles entières et le cylindre centré sur une maille : avec un alésage d'un nombre pair de mailles, X tombe
+# sur une face de maille (0.075 avec des mailles de 5 mm).
+
+paramètre NOM = "moteur"
+paramètre X = 0.075                   # axe du vilebrequin (m)
+paramètre Y = 0.05
+paramètre RAYON = 2 cm                # rayon de manivelle : la course vaut deux rayons
+paramètre BIELLE = 6 cm               # entre les axes de la bielle
+paramètre ALESAGE = 4 cm
+paramètre PISTON = 1 cm               # hauteur du piston
+paramètre CHAMBRE = 1 cm              # hauteur de la chambre au point mort haut
+paramètre PAROI = 5 mm                # parois du cylindre et culasse
+paramètre LUMIERE = 1 cm              # largeur de la lumière de la culasse
+paramètre MATIERE = "acier"
+paramètre ANGLE = 0                   # angle de départ depuis le point mort haut (°)
+paramètre ROTATION = 0 tr/min         # vitesse de départ
+paramètre INERTIE = 0.5               # volant (kg·m par mètre de profondeur)
+paramètre COUPLE = "0"                # couple appliqué (N) : formule en t, angle, tours, rotation (°/s)
+# calculés : la face de la culasse, le haut du piston au point mort bas
+paramètre HAUT = $(Y + RAYON + BIELLE + PISTON + CHAMBRE)
+paramètre BAS = $(Y + BIELLE - RAYON + PISTON)
+
+vilebrequin ($X, $Y) rayon $RAYON bielle $BIELLE $MATIERE alésage $ALESAGE piston $PISTON cylindre chambre $CHAMBRE paroi $PAROI angle $ANGLE libre rotation $ROTATION inertie $INERTIE couple $COUPLE nom $NOM
+
+zone "$NOM.chambre" = rect ($(X - ALESAGE/2), $BAS) ($(X + ALESAGE/2), $HAUT)
+zone "$NOM.lumière" = rect ($(X - LUMIERE/2), $HAUT) ($(X + LUMIERE/2), $(HAUT + PAROI))
+zone "$NOM.culasse" = point ($X, $(HAUT - CHAMBRE/2))
+
+# la lumière, percée dans la culasse et fermée
+effacer zone "$NOM.lumière"
+vanne zone "$NOM.lumière" fermée

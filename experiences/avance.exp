@@ -1,0 +1,14 @@
+# Avance à l'allumage : le moteur à explosion de « moteur_explosion.exp » (le composant « composants/moteur_2t.exp »), relancé pour
+# quatre angles d'étincelle — un balayage dont chaque valeur est passée au composant. Une variante par angle, chacune dans son
+# dossier de résultats (résultats/avance/AVANCE=330/, …). Sur la seconde moitié (0.25 à 0.5 s), le moteur tourne à 567 tr/min avec
+# l'étincelle à 330°, 600 à 340°, 616 à 350° et 619 à 355° : plus l'étincelle est précoce, plus la charge brûle pendant la
+# compression, contre le piston qui monte.
+#   fluid-sim experience experiences/avance.exp
+
+départ scénario "Explosion confinée (hydrogène–air)" grille 30 x 40 maille 5 mm
+balayage AVANCE = 330, 340, 350, 355
+remplir partout avec "air sec (O2 + N2)" à 20 °C
+inclure "composants/moteur_2t.exp" avec AVANCE = $AVANCE
+
+mesurer toutes les 2 ms
+simuler 0.5 s

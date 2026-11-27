@@ -3,11 +3,14 @@
 //! Une commande par ligne, `#` commence un commentaire ; mots-clés sans casse ni accents obligatoires (« départ » = « depart ») ;
 //! noms (fluides, matériaux, fichiers) entre guillemets ; nombres avec un POINT décimal ; unités facultatives (SI par défaut :
 //! m, s, K, m/s, m/s², Pa, W/m³). Un `balayage NOM = v1, v2, …` rejoue le protocole pour chaque valeur (`$NOM` dans le texte).
+//! Composants (`inclure "fichier.exp" avec NOM = valeur`, `paramètre NOM = valeur`, `$NOM`, `$(expression)`) : `mp_compose`, avant la
+//! lecture ; zones nommées (`zone "nom" = <zone>`, puis `zone "nom"` à la place d'une zone) : ici, à la lecture de chaque ligne.
 
 use super::mp_experiment::{
-    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, CrankQty, CrankSpec, FieldQty, FieldSource, LetValue, Logic, Measure, Protocol,
-    Quantity, Reduce, Start, Step, ThermalSpec, Threshold, Zone,
+    norm, Action, BodyMotion, BodyQty, BodySpec, BoundarySpec, Calc, Clause, Cmp, CrankQty, CrankSpec, FieldQty, FieldSource, Includes, LetValue, Logic, Measure,
+    Protocol, Quantity, Reduce, Start, Step, ThermalSpec, Threshold, Who, Zone,
 };
+use std::path::Path;
 use super::mp_view::T_IGNITION;
 
 const P_ATM: f64 = 101325.0;
@@ -133,6 +136,20 @@ fn unit_of(w: &str) -> Option<(Dim, f64, f64)> {
     })
 }
 
+/// valeur SI d'un nombre suivi ou non de son unité (« 5 cm » : 0.05 ; « 20 °C » : 293.15 ; angles et vitesses de rotation en degrés,
+/// comme leurs relevés : « 600 tr/min » : 3600) ; None si le texte n'est pas un nombre
+pub(crate) fn si_number(text: &str) -> Option<f64> {
+    match tokenize(text, 0).ok()?.as_slice() {
+        [Tok::N(v)] => Some(*v),
+        [Tok::N(v), Tok::W(w, _)] => {
+            let (d, f, off) = unit_of(w)?;
+            let x = v * f + off;
+            Some(if matches!(d, Dim::Angle | Dim::AngSpeed) { x.to_degrees() } else { x })
+        }
+        _ => None,
+    }
+}
+
 fn word_start(c: char) -> bool {
     c.is_alphabetic() || matches!(c, '_' | '°' | 'µ' | '%')
 }
@@ -216,7 +233,7 @@ fn tokenize(line: &str, ln: usize) -> Result<Vec<Tok>, ScriptError> {
         }
         if c == '$' {
             let name: String = cs[i + 1..].iter().take_while(|c| c.is_alphanumeric() || **c == '_').collect();
-            return Err(err(format!("variable « ${name} » : il faut une ligne « balayage {name} = … »")));
+            return Err(err(format!("valeur « ${name} » inconnue : il faut une ligne « paramètre {name} = … » (ou « balayage {name} = … »)")));
         }
         let prev_value = matches!(out.last(), Some(Tok::N(_)) | Some(Tok::RP));
         let num_start = c.is_ascii_digit() || (c == '.' && digit(i + 1)) || ((c == '-' || c == '+') && !prev_value && (digit(i + 1) || (i + 1 < n && cs[i + 1] == '.' && digit(i + 2))));
@@ -279,6 +296,9 @@ struct P<'a> {
     ln: usize,
     /// variables affectées par les lignes d'avant (`soit`) : seuils, relevés et formules peuvent les nommer
     vars: Vec<String>,
+    /// noms lus sur la ligne : relevés d'un objet nommé et objets nommés posés, (vilebrequin ?, nom) — vérifiés en fin de lecture
+    refs: Vec<(bool, String)>,
+    decls: Vec<(bool, String)>,
 }
 
 /// mots qui ne peuvent pas nommer une variable (relevés, grandeurs, liaisons, fonctions des formules)
@@ -359,6 +379,20 @@ impl<'a> P<'a> {
             )),
             _ => self.err(format!("il faut {what}{}", self.here())),
         }
+    }
+    /// corps ou vilebrequin d'un relevé : son numéro (1 pour le premier posé) ou son nom entre guillemets (noté, pour la vérification
+    /// de fin de lecture)
+    fn who(&mut self, what: &str, crank: bool) -> R<Who> {
+        if let Some(Tok::S(s)) = self.peek() {
+            let s = s.clone();
+            self.i += 1;
+            if s.trim().is_empty() {
+                return self.err("nom vide");
+            }
+            self.refs.push((crank, s.clone()));
+            return Ok(Who::Name(s));
+        }
+        Ok(Who::Rank(self.count(what)? - 1))
     }
     fn count(&mut self, what: &str) -> R<usize> {
         let v = self.number(what)?;
@@ -482,6 +516,10 @@ impl<'a> P<'a> {
         Ok(Threshold::Num(if unit && matches!(dim, Dim::Angle | Dim::AngSpeed) { v.to_degrees() } else { v }))
     }
     fn point(&mut self) -> R<[f64; 2]> {
+        // « point (x, y) » aussi : ce qu'écrit une zone nommée qui est un point (`zone "capteur" = point (x, y)`, puis `p en zone "capteur"`)
+        if self.peek_w() == Some("point") && self.t.get(self.i + 1) == Some(&Tok::LP) {
+            self.i += 1;
+        }
         if !self.eat(&Tok::LP) {
             return self.err(format!("il faut un point (x, y){}", self.here()));
         }
@@ -646,7 +684,7 @@ impl<'a> P<'a> {
                 Measure::Flux { fluid, mass, a, b, label: None }
             }
             ("vilebrequin", _) => {
-                let n = self.count("le numéro du vilebrequin (1 pour le premier posé)")?;
+                let who = self.who("le vilebrequin : son numéro (1 pour le premier posé) ou son nom entre guillemets", true)?;
                 let q = match self.word("la grandeur du vilebrequin (angle, tours, rotation, couple, puissance)")?.as_str() {
                     "angle" => CrankQty::Angle,
                     "tours" | "tour" => CrankQty::Turns,
@@ -655,10 +693,10 @@ impl<'a> P<'a> {
                     "puissance" => CrankQty::Power,
                     o => return self.err(format!("grandeur « {o} » d'un vilebrequin : angle, tours, rotation, couple, puissance")),
                 };
-                Measure::Crank { index: n - 1, q, label: None }
+                Measure::Crank { who, q, label: None }
             }
             ("corps", _) => {
-                let n = self.count("le numéro du corps (1 pour le premier posé)")?;
+                let who = self.who("le corps : son numéro (1 pour le premier posé) ou son nom entre guillemets", false)?;
                 let w = self.word("la grandeur du corps (x, y, angle, vx, vy, rotation, fx, fy, couple [contact | loi | total], température)")?;
                 let q = match w.as_str() {
                     "x" => BodyQty::X,
@@ -689,7 +727,7 @@ impl<'a> P<'a> {
                     "t" | "temperature" => BodyQty::Temp,
                     o => return self.err(format!("grandeur « {o} » d'un corps : x, y, angle, vx, vy, rotation, fx, fy, couple, température")),
                 };
-                Measure::Body { index: n - 1, q, label: None }
+                Measure::Body { who, q, label: None }
             }
             (_, Some(reduce)) => {
                 let q = self.quantity_name()?;
@@ -807,8 +845,10 @@ fn timed_action(p: &mut P, ln: usize, pause_ok: bool) -> R<Action> {
         return p.err("il manque l'action après « : »");
     }
     let mut inner = Protocol::default();
-    let mut q = P { t: &p.t[p.i..], i: 0, ln, vars: p.vars.clone() };
+    let mut q = P { t: &p.t[p.i..], i: 0, ln, vars: p.vars.clone(), refs: vec![], decls: vec![] };
     parse_line(&mut q, &mut inner)?;
+    p.refs.append(&mut q.refs);
+    p.decls.append(&mut q.decls);
     p.i = p.t.len();
     let only = inner.measures.is_empty() && inner.period.is_none() && inner.images.is_empty() && inner.start.is_none();
     match inner.steps.pop() {
@@ -849,6 +889,11 @@ fn deferred(p: &mut P, ln: usize) -> R<Action> {
     match action_from_tokens(&probe, ln, &p.vars) {
         Ok(a) => {
             p.i = p.t.len();
+            match &a {
+                Action::Crank(CrankSpec { name: Some(n), .. }) => p.decls.push((true, n.clone())),
+                Action::Body { name: Some(n), .. } => p.decls.push((false, n.clone())),
+                _ => {}
+            }
             Ok(Action::Deferred { toks, calcs, check: Box::new(a) })
         }
         Err(e) => p.err(e),
@@ -858,7 +903,7 @@ fn deferred(p: &mut P, ln: usize) -> R<Action> {
 /// action d'une ligne déjà découpée (valeurs calculées remplacées par des nombres) ; `vars` : les variables du protocole
 pub(crate) fn action_from_tokens(toks: &[Tok], ln: usize, vars: &[String]) -> Result<Action, String> {
     let mut scratch = Protocol { vars: vars.to_vec(), ..Default::default() };
-    let mut q = P { t: toks, i: 0, ln, vars: vars.to_vec() };
+    let mut q = P { t: toks, i: 0, ln, vars: vars.to_vec(), refs: vec![], decls: vec![] };
     parse_line(&mut q, &mut scratch).map_err(|e| e.msg)?;
     match scratch.steps.pop() {
         Some((Step::Do(a), _)) if scratch.steps.is_empty() && scratch.measures.is_empty() => Ok(a),
@@ -994,24 +1039,31 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             proto.images.push((period, display, ln));
         }
         "mesurer" | "mesure" => {
-            if p.eat_w("toutes") {
-                if !p.eat_w("les") {
-                    return p.err("il faut « toutes les <durée> »");
+            // « mesurer toutes les <durée> [: <mesures>] » ; « mesurer : <mesures> » ajoute des colonnes sans fixer la période (celles
+            // d'un composant : la période est celle de l'expérience)
+            if !p.eat(&Tok::Colon) {
+                if p.eat_w("toutes") {
+                    if !p.eat_w("les") {
+                        return p.err("il faut « toutes les <durée> »");
+                    }
+                } else if !p.eat_w("chaque") {
+                    return p.err(format!("il faut « toutes les <durée> : … » (ou « mesurer : … » sans la période){}", p.here()));
                 }
-            } else if !p.eat_w("chaque") {
-                return p.err(format!("il faut « toutes les <durée> : … »{}", p.here()));
-            }
-            let period = p.quantity(Dim::Time, "la période des mesures")?;
-            if !(period > 0.0) {
-                return p.err("la période des mesures doit être positive");
-            }
-            if let Some(old) = proto.period {
-                if (old - period).abs() > 1e-12 * old.max(1.0) {
-                    return p.err(format!("une seule période de mesure par protocole (déjà {old} s)"));
+                let period = p.quantity(Dim::Time, "la période des mesures")?;
+                if !(period > 0.0) {
+                    return p.err("la période des mesures doit être positive");
                 }
+                if let Some(old) = proto.period {
+                    if (old - period).abs() > 1e-12 * old.max(1.0) {
+                        return p.err(format!("une seule période de mesure par protocole (déjà {old} s)"));
+                    }
+                }
+                proto.period = Some(period);
+                if p.done() {
+                    return Ok(());
+                }
+                p.eat(&Tok::Colon);
             }
-            proto.period = Some(period);
-            p.eat(&Tok::Colon);
             loop {
                 let m = p.measure()?;
                 proto.measures.push((m, ln));
@@ -1227,6 +1279,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 inertia: 0.0,
                 load: None,
                 temp: None,
+                name: None,
             };
             let deg = |p: &mut P, what: &str| -> R<f64> {
                 let v = p.number(what)?;
@@ -1234,7 +1287,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Ok(if unit { v.to_degrees() } else { v })
             };
             while !p.done() {
-                match p.word("une option (axe, angle, alésage, piston, cylindre, chambre, paroi, rotation, libre, inertie, couple, à T)")?.as_str() {
+                match p.word("une option (axe, angle, alésage, piston, cylindre, chambre, paroi, rotation, libre, inertie, couple, nom, à T)")?.as_str() {
                     "axe" => spec.axis_deg = deg(p, "la direction de l'axe du cylindre")?,
                     "angle" => spec.angle_deg = deg(p, "l'angle de départ depuis le point mort haut")?,
                     "alesage" => spec.bore = Some(p.quantity(Dim::Length, "l'alésage")?),
@@ -1267,6 +1320,14 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                             return p.err(format!("couple « {f} » : {e} (variables : t, angle, tours, rotation)"));
                         }
                         spec.load = Some(f);
+                    }
+                    "nom" => {
+                        let n = p.string("le nom du vilebrequin")?;
+                        if n.trim().is_empty() {
+                            return p.err("nom vide");
+                        }
+                        p.decls.push((true, n.clone()));
+                        spec.name = Some(n);
                     }
                     "a" => spec.temp = Some(p.quantity(Dim::Temp, "la température des pièces")?),
                     o => return p.err(format!("option « {o} » inconnue après « vilebrequin »")),
@@ -1317,6 +1378,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             let mut osc = false;
             let mut fixed_kw = false;
             let mut temp = None;
+            let mut name: Option<String> = None;
             // formule(s) d'une loi de mouvement ou de force, vérifiées sur les variables de `LAW_VARS`
             let law_formulas = |p: &mut P, n: usize, what: &str| -> R<Vec<String>> {
                 if !p.eat_w("formule") {
@@ -1353,7 +1415,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Ok(if unit { v } else { v.to_radians() })
             };
             while !p.done() {
-                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement, à T)")?.as_str() {
+                match p.word("une option (angle, fixe, libre, bloqué, vitesse, rotation, oscillation, période, pivot, masse volumique, rebond, frottement, nom, à T)")?.as_str() {
                     "a" => temp = Some(p.quantity(Dim::Temp, "la température du corps")?),
                     "angle" if p.peek_w() == Some("formule") => {
                         let f = law_formulas(p, 1, "angle")?;
@@ -1450,11 +1512,19 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                         }
                     }
                     "pivot" => motion.pivot = Some(p.point()?),
+                    "nom" => {
+                        let n = p.string("le nom du corps")?;
+                        if n.trim().is_empty() {
+                            return p.err("nom vide");
+                        }
+                        p.decls.push((false, n.clone()));
+                        name = Some(n);
+                    }
                     o => {
                         return p.err(format!(
                             "option « {o} » inconnue après « corps » : angle <a>, fixe, libre, bloqué x | y | rotation, vitesse (vx, vy), \
                              rotation <ω>, oscillation (vx, vy) | oscillation rotation <ω> avec période <T>, pivot (x, y), masse volumique <ρ>, \
-                             rebond <e>, frottement <μ>, à <T> ; lois en formules : position | vitesse | accélération formule \"…\" \"…\", \
+                             rebond <e>, frottement <μ>, nom \"X\", à <T> ; lois en formules : position | vitesse | accélération formule \"…\" \"…\", \
                              angle | rotation formule \"…\", force formule \"…\" \"…\", couple formule \"…\""
                         ))
                     }
@@ -1501,7 +1571,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             if motion.pivot.is_some() && (motion.v != [0.0, 0.0] || motion.osc_v != [0.0, 0.0]) {
                 return p.err("sur un pivot, seul le mouvement de rotation compte (rotation, oscillation rotation)");
             }
-            push(proto, Action::Body { shape, material, angle, motion, temp }, ln);
+            push(proto, Action::Body { shape, material, angle, motion, temp, name }, ln);
         }
         "chauffer" | "refroidir" => {
             let zone = p.zone()?;
@@ -1766,19 +1836,19 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             push(proto, Action::Pause, ln);
         }
         "balayage" => return p.err("un seul « balayage » par protocole"),
+        "zone" => return p.err("il faut « zone \"nom\" = <zone> » (puis « zone \"nom\" » à la place d'une zone)"),
         o => {
             return p.err(format!(
                 "commande « {o} » inconnue (départ, mesurer, simuler, remplir, température, solide, corps, effacer, chauffer, accélérer, vitesse, \
                  allumer, puits, émetteur, grille, vanne, pompe, téléporteur, bord, champ, gravité, pas max, sauver état, marque, pause, \
                  calcul, matériaux, balayage, toutes les, à, quand, attendre, tant que … fin, répéter n fois … fin, si … sinon … fin, soit, \
-                 vilebrequin)"
+                 vilebrequin, zone \"nom\" = …, inclure, paramètre)"
             ))
         }
     }
     Ok(())
 }
 
-/// Lit un protocole (sans balayage : voir `parse_all`).
 /// nom d'un bloc pour les messages
 fn block_name(s: &Step) -> &'static str {
     match s {
@@ -1846,14 +1916,98 @@ fn close_blocks(proto: &mut Protocol, open: &mut Vec<(usize, usize, usize)>, err
     }
 }
 
+/// Lit un protocole (sans balayage : voir `parse_all`) ; ses composants (`inclure`) se cherchent depuis le dossier courant.
 pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, Vec<ScriptError>> {
-    let mut proto = Protocol { source: text.to_string(), variant, ..Default::default() };
+    parse_in(text, Path::new("."), variant)
+}
+
+/// Lit un protocole dont les composants se cherchent depuis le dossier `base` ; `variant` : (nom, valeur) d'une variante de balayage.
+fn parse_in(text: &str, base: &Path, variant: Option<(String, String)>) -> Result<Protocol, Vec<ScriptError>> {
+    let ex = super::mp_compose::expand(text, base, variant.as_ref().map(|(n, v)| (n.as_str(), v.as_str())))?;
+    let includes = ex.includes.clone();
+    parse_lines(&ex.lines, ex.text, ex.includes, variant).map_err(|errs| errs.into_iter().map(|e| locate(&includes, e)).collect())
+}
+
+/// erreur à une ligne venue d'un composant : à la ligne de son « inclure », située dans le composant
+fn locate(inc: &Includes, e: ScriptError) -> ScriptError {
+    match inc.get(e.line) {
+        Some(o) => ScriptError { line: o.line, msg: format!("{}« {} » ligne {} : {}", o.via, o.file, o.at, e.msg) },
+        None => e,
+    }
+}
+
+/// zone nommée : (nom sans casse ni accents, nom écrit, mots de la zone, ligne de sa définition)
+type NamedZone = (String, String, Vec<Tok>, usize);
+
+/// `zone "nom"` remplacé par les mots de la zone nommée (la définition `zone "nom" = …` garde son nom)
+fn named_zones(toks: &[Tok], zones: &[NamedZone], ln: usize) -> R<Vec<Tok>> {
+    if !toks.iter().any(|t| matches!(t, Tok::W(w, _) if w == "zone")) {
+        return Ok(toks.to_vec());
+    }
+    let mut out = vec![];
+    let mut i = 0;
+    if matches!(toks, [Tok::W(w, _), Tok::S(_), Tok::Eq, ..] if w == "zone") {
+        out.extend_from_slice(&toks[..3]);
+        i = 3;
+    }
+    while i < toks.len() {
+        if let (Tok::W(w, _), Some(Tok::S(name))) = (&toks[i], toks.get(i + 1)) {
+            if w == "zone" {
+                let key = norm(name);
+                let Some(z) = zones.iter().find(|z| z.0 == key) else {
+                    let known: Vec<&str> = zones.iter().map(|z| z.1.as_str()).collect();
+                    let hint = if known.is_empty() { String::new() } else { format!(" (zones nommées : {})", known.join(", ")) };
+                    return Err(ScriptError { line: ln, msg: format!("zone « {name} » inconnue : il faut d'abord une ligne « zone \"{name}\" = … »{hint}") });
+                };
+                out.extend(z.2.iter().cloned());
+                i += 2;
+                continue;
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// `zone "nom" = <zone>` : la zone, vérifiée, retenue par ses mots
+fn define_zone(name: &str, rest: &[Tok], ln: usize, zones: &mut Vec<NamedZone>, inc: &Includes) -> R<()> {
+    let err = |m: String| Err(ScriptError { line: ln, msg: m });
+    if name.trim().is_empty() {
+        return err("nom de zone vide".into());
+    }
+    if rest.iter().any(|t| matches!(t, Tok::Calc(_))) {
+        return err("une zone nommée est fixée à la lecture : pour la calculer, $(…) avec des paramètres (pas {…}, relu pendant l'expérience)".into());
+    }
+    let key = norm(name);
+    if let Some(z) = zones.iter().find(|z| z.0 == key) {
+        return err(format!("zone « {name} » déjà nommée ({})", inc.place(z.3)));
+    }
+    let mut q = P { t: rest, i: 0, ln, vars: vec![], refs: vec![], decls: vec![] };
+    q.zone()?;
+    q.end()?;
+    zones.push((key, name.to_string(), rest.to_vec(), ln));
+    Ok(())
+}
+
+/// d'où vient une ligne : du protocole (None), ou de quel composant inclus où
+fn origin_key(inc: &Includes, l: usize) -> Option<(usize, String, String)> {
+    inc.get(l).map(|o| (o.line, o.via.clone(), o.file.clone()))
+}
+
+/// Lit les lignes (numéro, texte) d'un protocole développé (`mp_compose::expand`).
+fn parse_lines(lines: &[(usize, String)], source: String, includes: Includes, variant: Option<(String, String)>) -> Result<Protocol, Vec<ScriptError>> {
+    let mut proto = Protocol { source, variant, includes, ..Default::default() };
     let mut errs = vec![];
     // blocs ouverts (tant que, répéter, si, quand … fin) : (étape d'ouverture, ligne, dernière branche d'un « si ») ; usize::MAX pour
     // une ligne d'ouverture mal écrite (son « fin » la ferme sans autre erreur)
     let mut open: Vec<(usize, usize, usize)> = vec![];
-    for (k, l) in text.lines().enumerate() {
-        let ln = k + 1;
+    let mut zones: Vec<NamedZone> = vec![];
+    // objets nommés posés (vilebrequin ?, nom) ; relevés qui en nomment un (vilebrequin ?, nom, ligne)
+    let mut decls: Vec<(bool, String)> = vec![];
+    let mut refs: Vec<(bool, String, usize)> = vec![];
+    for (ln, l) in lines {
+        let ln = *ln;
         let toks = match tokenize(l, ln) {
             Ok(t) => t,
             Err(e) => {
@@ -1864,7 +2018,22 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
         if toks.is_empty() || matches!(toks.first(), Some(Tok::W(w, _)) if w == "balayage") {
             continue;
         }
-        let mut p = P { t: &toks, i: 0, ln, vars: proto.vars.clone() };
+        let toks = match named_zones(&toks, &zones, ln) {
+            Ok(t) => t,
+            Err(e) => {
+                errs.push(e);
+                continue;
+            }
+        };
+        if let [Tok::W(w, _), Tok::S(name), Tok::Eq, rest @ ..] = toks.as_slice() {
+            if w == "zone" {
+                if let Err(e) = define_zone(name, rest, ln, &mut zones, &proto.includes) {
+                    errs.push(e);
+                }
+                continue;
+            }
+        }
+        let mut p = P { t: &toks, i: 0, ln, vars: proto.vars.clone(), refs: vec![], decls: vec![] };
         let n0 = proto.steps.len();
         if let Err(e) = parse_line(&mut p, &mut proto) {
             let opens = match toks.first() {
@@ -1876,6 +2045,8 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
             }
             errs.push(e);
         }
+        refs.extend(p.refs.drain(..).map(|(c, n)| (c, n, ln)));
+        decls.append(&mut p.decls);
         for s in n0..proto.steps.len() {
             close_blocks(&mut proto, &mut open, &mut errs, s, ln);
         }
@@ -1884,6 +2055,38 @@ pub fn parse(text: &str, variant: Option<(String, String)>) -> Result<Protocol, 
         if w != usize::MAX {
             errs.push(ScriptError { line: wl, msg: format!("« {} » sans son « fin »", block_name(&proto.steps[w].0)) });
         }
+    }
+    // un bloc s'ouvre et se ferme dans le même fichier
+    for (st, ln) in &proto.steps {
+        if let Step::End { start } = st {
+            if *start < proto.steps.len() && origin_key(&proto.includes, proto.steps[*start].1) != origin_key(&proto.includes, *ln) {
+                errs.push(ScriptError {
+                    line: *ln,
+                    msg: "ce « fin » ferme un bloc ouvert dans un autre fichier : un bloc s'ouvre et se ferme dans le même fichier (protocole ou composant)".into(),
+                });
+            }
+        }
+    }
+    // relevés d'objets nommés : posés par le protocole (un état de départ enregistré peut en apporter d'autres)
+    if matches!(proto.start, Some((Start::Scenario { .. }, _))) {
+        let cranks: Vec<String> = decls.iter().filter(|d| d.0).map(|d| d.1.clone()).collect();
+        let mut bodies: Vec<String> = decls.iter().filter(|d| !d.0).map(|d| d.1.clone()).collect();
+        for c in &cranks {
+            bodies.extend(super::mp_mechanism::CRANK_PARTS.iter().map(|part| format!("{c}.{part}")));
+        }
+        for (crank, name, ln) in &refs {
+            let (known, what, line) = if *crank { (&cranks, "vilebrequin", "« vilebrequin … »") } else { (&bodies, "corps", "« corps … » (ou de son vilebrequin)") };
+            if !known.iter().any(|k| norm(k) == norm(name)) {
+                let hint = if known.is_empty() { String::new() } else { format!(" ; noms posés : {}", known.join(", ")) };
+                errs.push(ScriptError { line: *ln, msg: format!("aucun {what} ne s'appelle « {name} » : il faut « nom \"{name}\" » sur sa ligne {line}{hint}") });
+            }
+        }
+    }
+    if let (None, Some((_, l))) = (proto.period, proto.measures.first()) {
+        errs.push(ScriptError {
+            line: *l,
+            msg: "des colonnes de mesure sans période : il faut une ligne « mesurer toutes les <durée> » (seule, ou suivie de ses mesures)".into(),
+        });
     }
     if proto.start.is_none() && errs.is_empty() {
         errs.push(ScriptError { line: 1, msg: "il manque la ligne « départ scénario \"…\" » (ou « départ état \"fichier.mps\" »)".into() });
@@ -1928,8 +2131,14 @@ fn sweep_line(l: &str, ln: usize) -> Option<Result<(String, Vec<String>), Script
 }
 
 /// Lit un protocole et ses variantes : une par valeur du balayage (`balayage NOM = v1, v2, …` ; « ; » entre les valeurs si elles
-/// contiennent des virgules), `$NOM` remplacé dans le texte. Les numéros de ligne sont ceux du texte d'origine.
+/// contiennent des virgules), `$NOM` remplacé dans le texte. Les numéros de ligne sont ceux du texte d'origine. Composants cherchés
+/// depuis le dossier courant : voir `parse_all_in`.
 pub fn parse_all(text: &str) -> Result<Vec<Protocol>, Vec<ScriptError>> {
+    parse_all_in(text, Path::new("."))
+}
+
+/// Comme `parse_all`, les composants (`inclure "fichier.exp"`) cherchés depuis le dossier `base` (celui du protocole).
+pub fn parse_all_in(text: &str, base: &Path) -> Result<Vec<Protocol>, Vec<ScriptError>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut sweep = None;
     let mut errs = vec![];
@@ -1949,14 +2158,12 @@ pub fn parse_all(text: &str) -> Result<Vec<Protocol>, Vec<ScriptError>> {
     if !errs.is_empty() {
         return Err(errs);
     }
-    let Some((k, name, values)) = sweep else {
-        return parse(text, None).map(|p| vec![p]);
+    let Some((_, name, values)) = sweep else {
+        return parse_in(text, base, None).map(|p| vec![p]);
     };
-    let var = format!("${name}");
     let mut out = vec![];
     for v in &values {
-        let src: Vec<String> = lines.iter().enumerate().map(|(i, l)| if i == k { format!("# balayage {name} = {v}") } else { l.replace(&var, v) }).collect();
-        out.push(parse(&src.join("\n"), Some((name.clone(), v.clone())))?);
+        out.push(parse_in(text, base, Some((name.clone(), v.clone())))?);
     }
     Ok(out)
 }

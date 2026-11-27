@@ -1,0 +1,26 @@
+# Composant : réservoir ouvert en haut, aux parois pleines, vidé par une sortie au milieu de son fond, fermée par une vanne
+# (expériences « chasse.exp », « bachees.exp »). Le rectangle (X1, Y1) (X2, Y2) est le réservoir avec ses parois.
+#   inclure "composants/reservoir.exp" avec NOM = "cuve", X1 = 0.11, Y1 = 0.21, X2 = 0.29, Y2 = 0.37, SORTIE = 2 cm
+#
+# Zones nommées d'après NOM : zone "NOM.intérieur" (le volume du réservoir), zone "NOM.sortie" (la sortie, dans le fond) — à ouvrir
+# et fermer par « vanne zone "NOM.sortie" ouverte | fermée ». Colonne de mesure « NOM » : la masse de FLUIDE dans le réservoir
+# (kg par mètre de profondeur), à la période de l'expérience.
+
+paramètre NOM = "réservoir"
+paramètre X1 = 0.11                   # coin bas gauche, parois comprises (m)
+paramètre Y1 = 0.21
+paramètre X2 = 0.29                   # coin haut droit
+paramètre Y2 = 0.37
+paramètre PAROI = 1 cm
+paramètre SORTIE = 4 cm               # largeur de la sortie
+paramètre MATIERE = "acier"
+paramètre FLUIDE = "eau"              # fluide pesé par la colonne de mesure
+
+solide rect ($X1, $Y1) ($X2, $Y2) $MATIERE
+zone "$NOM.intérieur" = rect ($(X1 + PAROI), $(Y1 + PAROI)) ($(X2 - PAROI), $Y2)
+zone "$NOM.sortie" = rect ($((X1 + X2 - SORTIE)/2), $Y1) ($((X1 + X2 + SORTIE)/2), $(Y1 + PAROI))
+effacer zone "$NOM.intérieur"
+effacer zone "$NOM.sortie"
+vanne zone "$NOM.sortie" fermée
+
+mesurer : masse $FLUIDE dans zone "$NOM.intérieur" comme $NOM

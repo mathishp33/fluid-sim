@@ -5,23 +5,13 @@
 # charge sans la brûler) l'allume à 355° ; la combustion (jusqu'à ≈ 44 atm, 3000 K) pousse le piston et relance le volant. Un frein
 # de banc d'essai absorbe la puissance : il ne freine qu'au-dessus de 3600 °/s, et le moteur tient ≈ 615 tr/min.
 #   fluid-sim experience experiences/moteur_explosion.exp
+#
+# Le moteur est un composant, « composants/moteur_2t.exp » (son cylindre : « composants/cylindre.exp ») : « deux_moteurs.exp » en
+# pose deux côte à côte, « avance.exp » le relance pour plusieurs avances à l'allumage.
 
 départ scénario "Explosion confinée (hydrogène–air)" grille 30 x 40 maille 5 mm
 remplir partout avec "air sec (O2 + N2)" à 20 °C
-vilebrequin (0.075, 0.05) rayon 2 cm bielle 6 cm "acier" alésage 4 cm piston 1 cm cylindre chambre 1 cm angle 180 libre rotation 600 tr/min inertie 0.5 couple "-0.5*max(rotation - 3600, 0)"
+inclure "composants/moteur_2t.exp"
 
-# lumière de la culasse, fermée ; première charge
-effacer rect (0.07, 0.15) (0.08, 0.155)
-vanne rect (0.07, 0.15) (0.08, 0.155) fermée
-remplir rect (0.055, 0.1) (0.095, 0.15) avec "hydrogène–air stœchiométrique" à 20 °C
-
-# échappement, balayage, allumage
-quand vilebrequin 1 angle > 140 et vilebrequin 1 angle < 180 : vanne rect (0.07, 0.15) (0.08, 0.155) ouverte
-quand vilebrequin 1 angle > 180 et vilebrequin 1 angle < 270
-    remplir rect (0.055, 0.1) (0.095, 0.15) avec "hydrogène–air stœchiométrique" à 20 °C
-    vanne rect (0.07, 0.15) (0.08, 0.155) fermée
-fin
-quand vilebrequin 1 angle > 355 : allumer disque (0.075, 0.145) rayon 4 mm
-
-mesurer toutes les 2 ms : vilebrequin 1 rotation, vilebrequin 1 tours, vilebrequin 1 puissance, p en (0.075, 0.145) comme "chambre", max T dans rect (0.055, 0.1) (0.095, 0.15) comme "T chambre"
+mesurer toutes les 2 ms
 simuler 1 s
