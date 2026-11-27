@@ -1,0 +1,14 @@
+# Rampe de chauffe : une plaque au fond d'une cuve d'air chauffe par paliers de 0.5 s, sa consigne montant de 20 K à chaque palier
+# (320, 340, … 400 K) : la consigne est calculée à partir du compteur de paliers k ({300 + 20*k}). On mesure l'air au-dessus.
+#   fluid-sim experience experiences/rampe.exp
+
+départ scénario "Cuve vide" grille 30 x 30 maille 1 cm
+soit k = 0
+mesurer toutes les 20 ms : T en (0.15, 0.08) comme "air au-dessus", k comme "palier"
+
+répéter 5 fois
+    soit k = {k + 1}
+    chauffer rect (0.1, 0.01) (0.2, 0.03) à {300 + 20*k} K pendant 0.5 s
+    attendre 0.5 s
+fin
+marque "dernière consigne : {300 + 20*k} K"

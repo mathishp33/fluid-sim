@@ -1615,12 +1615,71 @@ marque \"fin : n = {n}, seuil = {seuil}, a = {a}\"
         ("soit n 3", "soit n = <valeur>"),
         ("soit n = \"m + 1\"", "formule « m + 1 »"),
         ("soit n = stats", "pas une valeur"),
-        ("marque \"{x}\"", "variable inconnue"),
+        ("marque \"{x}\"", "« x » inconnu"),
         ("si n > 0\nattendre 1 ms\nfin", "inconnue"),
     ] {
         let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
         assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
     }
+}
+
+#[test]
+fn computed_values_in_braces_are_read_when_the_action_is_done() {
+    // « répéter {2 + 1} fois » : au tour k, gravité (0, −2k) et attente de k ms — à la fin, (0, −6) au bout de 6 ms
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+soit k = 0
+répéter {2 + 1} fois
+    soit k = {k + 1}
+    gravité (0, {-2*k})
+    attendre {k} ms
+fin
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    assert!((r.sim.time - 0.006).abs() < 1e-9 && r.sim.gravity == [0.0, -6.0], "t = {}, g = {:?}\n{log}", r.sim.time, r.sim.gravity);
+    assert!(log.contains("ligne 3 : répéter 3 fois — fini après 3 tours") && log.contains("ligne 5 : gravité"), "{log}");
+    // dans une règle, les valeurs sont celles de l'instant où elle joue (vent = 5 posé après elle)
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+pas max 1 ms
+soit vent = 1
+quand temps > 0.0025 s : gravité ({vent}, 0)
+soit vent = 5
+attendre 5 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    assert_eq!(r.sim.gravity, [5.0, 0.0], "{}", r.log.join("\n"));
+    // dans une répétition : relue à chaque fois (t en ms), seuil et nombre de tours calculés
+    let text = "départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm
+toutes les 1 ms : gravité ({1000*t}, 0)
+attendre que temps > {0.0025}
+répéter {0} fois
+    attendre 1 ms
+fin
+attendre jusqu'à 3.5 ms
+";
+    let mut r = Runner::new(proto(text), Path::new("."), None, Some(false)).unwrap();
+    run_to_end(&mut r);
+    let log = r.log.join("\n");
+    // (fois à 0, 1, 2 et 3 ms : la dernière donne 3)
+    assert!((r.sim.gravity[0] - 3.0).abs() < 1e-9 && log.contains("ligne 4 : répéter 0 fois — aucun tour"), "{:?}\n{log}", r.sim.gravity);
+    // lecture : erreurs
+    for (bad, what) in [
+        ("toutes les {1} s : marque \"x\"", "ne va pas ici"),
+        ("gravité (0, {m})", "formule « m »"),
+        ("gravité (0, {-9.81)", "accolade non refermée"),
+        ("chauffer {1}", "zone"),
+        ("simuler jusqu'à {2} s", "ne va pas ici"),
+    ] {
+        let e = parse(&format!("départ scénario \"cuve vide\"\n{bad}"), None).unwrap_err();
+        assert!(e[0].line == 2 && e[0].msg.contains(what), "{bad} : {e:?}");
+    }
+    // une valeur qui n'est pas un nombre arrête l'expérience
+    let p = proto("départ scénario \"cuve vide\" grille 10 x 10 maille 1 cm\nsoit z = 0\ngravité (0, {1/z})\nattendre 1 ms\n");
+    let mut r = Runner::new(p, Path::new("."), None, Some(false)).unwrap();
+    let e = run_until_failure(&mut r).expect("la valeur infinie aurait dû arrêter l'expérience");
+    assert!(e.contains("« 1/z »") && e.contains("il faut un nombre"), "{e}");
 }
 
 #[test]

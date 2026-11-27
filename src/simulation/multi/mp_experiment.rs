@@ -551,6 +551,9 @@ pub enum Action {
     Periodic { period: f64, start: Option<f64>, end: Option<f64>, action: Box<Action> },
     /// variable du protocole (indice dans `Protocol::vars`) : `soit n = <valeur>`
     Let { var: usize, value: LetValue },
+    /// action aux valeurs calculées (`{…}`, formules `calcs` dans l'ordre) : ses mots `toks` sont relus avec les valeurs de l'instant
+    /// chaque fois qu'elle est faite ; `check` : la même lue avec ces valeurs à 1 (noms vérifiés au départ)
+    Deferred { toks: Vec<super::mp_script::Tok>, calcs: Vec<Calc>, check: Box<Action> },
     /// règle « quand <condition> : <action> », en parallèle du déroulement dès que sa ligne est atteinte : l'action est faite chaque
     /// fois que la condition devient vraie (relevée après chaque pas ; tout de suite si elle l'est déjà)
     When { clauses: Vec<Clause>, logic: Logic, action: Box<Action> },
@@ -572,6 +575,7 @@ impl Action {
                     | Action::Pause
                     | Action::When { .. }
                     | Action::Let { .. }
+                    | Action::Deferred { .. }
             ),
         }
     }
@@ -737,8 +741,10 @@ pub enum Step {
     /// boucle « tant que <condition> [au plus d] » : la condition est relevée à chaque tour ; vraie, les étapes du corps sont faites,
     /// jusqu'au « fin » (étape `end`) qui ramène au test ; fausse (ou la durée `limit` écoulée depuis l'entrée), on passe après `end`
     While { clauses: Vec<Clause>, logic: Logic, limit: Option<f64>, end: usize },
-    /// boucle « répéter n fois » : son corps, jusqu'au « fin » (étape `end`), est fait n fois
-    Repeat { n: usize, end: usize },
+    /// boucle « répéter n fois » : son corps, jusqu'au « fin » (étape `end`), est fait n fois ; `count` : n calculé à l'entrée
+    Repeat { n: usize, count: Option<Calc>, end: usize },
+    /// avance d'une durée calculée quand l'étape est atteinte (valeur × `factor`, l'unité écrite)
+    SimulateCalc { calc: Calc, factor: f64 },
     /// « si <condition> » : vraie, la branche qui suit ; fausse, saut au premier « sinon » (étape `next`) ou au « fin » (`end`)
     If { clauses: Vec<Clause>, logic: Logic, next: usize, end: usize },
     /// « sinon » ou « sinon si <condition> » : atteint en suivant la branche d'avant, on passe après le « fin » (`end`) ; atteint par
@@ -804,8 +810,10 @@ impl Protocol {
                     t = self.span(k + 1, *end, t);
                     k = *end;
                 }
-                Step::Repeat { n, end } => {
-                    t += *n as f64 * self.span(k + 1, *end, 0.0);
+                Step::Repeat { n, count, end } => {
+                    // (nombre de tours calculé : un tour)
+                    let n = if count.is_some() { 1 } else { *n };
+                    t += n as f64 * self.span(k + 1, *end, 0.0);
                     k = *end;
                 }
                 Step::If { next, end, .. } => {
@@ -820,7 +828,7 @@ impl Protocol {
                     k = *end;
                 }
                 Step::WhenBlock { end, .. } => k = *end,
-                Step::Do(_) | Step::Else { .. } | Step::End { .. } => {}
+                Step::Do(_) | Step::Else { .. } | Step::End { .. } | Step::SimulateCalc { .. } => {}
             }
             k += 1;
         }
@@ -967,6 +975,7 @@ pub fn check_names(proto: &Protocol, sim: &MultiphaseSim) -> Vec<(usize, String)
             Action::Periodic { action, .. } | Action::When { action, .. } => action.as_ref(),
             _ => a,
         };
+        let a = if let Action::Deferred { check, .. } = a { check.as_ref() } else { a };
         match a {
             Action::Fill { fluid: f, .. } => fluid(f, *line, false, &mut errs),
             Action::Emitter { fluid: f, .. } => fluid(f, *line, true, &mut errs),
@@ -1231,7 +1240,8 @@ pub fn apply_action(sim: &mut MultiphaseSim, a: &Action, base: &Path) -> Result<
         | Action::Mark(_)
         | Action::Pause
         | Action::When { .. }
-        | Action::Let { .. } => Ok(0),
+        | Action::Let { .. }
+        | Action::Deferred { .. } => Ok(0),
         // (conditions initiales : sa première fois ; le déroulement la répète)
         Action::Periodic { action, .. } => apply_action(sim, action, base),
     }
@@ -1694,6 +1704,8 @@ struct LoopState {
     turns: usize,
     idle: usize,
     last: f64,
+    /// tours à faire (« répéter »)
+    n: usize,
 }
 
 /// suite d'étapes en cours : le déroulement principal, ou le corps d'une règle « quand » en bloc, déroulé en parallèle
@@ -2071,7 +2083,19 @@ impl Runner {
         match step {
             Step::Do(_) => self.run_actions(seq, main),
             Step::While { clauses, logic, limit, end } => self.loop_test(seq, line, &clauses, &logic, limit, end, outer),
-            Step::Repeat { n, end } => self.repeat_test(seq, line, n, end, outer),
+            Step::Repeat { n, count, end } => self.repeat_test(seq, line, n, count.as_ref(), end, outer),
+            Step::SimulateCalc { calc, factor } => {
+                let d = calc.eval(&self.var_values()) * factor;
+                if !(d >= 0.0 && d.is_finite()) {
+                    self.fail(format!("ligne {line} : durée calculée « {} » = {} s : il faut un nombre positif", calc.text, fmt_num(d)));
+                } else {
+                    if main {
+                        self.start_sampling();
+                    }
+                    seq.target = Some(self.sim.time + d);
+                    seq.pc += 1;
+                }
+            }
             Step::If { clauses, logic, next, .. } => {
                 if let Some((holds, text)) = self.eval_cond(line, &clauses, &logic) {
                     self.note(format!("ligne {line} : si {text} — {}", if holds { "vrai" } else { "faux" }));
@@ -2327,18 +2351,17 @@ impl Runner {
         std::iter::once(self.sim.time).chain(self.vars.iter().copied()).collect()
     }
 
-    /// texte d'un repère : chaque « {nom} » remplacé par la valeur de la variable
+    /// texte d'un repère : chaque « {…} » (formule en t et en variables, un nom seul par exemple) remplacé par sa valeur
     fn interpolate(&self, t: &str) -> String {
+        let names: Vec<&str> = std::iter::once("t").chain(self.proto.vars.iter().map(|s| s.as_str())).collect();
+        let vals = self.var_values();
         let (mut out, mut rest) = (String::new(), t);
         while let Some(i) = rest.find('{') {
             let Some(j) = rest[i..].find('}') else { break };
-            let name = norm(rest[i + 1..i + j].trim());
-            match self.proto.vars.iter().position(|v| *v == name) {
-                Some(k) => {
-                    out += &rest[..i];
-                    out += &fmt_num(self.vars[k]);
-                }
-                None => out += &rest[..i + j + 1],
+            out += &rest[..i];
+            match Calc::new(rest[i + 1..i + j].trim(), &names) {
+                Ok(c) => out += &fmt_num(c.eval(&vals)),
+                Err(_) => out += &rest[i..i + j + 1],
             }
             rest = &rest[i + j + 1..];
         }
@@ -2365,7 +2388,7 @@ impl Runner {
             st.idle = if now <= st.last + eps { st.idle + 1 } else { 0 };
             st.last = now;
         } else {
-            *st = LoopState { since: now, turns: 0, idle: 0, last: now };
+            *st = LoopState { since: now, turns: 0, idle: 0, last: now, n: 0 };
         }
         let (since, idle) = (st.since, st.idle);
         if idle > 1000 {
@@ -2382,15 +2405,22 @@ impl Runner {
         }
     }
 
-    /// Test d'une boucle « répéter n fois » (étape `seq.pc`, « fin » à `end`)
-    fn repeat_test(&mut self, seq: &mut Seq, line: usize, n: usize, end: usize, outer: bool) {
+    /// Test d'une boucle « répéter n fois » (étape `seq.pc`, « fin » à `end`) ; un nombre de tours calculé l'est à l'entrée
+    fn repeat_test(&mut self, seq: &mut Seq, line: usize, n: usize, count: Option<&Calc>, end: usize, outer: bool) {
         let k = seq.pc;
         let back = seq.jumped.take() == Some(k);
         let now = self.sim.time;
-        let st = seq.loops.entry(k).or_default();
-        if !back {
-            *st = LoopState { since: now, turns: 0, idle: 0, last: now };
-        }
+        let n = if back {
+            seq.loops.get(&k).map_or(n, |s| s.n)
+        } else {
+            let n = count.map_or(n, |c| {
+                let v = c.eval(&self.var_values()).round();
+                if v.is_finite() && v > 0.0 { v as usize } else { 0 }
+            });
+            seq.loops.insert(k, LoopState { since: now, turns: 0, idle: 0, last: now, n });
+            n
+        };
+        let st = seq.loops.get(&k).unwrap();
         let what = format!("répéter {n} fois");
         if st.turns < n {
             self.enter_turn(seq, k, line, end, &what);
@@ -2709,6 +2739,36 @@ impl Runner {
                 Action::Mark(t) => {
                     let t = self.interpolate(t);
                     self.note(format!("ligne {line} : repère « {t} »"))
+                }
+                Action::Deferred { toks, calcs, .. } => {
+                    // valeurs de l'instant, puis l'action relue
+                    let vals = self.var_values();
+                    let mut k = 0;
+                    let mut concrete = Vec::with_capacity(toks.len());
+                    for t in toks {
+                        if let super::mp_script::Tok::Calc(_) = t {
+                            let v = calcs[k].eval(&vals);
+                            if !v.is_finite() {
+                                self.fail(format!("ligne {line} : valeur calculée « {} » = {} : il faut un nombre", calcs[k].text, fmt_num(v)));
+                                return Err(());
+                            }
+                            concrete.push(super::mp_script::Tok::N(v));
+                            k += 1;
+                        } else {
+                            concrete.push(t.clone());
+                        }
+                    }
+                    match super::mp_script::action_from_tokens(&concrete, line, &self.proto.vars) {
+                        Ok(a) => {
+                            let (e, h) = self.do_action(&a, line)?;
+                            edited |= e;
+                            heat |= h;
+                        }
+                        Err(e) => {
+                            self.fail(format!("ligne {line} : avec ses valeurs calculées, {e}"));
+                            return Err(());
+                        }
+                    }
                 }
                 Action::Let { var, value } => {
                     let v = match value {
@@ -3255,6 +3315,7 @@ fn describe(a: &Action) -> String {
         }
         Action::Periodic { period, start, action, .. } if period.is_infinite() => format!("à {} s : {}", fmt_num(start.unwrap_or(0.0)), describe(action)),
         Action::Periodic { period, action, .. } => format!("toutes les {} s : {}", fmt_num(*period), describe(action)),
+        Action::Deferred { .. } => "action aux valeurs calculées".into(),
         Action::Let { value, .. } => match value {
             LetValue::Num(v) => format!("variable = {}", fmt_num(*v)),
             LetValue::Calc(c) => format!("variable = « {} »", c.text),

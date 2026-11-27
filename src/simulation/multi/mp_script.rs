@@ -26,11 +26,13 @@ impl std::fmt::Display for ScriptError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     /// mot (normalisé, tel qu'écrit)
     W(String, String),
     N(f64),
     S(String),
+    /// valeur calculée « {…} » : formule en t (temps simulé) et en variables
+    Calc(String),
     LP,
     RP,
     Comma,
@@ -46,6 +48,7 @@ fn show(t: &Tok) -> String {
         Tok::W(_, s) => format!("« {s} »"),
         Tok::N(v) => format!("le nombre {v}"),
         Tok::S(s) => format!("« \"{s}\" »"),
+        Tok::Calc(s) => format!("« {{{s}}} »"),
         Tok::LP => "« ( »".into(),
         Tok::RP => "« ) »".into(),
         Tok::Comma => "une virgule".into(),
@@ -180,6 +183,18 @@ fn tokenize(line: &str, ln: usize) -> Result<Vec<Tok>, ScriptError> {
                 _ => Cmp::Ge,
             }));
             i += if eq { 2 } else { 1 };
+            continue;
+        }
+        if c == '{' {
+            let mut j = i + 1;
+            while j < n && cs[j] != '}' {
+                j += 1;
+            }
+            if j >= n {
+                return Err(err("accolade non refermée".into()));
+            }
+            out.push(Tok::Calc(cs[i + 1..j].iter().collect::<String>().trim().to_string()));
+            i = j + 1;
             continue;
         }
         if matches!(c, '"' | '«' | '“') {
@@ -339,6 +354,9 @@ impl<'a> P<'a> {
                 self.i += 1;
                 Ok(v)
             }
+            Some(Tok::Calc(_)) => self.err(format!(
+                "une valeur calculée {{…}} ne va pas ici (il faut {what}) : elle va dans une action, une durée de simuler ou attendre, un nombre de tours de répéter, un seuil ou la valeur de « soit »"
+            )),
             _ => self.err(format!("il faut {what}{}", self.here())),
         }
     }
@@ -418,7 +436,7 @@ impl<'a> P<'a> {
     fn threshold(&mut self, m: &Measure) -> R<Threshold> {
         // variable seule, ou formule en t et en variables : calculées à chaque relevé, dans l'unité du relevé
         match self.peek() {
-            Some(Tok::S(s)) => {
+            Some(Tok::S(s) | Tok::Calc(s)) => {
                 let s = s.clone();
                 self.i += 1;
                 return Ok(Threshold::Calc(self.calc(&s)?));
@@ -793,9 +811,53 @@ fn push(proto: &mut Protocol, a: Action, ln: usize) {
     proto.steps.push((Step::Do(a), ln));
 }
 
+/// commandes qui ne sont pas des actions : leurs valeurs calculées {…} (seuils, durées, tours, « soit ») sont lues par elles-mêmes
+const NOT_ACTIONS: [&str; 19] = [
+    "depart", "materiaux", "mesurer", "simuler", "avancer", "attendre", "tant", "repeter", "si", "sinon", "fin", "quand", "soit", "toutes",
+    "chaque", "a", "calcul", "images", "image",
+];
+
+/// Action dont des valeurs sont calculées (`{…}`) : vérifiée ici, ces valeurs posées à 1 ; relue avec les valeurs de l'instant chaque
+/// fois qu'elle est faite
+fn deferred(p: &mut P, ln: usize) -> R<Action> {
+    let toks: Vec<Tok> = p.t[p.i - 1..].to_vec();
+    let mut calcs = vec![];
+    for t in &toks {
+        if let Tok::Calc(f) = t {
+            calcs.push(p.calc(f)?);
+        }
+    }
+    let probe: Vec<Tok> = toks.iter().map(|t| if matches!(t, Tok::Calc(_)) { Tok::N(1.0) } else { t.clone() }).collect();
+    match action_from_tokens(&probe, ln, &p.vars) {
+        Ok(a) => {
+            p.i = p.t.len();
+            Ok(Action::Deferred { toks, calcs, check: Box::new(a) })
+        }
+        Err(e) => p.err(e),
+    }
+}
+
+/// action d'une ligne déjà découpée (valeurs calculées remplacées par des nombres) ; `vars` : les variables du protocole
+pub(crate) fn action_from_tokens(toks: &[Tok], ln: usize, vars: &[String]) -> Result<Action, String> {
+    let mut scratch = Protocol { vars: vars.to_vec(), ..Default::default() };
+    let mut q = P { t: toks, i: 0, ln, vars: vars.to_vec() };
+    parse_line(&mut q, &mut scratch).map_err(|e| e.msg)?;
+    match scratch.steps.pop() {
+        Some((Step::Do(a), _)) if scratch.steps.is_empty() && scratch.measures.is_empty() => Ok(a),
+        _ => Err("des valeurs calculées {…} vont dans une action, une durée (simuler, attendre {…} s), un nombre de tours (répéter {…} fois), un seuil ou la valeur de « soit »".into()),
+    }
+}
+
 fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
     let ln = p.ln;
     let cmd = p.word("une commande")?;
+    // action aux valeurs calculées {…} : relue avec les valeurs de l'instant chaque fois qu'elle est faite (aussi après « : » d'une
+    // règle ou d'une répétition, lue par cette même fonction)
+    if !NOT_ACTIONS.contains(&cmd.as_str()) && p.t[p.i..].iter().any(|t| matches!(t, Tok::Calc(_))) {
+        let a = deferred(p, ln)?;
+        push(proto, a, ln);
+        return Ok(());
+    }
     match cmd.as_str() {
         "depart" => {
             if proto.start.is_some() {
@@ -951,6 +1013,13 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 Step::UntilCond { clauses, logic, limit: opt_limit(p)? }
             } else if matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::W(w, _)) if w == "jusqua" || w == "jusque") {
                 Step::Until(p.quantity(Dim::Time, "le temps à atteindre")?)
+            } else if let Some(Tok::Calc(f)) = p.peek() {
+                // durée calculée {…} [unité], quand la ligne est atteinte
+                let f = f.clone();
+                p.i += 1;
+                let calc = p.calc(&f)?;
+                let factor = p.opt_unit(Dim::Time, 1.0)?.0;
+                Step::SimulateCalc { calc, factor }
             } else {
                 let d = p.quantity(Dim::Time, "la durée à simuler")?;
                 if !(d >= 0.0) {
@@ -982,7 +1051,7 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
                 }
             };
             let value = match p.peek() {
-                Some(Tok::S(f)) => {
+                Some(Tok::S(f) | Tok::Calc(f)) => {
                     let f = f.clone();
                     p.i += 1;
                     LetValue::Calc(p.calc(&f)?)
@@ -1004,7 +1073,14 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         }
         "attendre" => {
             // attendre <durée> | jusqu'à <instant> | [que | jusqu'à ce que] <condition> [au plus <durée>] — comme « simuler »
-            let step = if matches!(p.peek(), Some(Tok::N(_))) {
+            let step = if let Some(Tok::Calc(f)) = p.peek() {
+                // durée calculée {…} [unité], quand la ligne est atteinte
+                let f = f.clone();
+                p.i += 1;
+                let calc = p.calc(&f)?;
+                let factor = p.opt_unit(Dim::Time, 1.0)?.0;
+                Step::SimulateCalc { calc, factor }
+            } else if matches!(p.peek(), Some(Tok::N(_))) {
                 let d = p.quantity(Dim::Time, "la durée à attendre")?;
                 if !(d >= 0.0) {
                     return p.err("la durée doit être positive");
@@ -1040,13 +1116,19 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
             proto.steps.push((Step::End { start: usize::MAX }, ln));
         }
         "repeter" => {
-            // répéter <n> fois … fin
-            let n = p.count("le nombre de tours")?;
+            // répéter <n> fois … fin — n peut être calculé ({…}, à l'entrée dans la boucle)
+            let (n, count) = if let Some(Tok::Calc(f)) = p.peek() {
+                let f = f.clone();
+                p.i += 1;
+                (0, Some(p.calc(&f)?))
+            } else {
+                (p.count("le nombre de tours")?, None)
+            };
             if !p.eat_w("fois") {
                 return p.err(format!("il faut « répéter <n> fois »{}", p.here()));
             }
             p.end()?;
-            proto.steps.push((Step::Repeat { n, end: usize::MAX }, ln));
+            proto.steps.push((Step::Repeat { n, count, end: usize::MAX }, ln));
         }
         "si" => {
             // si <condition> … [sinon si <condition> …] [sinon …] fin
@@ -1570,14 +1652,11 @@ fn parse_line(p: &mut P, proto: &mut Protocol) -> R<()> {
         }
         "marque" | "repere" => {
             let t = p.string("le texte du repère")?;
-            // « {nom} » : valeur d'une variable
+            // « {…} » : valeur d'une formule en t et en variables (un nom de variable seul, par exemple), quand le repère est posé
             let mut rest = t.as_str();
             while let Some(i) = rest.find('{') {
                 let Some(j) = rest[i..].find('}') else { break };
-                let name = norm(rest[i + 1..i + j].trim());
-                if !p.vars.contains(&name) {
-                    return p.err(format!("« {{{}}} » dans le repère : variable inconnue (« soit {name} = … » d'abord)", &rest[i + 1..i + j]));
-                }
+                p.calc(rest[i + 1..i + j].trim())?;
                 rest = &rest[i + j + 1..];
             }
             p.end()?;
@@ -1636,7 +1715,9 @@ fn close_blocks(proto: &mut Protocol, open: &mut Vec<(usize, usize, usize)>, err
             Some((usize::MAX, _, _)) => {}
             Some((w, wl, branch)) => {
                 if matches!(proto.steps[w].0, Step::While { .. }) {
-                    let advances = proto.steps[w + 1..s].iter().any(|(st, _)| matches!(st, Step::Simulate(_) | Step::Until(_) | Step::UntilCond { .. }));
+                    let advances = proto.steps[w + 1..s]
+                        .iter()
+                        .any(|(st, _)| matches!(st, Step::Simulate(_) | Step::SimulateCalc { .. } | Step::Until(_) | Step::UntilCond { .. }));
                     if !advances {
                         errs.push(ScriptError { line: wl, msg: "le corps d'une boucle « tant que » doit faire avancer le temps (simuler, attendre)".into() });
                     }

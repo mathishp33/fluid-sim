@@ -194,7 +194,8 @@ TEMPS, MESURES, SORTIES
   répéter 3 fois  …  fin    ·    si <condition>  …  sinon si <condition>  …  sinon  …  fin   (blocs, imbriquables)
   quand <condition>  …  fin   (règle en bloc : ses lignes, attentes comprises, se déroulent en parallèle du protocole)
   conditions : (A et B) ou C ; seuil : nombre et unité, variable, ou \"formule\" en t et variables
-  soit n = 0 · soit p0 = p en (0.1, 0.1) · soit n = \"n + 1\"   (variable : relevé, nombre, formule ; marque \"{n} rebonds\")
+  soit n = 0 · soit p0 = p en (0.1, 0.1) · soit n = {n + 1}   (variable : relevé, nombre, formule ; marque \"{n} rebonds\")
+  {formule} à la place d'un nombre : chauffer … à {300 + 20*k} K · attendre {d} s · répéter {n} fois   (relue quand l'action est faite)
   toutes les 0.5 s [à partir de 1 s] [jusqu'à 3 s] : chauffer rect (0, 0) (0.1, 0.02) à 600 K pendant 0.1 s   (action répétée, à l'heure pile)
   à 1.2 s : <action>   (action datée, une fois ; un geste fait pendant une expérience s'inscrit ainsi)
   quand p en (0.15, 0.1) > 104 kPa [et | ou …] : <action>   (règle : faite chaque fois que la condition devient vraie ; aussi « pause »)
