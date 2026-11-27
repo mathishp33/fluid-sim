@@ -24,9 +24,12 @@ EXPERIENCES.md (protocoles).
   Churchill–Chu) : mesurer à 20 mailles, revoir les ouvertures prudentes des faces pour le fluide chauffé au contact.
 - [M] Rebond dans un liquide selon le nombre de Stokes (Gondret et al. 2002) : à mesurer ; le film entre deux surfaces n'est pas
   résolu (pas de lubrification).
-- [M] Bruit de pression des corps en mouvement dans l'eau (fluide balayé routé vers une seule voisine) ; niveau de pression d'une
-  cuve fermée pleine de liquide qui oscille de quelques kPa sous un corps libre ; masse ajoutée apparente jusqu'à 1.4 quand le pas
-  double au démarrage.
+- [M] Bruit de pression des corps en mouvement dans l'eau : une fonction de la place du corps dans sa maille (±10 ½ρU²d sur un
+  disque qui suit le courant), ni le routage du fluide balayé ni l'ouverture des faces ; anticiper le volume balayé par un corps
+  imposé le divise par cinq mais le compte en partie deux fois (traînée à Re = 20 : 3.44 au lieu de 2.68) — refaire le bilan de
+  volume d'une maille balayée (SOLID.md § 8), qui expliquerait aussi le disque libre qui sédimente 23 % trop lentement ; niveau de
+  pression d'une cuve fermée pleine de liquide qui oscille de quelques kPa sous un corps libre ; masse ajoutée apparente jusqu'à
+  1.4 quand le pas double au démarrage.
 - [M] Grains : leur sédimentation ignore les corps (la fermeture les pousse hors du corps, mais ils n'y voient pas une paroi).
 - [M] Plus tard : bloc de glace qui fond, bûche qui brûle, liaisons, butées, ressorts, formes non convexes, température non uniforme
   dans un corps (nombre de Biot élevé).

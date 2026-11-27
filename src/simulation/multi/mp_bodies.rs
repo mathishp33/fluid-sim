@@ -2235,6 +2235,46 @@ mod tests {
         (sum / q, s.step_count)
     }
 
+    /// Le même disque qui suit le courant (dans l'eau), pas à pas : sa force en unités de ½ρU²d, avec la place de son centre dans sa
+    /// maille. Le « bruit » est une fonction de cette place (≈ −10 à 0.1–0.2 maille, +8 à 0.45, et ainsi à chaque maille traversée),
+    /// avec des pressions de ±100 Pa (≈ ρ U dx / dt). Diagnostic : `cargo test --release co_moving_steps -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn co_moving_steps_diag() {
+        let (d, cells, u) = (0.01, 10usize, 0.142);
+        let dx = d / cells as f64;
+        let mut s = scene(&format!(
+            "départ scénario \"cuve vide\" grille {} x {} maille {dx} m\n\
+             gravité (0, 0)\n\
+             remplir partout avec \"eau\" à 20 °C\n\
+             bord haut mur\n\
+             bord bas mur\n\
+             bord gauche entrée ({u}, 0) m/s à 20 °C \"eau\"\n\
+             bord droite ouvert\n\
+             vitesse partout ({u}, 0) m/s\n\
+             corps disque ({}, {}) rayon {} \"acier\" vitesse ({u}, 0) m/s\n",
+            30 * cells,
+            10 * cells,
+            5.0 * d,
+            5.0 * d,
+            0.5 * d
+        ));
+        s.surface_tension = false;
+        let rho = s.rho_mix[5];
+        let q = 0.5 * rho * u * u * d;
+        let mut k = 0;
+        while s.time < 4.0 * d / u && !s.diverged {
+            s.step();
+            k += 1;
+            if k > 60 && k < 140 {
+                let x = s.bodies[0].pos[0];
+                let pmin = s.p.iter().cloned().fold(f64::MAX, f64::min) - 101325.0;
+                let pmax = s.p.iter().cloned().fold(f64::MIN, f64::max) - 101325.0;
+                eprintln!("pas {k} dt {:.2e} x/dx {:.3} Fx {:+.3} Fy {:+.3} p [{:+.2}, {:+.2}] Pa", s.last_dt, (x / dx).fract(), s.body_force[0][0] / q, s.body_force[0][1] / q, pmin, pmax);
+            }
+        }
+    }
+
     /// Disque qui avance À LA VITESSE du courant (mouvement imposé dans un écoulement uniforme) : le fluide est au repos par rapport à
     /// lui, la force doit être nulle — toute force est un défaut du bord mobile. Diagnostic : `cargo test --release co_moving --
     /// --ignored --nocapture`

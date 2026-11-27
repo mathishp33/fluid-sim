@@ -456,10 +456,22 @@ Les empreintes de l'état complet (`cpu_state_fingerprints`), elles, changent fo
   - disque tiré, domaine de 45 × 15 diamètres : C_D = 2.47 à Re = 20 et 2.36 à Re = 40 (fixe : 1.83 et 1.38) ;
   - disque qui sédimente dans l'huile (Re visé 20) : 0.109 m/s pour 0.142 (−23 %, Re 15), au lieu de 0.065.
   Restent : le frottement, trop faible à 20 mailles (non-glissement étalé sur une maille), et un bruit de pression sur les corps en
-  mouvement dans l'eau (force d'un disque qui suit le courant qui varie de plusieurs ½ρU²d d'un pas à l'autre : le fluide balayé va
-  à une seule voisine, alors que le fluide collé quitte la maille par deux faces sur un bord oblique). Répartir le volume balayé
-  entre les voisines, au prorata du débit collé qui sort par chaque face, améliorait la traînée (2.36) mais cassait un flotteur à la
-  ligne d'eau (mailles mêlées d'eau et d'air) : écarté. Diagnostic : `co_moving_disc_diag` (disque qui suit le courant).
+  mouvement dans l'eau (force d'un disque qui suit le courant qui varie de plusieurs ½ρU²d d'un pas à l'autre). Répartir le volume
+  balayé entre les voisines, au prorata du débit collé qui sort par chaque face, améliorait la traînée (2.36) mais cassait un
+  flotteur à la ligne d'eau (mailles mêlées d'eau et d'air) : écarté. Diagnostic : `co_moving_disc_diag` (disque qui suit le
+  courant), `co_moving_steps_diag` (le même, pas à pas).
+- Ce bruit, examiné le 2026-11-27 : ce n'est pas du hasard mais une fonction de la place du disque dans sa maille (dans l'eau, à
+  10 mailles par diamètre : ≈ −10 ½ρU²d quand son centre est à 0.1–0.2 maille, +8 à 0.45 maille, et ainsi à chaque maille
+  traversée), avec des pressions de ±100 Pa, de l'ordre de ρ U dx / dt — le volume que le corps vient de balayer, chassé en un pas.
+  - Ni le routage vers UNE voisine : réparti entre les voisines au prorata de −∇α_corps·e (un bord oblique à 45° pousse moitié par
+    moitié), le fluide balayé donne les mêmes écarts (−7 à +11 ½ρU²d) ;
+  - ni l'ouverture des faces 1 − max(α_a, α_b) : la part géométrique de chaque face hors du corps donne aussi −12 à +9.
+  - Ce qui le réduit : anticiper, pour un corps à mouvement imposé (et une pièce menée), le volume qu'il balaiera au pas suivant,
+    comme pour un corps libre (dt J·V dans le second membre, `push_src` pour ne pas le compter comme une erreur) — écarts de −2 à
+    +1 ½ρU²d, cinq fois moins. Mais une partie du volume est alors comptée deux fois : le disque qui suit le courant subit en moyenne
+    −1 ½ρU²d, et la traînée du disque tiré à Re = 20 passe de 2.68 à 3.44 : écarté. Piste : le même double compte (débit collé,
+    volume anticipé, `push_src`) expliquerait le disque libre qui sédimente 23 % trop lentement ; il faut refaire le bilan de volume
+    d'une maille que le corps balaie.
 - Pas encore : grains, GPU. Au démarrage, quand le pas double d'un pas à l'autre, la masse ajoutée apparente monte jusqu'à 1.4 (la
   correction de fermeture était prévue pour l'ancien pas).
 

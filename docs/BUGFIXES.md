@@ -42,7 +42,9 @@ tâches à venir dans TODO.md. Mis à jour le 2026-11-27.
 - **Convection naturelle sous-résolue autour d'un corps** à 10 mailles par diamètre : échange thermique 3 à 6 fois trop faible
   (h ≈ 250 W/(m²·K) pour ≈ 1400).
 - **Traînée d'un corps en mouvement** approchée à 10 mailles par diamètre (+30 % à Re 20), frottement trop faible à 20 mailles.
-- **Bruit de pression des corps en mouvement dans l'eau** : le fluide balayé va à une seule voisine.
+- **Bruit de pression des corps en mouvement dans l'eau** : force d'un disque qui suit le courant qui varie de ±10 ½ρU²d selon sa
+  place dans sa maille (le volume balayé chassé en un pas : ρ U dx / dt de pression) ; pas le routage du fluide balayé ni l'ouverture
+  des faces ; l'anticiper le divise par cinq mais le compte en partie deux fois (SOLID.md § 8).
 - **Niveau de pression d'une cuve fermée pleine de liquide** qui oscille de quelques kPa sous un corps libre.
 - **Masse ajoutée apparente jusqu'à 1.4 au démarrage**, quand le pas double d'un pas à l'autre.
 - **Choc de deux corps libres** : la vitesse de l'autre corps est celle du pas précédent (restitution 0.777 pour 0.8).
